@@ -412,9 +412,11 @@ impl Machine {
         // Attach SCSI devices from config (IDs 1–7).
         let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
         scsi_ids.sort();
-        // CI mode: isolate each COW overlay under /tmp so an interactive
-        // iris holding {base}.overlay can coexist with any number of `--ci`
-        // processes. Files are kept for post-mortem inspection; cleanup
+        // CI mode: isolate each COW overlay so an interactive iris holding
+        // {base}.overlay can coexist with any number of `--ci` processes.
+        // By default the overlay lives under /tmp; IRIS_COW_OVERLAY_DIR moves
+        // it into that directory instead (per-task rigs keep it on the shared
+        // volume). Files are kept for post-mortem inspection; cleanup
         // happens on machine drop below.
         let ci_pid = std::process::id();
         // Track the on-disk path of any scratch device so the CI socket can
@@ -504,7 +506,12 @@ impl Machine {
                 (dev.path.clone(), vec![])
             };
             let result = if ci_enabled && dev.overlay && !dev.cdrom {
-                let ci_overlay = format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id);
+                // IRIS_COW_OVERLAY_DIR relocates the CI overlay; without it,
+                // keep the historical /tmp location keyed by pid.
+                let ci_overlay = match std::env::var_os("IRIS_COW_OVERLAY_DIR") {
+                    Some(dir) => format!("{}/scsi{}.overlay", dir.to_string_lossy(), id),
+                    None => format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id),
+                };
                 hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
             } else {
                 hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
