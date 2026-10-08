@@ -305,7 +305,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-The latest benchmark run on an Intel Xeon Platinum 8370C CPU demonstrates a significant performance boost when using the JIT compiler compared to the interpreter, with the r4400-jitv2 configuration achieving 1057.6 MIPS and 913.8 DMIPS, which is roughly a 16x speedup over the r4400-interp's 65.8 MIPS and 90.5 DMIPS. Similarly, the r5000-jitv2 setup recorded 496.0 MIPS and 340.3 DMIPS, representing a 10x improvement over the r5000-interp's 49.6 MIPS and 68.5 DMIPS. These results are part of a total of 11 recorded runs, all of which achieved a 100.0% completion rate.
+The JIT compiler (jitv2) delivers a massive performance boost over the interpreter, achieving 589.0 MIPS for the R4400 and 556.5 MIPS for the R5000, which represents a roughly 10x speedup compared to the interpreter’s 59.5 and 103.2 MIPS respectively. While the JIT significantly outpaces the interpreter in raw MIPS, the R4400 configuration yields higher DMIPS (522.9) than the R5000 (324.2), and all four configurations achieved a 100.0% success rate across the 12 recorded runs.
 
 ![latest benchmark cells](data/bench_cells.svg)
 
@@ -313,15 +313,15 @@ Latest run's four cells:
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
 |---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 65.8 | 90.5 | 10.9 |
-| `r4400-jitv2` | R4400 | 100.0% | 1057.6 | 913.8 | 94.2 |
-| `r5000-interp` | R5000 | 100.0% | 49.6 | 68.5 | 9.1 |
-| `r5000-jitv2` | R5000 | 100.0% | 496.0 | 340.3 | 25.9 |
+| `r4400-interp` | R4400 | 100.0% | 59.5 | 87.0 | 10.1 |
+| `r4400-jitv2` | R4400 | 100.0% | 589.0 | 522.9 | 31.8 |
+| `r5000-interp` | R5000 | 100.0% | 103.2 | 141.7 | 16.1 |
+| `r5000-jitv2` | R5000 | 100.0% | 556.5 | 324.2 | 30.8 |
 
-History — all 11 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
+History — all 12 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
 
 ![benchmark history](data/bench_history.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (11 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (12 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
