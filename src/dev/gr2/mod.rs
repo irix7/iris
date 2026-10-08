@@ -342,6 +342,11 @@ impl Gr2 {
     /// (the caller's store retries).
     fn hq_push_word(&self, index: u32, val: u64) -> bool {
         let seq = self.hq_queued_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        // Remember the prior targets so a rejected reservation cannot leave a
+        // wait pinned on a sequence that is never queued (the seq would be
+        // reused by an unrelated word, raising the flag early or never).
+        let fin3_prev = self.fin3_target.load(Ordering::Acquire);
+        let gedma_prev = self.gedma_target.load(Ordering::Acquire);
         if is_fin3_token(index) {
             self.fin3_target.store(seq, Ordering::Release);
         }
@@ -350,6 +355,12 @@ impl Gr2 {
         }
         if !self.hq_fifo.try_push(index, val) {
             self.hq_queued_seq.fetch_sub(1, Ordering::AcqRel);
+            if is_fin3_token(index) {
+                let _ = self.fin3_target.compare_exchange(seq, fin3_prev, Ordering::AcqRel, Ordering::Acquire);
+            }
+            if is_gedma_token(index) {
+                let _ = self.gedma_target.compare_exchange(seq, gedma_prev, Ordering::AcqRel, Ordering::Acquire);
+            }
             return false;
         }
         Self::wake(&self.hq_thread);
@@ -360,6 +371,8 @@ impl Gr2 {
     /// `base + 1` and `base + 2`.
     fn hq_push2_words(&self, i0: u32, v0: u64, i1: u32, v1: u64) -> bool {
         let base = self.hq_queued_seq.fetch_add(2, Ordering::AcqRel);
+        let fin3_prev = self.fin3_target.load(Ordering::Acquire);
+        let gedma_prev = self.gedma_target.load(Ordering::Acquire);
         if is_fin3_token(i0) {
             self.fin3_target.store(base + 1, Ordering::Release);
         }
@@ -374,6 +387,14 @@ impl Gr2 {
         }
         if !self.hq_fifo.try_push2(i0, v0, i1, v1) {
             self.hq_queued_seq.fetch_sub(2, Ordering::AcqRel);
+            if is_fin3_token(i0) || is_fin3_token(i1) {
+                let claimed = if is_fin3_token(i1) { base + 2 } else { base + 1 };
+                let _ = self.fin3_target.compare_exchange(claimed, fin3_prev, Ordering::AcqRel, Ordering::Acquire);
+            }
+            if is_gedma_token(i0) || is_gedma_token(i1) {
+                let claimed = if is_gedma_token(i1) { base + 2 } else { base + 1 };
+                let _ = self.gedma_target.compare_exchange(claimed, gedma_prev, Ordering::AcqRel, Ordering::Acquire);
+            }
             return false;
         }
         Self::wake(&self.hq_thread);
