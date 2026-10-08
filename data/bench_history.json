@@ -12880,6 +12880,64 @@
           "efficiency": 0.0368
         }
       ]
+    },
+    {
+      "source": "irix7/iris",
+      "commit": "aea3613707197f41f2295a774ed28f524fd8ab96",
+      "ref": "main",
+      "date": "2026-10-08T12:24:27Z",
+      "title": "ci: read the guest bench result, not the host baseline\n\nThe host-baseline step writes '<cell>-host.json' into the same\nbench/build/results/ directory as the guest run, and the accuracy check took\npaths[0] over an unsorted glob, so it could load the host result and fail with\n'guest reports host'. Select the cell's own guest result by name.",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 9V74 80-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 48.2,
+          "dmips": 68.3,
+          "whet": 2519.0,
+          "linpack": 8.85,
+          "efficiency": 0.0057
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 341.8,
+          "dmips": 689.2,
+          "whet": 1213.0,
+          "linpack": 63.34,
+          "efficiency": 0.0393
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 61.6,
+          "dmips": 88.3,
+          "whet": 3213.0,
+          "linpack": 11.22,
+          "efficiency": 0.0056
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 316.3,
+          "dmips": 690.6,
+          "whet": 1477.0,
+          "linpack": 68.13,
+          "efficiency": 0.0388
+        }
+      ]
     }
   ]
 }

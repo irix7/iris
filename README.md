@@ -313,10 +313,10 @@ Latest run's four cells:
 |---|---|---:|---:|---:|---:|
 | `r4400-jitv2` | R4400 | 100.0% | 763.6 | 753.1 | 50.0 |
 
-Normalised benchmark across all 405 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
+Normalised benchmark across all 406 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
 
 ![normalised benchmark history](data/bench_history_eff.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (405 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (406 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
