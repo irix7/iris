@@ -412,3 +412,4 @@ so cross-host MIPS deltas are host noise, not code change.
 | 2026-10-08 | irix7/iris | `817513e2` | AMD EPYC 9V45 96-Core Processor | — | 1146.8 | — | — |
 | 2026-10-08 | irix7/iris | `8877a691` | AMD EPYC 7763 64-Core Processor | 57.8 | — | — | — |
 | 2026-10-08 | irix7/iris | `8877a691` | AMD EPYC 9V74 80-Core Processor | — | 763.6 | — | — |
+| 2026-10-08 | irix7/iris | `800f7852` | AMD EPYC 9V74 80-Core Processor | 60.1 | 304.4 | 52.9 | 286.8 |
