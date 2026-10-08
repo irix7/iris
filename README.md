@@ -305,8 +305,6 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-The latest benchmark run on an AMD EPYC 9V74 80-Core Processor achieved a score of 763.6 MIPS using the r4400-jitv2 build, representing a 100.0% speedup over the baseline interpreter performance of 753.1 DMIPS. This result is part of a comprehensive dataset that now includes a total of 404 recorded runs.
-
 ![latest benchmark cells](data/bench_cells.svg)
 
 Latest run's four cells:
@@ -315,10 +313,10 @@ Latest run's four cells:
 |---|---|---:|---:|---:|---:|
 | `r4400-jitv2` | R4400 | 100.0% | 763.6 | 753.1 | 50.0 |
 
-Normalised benchmark across all 404 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
+Normalised benchmark across all 405 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
 
 ![normalised benchmark history](data/bench_history_eff.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (404 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (405 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->

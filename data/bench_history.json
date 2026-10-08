@@ -12822,6 +12822,64 @@
           }
         }
       ]
+    },
+    {
+      "source": "irix7/iris",
+      "commit": "2aafdc8bd162acfd8c75c98b588e15ba691337d0",
+      "ref": "main",
+      "date": "2026-10-08T12:02:46Z",
+      "title": "ci: auto-refresh the prebuilt guest image on main\n\nbench/prebuilt went stale when a bench: commit changed the shared harness\n(bench/harness, cpu-tests/harness) without re-running 'make -C bench\nprebuilt', failing the guests job's check-prebuilt on every push since.\n\nKeep check-prebuilt as a hard gate on pull requests, and have the report job\ndetect a stale image on main, rebuild and re-stamp it, and commit it with the\nother recorded artefacts. A missed refresh can no longer leave main red or\nship a stale image in the released binaries.",
+      "host": {
+        "raw": "linux x86_64 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz / 4 cores",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 68.3,
+          "dmips": 93.6,
+          "whet": 3345.0,
+          "linpack": 11.02,
+          "efficiency": 0.0074
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 777.1,
+          "dmips": 643.1,
+          "whet": 3888.0,
+          "linpack": 52.4,
+          "efficiency": 0.0437
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 49.1,
+          "dmips": 68.9,
+          "whet": 2620.0,
+          "linpack": 8.58,
+          "efficiency": 0.0052
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 533.4,
+          "dmips": 342.3,
+          "whet": 1084.0,
+          "linpack": 34.07,
+          "efficiency": 0.0368
+        }
+      ]
     }
   ]
 }
