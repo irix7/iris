@@ -189,6 +189,79 @@ fn fifo_backpressure_never_duplicates_64bit_stores() {
     assert_eq!(pixel(g, 1, 1), 5);
 }
 
+/// Issue #67: a GR2 `BUS_BUSY` must re-dispatch when the peer queue drains,
+/// not wait the VDMA worker's fallback timeout. The machine wires
+/// [`Gr2::set_dma_space_callback`] to the MC's `GioDma` condvar; here the
+/// callback stands in for the parked worker's wake.
+#[test]
+fn gr2_drain_notifies_a_dma_worker_parked_after_bus_busy() {
+    use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicUsize};
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::time::Duration;
+
+    // Build the board but leave the consumers stopped, so the FIFO can be
+    // filled to capacity deterministically: a VDMA write then reports
+    // BUS_BUSY, exactly the state that parks the worker.
+    let g: &'static Gr2 = Box::leak(Box::new(Gr2::new(Gr2Variant::Xz, Gr2Stats {
+        heartbeat: Arc::new(AtomicU64::new(0)),
+        fasttick: Arc::new(AtomicU64::new(0)),
+    })));
+
+    let mut saw_bus_busy = false;
+    for _ in 0..HQ_FIFO_DEPTH + 8 {
+        // GL_FLUSH is an inert one-word command, so filling with it cannot
+        // stall the consumer once it starts.
+        if g.write32(GR2_BASE + FIFO_BASE + hq2::GL_FLUSH * 4, 0) == BUS_BUSY {
+            saw_bus_busy = true;
+            break;
+        }
+    }
+    assert!(saw_bus_busy, "a full HQ2 FIFO must report BUS_BUSY");
+
+    // The parked worker waits on a condvar the drain callback notifies, with a
+    // fallback far longer than the 1 ms production timeout. Counting timeouts
+    // proves the wake came from the notification, not the fallback.
+    let wake = Arc::new((StdMutex::new(false), Condvar::new()));
+    let parked = Arc::new(StdAtomicBool::new(false));
+    let timeouts = Arc::new(AtomicUsize::new(0));
+    let cb = wake.clone();
+    g.set_dma_space_callback(Arc::new(move || {
+        let (m, c) = &*cb;
+        *m.lock().unwrap() = true;
+        c.notify_all();
+    }));
+
+    let waiter = {
+        let wake = wake.clone();
+        let parked = parked.clone();
+        let timeouts = timeouts.clone();
+        thread::spawn(move || {
+            let (m, c) = &*wake;
+            let mut guard = m.lock().unwrap();
+            parked.store(true, Ordering::Release);
+            let mut n = 0;
+            while !*guard {
+                let (g, t) = c.wait_timeout(guard, Duration::from_secs(5)).unwrap();
+                guard = g;
+                if t.timed_out() {
+                    n += 1;
+                    break;
+                }
+            }
+            timeouts.store(n, Ordering::Release);
+        })
+    };
+
+    // Ensure the worker is parked before the queue can drain, then start the
+    // consumers: draining the FIFO is the busy -> idle transition under test.
+    while !parked.load(Ordering::Acquire) { std::hint::spin_loop(); }
+    g.start();
+
+    waiter.join().unwrap();
+    assert_eq!(timeouts.load(Ordering::Acquire), 0,
+        "the GR2 drain must fire dma_space_cb; the worker woke on the fallback instead");
+}
+
 #[test]
 fn trace_captures_annotated_hq_and_re3_traffic() {
     let g = live_gr2(Gr2Variant::Xz);

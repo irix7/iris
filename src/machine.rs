@@ -835,6 +835,10 @@ impl Machine {
                     if vblank { ioc_r.set_interrupt(line, true); }
                     if !guinness { ioc_r.set_ext_io_level(crate::dev::ioc::ext_io_regs::SG_STAT_0, !vblank); }
                 }));
+                // Let a blocked VDMA worker wake when a GR2 FIFO drains, the
+                // same contract REX3's consumer provides.
+                let giodma = mc.giodma().clone();
+                g.set_dma_space_callback(Arc::new(move || giodma.notify_space()));
                 Some(g)
             }
             _ => None,
