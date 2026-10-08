@@ -80,8 +80,11 @@ pub mod reg {
     pub const INDIRECT_DATA: u32 = 0x15D;
     pub const STATUS: u32 = 0x15E;
     pub const PP1FILLMODE: u32 = 0x161;
+    pub const PP1WINMODE: u32 = 0x17B;
     /// Plane write mask (low planes, buffer A).
     pub const COLORMASKLSBSA: u32 = 0x163;
+    /// Plane write mask (low planes, buffer B).
+    pub const COLORMASKLSBSB: u32 = 0x164;
     /// Page pointer of the buffer drawn into (bits 9:0).
     pub const DRBPOINTERS: u32 = 0x16D;
     /// Tiles per row: bits 5:2 for 36-bit buffers, 1:0 for the overlay.
@@ -358,29 +361,45 @@ const FILL_FAST: u32 = 1 << 20;
 /// stipple is opaque, its 0 bits drawn in the background colour.
 const FILL_CHAR_STIPPLE: u32 = 1 << 3;
 const FILL_CHAR_STIPPLE_OPAQUE: u32 = 1 << 4;
-/// Pixel processor fill mode used when drawing window IDs, which live in
-/// their own planes, not the colour planes.
 /// PP1 fill mode draw-buffer field (bits 20:14), as the drivers use it:
 /// 0x01 the main colour buffer (A), 0x02 the second (B), 0x03 both (see
 /// `Rss::target`), 0x4F the overlay planes (4Dwm menus, overlay
-/// clears), 0x50 the window-ID planes (not modelled: their drawing is
-/// dropped). The 6.5.22 TrueColor server keeps `DRBpointers` at 0xB81C0
+/// clears), 0x50 the clip-ID planes (see `Rss::cid`). The 6.5.22
+/// TrueColor server keeps `DRBpointers` at 0xB81C0
 /// (A 0x1C0, B 0x2E0) for all drawing and picks the buffer here.
 fn draw_buffer(pp1fillmode: u32) -> u32 {
     (pp1fillmode >> 14) & 0x7F
 }
 const DRAW_B: u32 = 0x02;
 const DRAW_A_AND_B: u32 = 0x03;
-const DRAW_OVERLAY: u32 = 0x4F;
 const DRAW_CID: u32 = 0x50;
 
-/// PP1 fill mode read-buffer field (bits 25:21): 0 for every read of the
-/// main buffer traced; 4 when the X server reads the overlay back (with the
-/// draw field 0 and DRBpointers at the overlay's pages: it copies popup
-/// menu pixels through host memory).
+/// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
+/// CIDmatch, CIDdata, CIDmask). Bits 3:0 are the window origin's low x and
+/// y bits (not modelled). Bits 7:4 (CIDmatch) are one bit per clip ID:
+/// bit 4 + n lets a pixel whose clip ID is n be drawn; all clear, no
+/// check. The kernel (MgrasValidateClip) sets 1 << (4 + n) for a window
+/// that X gave clip ID n, else 0. Bits 11:10 (CIDmask, our reading) write
+/// enable the two clip-ID planes: the X server (mgrasDrawCID) sets 0xC00
+/// to draw clip IDs and leaves it set.
+fn cid_match(pp1winmode: u32) -> u32 {
+    (pp1winmode >> 4) & 0xF
+}
+fn cid_write_mask(pp1winmode: u32) -> u8 {
+    ((pp1winmode >> 10) & 3) as u8
+}
+
+/// PP1 fill mode read-buffer field (bits 25:21), whatever the draw field:
+/// 0 the first buffer, DRBpointers bits 9:0; 1 the second buffer, DRBpointers bits 19:10
+/// (the file manager scrolls its double-buffered 12-bit window, drawn with
+/// draw field 2, by reading it with read field 1 and draw field 0 and
+/// writing it back a line up); 4 the overlay, when the X server reads it
+/// back (with draw field 0 and DRBpointers at the overlay's pages: it
+/// copies popup menu pixels through host memory).
 fn read_buffer(pp1fillmode: u32) -> u32 {
     (pp1fillmode >> 21) & 0x1F
 }
+const READ_B: u32 = 1;
 const READ_OVERLAY: u32 = 4;
 
 /// Block types (fill mode bits 24:22).
@@ -395,7 +414,7 @@ mod block {
 /// Whether the pixel processors' pixel type (fill mode bits 10:8) is an RGB
 /// one; the others are colour index.
 fn rgb_pixtype(pp1fillmode: u32) -> bool {
-    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 4)
+    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2 | 4)
 }
 
 /// Pixel processor logic op (fill mode bit 2 enables it; bits 29:26 hold
@@ -458,7 +477,7 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
     match format {
         (8, 8) => pack_rgb(c4(0), c4(4), c4(8)),
         (8, 10) => pack_rgb(c5(0), c5(5), c5(10)),
-        (8, 0) => v & 0xFF_FFFF,
+        (8, 0) => v,
         (0, 1) => v & 0xFFF,
         _ => v,
     }
@@ -482,7 +501,7 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
         return (z << 8 | z >> 16) as u64;
     }
     (match format {
-        (8, 8) => c(0) / 0x11 | (c(8) / 0x11) << 4 | (c(16) / 0x11) << 8,
+        (8, 8) => c(0) >> 4 | (c(8) >> 4) << 4 | (c(16) >> 4) << 8,
         (8, 10) => c(0) >> 3 | (c(8) >> 3) << 5 | (c(16) >> 3) << 10,
         _ => v,
     }) as u64
@@ -661,6 +680,14 @@ pub struct Rss {
     te_load: u32,
     /// A texture read transfer is armed: armed, texels a line, lines.
     te_read: [u32; 3],
+    /// The clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH +
+    /// x`. The X server paints a window's visible region with an ID (1-3)
+    /// when its clip is too complex for the four screen masks, and the
+    /// kernel has that window's GL drawing match it (`pp1winmode`). Where
+    /// the board keeps them in RDRAM is not known (X draws them with
+    /// DRBpointers at the main buffer); nothing reads them back, so they
+    /// are kept apart here. Separate from the VC3's display IDs.
+    pub cid: [u8; WIDTH * HEIGHT],
 }
 
 /// XFRCONTROL (provisional layout, from the IDE's TRAM load writing 5):
@@ -808,12 +835,17 @@ impl Rss {
         }
     }
 
-    /// Whether a framebuffer pixel may be written: on screen, and passing
-    /// every enabled screen mask. Window mode bit `n - 1` enables mask `n`
-    /// (1..4, `scrmsk{n}x` / `scrmsk{n}y`, each `min << 16 | max`), and bit
-    /// `n + 3` keeps the pixels inside it rather than outside.
+    /// Whether a framebuffer pixel may be written: on screen, passing
+    /// every enabled screen mask, and its clip ID matching (`cid_match`).
+    /// Window mode bit `n - 1` enables mask `n` (1..4, `scrmsk{n}x` /
+    /// `scrmsk{n}y`, each `min << 16 | max`), and bit `n + 3` keeps the
+    /// pixels inside it rather than outside.
     fn visible(&self, x: i32, y: i32) -> bool {
         if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        let m = cid_match(self.reg(reg::PP1WINMODE));
+        if m != 0 && (m >> self.cid[y as usize * WIDTH + x as usize]) & 1 == 0 {
             return false;
         }
         let mode = self.reg(reg::CLIP_MODE);
@@ -831,7 +863,7 @@ impl Rss {
         true
     }
 
-    /// The buffer drawing and pixel reads go to: the page pointer in
+    /// The buffer drawing goes to: the page pointer in
     /// `DRBpointers`, its kind from the draw-buffer field.
     ///
     /// Main-buffer drawing names its buffer absolutely in the draw-buffer
@@ -858,31 +890,54 @@ impl Rss {
     }
 
     /// Store `v` at framebuffer `(x, y)` in the buffer (or both buffers)
-    /// the pixel processors are drawing to. Window-ID drawing is dropped.
+    /// the pixel processors are drawing to, or its low two bits in the
+    /// clip-ID planes.
     fn put(&mut self, x: i32, y: i32, v: u32) {
         let field = draw_buffer(self.reg(reg::PP1FILLMODE));
-        if field == DRAW_CID || !self.visible(x, y) {
+        if !self.visible(x, y) {
+            return;
+        }
+        if field == DRAW_CID {
+            let m = cid_write_mask(self.reg(reg::PP1WINMODE));
+            let c = &mut self.cid[y as usize * WIDTH + x as usize];
+            *c = (*c & !m) | (v as u8 & m);
             return;
         }
         let b = self.target();
-        self.put_in(b, x, y, v);
+        self.put_in(b, x, y, v, field == DRAW_B);
         if field == DRAW_A_AND_B {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
-                self.put_in(b2, x, y, v);
+                // The 12-bit X visuals can give A and B the same page.
+                // Applying an XOR twice there would erase the drawing.
+                if b2 != b {
+                    self.put_in(b2, x, y, v, true);
+                }
             }
         }
     }
 
-    fn put_in(&mut self, b: Buffer, x: i32, y: i32, v: u32) {
+    fn put_in(&mut self, b: Buffer, x: i32, y: i32, v: u32, back: bool) {
         let pp1 = self.reg(reg::PP1FILLMODE);
+        let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
         // A write through all planes (window moves copy the screen that way,
         // 24 bits a pixel) keeps the whole value; so does RGB.
-        let wide = self.rgb_mode() || self.reg(reg::COLORMASKLSBSA) == 0xFFFF_FFFF;
+        let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
         let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
-            let width = if wide { 0xFF_FFFF } else { 0xFFF };
+            let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF };
             logic_op(pp1 >> 26, v, old) & width
+        } else {
+            v
+        };
+        // X's 12-bit TrueColor visual uses RGB444 (pixel type 0, buffer
+        // size 0). Keep expanded nibbles in our RGB888 storage, whether
+        // the pixel came from a fill, an iterator, or a host transfer.
+        // Otherwise a scroll through RGBA4444 changes a fresh fill's
+        // 0x20/0x60/0x50 into a different shade on every round trip.
+        let v = if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 0 && pp1 & (1 << 13) == 0 {
+            let nibbles = v & 0xF0_F0F0;
+            nibbles | nibbles >> 4
         } else {
             v
         };
@@ -894,17 +949,23 @@ impl Rss {
         // values 0-15) or 0x70 (popup menus, values 0-3, colormap entries
         // 0-3); read as the high nibble masking overlay planes 3:0 (our
         // reading: the stored values stay as the X server wrote them).
-        // Other formats (colour index, 12-bit RGB) keep whole values: their
-        // masks describe a storage layout this model does not keep.
+        // Other formats keep their decoded values: their masks describe
+        // a packed storage layout this model does not keep.
         let v = if b.kind == Kind::Overlay {
-            let mask = (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF;
+            // Native GL CI8 overlays select the upper overlay planes
+            // (DRAW_BUFFER 0x48). X's 4-bit overlay/popup selector 0x4f
+            // presents those planes as indices 0..15.
+            let mask = if draw_buffer(pp1) == 0x48 {
+                self.reg(reg::COLORMASKMSBS) & 0xFF
+            } else {
+                (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF
+            };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
-            let lsb = self.reg(reg::COLORMASKLSBSA);
             let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 6 {
-            let mask = self.reg(reg::COLORMASKLSBSA) & 0xFFF;
+            let mask = lsb & 0xFFF;
             (old & !mask) | (v & mask)
         } else {
             v
@@ -914,17 +975,18 @@ impl Rss {
 
     /// Drawing goes to the overlay planes.
     fn draws_overlay(&self) -> bool {
-        draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_OVERLAY
+        draw_buffer(self.reg(reg::PP1FILLMODE)) & 0x70 == 0x40
     }
 
-    /// The buffer pixel reads (transfers to the host) come from: the
-    /// overlay when the read-buffer field says so, else the drawing target.
+    /// Pixel reads select A, B, or the overlay independently of drawing.
     fn source(&self) -> Buffer {
-        if read_buffer(self.reg(reg::PP1FILLMODE)) == READ_OVERLAY {
-            Buffer::new(self.reg(reg::DRBPOINTERS), Kind::Overlay, self.reg(reg::DRBSIZE))
-        } else {
-            self.target()
-        }
+        let drb = self.reg(reg::DRBPOINTERS);
+        let (ptr, kind) = match read_buffer(self.reg(reg::PP1FILLMODE)) {
+            READ_OVERLAY => (drb, Kind::Overlay),
+            READ_B => (self.second_buffer().unwrap_or(drb), Kind::Wide),
+            _ => (drb, Kind::Wide),
+        };
+        Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
     }
 
     fn get(&self, x: i32, y: i32) -> u32 {
@@ -1406,12 +1468,24 @@ impl Rss {
                 return;
             }
         }
-        let b = self.target();
-        let dst = self.mem.get(&b, ux, uy) as u32;
         let pp1 = self.reg(reg::PP1FILLMODE);
+        let b = self.target();
+        self.fragment_color(b, ux, uy, rgba, pp1, draw_buffer(pp1) == DRAW_B);
+        if draw_buffer(pp1) == DRAW_A_AND_B {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
+                }
+            }
+        }
+    }
+
+    fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [f64; 4], pp1: u32, back: bool) {
+        let dst = self.mem.get(&b, ux, uy) as u32;
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
-        let rgb = (pp1 >> 8) & 7 == 2 || self.rgb_mode();
+        let rgb = self.rgb_mode();
         let src = if rgb {
             let blend = self.reg(reg::BLENDFACTOR);
             let c = if blend & BLEND_ENABLE != 0 && !logic {
@@ -1443,9 +1517,7 @@ impl Rss {
         } else {
             (rgba[0] * 4095.0).round() as u32 & 0xFFF
         };
-        let v = if logic { logic_op(pp1 >> 26, src, dst) } else { src };
-        let mask = self.reg(reg::COLORMASKLSBSA) & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24;
-        self.mem.put(&b, ux, uy, ((dst & !mask) | (v & mask)) as u64);
+        self.put_in(b, ux as i32, uy as i32, src, back);
     }
 
     fn fill(&mut self, b: &Block) {
@@ -1731,6 +1803,92 @@ mod tests {
     }
 
     #[test]
+    fn pixel_reads_select_a_or_b_independently_of_drawing() {
+        let mut r = x_server();
+        let a = 0x240;
+        let b = 0x140;
+        r.write(reg::DRBPOINTERS, a | b << 10, false);
+        let ba = Buffer::new(a, Kind::Wide, r.reg(reg::DRBSIZE));
+        let bb = Buffer::new(b, Kind::Wide, r.reg(reg::DRBSIZE));
+        r.mem.put(&ba, 10, 1018, 0x123456);
+        r.mem.put(&bb, 10, 1018, 0x654321);
+        r.write(reg::FILLMODE, 2 << 22, false);
+        r.write(reg::XFRMODE, 0x80, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        for (read, draw, expected) in [(0, 2, 0x123456), (1, 1, 0x654321), (0, 3, 0x123456), (1, 3, 0x654321)] {
+            r.write(reg::PP1FILLMODE, 0x0C00_0204 | read << 21 | draw << 14, false);
+            block(&mut r, 10, 5, 10, 5);
+            assert_eq!(r.pio_read_hi(), expected, "read {read}, draw {draw}");
+        }
+    }
+
+    /// File Manager scrolls its depth-12 TrueColor child by reading
+    /// RGBA4444 with pp1fillmode 0, then uploading with 0x0c004004.
+    /// Newly exposed rows are filled with 0x0c00c804. All three paths
+    /// must agree for every background, icon, and text colour.
+    #[test]
+    fn rgb12_scroll_preserves_every_colour() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+        r.write(reg::XFRMODE, 0x88, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        for colour in 0..0x1000 {
+            r.write(reg::PP1FILLMODE, 0x0C00_C804, false);
+            r.write(reg::COLORMASKLSBSA, 0xFF_FFFF, false);
+            r.write(reg::COLORMASKLSBSB, 0xFF_FFFF, false);
+            r.write(reg::FILLMODE, FILL_FAST, false);
+            r.write(reg::FILL_COLOR_R, (colour & 0xF) << 8, false);
+            r.write(reg::FILL_COLOR_G, (colour & 0xF0) << 4, false);
+            r.write(reg::FILL_COLOR_B, colour & 0xF00, false);
+            block(&mut r, 10, 5, 10, 5);
+            let expected = from_host((8, 8), colour as u64);
+            assert_eq!(px(&r, 10, 5), expected, "fresh fill {colour:#x}");
+            for _ in 0..3 {
+                r.write(reg::PP1FILLMODE, 0, false);
+                r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+                r.write(reg::FILLMODE, 4 << 22, false);
+                block(&mut r, 10, 5, 10, 5);
+                let bytes = r.dma_read_line(0);
+                assert_eq!(bytes, (colour as u16).to_be_bytes());
+                r.write(reg::PP1FILLMODE, 0x0C00_4004, false);
+                r.write(reg::FILLMODE, 5 << 22, false);
+                block(&mut r, 10, 5, 10, 5);
+                r.dma_write_line(0, &bytes);
+                assert_eq!(px(&r, 10, 5), expected, "scroll {colour:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn drawing_both_aliased_buffers_applies_xor_once() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+        r.write(reg::PP1FILLMODE, 6 << 26 | PP1_LOGIC_OP_ENABLE | 3 << 14 | 0x500, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 0xA5, false);
+        block(&mut r, 10, 5, 10, 5);
+        assert_eq!(px(&r, 10, 5), 0xA5);
+        block(&mut r, 10, 5, 10, 5);
+        assert_eq!(px(&r, 10, 5), 0);
+    }
+
+    #[test]
+    fn fragments_replicate_to_both_buffers_with_their_own_masks() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x140 << 10, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_C204, false);
+        r.write(reg::COLORMASKLSBSA, 0xFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFF_0000, false);
+        let a = Buffer::new(0x240, Kind::Wide, r.reg(reg::DRBSIZE));
+        let b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
+        r.mem.put(&a, 10, 1018, 0x123456);
+        r.mem.put(&b, 10, 1018, 0x654321);
+        r.gl_fragment(10, 5, [1.0, 1.0, 1.0, 1.0], 0.0);
+        assert_eq!(r.mem.get(&a, 10, 1018), 0x1234FF);
+        assert_eq!(r.mem.get(&b, 10, 1018), 0xFF4321);
+    }
+
+    #[test]
     fn rgb_fast_fill_packs_components() {
         let mut r = x_server();
         r.write(reg::PP1FILLMODE, 3 << 26 | 0x104, false); // RGB pixel type, copy
@@ -1807,6 +1965,9 @@ mod tests {
             assert_eq!(to_host(fmt, from_host(fmt, v)), v, "{fmt:?}");
         }
         assert_eq!(from_host((8, 8), 0x0F0), pack_rgb(0, 0xFF, 0));
+        // A 12-bit visual's pixel reads back as its top nibbles.
+        assert_eq!(to_host((8, 8), 0x50_2020), 0x522);
+        assert_eq!(from_host((8, 8), 0x522), 0x55_2222);
         // 8-8-8 host pixels are X pixel values of the visuals, red in 7:0.
         assert_eq!(from_host((8, 0), 0x00_00FF), pack_rgb(0xFF, 0, 0));
     }
@@ -1882,7 +2043,7 @@ mod tests {
     }
 
     /// In RGB modes the background is three 12-bit components across two
-    /// registers, as IRIX writes it for a 12-bit window's icon: a 0xf0 grey
+    /// registers, as IRIX writes it for a 12-bit window's icon: white
     /// is 0xf00f00 (blue, green) and 0xf00 (red). These are the values from
     /// a trace of the desktop repainting its Icon Catalog.
     #[test]
@@ -1898,8 +2059,8 @@ mod tests {
         r.write(reg::IR_ALIAS, 0x15, false);
         r.write(reg::LINE_START, 300 << 16 | 40, false);
         r.write(reg::LINE_END, 301 << 16 | 40, true);
-        assert_eq!(px(&r, 300, 40), 0xA0_A0A0);
-        assert_eq!(px(&r, 301, 40), pack_rgb(0x30, 0x70, 0xC0), "red 0x30, green 0x70, blue 0xc0");
+        assert_eq!(px(&r, 300, 40), 0xAA_AAAA);
+        assert_eq!(px(&r, 301, 40), pack_rgb(0x33, 0x77, 0xCC), "expanded RGB444 background");
     }
 
     /// Block type 0 is a fill in the iterated colour, drawn at once (the
@@ -1965,6 +2126,39 @@ mod tests {
         block(&mut r, 0, 5, 30, 5);
         let drawn: Vec<usize> = (0..31).filter(|&x| px(&r, x, 5) == 7).collect();
         assert_eq!(drawn, [10, 11, 12, 13, 16, 17, 18, 19, 20]);
+    }
+
+    /// Clip-ID drawing (draw field 0x50) writes the fill colour's low two
+    /// bits under pp1winmode bits 11:10, not the colour planes; CIDmatch
+    /// (bits 7:4, one bit per ID) limits other drawing to the IDs it names,
+    /// and with no bit set nothing is checked.
+    #[test]
+    fn clipping_id_writes_masks_and_match() {
+        let mut r = x_server();
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::PP1FILLMODE, 0x142600, false);
+        r.write(reg::PP1WINMODE, 0xC00, false);
+        r.write(reg::FILL_COLOR_R, 7, false);
+        block(&mut r, 10, 5, 12, 5);
+        assert_eq!(px(&r, 10, 5), 0, "CID drawing keeps colour planes");
+        assert_eq!(r.cid[1018 * WIDTH + 10], 3, "two clip-ID planes");
+        r.write(reg::PP1WINMODE, 0x400, false);
+        r.write(reg::FILL_COLOR_R, 0, false);
+        block(&mut r, 10, 5, 10, 5);
+        assert_eq!(r.cid[1018 * WIDTH + 10], 2, "plane 0 alone written");
+        r.write(reg::PP1WINMODE, 0xC00, false);
+        block(&mut r, 11, 5, 11, 5);
+
+        r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
+        r.write(reg::COLORMASKLSBSA, 0xFF, false);
+        // IDs now 2, 0, 3 at x 10, 11, 12.
+        r.write(reg::PP1WINMODE, 1 << (4 + 2) | 1 << (4 + 3), false);
+        r.write(reg::FILL_COLOR_R, 0x55, false);
+        block(&mut r, 10, 5, 12, 5);
+        assert_eq!((px(&r, 10, 5), px(&r, 11, 5), px(&r, 12, 5)), (0x55, 0, 0x55));
+        r.write(reg::PP1WINMODE, 0xC00, false);
+        block(&mut r, 11, 5, 11, 5);
+        assert_eq!(px(&r, 11, 5), 0x55, "no CIDmatch bit: no check");
     }
 
     /// Without the opaque bit, BG_COLOR plays no part.
