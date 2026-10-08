@@ -95,11 +95,12 @@ impl StatePaths {
     }
 
     /// Serial console capture. There is no default today — `serial_log` is an
-    /// `Option<String>` and logging is off unless configured. This name is the
-    /// conventional filename a caller should use; `neutral()` returning it does
-    /// *not* enable logging by itself.
-    pub fn serial_log(&self) -> PathBuf {
-        self.at("iris-serial.log")
+    /// `Option<String>` and logging is off unless configured, so `neutral()`
+    /// returns `None` (nothing to point at). Under a root it is the
+    /// conventional `<root>/iris-serial.log`; returning `Some` here does *not*
+    /// enable logging by itself.
+    pub fn serial_log(&self) -> Option<PathBuf> {
+        self.root.as_ref().map(|root| root.join("iris-serial.log"))
     }
 
     /// Bare-metal test-device JSON dump. Today: `iris-testdev-dump.json`.
@@ -117,7 +118,7 @@ impl StatePaths {
     pub fn ci_socket(&self) -> PathBuf {
         match &self.root {
             Some(root) => root.join("iris.sock"),
-            None => PathBuf::from(default_ci_socket()),
+            None => PathBuf::from(crate::config::default_ci_socket()),
         }
     }
 
@@ -136,25 +137,11 @@ impl StatePaths {
     }
 }
 
-/// Platform CI socket default, matching `config::default_ci_socket`.
-fn default_ci_socket() -> &'static str {
-    #[cfg(unix)]
-    {
-        "/tmp/iris.sock"
-    }
-    #[cfg(windows)]
-    {
-        "127.0.0.1:19851"
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        "/tmp/iris.sock"
-    }
-}
-
 /// Platform user cache directory plus `iris/jitv2`, mirroring
-/// `cpu::jitv2::pcache::default_base` (which is private). `None` when the
-/// platform's cache base variable (HOME / LOCALAPPDATA) is unset.
+/// `cpu::jitv2::pcache::default_base` (which is private, and lives behind the
+/// `jitv2` feature, so it cannot be called from here on every build). Keep the
+/// two in lockstep. `None` when the platform's cache base variable
+/// (HOME / LOCALAPPDATA) is unset.
 fn default_jit_cache_base() -> Option<PathBuf> {
     let cache = if cfg!(target_os = "macos") {
         PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches")
@@ -185,7 +172,8 @@ mod tests {
         assert_eq!(p.chunk_store_dir(), PathBuf::from("saves").join(".cas"));
         assert_eq!(p.test_device_dump(), PathBuf::from("iris-testdev-dump.json"));
         assert_eq!(p.crash_log(), PathBuf::from("iris-crash.log"));
-        assert_eq!(p.serial_log(), PathBuf::from("iris-serial.log"));
+        // Serial logging is off by default, so there is no path to report.
+        assert_eq!(p.serial_log(), None);
 
         // The two env-resolved artefacts stay unresolved in neutral mode.
         assert_eq!(p.cow_overlay_dir(), None);
@@ -211,7 +199,7 @@ mod tests {
         assert_eq!(p.snapshots_dir(), root.join("saves"));
         assert_eq!(p.chunk_store_dir(), root.join("saves").join(".cas"));
         assert_eq!(p.jit_cache_dir(), root.join("jitv2"));
-        assert_eq!(p.serial_log(), root.join("iris-serial.log"));
+        assert_eq!(p.serial_log(), Some(root.join("iris-serial.log")));
         assert_eq!(p.test_device_dump(), root.join("iris-testdev-dump.json"));
         assert_eq!(p.crash_log(), root.join("iris-crash.log"));
         assert_eq!(p.ci_socket(), root.join("iris.sock"));

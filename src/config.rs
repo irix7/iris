@@ -203,18 +203,21 @@ pub fn instance_identity(
 
 /// Deterministic SGI-OUI (`08:00:69`) station address for an instance id.
 ///
-/// This mirrors `iris_gui::settings::generate_mac_bytes`: a `DefaultHasher`
-/// seeded from a stable string, with the low three hash bytes under the OUI.
-/// Unlike the GUI's raw hash, the final octet is forced to the low byte of
-/// `id`, which makes a fleet of up to 256 instances collision-free (a 24-bit
-/// hash cannot promise that). The two implementations therefore agree on
-/// OUI and hashing approach, but not byte-for-byte for a shared seed.
+/// This mirrors the *approach* of `iris_gui::settings` (a hashed host part
+/// under the OUI, so a fleet gets visually distinct addresses), but uses a
+/// fixed FNV-1a over the id bytes rather than `DefaultHasher`, whose output is
+/// not guaranteed stable across Rust releases — the parent spec wants a
+/// *stable* address. The final octet is the low byte of `id`, so a fleet of up
+/// to 256 instances (0..255) is collision-free by construction; larger ids
+/// rely on the hash bytes, so they are stable but only probabilistically
+/// unique. The GUI's addresses do not agree byte-for-byte, by design.
 pub fn instance_mac(id: u32) -> [u8; 6] {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("iris-instance-{id}").hash(&mut h);
-    let v = h.finish();
-    [0x08, 0x00, 0x69, (v >> 16) as u8, (v >> 8) as u8, id as u8]
+    let mut h: u32 = 0x811c_9dc5;
+    for b in id.to_le_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    [0x08, 0x00, 0x69, (h >> 16) as u8, (h >> 8) as u8, id as u8]
 }
 
 /// Derive a fully-isolated instance configuration from a base config.
@@ -250,15 +253,16 @@ pub fn derive_instance(
     port_base: Option<u16>,
 ) -> MachineConfig {
     let ident = instance_identity(id, state_dir, port_base);
+    let paths = crate::state::StatePaths::under(&ident.state_dir);
     let mut cfg = base.clone();
 
     cfg.state_dir = Some(ident.state_dir.to_string_lossy().into_owned());
 
     if cfg.nvram == default_nvram() {
-        cfg.nvram = ident.state_dir.join("nvram.bin").to_string_lossy().into_owned();
+        cfg.nvram = paths.nvram().to_string_lossy().into_owned();
     }
     if cfg.nveeprom == default_nveeprom() {
-        cfg.nveeprom = ident.state_dir.join("nveeprom.bin").to_string_lossy().into_owned();
+        cfg.nveeprom = paths.nveeprom().to_string_lossy().into_owned();
     }
 
     if cfg.monitor_port.is_none() {
@@ -278,7 +282,7 @@ pub fn derive_instance(
         }
         #[cfg(not(windows))]
         {
-            cfg.ci_socket = ident.state_dir.join("iris.sock").to_string_lossy().into_owned();
+            cfg.ci_socket = paths.ci_socket().to_string_lossy().into_owned();
         }
     }
 
@@ -307,16 +311,37 @@ pub fn instance_report(cfg: &MachineConfig, ident: &InstanceIdentity) -> String 
         .nat_subnet
         .clone()
         .unwrap_or_else(|| format!("192.168.{}.0/24", ident.id % 256));
+    let serial_log = cfg
+        .serial_log
+        .clone()
+        .or_else(|| paths.serial_log().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "(disabled)".to_string());
+    let test_dump = cfg
+        .test_device_dump
+        .clone()
+        .unwrap_or_else(|| paths.test_device_dump().display().to_string());
+    // The CI TCP port slot (base + 3) is only real on Windows; a Unix instance
+    // uses the derived socket path instead.
+    let ci_port = if cfg!(windows) {
+        format!("ci_port: {}\n", ident.port_base.saturating_add(3))
+    } else {
+        String::new()
+    };
     format!(
         "instance: {}\n\
          state_dir: {}\n\
          nvram: {}\n\
          nveeprom: {}\n\
          snapshots: {}\n\
+         chunk_store: {}\n\
+         jit_cache: {}\n\
+         serial_log: {}\n\
+         test_dump: {}\n\
+         crash_log: {}\n\
          monitor: {}\n\
          serial_a: {}\n\
          serial_b: {}\n\
-         ci_port: {}\n\
+         {ci_port}\
          ci_socket: {}\n\
          mac: {}\n\
          nat_subnet: {}\n",
@@ -325,10 +350,14 @@ pub fn instance_report(cfg: &MachineConfig, ident: &InstanceIdentity) -> String 
         cfg.nvram,
         cfg.nveeprom,
         paths.snapshots_dir().display(),
+        paths.chunk_store_dir().display(),
+        paths.jit_cache_dir().display(),
+        serial_log,
+        test_dump,
+        paths.crash_log().display(),
         cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT),
         serial_a,
         serial_b,
-        ident.port_base.saturating_add(3),
         cfg.ci_socket,
         mac,
         nat_subnet,
@@ -1337,11 +1366,11 @@ pub struct MachineConfig {
 fn default_scsi_deferred_int() -> bool { true }
 
 #[cfg(unix)]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+pub(crate) fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
 #[cfg(windows)]
-fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
+pub(crate) fn default_ci_socket() -> String { "127.0.0.1:19851".to_string() }
 #[cfg(not(any(unix, windows)))]
-fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
+pub(crate) fn default_ci_socket() -> String { "/tmp/iris.sock".to_string() }
 
 /// True when `ci_socket` is a TCP `host:port` address (Windows CI default).
 pub fn ci_socket_is_tcp(path: &str) -> bool {
@@ -2450,10 +2479,12 @@ mod instance_tests {
         assert!(report.contains("state_dir: iris-instance-3\n"), "{report}");
         assert!(report.contains("nvram: iris-instance-3/nvram.bin\n"), "{report}");
         assert!(report.contains("snapshots: iris-instance-3/saves\n"), "{report}");
+        assert!(report.contains("chunk_store: iris-instance-3/saves/.cas\n"), "{report}");
+        assert!(report.contains("serial_log: iris-instance-3/iris-serial.log\n"), "{report}");
         assert!(report.contains("monitor: 9030\n"), "{report}");
         assert!(report.contains("serial_a: 9031\n"), "{report}");
         assert!(report.contains("serial_b: 9032\n"), "{report}");
-        assert!(report.contains("ci_port: 9033\n"), "{report}");
+        assert!(report.contains("ci_socket: iris-instance-3/iris.sock\n"), "{report}");
         assert!(report.contains("mac: 08:00:69:"), "{report}");
         assert!(report.contains("nat_subnet: 192.168.3.0/24\n"), "{report}");
     }
