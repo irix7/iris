@@ -120,6 +120,9 @@ pub fn enabled_features() -> Vec<String> {
 pub struct DeviceSchema {
     pub name: String,
     pub version: u32,
+    /// Oldest device state version the capturing build could load (directly or
+    /// via a registered migration chain). `0` for unregistered/legacy devices.
+    pub minimum_version: u32,
     pub registered: bool,
     pub signature: u64,
     pub fields: Vec<FieldInfo>,
@@ -224,6 +227,7 @@ impl Manifest {
                 let mut dt = toml::map::Map::new();
                 dt.insert("name".into(), Value::String(d.name.clone()));
                 dt.insert("version".into(), Value::Integer(d.version as i64));
+                dt.insert("minimum_version".into(), Value::Integer(d.minimum_version as i64));
                 dt.insert("registered".into(), Value::Boolean(d.registered));
                 dt.insert("signature".into(), Value::String(format!("0x{:016x}", d.signature)));
                 dt.insert(
@@ -285,6 +289,7 @@ impl Manifest {
                 let t = x.as_table()?;
                 let name = t.get("name").and_then(|v| v.as_str())?.to_string();
                 let version = t.get("version").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+                let minimum_version = t.get("minimum_version").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
                 let registered = t.get("registered").and_then(|v| v.as_bool()).unwrap_or(false);
                 let signature = t.get("signature").and_then(|v| v.as_str())
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
@@ -292,7 +297,7 @@ impl Manifest {
                 let fields = t.get("fields").and_then(|v| v.as_array())
                     .map(|fs| fs.iter().filter_map(|f| f.as_str().and_then(FieldInfo::decode)).collect())
                     .unwrap_or_default();
-                Some(DeviceSchema { name, version, registered, signature, fields })
+                Some(DeviceSchema { name, version, minimum_version, registered, signature, fields })
             }).collect())
             .unwrap_or_default();
         Ok(Self {
@@ -681,6 +686,7 @@ mod tests {
             state: vec![DeviceSchema {
                 name: "cpu".into(),
                 version: 1,
+                minimum_version: 1,
                 registered: true,
                 signature: 0x1234_5678_9abc_def0,
                 fields: vec![

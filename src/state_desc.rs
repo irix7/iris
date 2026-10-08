@@ -140,6 +140,8 @@ impl FieldInfo {
 
 type SaveFn<'a> = Box<dyn Fn(&mut TomlMap) + 'a>;
 type LoadFn<'a> = Box<dyn Fn(&Value) -> Result<(), String> + 'a>;
+/// Transforms a payload captured at one version into the next version's shape.
+type MigrateFn<'a> = Box<dyn Fn(&Value) -> Result<Value, String> + 'a>;
 
 /// One registered field: metadata plus the closures that read and write it
 /// against the borrowing device. The closures capture `&device`; devices with
@@ -156,11 +158,16 @@ pub struct StateField<'a> {
 pub struct StateDesc<'a> {
     /// Device name (matches the snapshot file base, e.g. `"cpu"`).
     pub device: Cow<'static, str>,
-    /// Current schema version for this device. Per-device migration is a
-    /// separate ticket (#46); here it is recorded and folded into the
-    /// signature.
+    /// Current schema version for this device. Bump this when the registered
+    /// field set changes incompatibly and register a [`StateDesc::migrate`]
+    /// closure for every old version you want to keep loading.
     pub version: u32,
+    /// Oldest version this description can load, directly or through a chain of
+    /// registered migrations. Defaults to `version`; [`StateDesc::migrate`]
+    /// lowers it automatically.
+    pub minimum_version: u32,
     fields: Vec<StateField<'a>>,
+    migrations: Vec<(u32, MigrateFn<'a>)>,
     after_load: Option<Box<dyn Fn() -> Result<(), String> + 'a>>,
 }
 
@@ -169,7 +176,9 @@ impl<'a> StateDesc<'a> {
         Self {
             device: device.into(),
             version,
+            minimum_version: version,
             fields: Vec::new(),
+            migrations: Vec::new(),
             after_load: None,
         }
     }
@@ -201,6 +210,83 @@ impl<'a> StateDesc<'a> {
     pub fn after_load(mut self, f: impl Fn() -> Result<(), String> + 'a) -> Self {
         self.after_load = Some(Box::new(f));
         self
+    }
+
+    /// Register a migration from `from_version` to `from_version + 1`. The
+    /// closure receives the device's payload as captured at `from_version` and
+    /// returns it in the `from_version + 1` shape. Loading chains migrations
+    /// from the snapshot's version up to [`StateDesc::version`]; a gap is a
+    /// precise refusal rather than a silent misload. Registering a migration
+    /// also lowers [`StateDesc::minimum_version`] to include `from_version`.
+    pub fn migrate(
+        mut self,
+        from_version: u32,
+        f: impl Fn(&Value) -> Result<Value, String> + 'a,
+    ) -> Self {
+        self.minimum_version = self.minimum_version.min(from_version);
+        self.migrations.push((from_version, Box::new(f)));
+        self
+    }
+
+    /// Migrate a payload captured at `from` up to the current [`version`].
+    ///
+    /// * `from == version` → the value is cloned unchanged.
+    /// * `from > version` → refused: a snapshot from a newer build cannot be
+    ///   interpreted (we don't know its future layout).
+    /// * `from < minimum_version` → refused: older than any registered chain.
+    /// * a missing step in the chain → refused, naming the exact versions.
+    ///
+    /// The migrated value is verified against the current field set before it
+    /// is returned, so a broken migration fails at the migration, not midway
+    /// through applying fields.
+    ///
+    /// [`version`]: StateDesc::version
+    pub fn migrate_value(&self, from: u32, value: &Value) -> Result<Value, String> {
+        if from == self.version {
+            return Ok(value.clone());
+        }
+        if from > self.version {
+            return Err(format!(
+                "device '{}' snapshot state version {} is newer than this build's version {} \
+                 — refusing rather than misinterpreting a future layout",
+                self.device, from, self.version
+            ));
+        }
+        if from < self.minimum_version {
+            return Err(format!(
+                "device '{}' snapshot state version {} is older than the minimum supported \
+                 version {} (no migration chain reaches it)",
+                self.device, from, self.minimum_version
+            ));
+        }
+        let mut v = value.clone();
+        let mut cur = from;
+        while cur < self.version {
+            let step = self
+                .migrations
+                .iter()
+                .find(|(f, _)| *f == cur)
+                .ok_or_else(|| {
+                    format!(
+                        "device '{}' has no migration registered from state version {} to {}",
+                        self.device,
+                        cur,
+                        cur + 1
+                    )
+                })?;
+            v = (step.1)(&v).map_err(|e| {
+                format!(
+                    "device '{}' migration {} -> {} failed: {}",
+                    self.device,
+                    cur,
+                    cur + 1,
+                    e
+                )
+            })?;
+            cur += 1;
+        }
+        self.verify(&v)?;
+        Ok(v)
     }
 
     /// Serialise the descriptor's fields into a fresh table — the generated
@@ -456,5 +542,97 @@ mod tests {
         c.insert("x".into(), Value::Integer(1));
         c.insert("y".into(), Value::Integer(2));
         assert_ne!(value_signature("d", &va), value_signature("d", &Value::Table(c)));
+    }
+
+    // ---- per-device versioning + migration registry (#46) ----
+
+    /// A description at version 3 that added `b` in v2 and `c` in v3, with a
+    /// stepwise migration registered for each jump. `a` exists since v1.
+    fn migrating_desc() -> StateDesc<'static> {
+        StateDesc::new("mig", 3)
+            .field("a", FieldKind::U32, 1, |_| {}, |_| Ok(()))
+            .field("b", FieldKind::U32, 2, |_| {}, |_| Ok(()))
+            .field("c", FieldKind::U32, 3, |_| {}, |_| Ok(()))
+            .migrate(1, |v| {
+                let mut t = v.as_table().cloned().unwrap_or_default();
+                t.insert("b".into(), Value::Integer(0));
+                Ok(Value::Table(t))
+            })
+            .migrate(2, |v| {
+                let mut t = v.as_table().cloned().unwrap_or_default();
+                t.insert("c".into(), Value::Integer(0));
+                Ok(Value::Table(t))
+            })
+    }
+
+    fn old_value() -> Value {
+        let mut t = TomlMap::new();
+        t.insert("a".into(), Value::Integer(7));
+        Value::Table(t)
+    }
+
+    #[test]
+    fn old_version_state_migrates_to_current() {
+        let desc = migrating_desc();
+        // Registering migrations lowered the minimum supported version.
+        assert_eq!(desc.minimum_version, 1);
+        assert_eq!(desc.version, 3);
+
+        let migrated = desc.migrate_value(1, &old_value()).expect("v1 migrates");
+        // The migration chain added the fields introduced after v1.
+        assert_eq!(migrated.get("a").and_then(|v| v.as_integer()), Some(7));
+        assert_eq!(migrated.get("b").and_then(|v| v.as_integer()), Some(0));
+        assert_eq!(migrated.get("c").and_then(|v| v.as_integer()), Some(0));
+        // The migrated value now matches the current field set.
+        desc.verify(&migrated).expect("migrated value matches current schema");
+
+        // A v2 payload skips straight to v3 through the single remaining step.
+        let mut v2 = TomlMap::new();
+        v2.insert("a".into(), Value::Integer(1));
+        v2.insert("b".into(), Value::Integer(2));
+        let migrated = desc.migrate_value(2, &Value::Table(v2)).expect("v2 migrates");
+        assert_eq!(migrated.get("b").and_then(|v| v.as_integer()), Some(2));
+        assert_eq!(migrated.get("c").and_then(|v| v.as_integer()), Some(0));
+    }
+
+    #[test]
+    fn current_version_state_passes_through_unchanged() {
+        let desc = migrating_desc();
+        let v = desc.save();
+        assert_eq!(desc.migrate_value(3, &v).unwrap(), v);
+    }
+
+    #[test]
+    fn newer_version_refuses_with_a_precise_reason() {
+        let desc = migrating_desc();
+        let err = desc.migrate_value(4, &old_value()).unwrap_err();
+        assert!(err.contains("version 4"), "names the incoming version: {err}");
+        assert!(err.contains("newer than this build's version 3"), "names the current version: {err}");
+        assert!(err.contains("refusing"), "says it refuses rather than misloading: {err}");
+    }
+
+    #[test]
+    fn missing_migration_step_refuses_with_the_exact_versions() {
+        // v1 -> v2 registered, but no v2 -> v3 step: pulling a v1 payload up to
+        // the current v3 must refuse, not stop halfway.
+        let desc = StateDesc::new("gap", 3)
+            .field("a", FieldKind::U32, 1, |_| {}, |_| Ok(()))
+            .field("b", FieldKind::U32, 2, |_| {}, |_| Ok(()))
+            .field("c", FieldKind::U32, 3, |_| {}, |_| Ok(()))
+            .migrate(1, |v| {
+                let mut t = v.as_table().cloned().unwrap_or_default();
+                t.insert("b".into(), Value::Integer(0));
+                Ok(Value::Table(t))
+            });
+        let err = desc.migrate_value(1, &old_value()).unwrap_err();
+        assert!(err.contains("no migration registered from state version 2 to 3"), "{err}");
+    }
+
+    #[test]
+    fn version_below_the_chain_refuses_clearly() {
+        let desc = migrating_desc(); // minimum_version is 1
+        let err = desc.migrate_value(0, &old_value()).unwrap_err();
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("minimum supported version 1"), "{err}");
     }
 }

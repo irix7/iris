@@ -241,6 +241,7 @@ fn capture_device<T: Saveable + ?Sized>(
         let schema = DeviceSchema {
             name: name.to_string(),
             version: desc.version,
+            minimum_version: desc.minimum_version,
             registered: true,
             signature: desc.signature(),
             fields: desc.field_list(),
@@ -251,6 +252,7 @@ fn capture_device<T: Saveable + ?Sized>(
         let schema = DeviceSchema {
             name: name.to_string(),
             version: 0,
+            minimum_version: 0,
             registered: false,
             signature: value_signature(name, &value),
             fields: value_field_list(&value),
@@ -295,7 +297,72 @@ fn check_device_schema(
     Ok(())
 }
 
-/// Load a required device: read its state, check the schema, then apply it.
+/// Prepare a device's on-disk payload for load: bring it to the current
+/// per-device state version, then check the schema.
+///
+/// This is the #46 seam. For a device with a registered [`StateDesc`]:
+///
+/// * no manifest entry (pre-#45 snapshot) → load as-is; the description's own
+///   `Verify` still runs, so old snapshots keep loading;
+/// * recorded as unregistered (captured before the device was migrated) →
+///   value-shape integrity check, then load as-is;
+/// * recorded version **older** than current → run the registered migration
+///   chain up to the current version, or refuse naming the missing/below-chain
+///   step;
+/// * recorded version **newer** → refuse with a precise reason rather than
+///   misinterpreting a future layout;
+/// * recorded version **equal** → the code schema must match the recorded
+///   signature exactly (the #45 guarantee).
+///
+/// For a legacy device (no `StateDesc`) the value-shape check is unchanged.
+///
+/// [`StateDesc`]: crate::state_desc::StateDesc
+fn prepare_device_value<T: Saveable + ?Sized>(
+    base: &str,
+    value: toml::Value,
+    dev: &T,
+    schema: Option<&DeviceSchema>,
+) -> Result<toml::Value, String> {
+    let Some(desc) = dev.state_desc() else {
+        // Legacy hand-written codec: integrity check whichever schema was
+        // recorded (value-shape for pre-#45 devices), then load as-is.
+        check_device_schema(base, &value, None, schema)?;
+        return Ok(value);
+    };
+    let Some(s) = schema else {
+        // Pre-#45 snapshot with no per-device entry for this device. The
+        // registered description verifies the value when it loads; do not
+        // refuse, so old snapshots remain loadable.
+        return Ok(value);
+    };
+    if !s.registered {
+        // Captured before this device was migrated to a StateDesc. Only the
+        // value shape is known; check it and load as-is.
+        check_device_schema(base, &value, None, Some(s))?;
+        return Ok(value);
+    }
+    if s.version > desc.version {
+        return Err(format!(
+            "snapshot {base}: device state version {} is newer than this build's version {} \
+             — refusing rather than misinterpreting a future layout",
+            s.version, desc.version
+        ));
+    }
+    if s.version < desc.version {
+        // The recorded signature describes the old shape, so it is not
+        // comparable after migration; the migration chain and the resulting
+        // `Verify` against the current field set are the guarantees instead.
+        return desc
+            .migrate_value(s.version, &value)
+            .map_err(|e| format!("snapshot {base}: {e}"));
+    }
+    // Same version: the code schema must match the recorded one exactly.
+    check_device_schema(base, &value, Some(desc.signature()), Some(s))?;
+    Ok(value)
+}
+
+/// Load a required device: read its state, migrate/check the schema, then
+/// apply it.
 fn load_device<T: Saveable + ?Sized>(
     snap: &Snapshot,
     schema_version: u32,
@@ -304,8 +371,7 @@ fn load_device<T: Saveable + ?Sized>(
     schema: Option<&DeviceSchema>,
 ) -> Result<(), String> {
     let value = snap.read_state(base, schema_version).map_err(|e| e.to_string())?;
-    let sig = dev.state_desc().map(|d| d.signature());
-    check_device_schema(base, &value, sig, schema)?;
+    let value = prepare_device_value(base, value, dev, schema)?;
     dev.load_state(&value)
 }
 
@@ -321,8 +387,7 @@ fn load_device_opt<T: Saveable + ?Sized>(
 ) -> Result<bool, String> {
     match snap.read_state(base, schema_version) {
         Ok(value) => {
-            let sig = dev.state_desc().map(|d| d.signature());
-            check_device_schema(base, &value, sig, schema)?;
+            let value = prepare_device_value(base, value, dev, schema)?;
             dev.load_state(&value)?;
             Ok(true)
         }
@@ -2064,6 +2129,7 @@ impl Machine {
             schemas.push(DeviceSchema {
                 name: "eeprom".into(),
                 version: 0,
+                minimum_version: 0,
                 registered: false,
                 signature: value_signature("eeprom", &eeprom),
                 fields: value_field_list(&eeprom),
@@ -2640,6 +2706,7 @@ mod controller_lifetime_tests {
         let schema = DeviceSchema {
             name: "x".into(),
             version: 0,
+            minimum_version: 0,
             registered: false,
             signature: value_signature("x", &v),
             fields: value_field_list(&v),
@@ -2652,5 +2719,140 @@ mod controller_lifetime_tests {
         let v2 = toml::Value::Table(t2);
         let err = check_device_schema("x", &v2, None, Some(&schema)).unwrap_err();
         assert!(err.contains("state shape signature mismatch"), "{err}");
+    }
+
+    // ---- per-device versioning + migration registry (#46) ----
+
+    /// A throwaway device whose registered state is at version 2: field `a`
+    /// exists since v1, `b` was added in v2, and a v1 -> v2 migration inserts
+    /// the v2 default. Exercises the load-time migration seam without touching
+    /// any real device's on-disk format.
+    struct MigratingDevice {
+        a: std::sync::atomic::AtomicU32,
+        b: std::sync::atomic::AtomicU32,
+    }
+
+    impl MigratingDevice {
+        fn new() -> Self {
+            Self {
+                a: std::sync::atomic::AtomicU32::new(0),
+                b: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl crate::traits::Saveable for MigratingDevice {
+        fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+            use crate::state_desc::{FieldKind, StateDesc};
+            use std::sync::atomic::Ordering;
+            Some(
+                StateDesc::new("mig", 2)
+                    .field(
+                        "a",
+                        FieldKind::U32,
+                        1,
+                        |t| { t.insert("a".into(), toml::Value::Integer(self.a.load(Ordering::Relaxed) as i64)); },
+                        |v| {
+                            if let Some(n) = v.as_integer() { self.a.store(n as u32, Ordering::Relaxed); }
+                            Ok(())
+                        },
+                    )
+                    .field(
+                        "b",
+                        FieldKind::U32,
+                        2,
+                        |t| { t.insert("b".into(), toml::Value::Integer(self.b.load(Ordering::Relaxed) as i64)); },
+                        |v| {
+                            if let Some(n) = v.as_integer() { self.b.store(n as u32, Ordering::Relaxed); }
+                            Ok(())
+                        },
+                    )
+                    // v1 saved only `a`; bring it up to the v2 shape.
+                    .migrate(1, |v| {
+                        let mut t = v.as_table().cloned().unwrap_or_default();
+                        t.insert("b".into(), toml::Value::Integer(0));
+                        Ok(toml::Value::Table(t))
+                    }),
+            )
+        }
+
+        fn save_state(&self) -> toml::Value {
+            self.state_desc().expect("mig has a description").save()
+        }
+
+        fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+            self.state_desc().expect("mig has a description").load(v)
+        }
+    }
+
+    fn mig_schema(version: u32, minimum_version: u32, signature: u64) -> DeviceSchema {
+        DeviceSchema {
+            name: "mig".into(),
+            version,
+            minimum_version,
+            registered: true,
+            signature,
+            fields: Vec::new(),
+        }
+    }
+
+    /// Acceptance test for #46: a device state captured at an older version is
+    /// migrated up to the current version and then applies cleanly.
+    #[test]
+    fn old_device_state_version_migrates_on_load() {
+        let dev = MigratingDevice::new();
+        let mut old = toml::map::Map::new();
+        old.insert("a".into(), toml::Value::Integer(7));
+        let old = toml::Value::Table(old);
+
+        // Manifest recorded version 1 with a v1 -> v2 migration available.
+        let schema = mig_schema(1, 1, 0);
+        let prepared = prepare_device_value("mig", old, &dev, Some(&schema))
+            .expect("v1 state migrates to v2");
+        assert_eq!(prepared.get("a").and_then(|v| v.as_integer()), Some(7));
+        assert_eq!(prepared.get("b").and_then(|v| v.as_integer()), Some(0),
+            "migration filled in the field added after v1");
+
+        // The migrated payload is the current shape, so it loads.
+        dev.load_state(&prepared).expect("apply migrated state");
+        use std::sync::atomic::Ordering;
+        assert_eq!(dev.a.load(Ordering::Relaxed), 7);
+        assert_eq!(dev.b.load(Ordering::Relaxed), 0);
+    }
+
+    /// Acceptance test for #46: a snapshot from a newer build refuses with a
+    /// precise reason instead of silently misinterpreting the layout.
+    #[test]
+    fn newer_device_state_version_refuses_with_a_clear_error() {
+        let dev = MigratingDevice::new();
+        let schema = mig_schema(3, 3, 0);
+        let err = prepare_device_value("mig", dev.save_state(), &dev, Some(&schema))
+            .unwrap_err();
+        assert!(err.contains("snapshot mig"), "names the device: {err}");
+        assert!(err.contains("version 3"), "names the incoming version: {err}");
+        assert!(err.contains("newer than this build's version 2"), "names the current version: {err}");
+    }
+
+    /// The #45 guarantee survives: same device version but a changed field set
+    /// still fails the signature check.
+    #[test]
+    fn same_version_schema_change_still_refuses() {
+        let dev = MigratingDevice::new();
+        let real = dev.state_desc().unwrap().signature();
+        let schema = mig_schema(2, 1, real ^ 0xdead_beef);
+        let err = prepare_device_value("mig", dev.save_state(), &dev, Some(&schema))
+            .unwrap_err();
+        assert!(err.contains("registered schema signature mismatch"), "{err}");
+    }
+
+    /// Pre-#45 snapshots have no per-device entry at all; they must keep
+    /// loading (the description's own Verify still runs inside `load_state`).
+    #[test]
+    fn pre_45_snapshot_without_a_schema_entry_still_loads() {
+        let dev = MigratingDevice::new();
+        let v = dev.save_state();
+        let prepared = prepare_device_value("mig", v.clone(), &dev, None)
+            .expect("no schema entry is a legacy load, not a refusal");
+        assert_eq!(prepared, v);
     }
 }
