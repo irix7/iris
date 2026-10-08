@@ -5,6 +5,12 @@ R4400, R5000, or R10000 CPU selected at runtime. It boots IRIX 6.5 and 5.3 to a 
 system (shell, networking, X11). It is **not** cycle-accurate
 — IRIX doesn't need it and accuracy would only make it slower.
 
+This repository (`irix7/iris`) is a fork of
+[`techomancer/iris`](https://github.com/techomancer/iris); upstream is the
+canonical project. The fork carries performance work and parallel per-task
+instance operation for development. Sync upstream with
+`git fetch upstream && git merge upstream/main`.
+
 ## Read these first
 
 - `HACKING.md` — architecture: data path/endianness, concurrency model, the
@@ -82,3 +88,17 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
   Persistent compiled-page reuse is opt-in via `[jitv2] cache` / `cache_dir`.
 - CHD, camera, DaynaPort, Ultra64, IP28, and ppmem are unconditional in core;
   do not use their retired Cargo features in build commands.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues on `irix7/iris`, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles, label strings equal to their names: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.

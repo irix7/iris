@@ -23,6 +23,29 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
+## About this fork
+
+This repository (`irix7/iris`) is a fork of
+[`techomancer/iris`](https://github.com/techomancer/iris) — the upstream SGI
+Indy / Indigo2 emulator, and the source of the prebuilt releases linked above.
+Upstream remains the canonical project.
+
+This fork is a working tree for two things: **performance** (allocator, PGO and
+`target-cpu` build defaults; interpreter/JIT dispatch; idle-parking and
+device-thread polling; RAM access, SCSI/DMA and NAT hot paths) and **running
+IRIS as several parallel per-task instances** for development. The first
+upstream-facing change of the latter kind is the CI copy-on-write overlay
+relocation (`IRIS_COW_OVERLAY_DIR`). Changes are kept in the shape of upstream
+commits so they can be offered back rather than diverging.
+
+To pull upstream changes:
+
+```sh
+git remote add upstream https://github.com/techomancer/iris   # once
+git fetch upstream
+git merge upstream/main
+```
+
 ## Q&A
 
 **Q: What is it?**
