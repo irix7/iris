@@ -182,13 +182,13 @@ mod cmd {
     /// at GE_READBACK_LO.
     pub const CP_RETURN_MODE: u32 = 0xA2;
     /// Command-processor token: wait for the pipeline, then return the
-    /// argument word (libGLcore spin_and_return; same protocol as
-    /// CP_RETURN_MODE). IRIS GL programs (powerflip) block on it. That the
-    /// answer is the argument echoed is our reading of the name; its callers
-    /// are not in the decompiled libraries.
+    /// state word at the argument's GE address (same readback protocol as
+    /// CP_RETURN_MODE). Native IRIS GL getcolor() and clear() request address
+    /// 4: the current index as a float, not the address itself.
     pub const CP_SPIN_AND_RETURN: u32 = 0xA1;
     /// Kernel token (MgrasValidateClip, current context): a GL window's
-    /// raster state, 15 words: origin, buffer select bits, window mode,
+    /// raster state, 15 words: origin, window mode, PP1 window mode (the
+    /// kernel stores them as one doubleword, window mode high),
     /// screen masks 4..1 as (x, y) pairs, DRB pointers, 0, then the same
     /// origin and pointers for the second buffer set.
     /// The kernel's and X server's way into GE11 ERAM (MgrasEramRead /
@@ -584,12 +584,15 @@ impl Hq3Engine {
     /// Load a GL window's raster state (from a context image or
     /// CP_WINDOW): origin (x | y << 16, y bottom-up), window mode (masks
     /// enabled, bits 0-3, and kept inside, 4-7), screen masks 1-4 as (x, y)
-    /// ranges `min << 16 | max`, and the buffer page pointers.
-    fn apply_window(&mut self, origin: u32, mode: u32, masks: [[u32; 2]; 4], drb: u32, sink: &mut dyn Hq3Sink) {
+    /// ranges `min << 16 | max`, the buffer page pointers, and the PP1
+    /// window mode (the clip ID to match).
+    fn apply_window(&mut self, origin: u32, mode: u32, masks: [[u32; 2]; 4], drb: u32, pp1winmode: u32, sink: &mut dyn Hq3Sink) {
         if sink.tracing() {
-            sink.trace(format!("GL window: origin {:#x} mode {mode:#x} masks {masks:x?} DRBpointers {drb:#x}", origin));
+            sink.trace(format!(
+                "GL window: origin {origin:#x} mode {mode:#x} masks {masks:x?} DRBpointers {drb:#x} pp1winmode {pp1winmode:#x}"
+            ));
         }
-        self.gl.window = super::gl::Window { valid: 1, origin, mode, masks, drb };
+        self.gl.window = super::gl::Window { valid: 1, origin, mode, masks, drb, pp1winmode };
     }
 
     /// The current context's GL state and the parked contexts, for the
@@ -624,7 +627,8 @@ impl Hq3Engine {
                 // Word 0 is the context's ERAM slot; a first load (word 1
                 // bit 31, cleared by the kernel afterwards) starts from
                 // OpenGL's initial state. Every image also carries its
-                // context's window (words 2-13); the kernel
+                // context's window (words 2-13: origin, window mode, PP1
+                // window mode, masks 4..1, DRB pointers); the kernel
                 // (MgrasValidateClip) rewrites it and sets bit 29 of word 1
                 // when the window changed.
                 self.load_context(img[0], img[1] & CTX_FIRST_LOAD != 0, sink);
@@ -632,7 +636,9 @@ impl Hq3Engine {
                 if sink.tracing() && img[1] & CTX_WINDOW_CHANGED != 0 {
                     sink.trace(format!("context {:#x}: window changed", img[0]));
                 }
-                self.apply_window(img[2], img[3], masks, img[13], sink);
+                self.apply_window(img[2], img[3], masks, img[13], img[4], sink);
+                // Words 16-17: the banks drawn into (MgrasValidateBanks).
+                self.gl.set_draw_bank(img[16], sink);
                 sink.set_flags(host::FLAG_CONTEXT_LOADED);
             }
             return;
@@ -804,7 +810,7 @@ impl Hq3Engine {
             self.stats.cp_tokens[cmd as usize] += 1;
             let d = data;
             let masks = [[d[9], d[10]], [d[7], d[8]], [d[5], d[6]], [d[3], d[4]]];
-            self.apply_window(d[0], d[2], masks, d[11], sink);
+            self.apply_window(d[0], d[1], masks, d[11], d[2], sink);
         } else if matches!(cmd, cmd::CP_ERAM_WRITE | cmd::CP_ERAM_WRITE_AT | cmd::CP_ERAM_WRITE_END | cmd::CP_ERAM_READ) {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.eram_pass_through(cmd, data, sink);
@@ -816,7 +822,9 @@ impl Hq3Engine {
         } else if cmd == cmd::CP_SPIN_AND_RETURN {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
-            self.ge_return = Some([0, data.first().copied().unwrap_or(0)]);
+            let addr = data.first().copied().unwrap_or(0);
+            let v = self.gl.state_word(addr).unwrap_or(addr);
+            self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
             self.stats.cp_tokens[cmd as usize] += 1;
@@ -1202,7 +1210,7 @@ impl DmaPeer<'_> {
 /// Tokens the kernel sends to set up and save the GE11s (and the HQ DMA
 /// setup token), which nothing in this model needs.
 fn is_ge_plumbing(t: u32) -> bool {
-    matches!(t, 0x006 | 0x07C | 0x07F | 0x082 | 0x08C | 0x09A | 0x0EC | 0x0ED | 0x0F2 | 0x0F3..=0x0FF)
+    matches!(t, 0x006 | 0x07C | 0x07F | 0x082 | 0x08C | 0x0EC | 0x0ED | 0x0F2 | 0x0F3..=0x0FF)
 }
 
 /// One command FIFO command, decoded for the trace.
@@ -1312,6 +1320,7 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x047 => "SHADE_MODEL",
         0x048 => "DEPTH_RANGE",
         0x049 => "DRAW_BUFFER",
+        0x098 => "VALIDATE_BANKS",
         0x04A => "CLEAR_DEPTH_BUFFER",
         0x04C => "CLEAR_STENCIL_BUFFER",
         0x04D => "POINT_SIZE",

@@ -31,6 +31,7 @@ const DRBSIZE: u32 = 0x16E;
 const XFRSIZE: u32 = 0x153;
 const XFRMODE: u32 = 0x159;
 const PP1FILLMODE: u32 = 0x161;
+const PP1WINMODE: u32 = 0x17B;
 const FILL_COLOR_R: u32 = 0x176;
 const FILL_FAST: u32 = 1 << 20;
 
@@ -367,7 +368,7 @@ fn f(v: f32) -> u32 {
 fn gl_glprim_triangle(m: &Mgras, shade: u32) {
     x_server(m);
     let mut win = vec![0u32; 15];
-    win[2] = 0x11;
+    win[1] = 0x11;
     (win[9], win[10]) = (399, 299);
     win[11] = 0x240;
     fifo_token(m, 0xE4, &win);
@@ -421,7 +422,7 @@ fn gl_flat_triangle_and_clear() {
     // Window: origin (0, 0) bottom-up, mask 1 = the window, kept inside.
     let mut win = vec![0u32; 15];
     win[0] = 0;
-    win[2] = 0x11;
+    win[1] = 0x11;
     (win[9], win[10]) = (399, 299);
     win[11] = 0x240;
     fifo_token(&m, 0xE4, &win);
@@ -462,14 +463,23 @@ const SLOT_C: u32 = 0xA9B + 2 * 0x17C7;
 const SLOT_D: u32 = 0xA9B + 3 * 0x17C7;
 
 fn switch_to_gl_context(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32) {
+    switch_to_gl_context_cid(m, id, x, y, w, h, 0);
+}
+
+/// The same, the window's PP1 window mode (image word 4) `pp1winmode`.
+fn switch_to_gl_context_cid(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32, pp1winmode: u32) {
     write(m, 32, 0x50050, 0x4FC);
     let mut img = [0u32; 63];
     img[0] = id;
     img[2] = x | y << 16;
     img[3] = 0x11;
+    img[4] = pp1winmode;
     img[11] = x << 16 | (x + w - 1);
     img[12] = y << 16 | (y + h - 1);
     img[13] = 0x240;
+    // The banks drawn into, B and B, as the kernel stores them in a new
+    // context (MgrasValidateBanks).
+    (img[16], img[17]) = (1, 1);
     for wd in img {
         write(m, 32, CFIFO, wd as u64);
     }
@@ -509,6 +519,51 @@ fn gl_state_and_window_follow_the_context() {
     fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
     block(&m, 5, 5, 5, 5);
     assert_eq!(m.fb_pixel(5, 5), 0x2A, "X draws top-down at its own origin again");
+    m.stop_engines();
+}
+
+/// A window whose visible region is too complex for the screen masks: the
+/// X server paints it with a clip ID (mgrasDrawCID: draw field 0x50, the ID
+/// in the fill colour, pp1winmode 0xC00, left set), and the kernel has the
+/// window's GL drawing match that ID (pp1winmode 1 << (4 + id)). The clear
+/// lands only on the window's pixels with the ID; a window without one, and
+/// the X server, draw everywhere.
+#[test]
+fn gl_draws_only_where_the_clip_id_matches() {
+    let m = live_board();
+    x_server(&m);
+    let x_fillmode = 0x0C00_4504;
+    direct_rss(&m, PP1WINMODE, 0, false);
+    // Clip ID 0 over the screen, then 1 over the window's left half
+    // (screen rows top-down: GL rows 0..99 are 924..1023).
+    direct_rss(&m, PP1WINMODE, 0xC00, false);
+    direct_rss(&m, PP1FILLMODE, 0x14_2600, false);
+    fifo_rss(&m, FILLMODE, FILL_FAST, false);
+    fifo_rss(&m, FILL_COLOR_R, 0, false);
+    block(&m, 0, 0, 1279, 1023);
+    fifo_rss(&m, FILL_COLOR_R, 1, false);
+    block(&m, 0, 924, 49, 1023);
+    direct_rss(&m, PP1FILLMODE, x_fillmode, false);
+    assert_eq!(m.fb_pixel(10, 1000), 0, "clip IDs are not colour");
+
+    switch_to_gl_context_cid(&m, SLOT_A, 0, 0, 100, 100, 0x20);
+    gl_setup_window(&m, 100, 100, [1.0, 0.0, 0.0]);
+    fifo_token(&m, 0x15, &[]);
+    let at = |x: usize, y_gl: usize| m.fb_pixel(x, 1023 - y_gl) & 0xFF_FFFF;
+    assert_eq!(at(10, 50), 0x00_00FF, "clip ID 1: the window's own pixels");
+    assert_eq!(at(49, 99), 0x00_00FF);
+    assert_eq!(at(50, 50), 0, "clip ID 0: another window's pixels");
+
+    switch_to_gl_context_cid(&m, SLOT_B, 0, 0, 100, 100, 0);
+    gl_setup_window(&m, 100, 100, [0.0, 0.0, 1.0]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(at(50, 50), 0xFF_0000, "no clip ID to match: all of it");
+
+    // The X server draws anywhere with its pp1winmode back.
+    fifo_rss(&m, FILLMODE, FILL_FAST, false);
+    fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
+    block(&m, 60, 1000, 60, 1000);
+    assert_eq!(m.fb_pixel(60, 1000), 0x2A);
     m.stop_engines();
 }
 
@@ -1283,6 +1338,52 @@ fn gl_raster_position_queries_valid_bias_and_update() {
 }
 
 #[test]
+fn gl_attribute_queries_restore_scissor_viewport_and_index_mask() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x0A, &[12]);
+    fifo_token(&m, 0x3D, &[0xFFF]);
+    fifo_token(&m, 0x33, &[10, 20, 400, 300]);
+    fifo_token(&m, 0x39, &[30, 99, 40, 49]);
+    let vp = [0xB91, 0xB92, 0xB93, 0xB94].map(|a| gl_return_mode(&m, a));
+    let sc = [0xB98, 0xB99, 0xB9A, 0xB9B].map(|a| gl_return_mode(&m, a));
+    let mask = gl_return_mode(&m, 0x29F);
+    assert_eq!(vp, [10, 20, 400, 300]);
+    assert_eq!(sc, [30, 40, 129, 89]);
+    assert_eq!(mask, 0xFFF);
+
+    // Alias uses glPushAttrib/glPopAttrib around its UI drawing. Restore
+    // the queried values after a nested draw changed the relevant state.
+    fifo_token(&m, 0x33, &[0, 0, 1, 1]);
+    fifo_token(&m, 0x39, &[0, 0, 0, 0]);
+    fifo_token(&m, 0x3D, &[0]);
+    fifo_token(&m, 0x33, &vp);
+    fifo_token(&m, 0x39, &[sc[0], sc[2] - sc[0], sc[1], sc[3] - sc[1]]);
+    fifo_token(&m, 0x3D, &[mask]);
+    fifo_token(&m, 0x6E, &[1]);
+    fifo_token(&m, 0xBD, &[f(2044.0)]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(gl_px(&m, 30, 40), 2044);
+    assert_eq!(gl_px(&m, 129, 89), 2044);
+    assert_eq!(gl_px(&m, 130, 89), 0);
+    assert_eq!(gl_px(&m, 29, 40), 0);
+    assert_eq!([0xB91, 0xB92, 0xB93, 0xB94].map(|a| gl_return_mode(&m, a)), vp);
+
+    fifo_token(&m, 0x09, &[]);
+    fifo_token(&m, 0x3B, &[0x5]);
+    assert_eq!(gl_return_mode(&m, 0x29F), 0x5, "RGB component mask");
+    fifo_token(&m, 0x2A, &[0x1700]);
+    assert_eq!(gl_return_mode(&m, 0x29), u32::MAX, "modelview mode encoding");
+    assert_eq!(gl_return_mode(&m, 0x83), 0x899);
+    fifo_token(&m, 0x2F, &[]);
+    assert_eq!(gl_return_mode(&m, 0x83), 0x8A9);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    assert_eq!(gl_return_mode(&m, 0x29), 0);
+    assert_eq!(gl_return_mode(&m, 0x896), 0xA99);
+    assert_eq!(gl_return_mode(&m, 0x4A), gl_return_mode(&m, 0x3A));
+    m.stop_engines();
+}
+
+#[test]
 fn gl_colour_index_mask_applies_to_clear() {
     let m = live_board();
     x_server(&m);
@@ -1471,6 +1572,81 @@ fn gl_batch_leaves_x_instruction_alone() {
     m.state_hash();
     assert_eq!(m.fb_pixel(5, 5) & 0xFFF, 0x123, "X's block, with X's instruction");
     assert_eq!(m.fb_pixel(300, 5) & 0xFF_FFFF, 0, "no GL quad in X's window");
+    m.stop_engines();
+}
+
+/// Twilight is a full-screen GL root painter. X paints CID 1 only in its
+/// visible region; its context image's PP1winmode is 0x20. Iconifying a
+/// console changes that region, then Twilight redraws the whole screen.
+/// The geometric screen mask alone cannot protect the other X windows.
+#[test]
+fn gl_root_painter_respects_clipping_ids_after_iconify() {
+    use super::rss::reg;
+    let m = live_board();
+    x_server(&m);
+    direct_rss(&m, reg::PP1WINMODE, 0xC00, false);
+    direct_rss(&m, FILLMODE, FILL_FAST, false);
+    direct_rss(&m, FILL_COLOR_R, 0x77, false);
+    block(&m, 0, 724, 399, 1023);
+
+    // The visible root, with two occluding windows left at CID 0.
+    let paint_cid = |x0, y0, x1, y1, cid| {
+        direct_rss(&m, PP1FILLMODE, 0x142600, false);
+        direct_rss(&m, reg::COLORMASKMSBS, 0xFF, false);
+        direct_rss(&m, FILL_COLOR_R, cid, false);
+        block(&m, x0, y0, x1, y1);
+    };
+    paint_cid(0, 724, 399, 1023, 1);
+    paint_cid(40, 800, 79, 839, 0);
+    paint_cid(140, 800, 179, 839, 0);
+
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 400, 300);
+    // Reload the same context with the PP1 window word from the trace.
+    write(&m, 32, 0x50050, 0x4FC);
+    let mut img = [0u32; 63];
+    img[0] = SLOT_A;
+    img[3] = 0x11;
+    img[4] = 0x20;
+    img[11] = 399;
+    img[12] = 299;
+    img[13] = 0x240;
+    (img[16], img[17]) = (1, 1);
+    for wd in img { write(&m, 32, CFIFO, wd as u64); }
+    wait_flag(&m, 1 << 6);
+    gl_setup_window(&m, 400, 300, [1.0, 0.0, 0.0]);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(m.fb_pixel(20, 820) & 0xFF_FFFF, 0xFF);
+    assert_eq!(m.fb_pixel(50, 820), 0x77, "console protected from GL clear");
+    assert_eq!(m.fb_pixel(150, 820), 0x77, "other X window protected");
+
+    // Expose the console rectangle, then validate the current context with
+    // CP_WINDOW (window mode in word 1, the same PP1 word in word 2: the
+    // kernel stores them as one doubleword, window mode high) and draw a
+    // quad.
+    paint_cid(40, 800, 79, 839, 1);
+    let mut win = [0u32; 15];
+    win[1] = 0x11;
+    win[2] = 0x20;
+    win[9] = 399;
+    win[10] = 299;
+    win[11] = 0x240;
+    fifo_token(&m, 0xE4, &win);
+    fifo_token(&m, 0x2A, &[0x1701]);
+    fifo_token(&m, 0x2C, &[]);
+    fifo_token(&m, 0x35, &[f(0.0), f(400.0), f(0.0), f(300.0), f(-1.0), f(1.0)]);
+    fifo_token(&m, 0x2A, &[0x1700]);
+    fifo_token(&m, 0x2C, &[]);
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(m.fb_pixel(50, 820) & 0xFF_FFFF, 0xFF00, "exposed root repainted");
+    assert_eq!(m.fb_pixel(150, 820), 0x77, "other window survives GL triangles");
+
+    // X's bypass state must also survive the GL bracket: its next fill
+    // changes neither PP1winmode nor the CID planes.
+    direct_rss(&m, PP1FILLMODE, 0x0C00_4504, false);
+    direct_rss(&m, FILL_COLOR_R, 0x55, false);
+    block(&m, 150, 820, 150, 820);
+    assert_eq!(m.fb_pixel(150, 820), 0x55);
     m.stop_engines();
 }
 
@@ -2156,5 +2332,216 @@ fn gl_texture_clamp_to_border() {
     gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
     gl_tex_quad_st(&m, [-1.0, 2.0], [0.0, 1.0]);
     assert_eq!(gl_px(&m, 105, 137), 0x00_FF00, "border colour only");
+    m.stop_engines();
+}
+
+/// SEND_PIXELS receives RGBA components after HQ formatting, whereas X
+/// transfers use packed ABGR. Opaque black must not turn into red.
+#[test]
+fn gl_draw_pixels_rgba8_component_order() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x8D, &[3, 0, 0, 1, 0, 1, 0x49D0, 0x99]);
+    fifo_pixel_data(&m, &[0x0000_00FF, 0x1234_5678, 0xFF00_00FF]);
+    assert_eq!(gl_px(&m, 10, 20), 0, "opaque black");
+    assert_eq!(gl_px(&m, 11, 20), 0x56_3412, "RGB order");
+    assert_eq!(gl_px(&m, 12, 20), 0x00_00FF, "red");
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let b = super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E);
+    assert_eq!(rss.mem.get(&b, 11, 20) as u32, 0x7856_3412, "alpha survives upload");
+    drop(_sub);
+    m.stop_engines();
+}
+
+/// glCopyPixels' write half by host DMA (Maya copies the front buffer to
+/// the back after a full redraw, then redraws only what changes): the
+/// image size from pixel state 0xDA8, the transfer mode from the RSS
+/// register list, _WRITE_DMAGESETUP with glDrawPixels' routine (0x49D0),
+/// then one DMA line with every row. Without it the back buffer keeps
+/// whatever it held, and every other frame shows that.
+#[test]
+fn gl_draw_pixels_by_host_dma() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x0A, &[12]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0xC0_0001]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 0, 0, 3, 1, 2 << 16 | 4, 1, 0]);
+    fifo_token(&m, 0x9D, &[0, 0x175, 0x7C, 0x49D0]);
+    let mem = eram_dma_setup(&m, 16);
+    for (i, v) in [0x801u16, 0x802, 0x803, 0x804, 0x805, 0x806, 0x807, 0x808].iter().enumerate() {
+        let [hi, lo] = v.to_be_bytes();
+        mem.bytes.lock().insert(0x2000 + 2 * i as u32, hi);
+        mem.bytes.lock().insert(0x2001 + 2 * i as u32, lo);
+    }
+    fifo_dma(&m, 0x0B, 0x1);
+    fifo_token(&m, 0xD3, &[]);
+    let got: Vec<u32> = [(10, 20), (13, 20), (10, 21), (13, 21)].iter().map(|&(x, y)| gl_px(&m, x, y) & 0xFFF).collect();
+    assert_eq!(got, [0x801, 0x804, 0x805, 0x808], "bottom row first");
+    drop(mem);
+    m.stop_engines();
+}
+
+/// Softimage's CI8 overlay has a separate pointer, upper-plane index mask,
+/// and absolute draw selector. Clears and geometry must leave main intact.
+#[test]
+fn gl_native_overlay_clear_geometry_and_bitmap() {
+    let m = gl_board([0.25, 0.5, 0.75]);
+    let main_before = gl_px(&m, 100, 100);
+    {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &mut *m.rss.get() };
+        let b = super::pixmem::Buffer::new(0x1C0, super::pixmem::Kind::Overlay, 0x31E);
+        rss.mem.put(&b, 100, 100, 1); // another overlay plane must survive
+    }
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x101C0, 0, 0, 0]);
+    fifo_token(&m, 0x0A, &[8]);
+    fifo_token(&m, 0x9A, &[0x2500, 0x2500]);
+    fifo_token(&m, 0x49, &[0x48, 0x48, 1]);
+    fifo_token(&m, 0x3D, &[0xF0]);
+    fifo_token(&m, 0xBD, &[0x30]);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x02, &[f(16.0)]);
+    fifo_token(&m, 0x1D, &[]);
+    for p in [[0.0, 0.0], [200.0, 0.0], [200.0, 300.0], [0.0, 300.0]] {
+        fifo_token(&m, 0x00, &[f(p[0]), f(p[1]), f(0.0)]);
+    }
+    fifo_token(&m, 0x27, &[]);
+    fifo_token(&m, 0x02, &[f(32.0)]);
+    fifo_token(&m, 0x38, &[f(250.0), f(100.0), f(0.0)]);
+    fifo_token(&m, 0x94, &[0x18000, 16, 1, f(0.0), f(0.0), f(0.0), f(0.0), 1]);
+    fifo_pixel_data(&m, &[0x8000_0000]);
+    assert_eq!(gl_px(&m, 100, 100), main_before);
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let b = super::pixmem::Buffer::new(0x1C0, super::pixmem::Kind::Overlay, 0x31E);
+    assert_eq!(rss.mem.get(&b, 100, 100), 0x11, "overlay polygon preserves other planes");
+    assert_eq!(rss.mem.get(&b, 300, 100), 0x30, "overlay clear");
+    assert_eq!(rss.mem.get(&b, 250, 100), 0x20, "overlay glyph");
+    drop(_sub);
+    m.stop_engines();
+}
+
+#[test]
+fn gl_native_draw_buffer_masks_follow_the_swap() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[3, 3, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    fifo_token(&m, 0x49, &[2, 1, 0]); // GL_BACK, 12-bit: B until a swap
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_tri(&m, [0.0, 1.0, 0.0], [[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [0.0, 200.0, 0.0]]);
+    fifo_token(&m, 0x49, &[0, 0, 0]);
+    fifo_token(&m, 0xBA, &[f(0.0), f(0.0), f(1.0), f(1.0)]);
+    fifo_token(&m, 0x15, &[]);
+    gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+    gl_full_quad(&m); // DRAW_NONE preserves both pages
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let a = super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E);
+    let b = super::pixmem::Buffer::new(0x140, super::pixmem::Kind::Wide, 0x31E);
+    assert_eq!(rss.mem.get(&a, 300, 100) as u32 & 0xFF_FFFF, 0xFF);
+    assert_eq!(rss.mem.get(&b, 300, 100) as u32 & 0xFF_FFFF, 0xFF, "both pages drawn");
+    assert_eq!(rss.mem.get(&b, 50, 50) as u32 & 0xFF_FFFF, 0xFF00, "back before a swap: B");
+    assert_eq!(rss.mem.get(&a, 50, 50) as u32 & 0xFF_FFFF, 0xFF, "front A preserved");
+    drop(_sub);
+    m.stop_engines();
+}
+
+/// Every double-buffered demo traced (atlantis, powerflip, solidview)
+/// draws with DRAW_BUFFER [4, 1, 0], GL_BACK in a 24-bit visual: buffer B
+/// (4) until a swap, A (1) after it, B again after the next.
+#[test]
+fn gl_back_buffer_alternates_with_swaps() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    let page = |m: &Mgras, p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+    };
+    for (k, c) in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].iter().enumerate() {
+        gl_color4(&m, [c[0], c[1], c[2], 1.0]);
+        gl_full_quad(&m);
+        let want = (c[0] as u32) * 0xFF | (c[1] as u32) * 0xFF00 | (c[2] as u32) * 0xFF_0000;
+        let (drawn, other) = if k % 2 == 0 { (0x140, 0x240) } else { (0x240, 0x140) };
+        assert_eq!(page(&m, drawn), want, "frame {k} draws the back buffer");
+        assert_ne!(page(&m, other), want, "frame {k} leaves the front alone");
+        // The kernel's swap: the next frame's bank, then SCHEDULE_SWAP.
+        let next = (k as u32 + 1) % 2 ^ 1;
+        fifo_token(&m, 0x98, &[next, next]);
+        write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    }
+    m.stop_engines();
+}
+
+/// The bank comes from the kernel (VALIDATE_BANKS), not from counting
+/// swaps: a swap the kernel did not pair with a bank (or one the GE never
+/// saw) leaves the drawing where the kernel last said.
+#[test]
+fn gl_draw_bank_follows_the_kernel_not_the_swap_count() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    let page = |m: &Mgras, p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+    };
+    fifo_token(&m, 0x98, &[0, 0]);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(page(&m, 0x240), 0xFF, "bank 0: A, whatever the swaps");
+    assert_ne!(page(&m, 0x140), 0xFF);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [0.0, 1.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(page(&m, 0x140), 0xFF00, "bank 1: B");
+    m.stop_engines();
+}
+
+/// Native IRIS GL clear() reads the current index with SPIN_AND_RETURN,
+/// then uses the returned float for CLEAR_INDEX. Echoing address 4 reads
+/// as a denormal/zero and erases Softimage's background and grid planes.
+#[test]
+fn gl_spin_and_return_reads_current_color_for_index_clear() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let spin = |addr: u32| {
+        write(&m, 32, 0x7000C, 1 << 17);
+        fifo_token(&m, 0xA1, &[addr]);
+        wait_flag(&m, 1 << 17);
+        read(&m, 32, 0x70014) as u32
+    };
+    gl_color4(&m, [0.25, 0.5, 0.75, 1.0]);
+    for (addr, value) in [(4, 0.25), (5, 0.5), (6, 0.75), (7, 1.0)] {
+        assert_eq!(spin(addr), f(value));
+    }
+    fifo_token(&m, 0x0A, &[12]);
+    for index in [21.0, 31.0, 19.0] {
+        fifo_token(&m, 0x02, &[f(index)]);
+        let got = spin(4);
+        assert_eq!(got, f(index), "getcolor must return the index, not its address");
+        fifo_token(&m, 0x3D, &[0x3F]);
+        fifo_token(&m, 0xBD, &[got]);
+        fifo_token(&m, 0x15, &[]);
+        assert_eq!(gl_px(&m, 100, 100), index as u32, "background clear");
+        fifo_token(&m, 0x3D, &[0x1C0]);
+        fifo_token(&m, 0xBD, &[got]);
+        fifo_token(&m, 0x15, &[]);
+        assert_eq!(gl_px(&m, 100, 100), index as u32, "other planes preserve background");
+    }
     m.stop_engines();
 }
