@@ -49,7 +49,30 @@ which catches truncation/corruption but **not** a code rename.
 - Pre-#45 manifests have no `[[state]]` table, so no check runs — they load
   exactly as before. The on-disk `*.bin` postcard format and `SCHEMA_VERSION`
   are unchanged.
-- Per-device `version`/`since_version` are recorded but migration is #46.
+- Per-device `version`/`since_version`/`minimum_version` are recorded in the
+  manifest; migration closures live in `StateDesc` (#46).
+
+## Per-device versioning and migration (#46)
+
+Each `StateDesc` carries `version` (current) and `minimum_version` (oldest it
+can load). Bump `version` when the registered field set changes
+incompatibly and register a stepwise closure with
+`.migrate(from, |old_value| -> Result<Value, String>)`; registering lowers
+`minimum_version` automatically. On load `prepare_device_value`
+(`src/machine.rs`) brings the payload to the current version before the
+signature check:
+
+- recorded version **older** → chain `from -> from+1 -> … -> version`; a gap
+  refuses naming the exact missing step, a broken step fails at the migration,
+  and the result is `Verify`d against the current field set before applying;
+- recorded version **newer** → refused naming both versions (no forward
+  migration);
+- recorded version **equal** → the #45 signature check runs as before;
+- **no** manifest entry (pre-#45) → load as-is, so old snapshots keep loading.
+
+**Invariant:** `StateDesc::signature()` must *not* fold in `minimum_version`
+or the migration registry. #45 builders recorded the signature without them;
+adding them would make every pre-#46 snapshot fail the equal-version check.
 
 ## Not yet migrated
 
