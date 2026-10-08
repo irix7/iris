@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::config::AudioConfig;
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -107,12 +108,13 @@ const MODE_MONO:   usize = 1;
 const MODE_STEREO: usize = 2;
 const MODE_QUAD:   usize = 3;
 
-// Pre-buffer: accumulate this many ms of audio samples before pushing to the ring.
-// This gives the CPU time to fill its circular DMA buffer before we start draining it,
-// preventing initial underrun.
+// Default pre-buffer: accumulate this many ms of audio samples before pushing to
+// the ring (overridable via `[audio] prebuf_ms`; `AudioConfig::default` uses the
+// same value). This gives the CPU time to fill its circular DMA buffer before we
+// start draining it, preventing initial underrun.
 const PREBUF_MS: u64 = 20;
-// Ring buffer capacity as a multiple of PREBUF_MS.  Must absorb OS scheduling jitter.
-// Expressed as a multiplier of PREBUF_MS stereo samples.
+// Ring buffer capacity as a multiple of the pre-buffer.  Must absorb OS scheduling
+// jitter.  Expressed as a multiplier of pre-buffer stereo samples.
 const RING_BUF_MULTIPLIER: usize = 16;
 
 // Consecutive dry reads before giving up prebuf and opening stream anyway.
@@ -421,6 +423,8 @@ pub struct Hal2 {
     state: Arc<Mutex<Hal2State>>,
     dma_clients: Vec<Arc<dyn DmaClient>>,
     timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
+    /// `[audio]` host-output tuning: pre-buffer and cpal buffer size.
+    audio_config: AudioConfig,
     // Per-channel mutable state
     ca_state: Arc<Mutex<CodecAState>>,
     cb_state: Arc<Mutex<CodecBState>>,
@@ -432,23 +436,42 @@ pub struct Hal2 {
 
 // ─── cpal helpers ─────────────────────────────────────────────────────────────
 
-fn prebuf_samples(rate: u32) -> usize {
-    (rate as usize * 2 * PREBUF_MS as usize) / 1000
+fn prebuf_samples(rate: u32, prebuf_ms: u64) -> usize {
+    (rate as usize * 2 * prebuf_ms as usize) / 1000
+}
+
+/// Pure derivation of the two host-output sizes `[audio]` controls, kept out of
+/// the cpal-opening path so it can be tested without an audio device.
+struct AudioOutputSizing {
+    /// cpal's request to the host backend.
+    buffer_size: cpal::BufferSize,
+    /// Capacity of the rtrb ring, in i16 samples (both channels).
+    ring_size: usize,
+}
+
+fn audio_output_sizing(cfg: &AudioConfig, rate: u32) -> AudioOutputSizing {
+    AudioOutputSizing {
+        buffer_size: cfg.cpal_buffer_frames
+            .map(cpal::BufferSize::Fixed)
+            .unwrap_or(cpal::BufferSize::Default),
+        ring_size: prebuf_samples(rate, cfg.prebuf_ms) * RING_BUF_MULTIPLIER,
+    }
 }
 
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
 /// The stream plays silence when the ring buffer is empty.
-fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -> Option<AudioOut> {
+fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &AudioConfig) -> Option<AudioOut> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
 
     for &rate in PREFERRED_RATES {
+        let sizing = audio_output_sizing(cfg, rate);
         let config = cpal::StreamConfig {
             channels: 2,
             sample_rate: rate,
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: sizing.buffer_size,
         };
-        let ring_size = prebuf_samples(rate) * RING_BUF_MULTIPLIER;
+        let ring_size = sizing.ring_size;
         let err_fn = |err: cpal::Error| { eprintln!("HAL2: cpal stream error: {:?}", err); };
 
         // Try f32 first (macOS CoreAudio native), then i16 (Linux ALSA).
@@ -530,7 +553,7 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>) -
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
 
 impl Hal2 {
-    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
+    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>, audio_config: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(Hal2State {
                 isr: 0,
@@ -552,6 +575,7 @@ impl Hal2 {
             })),
             dma_clients,
             timer_manager: Arc::new(std::sync::OnceLock::new()),
+            audio_config,
             ca_state: Arc::new(Mutex::new(CodecAState::new())),
             cb_state: Arc::new(Mutex::new(CodecBState { timer_id: None })),
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
@@ -616,6 +640,7 @@ impl Hal2 {
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
+        let prebuf_ms = self.audio_config.prebuf_ms;
         let mut pacer = Pacer::new(pitch_rate);
 
         self.ca_state.lock().armed_ch = Some(dma_ch);
@@ -673,7 +698,7 @@ impl Hal2 {
                             // Accumulate before feeding the ring to prevent underrun.
                             st.prebuf.push(l);
                             st.prebuf.push(r);
-                            if st.prebuf.len() >= prebuf_samples(rate) {
+                            if st.prebuf.len() >= prebuf_samples(rate, prebuf_ms) {
                                 let samples = std::mem::take(&mut st.prebuf);
                                 st.push_to_ring(&samples);
                                 dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
@@ -1209,7 +1234,7 @@ fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16
 
 impl Default for Hal2 {
     fn default() -> Self {
-        Self::new(Vec::new())
+        Self::new(Vec::new(), AudioConfig::default())
     }
 }
 
@@ -1218,7 +1243,11 @@ impl Device for Hal2 {
 
     fn start(&self) {
         // Open persistent audio output once.  Codec A timer will push into it.
-        let audio = open_persistent_output(self.underruns.clone(), Arc::new(AtomicBool::new(false)));
+        let audio = open_persistent_output(
+            self.underruns.clone(),
+            Arc::new(AtomicBool::new(false)),
+            &self.audio_config,
+        );
         if audio.is_none() {
             eprintln!("HAL2: no audio output available");
         }
@@ -1338,6 +1367,28 @@ impl Device for Hal2 {
 mod tests {
     use super::*;
     use rtrb::RingBuffer;
+
+    #[test]
+    fn default_audio_config_reproduces_the_builtin_prebuffer() {
+        // Default config must be byte-for-byte the old hard-coded behaviour:
+        // host-default cpal buffer, ring sized from PREBUF_MS.
+        let sizing = audio_output_sizing(&AudioConfig::default(), 44100);
+        assert_eq!(sizing.buffer_size, cpal::BufferSize::Default);
+        assert_eq!(
+            sizing.ring_size,
+            prebuf_samples(44100, PREBUF_MS) * RING_BUF_MULTIPLIER
+        );
+    }
+
+    #[test]
+    fn audio_config_drives_buffer_and_ring_sizes() {
+        let cfg = AudioConfig { prebuf_ms: 40, cpal_buffer_frames: Some(512) };
+        let sizing = audio_output_sizing(&cfg, 48000);
+        assert_eq!(sizing.buffer_size, cpal::BufferSize::Fixed(512));
+        assert_eq!(sizing.ring_size, prebuf_samples(48000, 40) * RING_BUF_MULTIPLIER);
+        // 40 ms of stereo at 48 kHz is twice the 20 ms default.
+        assert_eq!(sizing.ring_size, 2 * prebuf_samples(48000, PREBUF_MS) * RING_BUF_MULTIPLIER);
+    }
 
     #[test]
     fn bres_modulus_zero_runs_at_the_master_rate() {
