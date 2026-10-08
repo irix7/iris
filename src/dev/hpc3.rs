@@ -2434,38 +2434,66 @@ fn load_pdma_channel(chan: &mut PdmaChannel, v: &toml::Value) {
 }
 
 impl Saveable for Hpc3 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("hpc3", 1)
+                .field(
+                    "intstat",
+                    FieldKind::U32,
+                    1,
+                    |t| { t.insert("intstat".into(), hex_u32(self.state.lock().intstat)); },
+                    |v| { self.state.lock().intstat = toml_u32(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "gio_misc",
+                    FieldKind::U32,
+                    1,
+                    |t| { t.insert("gio_misc".into(), hex_u32(self.state.lock().gio_misc)); },
+                    |v| { self.state.lock().gio_misc = toml_u32(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "eeprom_reg",
+                    FieldKind::U32,
+                    1,
+                    |t| { t.insert("eeprom_reg".into(), hex_u32(self.state.lock().eeprom_reg)); },
+                    |v| { self.state.lock().eeprom_reg = toml_u32(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "pbus_pio",
+                    FieldKind::U32Array,
+                    1,
+                    |t| { t.insert("pbus_pio".into(), u32_slice_to_toml(&self.state.lock().pbus_pio)); },
+                    |v| { load_u32_slice(v, &mut self.state.lock().pbus_pio); Ok(()) },
+                )
+                .field(
+                    "pdma_channels",
+                    FieldKind::Array,
+                    1,
+                    |t| {
+                        let chans: Vec<toml::Value> = self.pdma_channels.iter()
+                            .map(|c| save_pdma_channel(&c.lock())).collect();
+                        t.insert("pdma_channels".into(), toml::Value::Array(chans));
+                    },
+                    |v| {
+                        if let Some(arr) = v.as_array() {
+                            for (i, cv) in arr.iter().enumerate() {
+                                if i >= self.pdma_channels.len() { break; }
+                                load_pdma_channel(&mut self.pdma_channels[i].lock(), cv);
+                            }
+                        }
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let state = self.state.lock();
-        let mut tbl = toml::map::Map::new();
-
-        tbl.insert("intstat".into(),    hex_u32(state.intstat));
-        tbl.insert("gio_misc".into(),   hex_u32(state.gio_misc));
-        tbl.insert("eeprom_reg".into(), hex_u32(state.eeprom_reg));
-        tbl.insert("pbus_pio".into(), u32_slice_to_toml(&state.pbus_pio));
-
-        let chans: Vec<toml::Value> = self.pdma_channels.iter().map(|c| {
-            save_pdma_channel(&c.lock())
-        }).collect();
-        tbl.insert("pdma_channels".into(), toml::Value::Array(chans));
-
-        toml::Value::Table(tbl)
+        self.state_desc().expect("hpc3 has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut state = self.state.lock();
-        if let Some(x) = get_field(v, "intstat")    { state.intstat    = toml_u32(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "gio_misc")   { state.gio_misc   = toml_u32(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "eeprom_reg") { state.eeprom_reg = toml_u32(x).unwrap_or(0); }
-        if let Some(r) = get_field(v, "pbus_pio")   { load_u32_slice(r, &mut state.pbus_pio); }
-        drop(state);
-
-        if let Some(toml::Value::Array(chans)) = get_field(v, "pdma_channels") {
-            for (i, cv) in chans.iter().enumerate() {
-                if i >= self.pdma_channels.len() { break; }
-                load_pdma_channel(&mut self.pdma_channels[i].lock(), cv);
-            }
-        }
-        Ok(())
+        self.state_desc().expect("hpc3 has a state description").load(v)
     }
 }
 

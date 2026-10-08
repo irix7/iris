@@ -345,9 +345,24 @@ pub trait Resettable {
 
 /// Serialize / deserialize device register state to/from TOML.
 /// Memory bulk data (RAM) is handled separately as raw binary.
+///
+/// Devices may additionally return a registered [`StateDesc`] (see
+/// `src/state_desc.rs`): the snapshot orchestrator then generates the payload
+/// from that description and records its readable field list and schema
+/// signature in the manifest, so a missing or renamed field fails to load
+/// rather than mis-assigning state. Devices that return `None` (the default)
+/// keep their hand-written `save_state`/`load_state` codec.
+///
+/// [`StateDesc`]: crate::state_desc::StateDesc
 pub trait Saveable {
     fn save_state(&self) -> toml::Value;
     fn load_state(&self, v: &toml::Value) -> Result<(), String>;
+
+    /// Registered field description, if this device has been migrated to the
+    /// descriptor codec. `None` (the default) = legacy hand-written codec.
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        None
+    }
 }
 
 pub trait Device: Send + Sync {

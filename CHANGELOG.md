@@ -211,6 +211,22 @@ hashes are given where a change is easiest to understand by reading the commit.
   deadlines are serialisable and re-sorted on load; transient callbacks are
   never saved, so an anonymous timer cannot corrupt a snapshot.
 
+### Snapshots / save-state codec
+
+- **2026-10-09 — Registered save-state codec (#45).** A device can now describe
+  its state fields once (`Saveable::state_desc` returning a `StateDesc`: field
+  name, kind, read/write closure, `since_version`). The postcard payload, a
+  readable field list and a schema signature are all generated from that
+  description. The field list and signature are copied into `snapshot.toml`
+  (the QEMU "VM Description" analogue), and load checks the recorded signature
+  and exact field set before applying state — a missing or renamed field fails
+  the restore rather than loading a silent default (Dolphin-style Verify;
+  Measure is the signature without serialising). `Saveable`,
+  `SCHEMA_VERSION` and the on-disk format are unchanged: devices not yet
+  migrated keep their hand-written codec and get a value-shape integrity
+  signature. Migrated: MC, IOC, HPC3, SCC, PIT, PS/2, WD33C93A, DS1x86 RTC,
+  Seeq, testdev. New module `src/state_desc.rs`.
+
 ## September 2026
 
 ### Configuration and desktop usability

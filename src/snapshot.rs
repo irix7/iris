@@ -23,6 +23,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use toml::Value;
 
+use crate::state_desc::FieldInfo;
+
 /// On-disk schema version for the snapshot directory layout. Bumped when a
 /// device's save_state format changes incompatibly. Old snapshots without a
 /// manifest are treated as v0 (legacy, best-effort load).
@@ -107,6 +109,22 @@ pub fn enabled_features() -> Vec<String> {
     f
 }
 
+/// Schema entry for one captured device, recorded in the manifest as the
+/// analogue of QEMU's VM Description. `registered` is true when the device
+/// described its own fields via a [`StateDesc`](crate::state_desc::StateDesc);
+/// for those, `signature` is the code-derived schema signature and a mismatch
+/// on load fails the restore. For unregistered devices the field list is
+/// inferred from the saved value and `signature` is a value-shape integrity
+/// hash (catches truncation/corruption, not a code rename).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSchema {
+    pub name: String,
+    pub version: u32,
+    pub registered: bool,
+    pub signature: u64,
+    pub fields: Vec<FieldInfo>,
+}
+
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
 /// first on save and read first on load so the rest of the pipeline can fail
 /// fast with a clear error before reading half a snapshot.
@@ -129,6 +147,9 @@ pub struct Manifest {
     /// Emulated CPU at capture time. None for legacy manifests, and for those
     /// the check is skipped — the model was a build flag before it was config.
     pub cpu_model: Option<String>,
+    /// Per-device state schema: readable field list + signature. Empty for
+    /// legacy manifests written before the descriptor codec (#45).
+    pub state: Vec<DeviceSchema>,
 }
 
 impl Manifest {
@@ -153,6 +174,7 @@ impl Manifest {
             disks: Vec::new(),
             nvram: None,
             cpu_model: None,
+            state: Vec::new(),
         }
     }
 
@@ -194,6 +216,23 @@ impl Manifest {
         }
         if let Some(nv) = &self.nvram {
             tbl.insert("nvram".into(), Value::String(nv.clone()));
+        }
+        // Per-device state schema (readable field list + signature). Omitted
+        // when empty so pre-#45 manifest diffs stay clean.
+        if !self.state.is_empty() {
+            let devs: Vec<Value> = self.state.iter().map(|d| {
+                let mut dt = toml::map::Map::new();
+                dt.insert("name".into(), Value::String(d.name.clone()));
+                dt.insert("version".into(), Value::Integer(d.version as i64));
+                dt.insert("registered".into(), Value::Boolean(d.registered));
+                dt.insert("signature".into(), Value::String(format!("0x{:016x}", d.signature)));
+                dt.insert(
+                    "fields".into(),
+                    Value::Array(d.fields.iter().map(|f| Value::String(f.encode())).collect()),
+                );
+                Value::Table(dt)
+            }).collect();
+            tbl.insert("state".into(), Value::Array(devs));
         }
         Value::Table(tbl)
     }
@@ -237,6 +276,25 @@ impl Manifest {
             .unwrap_or_default();
         let nvram = tbl.get("nvram").and_then(|x| x.as_str()).map(String::from);
         let cpu_model = tbl.get("cpu_model").and_then(|x| x.as_str()).map(String::from);
+        // Per-device state schema. Absent in pre-#45 manifests. A malformed
+        // entry is dropped rather than failing the whole manifest read; the
+        // load path treats a missing entry as "unregistered/legacy".
+        let state = tbl.get("state")
+            .and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|x| {
+                let t = x.as_table()?;
+                let name = t.get("name").and_then(|v| v.as_str())?.to_string();
+                let version = t.get("version").and_then(|v| v.as_integer()).unwrap_or(0) as u32;
+                let registered = t.get("registered").and_then(|v| v.as_bool()).unwrap_or(false);
+                let signature = t.get("signature").and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+                let fields = t.get("fields").and_then(|v| v.as_array())
+                    .map(|fs| fs.iter().filter_map(|f| f.as_str().and_then(FieldInfo::decode)).collect())
+                    .unwrap_or_default();
+                Some(DeviceSchema { name, version, registered, signature, fields })
+            }).collect())
+            .unwrap_or_default();
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -249,6 +307,7 @@ impl Manifest {
             disks,
             nvram,
             cpu_model,
+            state,
         })
     }
 }
@@ -593,6 +652,7 @@ pub fn get_field<'a>(table: &'a Value, key: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state_desc::FieldKind;
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -618,6 +678,16 @@ mod tests {
             disks: vec![DiskRef { id: 1, path: "irix53.raw".into(), size_bytes: 4294967296 }],
             nvram: Some("nvram-irix53.bin".into()),
             cpu_model: Some("R5000".into()),
+            state: vec![DeviceSchema {
+                name: "cpu".into(),
+                version: 1,
+                registered: true,
+                signature: 0x1234_5678_9abc_def0,
+                fields: vec![
+                    FieldInfo { name: "pc".into(), kind: FieldKind::U64, since_version: 1 },
+                    FieldInfo { name: "gpr".into(), kind: FieldKind::U64Array, since_version: 1 },
+                ],
+            }],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -632,6 +702,15 @@ mod tests {
         assert_eq!(m2.disks, m.disks);
         assert_eq!(m2.nvram, m.nvram);
         assert_eq!(m2.cpu_model, m.cpu_model);
+        assert_eq!(m2.state, m.state);
+
+        // The same round-trip through actual TOML text (arrays of tables
+        // serialise as `[[state]]`; the reader must find them again).
+        let text = toml::to_string_pretty(&m.to_toml()).expect("serialise");
+        let reparsed = Manifest::from_toml(&toml::from_str::<Value>(&text).expect("parse text"))
+            .expect("manifest from text");
+        assert_eq!(reparsed.state, m.state);
+        assert_eq!(reparsed.schema_version, m.schema_version);
     }
 
     #[test]
@@ -648,6 +727,7 @@ mod tests {
             disks: vec![],
             nvram: None,
             cpu_model: None,
+            state: vec![],
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -659,6 +739,7 @@ mod tests {
         assert!(m2.disks.is_empty());
         assert!(m2.nvram.is_none());
         assert!(m2.cpu_model.is_none(), "legacy manifest has no cpu_model");
+        assert!(m2.state.is_empty());
     }
 
     #[test]

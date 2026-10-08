@@ -18,6 +18,12 @@ iris_git_rev = "abc123"       # from option_env!("IRIS_GIT_REV") at build time
 parent = "base/desktop"       # name of the snapshot we restored from before this save
 description = "post-install"  # free-form note
 ```
+Optional, written by registered-codec builds (#45): a `[[state]]` array with
+one entry per captured device — `name`, `version`, `registered`, a
+`signature` hex string and a `fields` list of `name:kind:since` strings (the
+QEMU VM Description analogue). See
+`registered-state-desc-and-signature.md`. Pre-#45 manifests have no `[[state]]`
+and load unchanged.
 
 ## Load behavior (`src/machine.rs:633` `load_snapshot`)
 - **No manifest** → treated as legacy v0 with a warning. Best-effort load. (Old `saves/working*` snapshots are v0.)

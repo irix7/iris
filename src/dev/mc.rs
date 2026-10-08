@@ -1284,69 +1284,102 @@ impl Resettable for MemoryController {
 }
 
 impl Saveable for MemoryController {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("mc", 1)
+                .field(
+                    "regs",
+                    FieldKind::U32Array,
+                    1,
+                    |t| { t.insert("regs".into(), u32_slice_to_toml(&self.state.lock().regs)); },
+                    |v| { load_u32_slice(v, &mut self.state.lock().regs); Ok(()) },
+                )
+                .field(
+                    "sys_semaphore",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("sys_semaphore".into(), toml::Value::Boolean(self.state.lock().sys_semaphore)); },
+                    |v| { self.state.lock().sys_semaphore = toml_bool(v).unwrap_or(false); Ok(()) },
+                )
+                .field(
+                    "user_semaphores",
+                    FieldKind::Array,
+                    1,
+                    |t| {
+                        let state = self.state.lock();
+                        let arr: Vec<toml::Value> = state.user_semaphores.iter()
+                            .map(|&b| toml::Value::Boolean(b)).collect();
+                        t.insert("user_semaphores".into(), toml::Value::Array(arr));
+                    },
+                    |v| {
+                        if let Some(arr) = v.as_array() {
+                            let mut state = self.state.lock();
+                            for (i, item) in arr.iter().enumerate() {
+                                if i >= 16 { break; }
+                                state.user_semaphores[i] = toml_bool(item).unwrap_or(false);
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "giodma",
+                    FieldKind::Table,
+                    1,
+                    |t| {
+                        let dma = self.giodma.state.lock();
+                        let mut d = toml::map::Map::new();
+                        d.insert("gio_mask".into(), hex_u32(dma.gio_mask));
+                        d.insert("gio_sub".into(),  hex_u32(dma.gio_sub));
+                        d.insert("cause".into(),    hex_u32(dma.cause));
+                        d.insert("ctl".into(),      hex_u32(dma.ctl));
+                        d.insert("tlb_hi".into(), u32_slice_to_toml(&dma.tlb_hi));
+                        d.insert("tlb_lo".into(), u32_slice_to_toml(&dma.tlb_lo));
+                        d.insert("memadr".into(),   hex_u32(dma.memadr));
+                        d.insert("size".into(),     hex_u32(dma.size));
+                        d.insert("stride".into(),   hex_u32(dma.stride));
+                        d.insert("gio_adr".into(),  hex_u32(dma.gio_adr));
+                        d.insert("mode".into(),     hex_u32(dma.mode));
+                        d.insert("count".into(),    hex_u32(dma.count));
+                        d.insert("run".into(),      hex_u32(dma.run));
+                        d.insert("stdma".into(),    hex_u32(dma.stdma));
+                        d.insert("run_real".into(), toml::Value::Boolean(dma.run_real));
+                        t.insert("giodma".into(), toml::Value::Table(d));
+                    },
+                    |v| {
+                        let mut dma = self.giodma.state.lock();
+                        macro_rules! ldu32 { ($f:ident) => {
+                            if let Some(x) = get_field(v, stringify!($f)) { dma.$f = toml_u32(x).unwrap_or(0); }
+                        }}
+                        ldu32!(gio_mask); ldu32!(gio_sub); ldu32!(cause); ldu32!(ctl);
+                        ldu32!(memadr); ldu32!(size); ldu32!(stride); ldu32!(gio_adr);
+                        ldu32!(mode); ldu32!(count); ldu32!(run); ldu32!(stdma);
+                        if let Some(r) = get_field(v, "tlb_hi") { load_u32_slice(r, &mut dma.tlb_hi); }
+                        if let Some(r) = get_field(v, "tlb_lo") { load_u32_slice(r, &mut dma.tlb_lo); }
+                        if let Some(x) = get_field(v, "run_real") { dma.run_real = toml_bool(x).unwrap_or(false); }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "eeprom",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("eeprom".into(), self.state.lock().eeprom.lock().save_state_owned()); },
+                    |v| {
+                        self.state.lock().eeprom.lock().load_state_mut(v)?;
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let state = self.state.lock();
-        let dma = self.giodma.state.lock();
-        let mut tbl = toml::map::Map::new();
-
-        tbl.insert("regs".into(), u32_slice_to_toml(&state.regs));
-        tbl.insert("sys_semaphore".into(),  toml::Value::Boolean(state.sys_semaphore));
-        tbl.insert("user_semaphores".into(), toml::Value::Array(
-            state.user_semaphores.iter().map(|&b| toml::Value::Boolean(b)).collect()
-        ));
-
-        let mut d = toml::map::Map::new();
-        d.insert("gio_mask".into(), hex_u32(dma.gio_mask));
-        d.insert("gio_sub".into(),  hex_u32(dma.gio_sub));
-        d.insert("cause".into(),    hex_u32(dma.cause));
-        d.insert("ctl".into(),      hex_u32(dma.ctl));
-        d.insert("tlb_hi".into(), u32_slice_to_toml(&dma.tlb_hi));
-        d.insert("tlb_lo".into(), u32_slice_to_toml(&dma.tlb_lo));
-        d.insert("memadr".into(),   hex_u32(dma.memadr));
-        d.insert("size".into(),     hex_u32(dma.size));
-        d.insert("stride".into(),   hex_u32(dma.stride));
-        d.insert("gio_adr".into(),  hex_u32(dma.gio_adr));
-        d.insert("mode".into(),     hex_u32(dma.mode));
-        d.insert("count".into(),    hex_u32(dma.count));
-        d.insert("run".into(),      hex_u32(dma.run));
-        d.insert("stdma".into(),    hex_u32(dma.stdma));
-        d.insert("run_real".into(), toml::Value::Boolean(dma.run_real));
-        tbl.insert("giodma".into(), toml::Value::Table(d));
-        tbl.insert("eeprom".into(), state.eeprom.lock().save_state_owned());
-
-        toml::Value::Table(tbl)
+        self.state_desc().expect("mc has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut state = self.state.lock();
-        let mut dma = self.giodma.state.lock();
-
-        if let Some(r) = get_field(v, "regs") { load_u32_slice(r, &mut state.regs); }
-        if let Some(x) = get_field(v, "sys_semaphore") { state.sys_semaphore = toml_bool(x).unwrap_or(false); }
-        if let Some(toml::Value::Array(arr)) = get_field(v, "user_semaphores") {
-            for (i, item) in arr.iter().enumerate() {
-                if i >= 16 { break; }
-                state.user_semaphores[i] = toml_bool(item).unwrap_or(false);
-            }
-        }
-
-        if let Some(d) = get_field(v, "giodma") {
-            macro_rules! ldu32 { ($f:ident) => {
-                if let Some(x) = get_field(d, stringify!($f)) { dma.$f = toml_u32(x).unwrap_or(0); }
-            }}
-            ldu32!(gio_mask); ldu32!(gio_sub); ldu32!(cause); ldu32!(ctl);
-            ldu32!(memadr); ldu32!(size); ldu32!(stride); ldu32!(gio_adr);
-            ldu32!(mode); ldu32!(count); ldu32!(run); ldu32!(stdma);
-            if let Some(r) = get_field(d, "tlb_hi") { load_u32_slice(r, &mut dma.tlb_hi); }
-            if let Some(r) = get_field(d, "tlb_lo") { load_u32_slice(r, &mut dma.tlb_lo); }
-            if let Some(x) = get_field(d, "run_real") { dma.run_real = toml_bool(x).unwrap_or(false); }
-        }
-
-        if let Some(e) = get_field(v, "eeprom") {
-            state.eeprom.lock().load_state_mut(e)?;
-        }
-
-        Ok(())
+        self.state_desc().expect("mc has a state description").load(v)
     }
 }
 

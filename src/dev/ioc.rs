@@ -1220,32 +1220,48 @@ impl Resettable for Ioc {
 }
 
 impl Saveable for Ioc {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        let mut d = StateDesc::new("ioc", 1);
+        macro_rules! u8_field {
+            ($name:ident) => {
+                d = d.field(
+                    stringify!($name),
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert(stringify!($name).into(), hex_u8(self.state.lock().$name)); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().$name = n; } Ok(()) },
+                );
+            };
+        }
+        u8_field!(l0_stat);
+        u8_field!(l0_mask);
+        u8_field!(l1_stat);
+        u8_field!(l1_mask);
+        u8_field!(map_stat);
+        u8_field!(map_mask0);
+        u8_field!(map_mask1);
+        u8_field!(map_pol);
+        u8_field!(err_stat);
+        u8_field!(port_config);
+        u8_field!(gc_select);
+        u8_field!(gen_cntl);
+        u8_field!(panel);
+        u8_field!(read_reg);
+        u8_field!(dma_sel);
+        u8_field!(reset_reg);
+        u8_field!(write_reg);
+        // Re-derive the MAP_INT0/MAP_INT1 cascade bits from the restored
+        // (map_stat & map_mask{0,1}) after every register is applied.
+        Some(d.after_load(|| { self.state.lock().update_interrupts(); Ok(()) }))
+    }
+
     fn save_state(&self) -> toml::Value {
-        let state = self.state.lock();
-        let mut tbl = toml::map::Map::new();
-        macro_rules! u8f { ($f:ident) => { tbl.insert(stringify!($f).into(), hex_u8(state.$f)); } }
-        u8f!(l0_stat); u8f!(l0_mask); u8f!(l1_stat); u8f!(l1_mask);
-        u8f!(map_stat); u8f!(map_mask0); u8f!(map_mask1); u8f!(map_pol); u8f!(err_stat);
-        u8f!(port_config);
-        u8f!(gc_select);
-        u8f!(gen_cntl); u8f!(panel); u8f!(read_reg);
-        u8f!(dma_sel); u8f!(reset_reg); u8f!(write_reg);
-        toml::Value::Table(tbl)
+        self.state_desc().expect("ioc has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut state = self.state.lock();
-        macro_rules! ldu8 { ($f:ident) => {
-            if let Some(x) = get_field(v, stringify!($f)) { state.$f = toml_u8(x).unwrap_or(state.$f); }
-        }}
-        ldu8!(l0_stat); ldu8!(l0_mask); ldu8!(l1_stat); ldu8!(l1_mask);
-        ldu8!(map_stat); ldu8!(map_mask0); ldu8!(map_mask1); ldu8!(map_pol); ldu8!(err_stat);
-        ldu8!(port_config);
-        ldu8!(gc_select);
-        ldu8!(gen_cntl); ldu8!(panel); ldu8!(read_reg);
-        ldu8!(dma_sel); ldu8!(reset_reg); ldu8!(write_reg);
-        state.update_interrupts();
-        Ok(())
+        self.state_desc().expect("ioc has a state description").load(v)
     }
 }
 

@@ -470,20 +470,50 @@ impl Resettable for TestDevice {
 }
 
 impl Saveable for TestDevice {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        fn v_i64(x: u64) -> toml::Value { toml::Value::Integer(x as i64) }
+        Some(
+            StateDesc::new("testdev", 1)
+                .field(
+                    "dumps",
+                    FieldKind::U32,
+                    1,
+                    |t| { t.insert("dumps".into(), v_i64(self.dumps.load(Ordering::Relaxed) as u64)); },
+                    |v| {
+                        if let Some(n) = v.as_integer() { self.dumps.store(n as u32, Ordering::Relaxed); }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "last_tag",
+                    FieldKind::U64,
+                    1,
+                    |t| { t.insert("last_tag".into(), v_i64(self.last_tag.load(Ordering::Relaxed))); },
+                    |v| {
+                        if let Some(n) = v.as_integer() { self.last_tag.store(n as u64, Ordering::Relaxed); }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "chars",
+                    FieldKind::U64,
+                    1,
+                    |t| { t.insert("chars".into(), v_i64(self.chars.load(Ordering::Relaxed))); },
+                    |v| {
+                        if let Some(n) = v.as_integer() { self.chars.store(n as u64, Ordering::Relaxed); }
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut t = toml::value::Table::new();
-        t.insert("dumps".into(), toml::Value::Integer(self.dumps.load(Ordering::Relaxed) as i64));
-        t.insert("last_tag".into(), toml::Value::Integer(self.last_tag.load(Ordering::Relaxed) as i64));
-        t.insert("chars".into(), toml::Value::Integer(self.chars.load(Ordering::Relaxed) as i64));
-        toml::Value::Table(t)
+        self.state_desc().expect("testdev has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let get = |k: &str| v.get(k).and_then(|x| x.as_integer()).unwrap_or(0);
-        self.dumps.store(get("dumps") as u32, Ordering::Relaxed);
-        self.last_tag.store(get("last_tag") as u64, Ordering::Relaxed);
-        self.chars.store(get("chars") as u64, Ordering::Relaxed);
-        Ok(())
+        self.state_desc().expect("testdev has a state description").load(v)
     }
 }
 
