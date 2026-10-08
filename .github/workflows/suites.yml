@@ -253,6 +253,7 @@ jobs:
             --iris ./target/release/iris \
             --label "${{ matrix.cpu }}-${{ matrix.engine }}" \
             --timeout 2400 \
+            --repeat "${BENCH_REPEAT:-10}" \
             -- --cpu ${{ matrix.cpu }} \
             2>&1 | tee bench/build/run.log
 

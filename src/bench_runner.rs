@@ -187,6 +187,8 @@ fn run_inner(
         wall_s,
         suite_id: benchsuite::suite_id(),
         settings: p.settings,
+        samples: 1,
+        mips_cv_pct: 0.0,
     })
 }
 

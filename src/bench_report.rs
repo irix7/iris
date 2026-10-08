@@ -223,7 +223,22 @@ pub struct Run {
     /// which is what they were.
     #[serde(default)]
     pub settings: RunSettings,
+    /// Number of independent suite runs pooled into this result (1 for a single
+    /// run). The throughput fields are their mean, so the rate accessors report
+    /// the pooled rate. `default` keeps results recorded before this existed
+    /// loadable, as single samples.
+    #[serde(default = "one_sample")]
+    pub samples: u32,
+    /// Coefficient of variation (%) of the per-sample guest MIPS. Only
+    /// meaningful when `samples > 1`: a large value means a noisy runner and a
+    /// correspondingly soft average. `default` (0) for older results.
+    #[serde(default)]
+    pub mips_cv_pct: f64,
 }
+
+/// One sample: the value a single-suite-run result (and any result recorded
+/// before `samples` existed) should load as.
+fn one_sample() -> u32 { 1 }
 
 impl Run {
     pub fn accuracy(&self) -> f64 {
@@ -823,6 +838,8 @@ IRIS-BENCH-END
             wall_s: 30.0,
             suite_id: "blake3:0123456789abcdef".into(),
             settings: p.settings,
+            samples: 1,
+            mips_cv_pct: 0.0,
         }
     }
 

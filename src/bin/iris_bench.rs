@@ -106,6 +106,8 @@ fn run_guest(
         wall_s,
         suite_id,
         settings: p.settings,
+        samples: 1,
+        mips_cv_pct: 0.0,
     })
 }
 
@@ -137,6 +139,8 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
         wall_s,
         suite_id: String::new(),
         settings: p.settings,
+        samples: 1,
+        mips_cv_pct: 0.0,
     })
 }
 
@@ -159,6 +163,97 @@ fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::Cpu
         if let bench_runner::Progress::Line(l) = p {
             println!("{}", l);
         }
+    })
+}
+
+/// Pool independent suite runs into one averaged result.
+///
+/// Throughput fields become their mean, so the rate accessors report the pooled
+/// rate (total work over total time). Accuracy must agree across every sample —
+/// if one repeat saw a different checksum or status, the average would hide a
+/// one-off miscompare, so that is an error rather than a silently softer number.
+fn average_runs(samples: Vec<Run>) -> Result<Run, String> {
+    let n = samples.len();
+    if n == 0 {
+        return Err("no samples to average".into());
+    }
+    if n == 1 {
+        return Ok(samples.into_iter().next().unwrap());
+    }
+    let first = &samples[0];
+    for (i, s) in samples.iter().enumerate().skip(1) {
+        if s.checked != first.checked || s.matched != first.matched {
+            return Err(format!(
+                "repeat {} disagrees on accuracy: {}/{} vs {}/{}",
+                i + 1, s.matched, s.checked, first.matched, first.checked));
+        }
+        if s.rows.len() != first.rows.len() {
+            return Err(format!(
+                "repeat {} ran {} kernels, expected {}", i + 1, s.rows.len(), first.rows.len()));
+        }
+    }
+
+    let nf = n as f64;
+    let mut rows = Vec::with_capacity(first.rows.len());
+    for r0 in &first.rows {
+        let (mut ns, mut icount, mut work, mut iters, mut count) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        let mut exc = 0u64;
+        for s in &samples {
+            let r = s.row(&r0.name)
+                .ok_or_else(|| format!("a repeat is missing kernel {}", r0.name))?;
+            if r.checksum != r0.checksum || r.status != r0.status {
+                return Err(format!(
+                    "kernel {} is inconsistent across repeats ({} vs {})",
+                    r0.name, r0.status, r.status));
+            }
+            ns += r.ns as f64;
+            icount += r.icount as f64;
+            work += r.work as f64;
+            iters += r.iters as f64;
+            count += r.count as f64;
+            exc = exc.max(r.exc);
+        }
+        rows.push(Row {
+            name: r0.name.clone(),
+            unit: r0.unit.clone(),
+            iters: (iters / nf).round() as u64,
+            work: (work / nf).round() as u64,
+            ns: (ns / nf).round() as u64,
+            icount: (icount / nf).round() as u64,
+            count: (count / nf).round() as u64,
+            exc,
+            checksum: r0.checksum.clone(),
+            golden: r0.golden.clone(),
+            status: r0.status.clone(),
+        });
+    }
+
+    let total_ns = (samples.iter().map(|s| s.total_ns as f64).sum::<f64>() / nf).round() as u64;
+    let total_icount = (samples.iter().map(|s| s.total_icount as f64).sum::<f64>() / nf).round() as u64;
+    let wall_s = samples.iter().map(|s| s.wall_s).sum::<f64>() / nf;
+
+    // Spread of the per-sample aggregate MIPS, so a noisy runner is visible
+    // rather than hidden behind the average.
+    let mips: Vec<f64> = samples.iter().map(|s| s.mips()).collect();
+    let mean = mips.iter().sum::<f64>() / nf;
+    let var = mips.iter().map(|m| (m - mean).powi(2)).sum::<f64>() / (nf - 1.0);
+    let cv = if mean > 0.0 { var.sqrt() / mean * 100.0 } else { 0.0 };
+
+    Ok(Run {
+        cell: first.cell.clone(),
+        features: first.features.clone(),
+        machine: first.machine.clone(),
+        host: first.host.clone(),
+        rows,
+        checked: first.checked,
+        matched: first.matched,
+        total_ns,
+        total_icount,
+        wall_s,
+        suite_id: first.suite_id.clone(),
+        settings: first.settings,
+        samples: n as u32,
+        mips_cv_pct: cv,
     })
 }
 
@@ -480,6 +575,8 @@ fn run_irix(ci: &Ci, steps_path: &Path, label: &str) -> Result<Run, String> {
         suite_id: String::new(),
         // Not the bare-metal harness, so its run configuration does not apply.
         settings: RunSettings::default(),
+        samples: 1,
+        mips_cv_pct: 0.0,
     })
 }
 
@@ -662,12 +759,16 @@ fn text_summary(runs: &[Run]) -> String {
     let mut o = String::new();
     for r in runs {
         o.push_str(&format!(
-            "{:<24} {:>6.1}% accuracy   {:>8}   {:>7} DMIPS   {:>7.1} s timed\n",
+            "{:<24} {:>6.1}% accuracy   {:>8}   {:>7} DMIPS   {:>7.1} s timed",
             r.cell, r.accuracy(),
             if r.mips() > 0.0 { format!("{:.1} MIPS", r.mips()) } else { "n/a".into() },
             r.dmips().map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
             r.total_ns as f64 / 1e9,
         ));
+        if r.samples > 1 {
+            o.push_str(&format!("   (mean of {} runs, {:.1}% cv)", r.samples, r.mips_cv_pct));
+        }
+        o.push('\n');
     }
     o
 }
@@ -723,6 +824,12 @@ enum Cmd {
         /// emulator instead: `-- --cpu r5000`.
         #[arg(long, default_value = "r4400")]
         cpu: iris::config::CpuModel,
+        /// Run the suite this many times and pool the samples into one result:
+        /// throughput is the pooled mean and every sample must verify
+        /// identically. Reduces shared-runner noise at N× the runtime. 1 =
+        /// a single run.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
         /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -754,6 +861,9 @@ enum Cmd {
         no_host: bool,
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
+        /// Pool this many independent runs per cell (see `run --repeat`).
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
 
     /// Turn saved results into a report.
@@ -844,38 +954,50 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, extra } => {
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, repeat, extra } => {
             let out = out.unwrap_or_else(default_out);
-            let run = match iris {
-                Some(iris) => {
-                    if quick {
-                        return Err("--quick needs the in-process runner; drop --iris".into());
-                    }
-                    let elf = elf.unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
-                    let config = config.unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
-                    run_guest(&iris, &elf, &config, &label, timeout, &extra)?
+            let repeat = repeat.max(1);
+
+            // Refuse in-process-only options once, before any repetition, so a
+            // 10-sample run fails immediately rather than after the first pass.
+            if iris.is_none() {
+                // Silently ignoring these would be worse than refusing: they all
+                // describe a subprocess that is not being started, and a run
+                // that quietly measured the wrong thing is the failure mode this
+                // whole suite exists to avoid.
+                let stray = [
+                    elf.is_some().then_some("--elf"),
+                    config.is_some().then_some("--config"),
+                    (!extra.is_empty()).then_some("trailing emulator arguments"),
+                ];
+                let stray: Vec<&str> = stray.into_iter().flatten().collect();
+                if !stray.is_empty() {
+                    let (verb, obj) = if stray.len() == 1 { ("applies", "it") }
+                                      else { ("apply", "them") };
+                    return Err(format!(
+                        "{} only {} to --iris, and `run` is in-process by default. \
+                         Add --iris PATH, or drop {}.", stray.join(" and "), verb, obj));
                 }
-                None => {
-                    // Silently ignoring these would be worse than refusing:
-                    // they all describe a subprocess that is not being started,
-                    // and a run that quietly measured the wrong thing is the
-                    // failure mode this whole suite exists to avoid.
-                    let stray = [
-                        elf.is_some().then_some("--elf"),
-                        config.is_some().then_some("--config"),
-                        (!extra.is_empty()).then_some("trailing emulator arguments"),
-                    ];
-                    let stray: Vec<&str> = stray.into_iter().flatten().collect();
-                    if !stray.is_empty() {
-                        let (verb, obj) = if stray.len() == 1 { ("applies", "it") }
-                                          else { ("apply", "them") };
-                        return Err(format!(
-                            "{} only {} to --iris, and `run` is in-process by default. \
-                             Add --iris PATH, or drop {}.", stray.join(" and "), verb, obj));
+            }
+            if quick && iris.is_some() {
+                return Err("--quick needs the in-process runner; drop --iris".into());
+            }
+
+            let mut samples = Vec::with_capacity(repeat as usize);
+            for _ in 0..repeat {
+                let run = match &iris {
+                    Some(iris) => {
+                        let elf = elf.clone()
+                            .unwrap_or_else(|| repo_relative("bench/build/irisbench.elf"));
+                        let config = config.clone()
+                            .unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
+                        run_guest(iris, &elf, &config, &label, timeout, &extra)?
                     }
-                    run_embedded(&label, timeout, quick, cpu)?
-                }
-            };
+                    None => run_embedded(&label, timeout, quick, cpu)?,
+                };
+                samples.push(run);
+            }
+            let run = average_runs(samples)?;
             let path = save(&run, &out)?;
             print!("{}", text_summary(std::slice::from_ref(&run)));
             println!("wrote {}", path.display());
@@ -892,7 +1014,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Matrix { cells, out, force_build, no_host, timeout } => {
+        Cmd::Matrix { cells, out, force_build, no_host, timeout, repeat } => {
             let root = if PathBuf::from("Cargo.toml").exists() { PathBuf::from(".") }
                        else { PathBuf::from("..") };
             let out = out.unwrap_or_else(default_out);
@@ -928,7 +1050,20 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                     Err(e) => { eprintln!("  {}", e); failures.push(cell.name); continue; }
                 };
                 let cpu_arg = ["--cpu".to_string(), cell.cpu.to_string()];
-                match run_guest(&iris, &elf, &config, cell.name, timeout, &cpu_arg) {
+                let repeat = repeat.max(1);
+                let mut samples = Vec::with_capacity(repeat as usize);
+                let mut sample_err = None;
+                for _ in 0..repeat {
+                    match run_guest(&iris, &elf, &config, cell.name, timeout, &cpu_arg) {
+                        Ok(r) => samples.push(r),
+                        Err(e) => { sample_err = Some(e); break; }
+                    }
+                }
+                let result = match sample_err {
+                    Some(e) => Err(e),
+                    None => average_runs(samples),
+                };
+                match result {
                     Ok(run) => {
                         // The guest reads PRId, so its banner is the authority
                         // on which CPU actually ran.
