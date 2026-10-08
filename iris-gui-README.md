@@ -91,8 +91,7 @@ automatically. You'll be asked for:
   R10000 and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
-  needed for IP24/IP22. IP28 disables the embedded option and needs your own
-  dumped IP28 PROM.
+  needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
 - **NVRAM file** — defaults to a stable per-user path (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
@@ -158,7 +157,7 @@ IRIX with a media-change Unit Attention, no restart needed.
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
 | **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
-| **Display** | Display resolution, window scale, headless, audio on/off and buffering |
+| **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
 | **Debug** | Build features, GDB stub port, capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |

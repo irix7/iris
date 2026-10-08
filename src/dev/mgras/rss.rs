@@ -22,8 +22,9 @@
 //! iterator), stipple it with character data, or move pixels in or out of it
 //! (by PIO through the character registers, or by DMA).
 
+use super::fixed;
 use super::pixmem::{Buffer, Kind, PixMem};
-use super::plain::RegMap;
+use super::plain::{RegMap, Slot};
 use super::te1::{reg as te_reg, tex_env, Sampler, Te1, ITER_ONE, TEXMODE1_ENABLE};
 
 /// Framebuffer coordinates the model accepts (x and y, 0..2048); where a
@@ -324,8 +325,8 @@ pub const OP_GL_LINE: u32 = 0x2;
 ///   fill mode bit 2     polygon stipple, rows at device address POLY_STIPPLE_RAM
 /// Compare functions in OpenGL order: NEVER LESS EQUAL LEQUAL GREATER
 /// NOTEQUAL GEQUAL ALWAYS, "incoming OP stored".
-const TEST_ENABLE: u32 = 1 << 3;
-const BLEND_ENABLE: u32 = 1 << 8;
+pub(super) const TEST_ENABLE: u32 = 1 << 3;
+pub(super) const BLEND_ENABLE: u32 = 1 << 8;
 const FILL_POLY_STIPPLE: u32 = 1 << 2;
 /// Polygon stipple RAM in the indirect device space (SGI's POLYSTIP_RAM).
 pub const POLY_STIPPLE_RAM: u32 = 0xA000_0000;
@@ -344,17 +345,17 @@ fn compare(func: u32, a: f64, b: f64) -> bool {
     }
 }
 /// Fill mode: a line leaves out its last pixel (X's CapNotLast).
-const FILL_LINE_SKIP_LAST: u32 = 1 << 10;
+pub(super) const FILL_LINE_SKIP_LAST: u32 = 1 << 10;
 /// Fill mode: lines follow the 32-bit line stipple pattern.
-const FILL_LINE_STIPPLE: u32 = 1 << 5;
+pub(super) const FILL_LINE_STIPPLE: u32 = 1 << 5;
 /// Fill mode: the line stipple is opaque, its 0 bits drawn in the background
 /// colour instead of left alone. The desktop shades icons this way: a 50%
 /// pattern of the foreground and background colours.
-const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
+pub(super) const FILL_LINE_STIPPLE_OPAQUE: u32 = 1 << 6;
 /// Status: command FIFO empty, engine and pixel processors idle, revision 1.
 const STATUS_IDLE: u32 = 0x100 | (1 << 4);
 /// Config: Y-flip.
-const CONFIG_YFLIP: u32 = 1 << 3;
+pub(super) const CONFIG_YFLIP: u32 = 1 << 3;
 /// Fill mode: fast fill (solid, from the fill colour registers).
 const FILL_FAST: u32 = 1 << 20;
 /// Fill mode: char data stipples the block (with block type 1), and the
@@ -367,12 +368,12 @@ const FILL_CHAR_STIPPLE_OPAQUE: u32 = 1 << 4;
 /// clears), 0x50 the clip-ID planes (see `Rss::cid`). The 6.5.22
 /// TrueColor server keeps `DRBpointers` at 0xB81C0
 /// (A 0x1C0, B 0x2E0) for all drawing and picks the buffer here.
-fn draw_buffer(pp1fillmode: u32) -> u32 {
+pub(super) fn draw_buffer(pp1fillmode: u32) -> u32 {
     (pp1fillmode >> 14) & 0x7F
 }
-const DRAW_B: u32 = 0x02;
-const DRAW_A_AND_B: u32 = 0x03;
-const DRAW_CID: u32 = 0x50;
+pub(super) const DRAW_B: u32 = 0x02;
+pub(super) const DRAW_A_AND_B: u32 = 0x03;
+pub(super) const DRAW_CID: u32 = 0x50;
 
 /// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
 /// CIDmatch, CIDdata, CIDmask). Bits 3:0 are the window origin's low x and
@@ -382,10 +383,10 @@ const DRAW_CID: u32 = 0x50;
 /// that X gave clip ID n, else 0. Bits 11:10 (CIDmask, our reading) write
 /// enable the two clip-ID planes: the X server (mgrasDrawCID) sets 0xC00
 /// to draw clip IDs and leaves it set.
-fn cid_match(pp1winmode: u32) -> u32 {
+pub(super) fn cid_match(pp1winmode: u32) -> u32 {
     (pp1winmode >> 4) & 0xF
 }
-fn cid_write_mask(pp1winmode: u32) -> u8 {
+pub(super) fn cid_write_mask(pp1winmode: u32) -> u8 {
     ((pp1winmode >> 10) & 3) as u8
 }
 
@@ -413,7 +414,7 @@ mod block {
 
 /// Whether the pixel processors' pixel type (fill mode bits 10:8) is an RGB
 /// one; the others are colour index.
-fn rgb_pixtype(pp1fillmode: u32) -> bool {
+pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
     matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2 | 4)
 }
 
@@ -439,7 +440,7 @@ fn logic_op(op: u32, s: u32, d: u32) -> u32 {
         _ => !0,
     }
 }
-const PP1_LOGIC_OP_ENABLE: u32 = 1 << 2;
+pub(super) const PP1_LOGIC_OP_ENABLE: u32 = 1 << 2;
 
 /// Framebuffer pixels: colour indices as they are, RGB as `0x00BBGGRR` with
 /// eight bits per component.
@@ -507,73 +508,76 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
     }) as u64
 }
 
-fn signed16(v: u32) -> i32 {
+pub(super) fn signed16(v: u32) -> i32 {
     v as u16 as i16 as i32
 }
 
 /// A block, in window coordinates, with its colour.
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct Block {
-    xs: i32,
-    ys: i32,
-    xe: i32,
-    ye: i32,
-    color: u32,
+pub(super) struct Block {
+    pub xs: i32,
+    pub ys: i32,
+    pub xe: i32,
+    pub ye: i32,
+    pub color: u32,
 }
 
 impl Block {
-    fn dx(&self) -> i32 {
+    pub(super) fn dx(&self) -> i32 {
         if self.xe < self.xs { -1 } else { 1 }
     }
-    fn dy(&self) -> i32 {
+    pub(super) fn dy(&self) -> i32 {
         if self.ye < self.ys { -1 } else { 1 }
     }
-    fn rows(&self) -> i32 {
+    pub(super) fn rows(&self) -> i32 {
         (self.ye - self.ys).abs() + 1
     }
-    fn cols(&self) -> i32 {
+    pub(super) fn cols(&self) -> i32 {
         (self.xe - self.xs).abs() + 1
     }
 }
 
 /// A character block being filled with stipple data, one row at a time.
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct Stipple {
-    block: Block,
-    col: i32,
-    row: i32,
-    opaque: bool,
+pub(super) struct Stipple {
+    pub block: Block,
+    pub col: i32,
+    pub row: i32,
+    pub opaque: bool,
 }
 
 /// An armed pixel transfer.
+#[repr(C)]
 #[derive(Clone, Copy)]
-struct Xfer {
-    block: Block,
-    read: bool,
+pub(super) struct Xfer {
+    pub block: Block,
+    pub read: bool,
     /// Armed by a PIO read block: the host reads it through the char
     /// registers.
-    pio_read: bool,
+    pub pio_read: bool,
     /// Pixels per line, bytes per pixel, and (PixelFormat, CompType).
-    width: u32,
-    bpp: u32,
-    format: (u32, u32),
-    begin_skip: u32,
-    stride_skip: u32,
+    pub width: u32,
+    pub bpp: u32,
+    pub format: (u32, u32),
+    pub begin_skip: u32,
+    pub stride_skip: u32,
     /// PIO write stream: the line being assembled, its byte offset within
     /// its first doubleword, the bytes collected (in `Rss::line_buf`), and
     /// filler still to skip.
-    line: u32,
-    line_begin: u32,
-    pending: u32,
-    skip: u32,
+    pub line: u32,
+    pub line_begin: u32,
+    pub pending: u32,
+    pub skip: u32,
     /// PIO read stream, produced as it is read: per line, filler up to its
     /// begin offset, the pixels, padding to the doubleword. The line, the
     /// byte within it, its begin offset, and the low half of the doubleword
     /// the last high read took.
-    rd_line: u32,
-    rd_pos: u32,
-    rd_begin: u32,
-    out_lo: u32,
+    pub rd_line: u32,
+    pub rd_pos: u32,
+    pub rd_begin: u32,
+    pub out_lo: u32,
 }
 
 impl Xfer {
@@ -644,7 +648,7 @@ fn gl_keeps(r: usize) -> bool {
 /// a 24-bit Z write mask): bits 2:0 the compare function in OpenGL's order
 /// (NEVER, LESS, EQUAL, LEQUAL, GREATER, NOTEQUAL, GEQUAL, ALWAYS), bit 3
 /// test enable (provisional), bits 27:4 the Z write mask.
-const ZMODE_TEST: u32 = 1 << 3;
+pub(super) const ZMODE_TEST: u32 = 1 << 3;
 /// Page pointer of the depth (ZST: Z 23:0, stencil 31:24) buffer: the
 /// buffer the PROM's 1280x1024 layout calls "aux" (page 0; unused by the
 /// X server at 1024x768). Provisional: how the PP1 is told is not known.
@@ -653,8 +657,8 @@ pub const ZST_PAGE: u32 = 0;
 /// Longest PIO line, in bytes (2048 pixels of 6 bytes, with room to spare).
 const MAX_LINE_BYTES: usize = 16384;
 
-/// The raster subsystem's state. Plain data apart from the `Option`s, which
-/// `init` writes; build with `Rss::init` on zeroed memory or `new_boxed`.
+/// The raster subsystem's state. Plain data, valid zeroed: build it in
+/// place on zeroed memory and run `Rss::init`, or use `new_boxed`.
 #[repr(C)]
 pub struct Rss {
     regs: [u32; 0x400],
@@ -663,11 +667,11 @@ pub struct Rss {
     pub mem: PixMem,
     /// The PIO write line being assembled.
     line_buf: [u8; MAX_LINE_BYTES],
-    stipple: Option<Stipple>,
-    xfer: Option<Xfer>,
+    stipple: Slot<Stipple>,
+    xfer: Slot<Xfer>,
     pub stats: RssStats,
     /// Pixels drawn since the GL line stipple was last restarted (lscrl).
-    gl_line_stipple_pos: u32,
+    pub(super) gl_line_stipple_pos: u32,
     /// The raster registers as `gl_enter` found them.
     gl_stash: [u32; 0x400],
     /// Fill modes seen with a block, for bring-up logging.
@@ -688,6 +692,78 @@ pub struct Rss {
     /// DRBpointers at the main buffer); nothing reads them back, so they
     /// are kept apart here. Separate from the VC3's display IDs.
     pub cid: [u8; WIDTH * HEIGHT],
+    /// The raster JIT's per-board state (mode, cached keys, counters), and
+    /// the context its shaders draw from.
+    #[cfg(feature = "gr4-jit")]
+    pub jit: super::rss_jit::JitState,
+    #[cfg(feature = "gr4-jit")]
+    pub jit_ctx: super::rss_jit::RasterCtx,
+}
+
+/// A triangle's setup (`Rss::tri_setup`): what both the interpreter and
+/// the JIT (`rss_jit`) draw it from. Float planes are (value at (xs,
+/// yref), d/dx, d/(-y)) at pixel centres.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct TriSetup {
+    pub x0: f64,
+    pub x1: f64,
+    pub x2: f64,
+    pub ymid: f64,
+    pub yref: f64,
+    pub yref2: f64,
+    pub s0: f64,
+    pub s1: f64,
+    pub s2: f64,
+    pub xs: f64,
+    /// Colour planes and the fog factor's, 12.16 (`fixed::plane`): pixel
+    /// (i, j) is `p[0] + p[1] (i - xs_i) + p[2] (yref_i - j)`.
+    pub cplanes: [[i32; 3]; 4],
+    pub fogp: [i32; 3],
+    pub xs_i: i32,
+    pub yref_i: i32,
+    /// Depth, z.12 (`fixed::zplane`), at pixels like `cplanes`.
+    pub zp: [i64; 3],
+    /// S/W, T/W, 1/W at 2^32 (`fixed::iter_plane`), at pixels likewise.
+    pub tp: [[i64; 3]; 3],
+    pub j0: i32,
+    pub j1: i32,
+    pub ltor: u32,
+    pub tex: u32,
+    pub fog: u32,
+    pub stipple: u32,
+}
+
+/// A GL line's setup (`Rss::gl_line_setup`), shared like `TriSetup`.
+/// Texture planes are (value, step along the major axis, 0).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct GlLineSetup {
+    /// Colours and the fog factor at the first pixel and their steps per
+    /// pixel, 12.16: pixel k of the line is `base + step k`, wrapping.
+    pub cbase: [i32; 4],
+    pub cstep: [i32; 4],
+    pub fbase: i32,
+    pub fstep: i32,
+    /// Depth at the first pixel and per pixel, z.12.
+    pub zbase: i64,
+    pub zstep: i64,
+    /// S/W, T/W, 1/W at the first pixel and per pixel, at 2^32.
+    pub tbase: [i64; 3],
+    pub tstep: [i64; 3],
+    pub a0: f64,
+    pub b0: f64,
+    pub slope: f64,
+    pub width: i32,
+    pub dir: i32,
+    pub p0: i32,
+    pub p1: i32,
+    pub xmajor: u32,
+    pub pattern: u32,
+    pub repeat: u32,
+    pub tex: u32,
+    pub fog: u32,
+    pub stipple: u32,
 }
 
 /// XFRCONTROL (provisional layout, from the IDE's TRAM load writing 5):
@@ -703,9 +779,10 @@ impl Rss {
     /// # Safety
     /// `p` points at a zeroed, exclusively owned `Rss`.
     pub unsafe fn init(p: *mut Rss) {
-        use std::ptr::addr_of_mut;
-        addr_of_mut!((*p).stipple).write(None);
-        addr_of_mut!((*p).xfer).write(None);
+        #[cfg(feature = "gr4-jit")]
+        std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
+        #[cfg(not(feature = "gr4-jit"))]
+        let _ = p;
     }
 
     /// A GL batch begins (our GE11 HLE): save the raster registers and
@@ -719,6 +796,8 @@ impl Rss {
     pub fn gl_enter(&mut self) {
         self.gl_stash = self.regs;
         self.regs[reg::CONFIG as usize] &= !CONFIG_YFLIP;
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
     }
 
     /// A GL batch ends: restore what `gl_enter` saved, but for what the GE
@@ -729,6 +808,8 @@ impl Rss {
                 self.regs[r] = *s;
             }
         }
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
     }
 
     /// A reset `Rss` on the heap (tests).
@@ -741,6 +822,22 @@ impl Rss {
             Rss::init(b.as_mut_ptr());
             b.assume_init()
         }
+    }
+
+    /// Polygon stipple row `j` (window y mod 32).
+    pub(super) fn poly_stipple_row(&self, j: u32) -> u32 {
+        self.device.get(POLY_STIPPLE_RAM + (j & 31))
+    }
+
+    /// The sampler for the texture registers as they stand.
+    pub(super) fn sampler(&self) -> Sampler {
+        self.te.sampler(&self.regs)
+    }
+
+    /// The character stipple's position, if one is active (tests).
+    #[cfg(test)]
+    pub(super) fn stipple_state(&self) -> Option<(i32, i32)> {
+        self.stipple.get().map(|s| (s.col, s.row))
     }
 
     pub fn fillmodes_seen(&self) -> &[u32] {
@@ -768,6 +865,10 @@ impl Rss {
     pub fn write(&mut self, r: u32, val: u32, exec: bool) -> bool {
         let r = r & 0x3FF;
         self.regs[r as usize] = val;
+        #[cfg(feature = "gr4-jit")]
+        if !super::rss_jit::is_data_reg(r) {
+            self.jit.invalidate();
+        }
         match r {
             reg::INDIRECT_DATA => {
                 self.device.insert(self.regs[reg::INDIRECT_ADDR as usize], val);
@@ -779,12 +880,12 @@ impl Rss {
             reg::IR_ALIAS => self.regs[reg::IR as usize] = val,
             reg::LSCRL => self.gl_line_stipple_pos = 0,
             reg::XFRCONTROL if val == 0 => {
-                self.xfer = None;
+                self.xfer.set(None);
                 self.te_load = 0;
                 self.te_read[0] = 0;
             }
             reg::XFRCONTROL if val & XFR_DEVICE_TE != 0 && val & XFR_START != 0 => {
-                self.xfer = None;
+                self.xfer.set(None);
                 let read = val & XFR_READ != 0;
                 self.te_load = (!read) as u32;
                 let size = self.regs[reg::XFRSIZE as usize];
@@ -820,7 +921,7 @@ impl Rss {
     /// or a write mask of exactly the 24 RGB planes (24-bit windows draw
     /// with other pixel types; colour-index drawing masks 8 or 12 planes, or
     /// all 32 when the PROM and kernel draw).
-    fn rgb_mode(&self) -> bool {
+    pub(super) fn rgb_mode(&self) -> bool {
         rgb_pixtype(self.reg(reg::PP1FILLMODE)) || self.reg(reg::COLORMASKLSBSA) == 0xFF_FFFF
     }
 
@@ -829,9 +930,9 @@ impl Rss {
         let win = self.reg(reg::XYWIN);
         let (ox, oy) = (signed16(win), signed16(win >> 16));
         if self.reg(reg::CONFIG) & CONFIG_YFLIP != 0 {
-            (ox + x, oy - y)
+            (ox.wrapping_add(x), oy.wrapping_sub(y))
         } else {
-            (ox + x, oy + y)
+            (ox.wrapping_add(x), oy.wrapping_add(y))
         }
     }
 
@@ -884,7 +985,7 @@ impl Rss {
     }
 
     /// DRBpointers' second buffer page (bits 19:10), if any.
-    fn second_buffer(&self) -> Option<u32> {
+    pub(super) fn second_buffer(&self) -> Option<u32> {
         let b = (self.reg(reg::DRBPOINTERS) >> 10) & 0x3FF;
         (b != 0).then_some(b)
     }
@@ -1001,7 +1102,7 @@ impl Rss {
         self.to_fb(b.xs + col * b.dx(), b.ys + row * b.dy())
     }
 
-    fn current_block(&self) -> Block {
+    pub(super) fn current_block(&self) -> Block {
         let s = self.reg(reg::BLOCKXYSTARTI);
         let e = self.reg(reg::BLOCKXYENDI);
         // Colour index modes: the index, from the fill colour register for
@@ -1043,8 +1144,8 @@ impl Rss {
         let b = self.current_block();
         // A new block ends whatever the last one was doing; a write transfer
         // in particular is never disarmed explicitly.
-        self.stipple = None;
-        self.xfer = None;
+        self.stipple.set(None);
+        self.xfer.set(None);
         let kind = (fm >> 22) & 7;
         if fm & FILL_FAST != 0 {
             self.stats.fast_fills += 1;
@@ -1056,7 +1157,7 @@ impl Rss {
             block::NORMAL if fm & FILL_CHAR_STIPPLE != 0 => {
                 // Character block: the char data that follows stipples it.
                 let opaque = fm & FILL_CHAR_STIPPLE_OPAQUE != 0;
-                self.stipple = Some(Stipple { block: b, col: 0, row: 0, opaque });
+                self.stipple.set(Some(Stipple { block: b, col: 0, row: 0, opaque }));
                 false
             }
             block::PIO_READ | block::PIO_WRITE | block::DMA_READ | block::DMA_WRITE => {
@@ -1139,6 +1240,10 @@ impl Rss {
     /// mode skips the last, in the current colour; with line stipple on,
     /// pixel `k` is drawn only where bit `31 - k % 32` of the pattern is set.
     fn line(&mut self) -> bool {
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::line(self) {
+            return true;
+        }
         let s = self.reg(reg::LINE_START);
         let e = self.reg(reg::LINE_END);
         let (mut x, mut y) = (signed16(s >> 16), signed16(s));
@@ -1181,7 +1286,7 @@ impl Rss {
     /// The background colour, in the same form as the drawing colour: packed
     /// RGB in RGB modes (from three 12-bit components, like the fast-fill
     /// colour), a colour index otherwise.
-    fn background(&self) -> u32 {
+    pub(super) fn background(&self) -> u32 {
         let bg = self.reg(reg::BG_COLOR);
         if self.rgb_mode() {
             let red = self.reg(reg::BG_COLOR_RED) & 0xFFF;
@@ -1211,27 +1316,69 @@ impl Rss {
     /// (bottom and left edges in). The real RE4's edge and tie rules are
     /// not known; this is the GL rule.
     fn triangle(&mut self, ltor: bool) -> bool {
+        let Some(t) = self.tri_setup(ltor) else { return true };
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::triangle(self, &t) {
+            return true;
+        }
+        let smp = (t.tex != 0).then(|| self.te.sampler(&self.regs));
+        for j in t.j0..t.j1 {
+            let dj = t.yref_i.wrapping_sub(j);
+            let yc = j as f64 + 0.5;
+            let major = t.x0 + t.s0 * (t.yref - yc);
+            let minor = if yc >= t.ymid { t.x1 + t.s1 * (t.yref - yc) } else { t.x2 + t.s2 * (t.yref2 - yc) };
+            let (l, r) = if t.ltor != 0 { (major, minor) } else { (minor, major) };
+            let i0 = (l - 0.5).ceil() as i32;
+            let i1 = (r - 0.5).ceil() as i32;
+            // Polygon stipple: 32 rows in the device space, window y mod 32,
+            // the most significant bit at window x mod 32 = 0.
+            let stip_row = (t.stipple != 0).then(|| self.device.get(POLY_STIPPLE_RAM + (j & 31) as u32));
+            for i in i0..i1 {
+                if let Some(row) = stip_row {
+                    if (row >> (31 - (i & 31))) & 1 == 0 {
+                        continue;
+                    }
+                }
+                let di = i.wrapping_sub(t.xs_i);
+                let mut rgba = t.cplanes.map(|p| fixed::at(p, di, dj));
+                if let Some(smp) = &smp {
+                    let v = t.tp.map(|p| fixed::at64(p, di, dj));
+                    rgba = self.textured(v, t.tp.map(|p| [p[1], p[2]]), smp, rgba);
+                }
+                if t.fog != 0 {
+                    rgba = self.fogged(rgba, fixed::at(t.fogp, di, dj));
+                }
+                self.gl_fragment(i, j, rgba, fixed::zat(t.zp, di, dj));
+            }
+        }
+        true
+    }
+
+    /// A triangle's per-primitive setup (see `triangle`): its edges, the
+    /// planes of everything it interpolates, and the rows it covers. None
+    /// when it draws nothing.
+    pub(super) fn tri_setup(&mut self, ltor: bool) -> Option<TriSetup> {
         let pos = |r: &Self, n: u32| f32::from_bits(r.reg(n)) as f64 - 49151.5;
         let slope = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / (1u64 << 24) as f64;
         let (x0, x1, x2) = (pos(self, 0x000), pos(self, 0x001), pos(self, 0x002));
         let (ymax, ymid, ymin) = (pos(self, 0x003), pos(self, 0x004), pos(self, 0x005));
         let (s0, s1, s2) = (slope(self, 0x006), slope(self, 0x008), slope(self, 0x00A));
         if !(ymax > ymin) || ![x0, x1, x2, ymax, ymid, ymin, s0, s1, s2].iter().all(|v| v.is_finite()) {
-            return true;
+            return None;
         }
         let (yref, yref2) = (ymax.floor(), ymid.floor());
         // Colour planes c(x, y) = c0 + dx * (x - xs) + dy * (yref - y).
         let xs = if ltor { x0.ceil() } else { x0.floor() };
         let n1 = s0.trunc();
         let fix = |v: u32| v as i32 as f64 / 0xFF_F000 as f64;
-        let plane = |r: &Self, c: u32, de: u32, dx: u32| -> (f64, f64, f64) {
+        let plane = |r: &Self, c: u32, de: u32, dx: u32| -> [f64; 3] {
             let dx_reg = fix(r.reg(dx));
             let dx = if ltor { dx_reg } else { -dx_reg };
             let mut de = fix(r.reg(de));
             if ltor ^ (s0 >= 0.0) {
                 de += dx_reg;
             }
-            (fix(r.reg(c)), dx, de - n1 * dx)
+            [fix(r.reg(c)), dx, de - n1 * dx]
         };
         let planes = [
             plane(self, 0x05C, 0x060, 0x061),
@@ -1248,98 +1395,93 @@ impl Rss {
             if ltor ^ (s0 >= 0.0) {
                 dze += dzx_reg;
             }
-            (fix64(self, 0x068), dzx, dze - n1 * dzx)
+            [fix64(self, 0x068), dzx, dze - n1 * dzx]
         };
         // Texture: S/W, T/W and 1/W, the same plane rule at 2^32 (te1.rs).
         let texture = self.reg(te_reg::TEXMODE1) & TEXMODE1_ENABLE != 0;
         let fixt = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / ITER_ONE;
-        let tplane = |r: &Self, c: u32, de: u32, dx: u32| -> (f64, f64, f64) {
+        let tplane = |r: &Self, c: u32, de: u32, dx: u32| -> [f64; 3] {
             let dx_reg = fixt(r, dx);
             let dx = if ltor { dx_reg } else { -dx_reg };
             let mut de = fixt(r, de);
             if ltor ^ (s0 >= 0.0) {
                 de += dx_reg;
             }
-            (fixt(r, c), dx, de - n1 * dx)
+            [fixt(r, c), dx, de - n1 * dx]
         };
-        let tex = texture.then(|| {
-            let planes = [
-                tplane(self, te_reg::SW, te_reg::DSWE, te_reg::DSWX),
-                tplane(self, te_reg::TW, te_reg::DTWE, te_reg::DTWX),
-                tplane(self, te_reg::WI, te_reg::DWIE, te_reg::DWIX),
-            ];
-            {
-                if let Some((want, have)) = self.te.stale(&self.regs) {
-                    self.te.stale_events += 1;
-                    self.te.stale_last = [want, have];
-                }
-                (planes, self.te.sampler(&self.regs))
-            }
-        });
-        let fog = (self.reg(reg::FOG_ON) != 0).then(|| tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2));
-        let stipple = self.reg(reg::FILLMODE) & FILL_POLY_STIPPLE != 0;
-        let j0 = (ymin - 0.5).ceil() as i32;
-        let j1 = (ymax - 0.5).ceil() as i32;
-        for j in j0..j1 {
-            let yc = j as f64 + 0.5;
-            let major = x0 + s0 * (yref - yc);
-            let minor = if yc >= ymid { x1 + s1 * (yref - yc) } else { x2 + s2 * (yref2 - yc) };
-            let (l, r) = if ltor { (major, minor) } else { (minor, major) };
-            let i0 = (l - 0.5).ceil() as i32;
-            let i1 = (r - 0.5).ceil() as i32;
-            // Polygon stipple: 32 rows in the device space, window y mod 32,
-            // the most significant bit at window x mod 32 = 0.
-            let stip_row = stipple.then(|| self.device.get(POLY_STIPPLE_RAM + (j & 31) as u32));
-            for i in i0..i1 {
-                if let Some(row) = stip_row {
-                    if (row >> (31 - (i & 31))) & 1 == 0 {
-                        continue;
-                    }
-                }
-                let xc = i as f64 + 0.5;
-                let at = |p: (f64, f64, f64)| p.0 + p.1 * (xc - xs) + p.2 * (yref - yc);
-                let mut rgba = [at(planes[0]), at(planes[1]), at(planes[2]), at(planes[3])];
-                if let Some((p, smp)) = &tex {
-                    rgba = self.textured(p, smp, at, rgba);
-                }
-                if let Some(fp) = fog {
-                    rgba = self.fogged(rgba, at(fp));
-                }
-                self.gl_fragment(i, j, rgba, at(zplane));
+        let tplanes = [
+            tplane(self, te_reg::SW, te_reg::DSWE, te_reg::DSWX),
+            tplane(self, te_reg::TW, te_reg::DTWE, te_reg::DTWX),
+            tplane(self, te_reg::WI, te_reg::DWIE, te_reg::DWIX),
+        ];
+        if texture {
+            if let Some((want, have)) = self.te.stale(&self.regs) {
+                self.te.stale_events += 1;
+                self.te.stale_last = [want, have];
             }
         }
-        true
+        let fog = self.reg(reg::FOG_ON) != 0;
+        Some(TriSetup {
+            x0,
+            x1,
+            x2,
+            ymid,
+            yref,
+            yref2,
+            s0,
+            s1,
+            s2,
+            xs,
+            cplanes: planes.map(|p| fixed::plane(p, fixed::colour)),
+            fogp: fixed::plane(tplane(self, reg::FOG_F, reg::FOG_F + 4, reg::FOG_F + 2), fixed::fraction),
+            xs_i: xs as i32,
+            yref_i: yref as i32,
+            zp: fixed::zplane(zplane),
+            tp: tplanes.map(fixed::iter_plane),
+            j0: (ymin - 0.5).ceil() as i32,
+            j1: (ymax - 0.5).ceil() as i32,
+            ltor: ltor as u32,
+            tex: texture as u32,
+            fog: fog as u32,
+            stipple: (self.reg(reg::FILLMODE) & FILL_POLY_STIPPLE != 0) as u32,
+        })
     }
 
-    /// A fragment's colour textured: S/W, T/W, 1/W from their planes (value,
-    /// d/dx, d/(-y)) evaluated by `at`; the level of detail from the
-    /// derivatives of s and t in level-0 texels; the texel through the
-    /// texture environment.
-    fn textured(&self, p: &[(f64, f64, f64); 3], smp: &Sampler, at: impl Fn((f64, f64, f64)) -> f64, rgba: [f64; 4]) -> [f64; 4] {
-        let (sw, tw, wi) = (at(p[0]), at(p[1]), at(p[2]));
-        if wi == 0.0 || !wi.is_finite() {
+    /// A fragment's colour textured, in integers: S/W, T/W, 1/W (`v`, at
+    /// 2^32) and their steps across x and down y (`d`: d/dx and d/(-y));
+    /// the reciprocal unit divides out W (`fixed::recip`), the level of
+    /// detail comes from the footprint in level-0 texels
+    /// (`fixed::lod_q8`), the texel through the texture environment. No
+    /// texturing where 1/W is not positive.
+    fn textured(&self, v: [i64; 3], d: [[i64; 2]; 3], smp: &Sampler, rgba: [i32; 4]) -> [i32; 4] {
+        let [sw, tw, wi] = v;
+        if wi <= 0 {
             return rgba;
         }
-        let (s, t) = (sw / wi, tw / wi);
+        let (y, n) = fixed::recip(wi);
+        let (s, t) = (fixed::persp(sw, y, n), fixed::persp(tw, y, n));
         // d(a/w) = (da' - a dw') / w for a' = a/w, w' = 1/w; y runs down
-        // the plane's third term.
-        let d = |q: &(f64, f64, f64), v: f64| ((q.1 - v * p[2].1) / wi, (v * p[2].2 - q.2) / wi);
-        let ((dsx, dsy), (dtx, dty)) = (d(&p[0], s), d(&p[1], t));
-        let (w, h) = smp.size();
-        let rho = (dsx * w).hypot(dtx * h).max((dsy * w).hypot(dty * h));
-        let lambda = if rho > 0.0 { rho.log2() } else { f64::NEG_INFINITY };
+        // the planes' second step.
+        let dx = |q: [i64; 2], c: i64| q[0].wrapping_sub(fixed::scale31(c, d[2][0]));
+        let dy = |q: [i64; 2], c: i64| fixed::scale31(c, d[2][1]).wrapping_sub(q[1]);
+        let lambda = fixed::lod_q8(
+            fixed::deriv(dx(d[0], s), y, n, smp.ls),
+            fixed::deriv(dx(d[1], t), y, n, smp.lt),
+            fixed::deriv(dy(d[0], s), y, n, smp.ls),
+            fixed::deriv(dy(d[1], t), y, n, smp.lt),
+        );
         let texel = smp.sample(&self.te, s, t, lambda);
         tex_env(self.reg(te_reg::TEXMODE1), self.reg(te_reg::TXENV_RG), self.reg(te_reg::TXENV_B), rgba, texel)
     }
 
     /// Fog applied to a fragment: factor `f` (1 = none) toward the fog
     /// colour (FOG_RG / FOG_B), alpha kept.
-    fn fogged(&self, rgba: [f64; 4], f: f64) -> [f64; 4] {
-        let f = f.clamp(0.0, 1.0);
-        let c = |v: u32| (v & 0xFFF) as f64 / 4095.0;
+    fn fogged(&self, rgba: [i32; 4], f: i32) -> [i32; 4] {
+        use fixed::{mul, ONE};
+        let f = f.clamp(0, ONE);
         let (rg, b) = (self.reg(reg::FOG_RG), self.reg(reg::FOG_B));
-        let fc = [c(rg), c(rg >> 12), c(b)];
-        [0, 1, 2, 3].map(|k| if k < 3 { f * rgba[k] + (1.0 - f) * fc[k] } else { rgba[3] })
+        let fc = [fixed::field12(rg), fixed::field12(rg >> 12), fixed::field12(b)];
+        [0, 1, 2, 3].map(|k| if k < 3 { mul(f, rgba[k]).wrapping_add(mul(ONE - f, fc[k])) } else { rgba[3] })
     }
 
     /// A GL line (our GE11 HLE, IR `OP_GL_LINE`): from gline_xstartf/ystartf
@@ -1353,79 +1495,114 @@ impl Rss {
     /// the repeat count less one; the position carries on until lscrl is
     /// written again.
     fn gl_line(&mut self) -> bool {
+        let Some(l) = self.gl_line_setup() else { return true };
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::gl_line(self, &l) {
+            return true;
+        }
+        let smp = (l.tex != 0).then(|| self.te.sampler(&self.regs));
+        let mut p = l.p0;
+        // Pixels along the line since the first (colour and fog steps).
+        let mut k = 0i32;
+        while p != l.p1 {
+            let t = ((p as f64 + 0.5) - l.a0).abs();
+            let draw = l.stipple == 0 || {
+                let bit = (self.gl_line_stipple_pos / l.repeat) % 16;
+                self.gl_line_stipple_pos = self.gl_line_stipple_pos.wrapping_add(1);
+                (l.pattern >> (15 - bit)) & 1 != 0
+            };
+            if draw {
+                let b = l.b0 + l.slope * ((p as f64 + 0.5) - l.a0);
+                let q0 = (b - 0.5 * l.width as f64 + 0.5).floor() as i32;
+                let mut rgba = [0, 1, 2, 3].map(|c| l.cbase[c].wrapping_add(l.cstep[c].wrapping_mul(k)));
+                if let Some(smp) = &smp {
+                    // Steps along the line, none across it.
+                    let v = [0, 1, 2].map(|c| l.tbase[c].wrapping_add(l.tstep[c].wrapping_mul(k as i64)));
+                    rgba = self.textured(v, l.tstep.map(|d| [d, 0]), smp, rgba);
+                }
+                if l.fog != 0 {
+                    rgba = self.fogged(rgba, l.fbase.wrapping_add(l.fstep.wrapping_mul(k)));
+                }
+                for q in q0..q0.wrapping_add(l.width) {
+                    let (wx, wy) = if l.xmajor != 0 { (p, q) } else { (q, p) };
+                    self.gl_fragment(wx, wy, rgba, l.zbase.wrapping_add(l.zstep.wrapping_mul(k as i64)));
+                }
+            }
+            p = p.wrapping_add(l.dir);
+            k = k.wrapping_add(1);
+        }
+        true
+    }
+
+    /// A GL line's per-primitive setup (see `gl_line`). None when it draws
+    /// nothing.
+    pub(super) fn gl_line_setup(&self) -> Option<GlLineSetup> {
         let pos = |r: &Self, n: u32| f32::from_bits(r.reg(n)) as f64 - 49151.5;
         let (x0, y0, x1, y1) = (pos(self, 0x00C), pos(self, 0x00D), pos(self, 0x00E), pos(self, 0x00F));
         if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
-            return true;
+            return None;
         }
         let fix = |r: &Self, n: u32| r.reg(n) as i32 as f64 / 0xFF_F000 as f64;
         let fix64 = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / 4096.0;
-        let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
-        let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
-        let (z0, dz) = (fix64(self, 0x068), fix64(self, 0x06C));
-        let width = (self.reg(reg::GLINECONFIG) & 0xFF) as i32 + 1;
-        let stipple = self.reg(reg::FILLMODE) & FILL_LINE_STIPPLE != 0;
-        let (pattern, repeat) = (self.reg(reg::LINE_STIPPLE) & 0xFFFF, (self.reg(reg::LSCRL) & 0xFF) + 1);
         // Texture along the line: S/W, T/W, Q/W at the start, steps per
         // pixel in the edge step registers; the fog factor likewise.
         let fix64t = |r: &Self, n: u32| ((r.reg(n) as u64) << 32 | r.reg(n + 1) as u64) as i64 as f64 / ITER_ONE;
-        let tex = (self.reg(te_reg::TEXMODE1) & TEXMODE1_ENABLE != 0).then(|| {
-            let q = |c: u32, d: u32| (fix64t(self, c), fix64t(self, d), 0.0);
-            ([q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)], self.te.sampler(&self.regs))
-        });
-        let fog = (self.reg(reg::FOG_ON) != 0).then(|| (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2)));
+        let q = |c: u32, d: u32| [fix64t(self, c), fix64t(self, d)];
+        let tq = [q(te_reg::SW, te_reg::DSWE), q(te_reg::TW, te_reg::DTWE), q(te_reg::WI, te_reg::DWIE)];
         let xmajor = (x1 - x0).abs() >= (y1 - y0).abs();
         let (a0, a1, b0, b1) = if xmajor { (x0, x1, y0, y1) } else { (y0, y1, x0, x1) };
         if a0 == a1 {
-            return true;
+            return None;
         }
-        let slope = (b1 - b0) / (a1 - a0);
         let dir = if a1 > a0 { 1 } else { -1 };
         // First and one-past-last pixel along the major axis.
         let (p0, p1) = if dir > 0 { ((a0 - 0.5).ceil() as i32, (a1 - 0.5).ceil() as i32) } else { ((a0 - 0.5).floor() as i32, (a1 - 0.5).floor() as i32) };
-        let mut p = p0;
-        while p != p1 {
-            let t = ((p as f64 + 0.5) - a0).abs();
-            let draw = !stipple || {
-                let bit = (self.gl_line_stipple_pos / repeat) % 16;
-                self.gl_line_stipple_pos += 1;
-                (pattern >> (15 - bit)) & 1 != 0
-            };
-            if draw {
-                let b = b0 + slope * ((p as f64 + 0.5) - a0);
-                let q0 = (b - 0.5 * width as f64 + 0.5).floor() as i32;
-                let mut rgba = [c0[0] + dc[0] * t, c0[1] + dc[1] * t, c0[2] + dc[2] * t, c0[3] + dc[3] * t];
-                if let Some((p, smp)) = &tex {
-                    // Planes (value, d/major, 0) evaluated at t along it.
-                    rgba = self.textured(p, smp, |q: (f64, f64, f64)| q.0 + q.1 * t, rgba);
-                }
-                if let Some((f0, df)) = fog {
-                    rgba = self.fogged(rgba, f0 + df * t);
-                }
-                for q in q0..q0 + width {
-                    let (wx, wy) = if xmajor { (p, q) } else { (q, p) };
-                    self.gl_fragment(wx, wy, rgba, z0 + dz * t);
-                }
-            }
-            p += dir;
-        }
-        true
+        // Colours and fog at the first pixel's centre, t0 along the line;
+        // each pixel after it is one further.
+        let t0 = ((p0 as f64 + 0.5) - a0).abs();
+        let zfix = |v: f64| (v * (1u64 << fixed::Z_FRAC) as f64).round() as i64;
+        let c0 = [fix(self, 0x05C), fix(self, 0x05D), fix(self, 0x05E), fix(self, 0x05F)];
+        let dc = [fix(self, 0x060), fix(self, 0x062), fix(self, 0x064), fix(self, 0x066)];
+        let (f0, df) = (fix64t(self, reg::FOG_F), fix64t(self, reg::FOG_F + 2));
+        Some(GlLineSetup {
+            cbase: [0, 1, 2, 3].map(|k| fixed::colour(c0[k] + dc[k] * t0)),
+            cstep: dc.map(fixed::colour),
+            fbase: fixed::fraction(f0 + df * t0),
+            fstep: fixed::fraction(df),
+            zbase: zfix(fix64(self, 0x068) + fix64(self, 0x06C) * t0),
+            zstep: zfix(fix64(self, 0x06C)),
+            tbase: tq.map(|q| fixed::iter(q[0] + q[1] * t0)),
+            tstep: tq.map(|q| fixed::iter(q[1])),
+            a0,
+            b0,
+            slope: (b1 - b0) / (a1 - a0),
+            width: (self.reg(reg::GLINECONFIG) & 0xFF) as i32 + 1,
+            dir,
+            p0,
+            p1,
+            xmajor: xmajor as u32,
+            pattern: self.reg(reg::LINE_STIPPLE) & 0xFFFF,
+            repeat: (self.reg(reg::LSCRL) & 0xFF) + 1,
+            tex: (self.reg(te_reg::TEXMODE1) & TEXMODE1_ENABLE != 0) as u32,
+            fog: (self.reg(reg::FOG_ON) != 0) as u32,
+            stipple: (self.reg(reg::FILLMODE) & FILL_LINE_STIPPLE != 0) as u32,
+        })
     }
 
     /// One GL fragment at window (wx, wy): the per-fragment pipeline our
     /// GE11 HLE programs (layouts provisional, see GL_RASTER_STATE): screen
     /// masks, alpha test, stencil test, depth test, stencil update, then
     /// blending or the logic op, and the colour write masks. `rgba` is
-    /// 0..1 (red alone is the index in colour-index windows), `z` window
-    /// depth (0..2^24 - 1).
-    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [f64; 4], z: f64) {
+    /// 12.16 (red alone is the index in colour-index windows), `z` window
+    /// depth in z.12 (`fixed::zbuf` rounds it to the buffer's 24 bits).
+    fn gl_fragment(&mut self, wx: i32, wy: i32, rgba: [i32; 4], z: i64) {
         let (fx, fy) = self.to_fb(wx, wy);
         if draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_CID || !self.visible(fx, fy) {
             return;
         }
-        let rgba = rgba.map(|c| c.clamp(0.0, 1.0));
+        let rgba = rgba.map(fixed::clamp);
         let af = self.reg(reg::AFUNCMODE);
-        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3], ((af >> 4) & 0xFFF) as f64 / 4096.0) {
+        if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
             return;
         }
         let st = self.reg(reg::STENCILMODE);
@@ -1439,7 +1616,7 @@ impl Rss {
             let masks = self.reg(reg::STENCILMASK);
             let (cmask, wmask) = (masks & 0xFF, (masks >> 8) & 0xFF);
             let sref = (st >> 16) & 0xFF;
-            let z = z.round().clamp(0.0, 16_777_215.0) as u64;
+            let z = fixed::zbuf(z);
             let zold = zst & 0xFF_FFFF;
             let spass = !sten || compare(st & 7, (sref & cmask) as f64, (s_old & cmask) as f64);
             let zpass = spass && (!ztest || compare(zm & 7, z as f64, zold as f64));
@@ -1481,7 +1658,10 @@ impl Rss {
         }
     }
 
-    fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [f64; 4], pp1: u32, back: bool) {
+    /// A fragment's colour (12.16, clamped) blended or not, shifted down
+    /// to the pixel, and written.
+    fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
+        use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
@@ -1489,38 +1669,40 @@ impl Rss {
         let src = if rgb {
             let blend = self.reg(reg::BLENDFACTOR);
             let c = if blend & BLEND_ENABLE != 0 && !logic {
-                let d = [dst & 0xFF, (dst >> 8) & 0xFF, (dst >> 16) & 0xFF, dst >> 24].map(|v| v as f64 / 255.0);
-                let f = |code: u32, k: usize| -> f64 {
-                    let sat = rgba[3].min(1.0 - d[3]);
+                let d = [0, 8, 16, 24].map(|s| (fixed::widen((dst >> s) & 0xFF, 2) << 16) as i32);
+                let f = |code: u32, k: usize| -> i32 {
                     match code {
-                        0 => 0.0,
-                        1 => 1.0,
+                        0 => 0,
+                        1 => ONE,
                         2 => rgba[k],
-                        3 => 1.0 - rgba[k],
+                        3 => ONE - rgba[k],
                         4 => rgba[3],
-                        5 => 1.0 - rgba[3],
+                        5 => ONE - rgba[3],
                         6 => d[3],
-                        7 => 1.0 - d[3],
+                        7 => ONE - d[3],
                         8 => d[k],
-                        9 => 1.0 - d[k],
-                        10 => if k == 3 { 1.0 } else { sat },
-                        _ => 1.0,
+                        9 => ONE - d[k],
+                        10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
+                        _ => ONE,
                     }
                 };
                 let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
-                [0, 1, 2, 3].map(|k| (rgba[k] * f(sf, k) + d[k] * f(df, k)).clamp(0.0, 1.0))
+                [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
             } else {
                 rgba
             };
-            let q = |v: f64| (v * 255.0).round() as u32;
-            q(c[0]) | q(c[1]) << 8 | q(c[2]) << 16 | q(c[3]) << 24
+            fixed::to_byte(c[0]) | fixed::to_byte(c[1]) << 8 | fixed::to_byte(c[2]) << 16 | fixed::to_byte(c[3]) << 24
         } else {
-            (rgba[0] * 4095.0).round() as u32 & 0xFFF
+            fixed::to_index(rgba[0]) & 0xFFF
         };
         self.put_in(b, ux as i32, uy as i32, src, back);
     }
 
     fn fill(&mut self, b: &Block) {
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::fill(self, b) {
+            return;
+        }
         for row in 0..b.rows() {
             for col in 0..b.cols() {
                 let (x, y) = self.block_px(b, col, row);
@@ -1535,9 +1717,14 @@ impl Rss {
     /// the block's edge, discarding the rest of the chunk.
     fn stipple_bits(&mut self, bits: u64, n: u32) -> bool {
         self.stats.stipple_chunks += 1;
-        let Some(mut s) = self.stipple else { return false };
+        let Some(mut s) = self.stipple.get() else { return false };
         if s.row >= s.block.rows() {
             return false;
+        }
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::stipple(self, &mut s, bits, n) {
+            self.stipple.set(Some(s));
+            return true;
         }
         let background = s.opaque.then(|| self.background());
         for i in 0..n {
@@ -1553,7 +1740,7 @@ impl Rss {
                 break;
             }
         }
-        self.stipple = Some(s);
+        self.stipple.set(Some(s));
         true
     }
 
@@ -1581,7 +1768,7 @@ impl Rss {
             out_lo: 0,
         };
         x.rd_settle();
-        self.xfer = Some(x);
+        self.xfer.set(Some(x));
     }
 
     /// `Some(read)` while a transfer is armed.
@@ -1601,6 +1788,10 @@ impl Rss {
     }
 
     fn put_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        #[cfg(feature = "gr4-jit")]
+        if super::rss_jit::xfer_line(self, x, line, bytes) {
+            return;
+        }
         let bpp = x.bpp as usize;
         for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
             // Big-endian bytes.
@@ -1660,7 +1851,7 @@ impl Rss {
                 break;
             }
         }
-        self.xfer = Some(x);
+        self.xfer.set(Some(x));
         changed
     }
 
@@ -1713,7 +1904,7 @@ impl Rss {
         }
         if let Some(x) = self.xfer.take() {
             self.put_line(&x, line, bytes);
-            self.xfer = Some(x);
+            self.xfer.set(Some(x));
         }
     }
 
@@ -1883,7 +2074,7 @@ mod tests {
         let b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
         r.mem.put(&a, 10, 1018, 0x123456);
         r.mem.put(&b, 10, 1018, 0x654321);
-        r.gl_fragment(10, 5, [1.0, 1.0, 1.0, 1.0], 0.0);
+        r.gl_fragment(10, 5, [fixed::colour(1.0); 4], 0);
         assert_eq!(r.mem.get(&a, 10, 1018), 0x1234FF);
         assert_eq!(r.mem.get(&b, 10, 1018), 0xFF4321);
     }

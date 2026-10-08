@@ -849,7 +849,7 @@ impl Gr2 {
                     self.trace_hq_entry(index, val as u32);
                     let mut done = |d: String| self.trace_hq_exec(&d);
                     engine.push(index, val as u32, &mut sink, Some(&mut done));
-                } else {
+} else {
                     engine.push(index, val as u32, &mut sink, None);
                 }
                 // One more word executed; a finish/readiness target is

@@ -17,8 +17,8 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
   graphics; GR2 and IMPACT use command interpreters and software rasterizers
   (see [Indigo2 IP22](docs/indigo2-ip22.md)).
 - **Indigo2 IMPACT IP28** — R10000 CPU and IMPACT graphics, with IRIX 6.5
-  booting to the desktop. Requires your own IP28 PROM; there is no embedded
-  fallback. Two 512 MB banks provide 1 GB of RAM
+  booting to the desktop, with an embedded IP28 PROM fallback.
+  Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
@@ -96,7 +96,8 @@ boots to a usable system: shell, networking, X11, the works.
 - R4400, R5000, or R10000 CPU, selected per machine at runtime
 - Cranelift JIT compiler for MIPS to host code (`jitv2`, optional, experimental),
   plus a REX3 draw pipeline of 400+ precompiled specialised draw functions and an
-  optional REX3 shader JIT (`rex-jit`)
+  optional REX3 shader JIT (`rex-jit`), and an IMPACT raster pipeline JIT
+  (`gr4-jit`)
 - Copy-on-write disk overlay, and CHD images with MAME-style `.diff.chd` sidecars.
   Crash all day, base image stays clean
 - Hot-swappable CD-ROM with runtime disc switching
@@ -124,8 +125,9 @@ You need:
 - A hard-disk image with IRIX 6.5.22 (or 5.3) for Indy. To produce one, follow
   [rules/irix/irix-install.md](rules/irix/irix-install.md) (install from the
   original media CDs into an empty CHD/raw disk).
-- `070-9101-011.bin` — Indy PROM image (optional; a default is embedded, and so
-  is an Indigo2 one)
+- An external PROM image (optional): `070-9101-011.bin` for Indy,
+  `070-1367-012.bin` for Indigo2 IP22, or `070-1477-002.bin` for Indigo2 IP28.
+  Each machine has its own embedded fallback.
 
 Now, if you feel like typing some commands in console. Sync the project and:
 
@@ -208,7 +210,8 @@ are in [FEATURES.md](FEATURES.md#emulated-cpu).
 ### JIT compilers
 
 Optional `jitv2` compiles MIPS code; `rex-jit` compiles Newport draw shaders
-alongside the precompiled drawing routines. See
+alongside the precompiled drawing routines; `gr4-jit` compiles IMPACT raster
+pipelines. See
 [FEATURES.md](FEATURES.md#jit-compilers) for their behavior, defaults,
 limitations, persistent caches, and corpus-measurement tools.
 

@@ -39,6 +39,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `accurate-cache` | Select the functional R4400/R5000 cache and raise VCE; default is the observation-only shadow. | — |
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -125,7 +126,7 @@ user config directory.
 
 Defaults below are **core schema/runtime defaults**, not this checkout's
 sample iris.toml or the GUI New Machine dialog. GUI IP28 creation selects
-R10000/Solid IMPACT and an external PROM; changing `machine.profile` in TOML
+R10000/Solid IMPACT and the embedded IP28 PROM; changing `machine.profile` in TOML
 does not automatically replace every other hardware setting. Omit optional
 keys to use defaults; TOML has no `null` value. Put top-level scalars before
 the first `[section]`, because TOML tables continue until the next header.
@@ -134,7 +135,7 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24/IP22 have embedded fallback, IP28 requires an external image. |
+| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory. |
 | `nvram` | `"nvram.bin"` | DS1386 backing file; GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
 | `banks` | `[128,128,0,0]` | Four RAM bank sizes in MB; see profile constraints below. |
@@ -290,7 +291,8 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 Bank values are 0, 8, 16, 32, 64, or 128 MB; only IP28 accepts 256/512 MB.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
-`heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT and its own PROM.
+`heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
+embedded fallback.
 The config validator currently permits SCSI controller 1 only on IP22.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
@@ -521,7 +523,7 @@ both the interpreter and jitv2.
 
 R4400 (the default), R5000, or R10000, chosen per machine at runtime.
 All three models are compiled into every binary; there is no separate CPU build
-or download. Pair R10000 with the IP28 profile and an IP28 PROM.
+or download. Pair R10000 with the IP28 profile, which has an embedded IP28 PROM.
 
 | | R4400 | R5000 | R10000 |
 |---|---|---|---|
@@ -597,7 +599,7 @@ branch/jump+NOP delay-slot fusion, jitv2's counterparts to the interpreter's
 `opcodefusion` — OFF by default, unlike the interpreter's own fusion, due to a
 history of live-boot bugs; see
 `rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`). Developer tools:
-`jitv2_analyze`, `jitv2_verify` and `jitv2_pcp_dump` binaries, and the `j2`
+`jitv2-analyze`, `jitv2-verify` and `jitv2-pcp-dump` binaries, and the `j2`
 monitor command.
 
 Compiled pages can be reused across runs with the optional persistent cache:
@@ -656,4 +658,32 @@ monitor inspects and controls it.
 
 ```
 cargo run --release --features rex-jit
+```
+
+### IMPACT raster JIT (`--features gr4-jit`)
+
+`gr4-jit` compiles IMPACT's raster pipelines (`src/dev/mgras/rss_jit`). The
+registers that shape a primitive's pipeline reduce to a 64-bit key, and each
+key gets its own monomorphised shader. The key covers the primitive (fills,
+X lines, character stipple, transfer lines, GL triangles and GL lines),
+clipping, draw buffers, pixel format, logic op, and the alpha, stencil and
+depth tests, blending, texture environment, texture format, filtering and
+wrap modes, and fog. Colours, masks, references, page pointers and plane
+coefficients reach a shader as data in a per-board context.
+
+Shaders compile on a background thread. Until a primitive's shader is ready
+the interpreter draws it. Shaders are bit-exact with the interpreter:
+`src/dev/mgras/rss_jit_tests.rs` sweeps the key space and compares whole
+boards (`GR4_JIT_SWEEP=<factor>` and `GR4_JIT_SEED=<n>` widen it). Measured
+on representative primitives, they are 2.5-6x faster than the interpreter:
+fills and transfers 5-6x, lines and text about 3x, shaded and textured
+triangles 2.5x.
+
+- `IRIS_GR4_JIT=off|on|sync` sets the starting mode. `sync` compiles on
+  first use and waits.
+- `mgras jit [on|off|sync|list]` in the monitor shows and changes it.
+- `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
+
+```
+cargo run --release --features lightning,rex-jit,gr4-jit
 ```

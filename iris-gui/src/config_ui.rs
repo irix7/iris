@@ -2,7 +2,7 @@ use egui::{Color32, ComboBox, DragValue, Grid, RichText, ScrollArea, TextEdit, U
 use iris::build_features;
 use std::path::Path;
 use iris::config::{
-    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard,
+    format_unix_utc, CpuModel, ForwardBind, ForwardProto, GraphicsBoard, KeyboardLayout,
     MachineConfig, MachineProfile, NetMode, NfsConfig, PortForwardConfig, RtcOffset,
     ScsiDeviceConfig, ScsiKind, VinoSource, VinoStandard, VALID_BANK_SIZES,
 };
@@ -147,7 +147,7 @@ pub enum ConfigAction {
     None,
     /// User clicked "Use embedded PROM"; the app should confirm with the user
     /// and, if accepted, clear `cfg.prom` (an empty path falls back to the
-    /// built-in PROM in `iris::dev::prom::Prom::from_file_or_embedded`).
+    /// profile's built-in PROM loader in `iris::dev::prom::Prom`).
     RequestEmbeddedProm,
     /// User clicked "Test Camera" on the Video-In tab; the app should open the
     /// host camera and show a live preview (using the current `[vino]` standard
@@ -405,18 +405,6 @@ fn show_general(ui: &mut Ui, cfg: &mut MachineConfig, mem_ctx: MemoryUiContext) 
         path_row_opt(ui, "serial_log", &mut cfg.serial_log, Pick::SaveFile, ANY_FILTERS);
         ui.end_row();
     });
-    if cfg.machine.profile.ip28() && !crate::disk_readable(&cfg.prom) {
-        ui.label(
-            RichText::new(
-                "There is no embedded IP28 PROM — this PROM path doesn't resolve to a \
-                 readable file, and falling back to the built-in IP22 PROM will not pass \
-                 POST on an IP28. Point PROM image at a real dumped IP28 PROM \
-                 (see ip28.toml.example).",
-            )
-            .color(Color32::from_rgb(220, 170, 90))
-            .small(),
-        );
-    }
 
     show_rtc_offset(ui, &mut cfg.rtc_offset, mem_ctx.running);
 
@@ -700,6 +688,18 @@ fn show_display(ui: &mut Ui, cfg: &mut MachineConfig, running: bool) {
 
         ui.label("No audio (disable HAL2)");
         ui.checkbox(&mut cfg.no_audio, "");
+        ui.end_row();
+
+        ui.label("Keyboard")
+            .on_hover_text("The shape of your keyboard, not its language: pick the character layout in the PROM (keybd). ISO and JIS boards have a key left of Enter that the host reports as the US backslash.");
+        ui.add_enabled_ui(!running, |ui| {
+            ComboBox::from_id_salt("keyboard_layout").selected_text(cfg.keyboard.label())
+                .show_ui(ui, |ui| {
+                    for k in KeyboardLayout::ALL {
+                        ui.selectable_value(&mut cfg.keyboard, k, k.label());
+                    }
+                });
+        });
         ui.end_row();
     });
     if !cfg.no_audio {

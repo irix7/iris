@@ -46,6 +46,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   window now releases everything the guest still sees held.
 - **Right Cmd releases the grab on macOS**, like Right Ctrl, which Mac
   keyboards lack.
+- **Japanese (JIS) keyboards.** With the PROM set to the Japanese layout, `]`
+  typed `\`, `}` typed `|` and `_` typed nothing. The new `keyboard = "jis"`
+  setting (`--keyboard jis`; also `iso`) sends the set-3 code of an SGI
+  keyboard for the key left of Enter (`0x53`, not the US backslash's `0x5C`).
+  In iris-gui it's **Keyboard** on the Display tab. ろ, ¥, 無変換, 変換 and
+  かな now send keys in all three scancode sets. Codes
+  are from xkeyboard-config's `sgi_vndr/indy(jp106)`.
 
 ### Build / features
 
@@ -54,6 +61,23 @@ hashes are given where a change is easiest to understand by reading the commit.
   dev shell supplies the native ALSA/X11/GL/v4l/libclang libraries and pins the
   host's shared rig Rust toolchain. `CLAUDE.md` records the invocation and the
   GC'd-toolchain remedy.
+- **IMPACT colour pipeline in 12.16 fixed point.** Colour iterators,
+  texel filtering (texels widened to 12 bits, 8-bit bilinear and mip
+  weights), the texture environment, fog and blending now compute in
+  integers, as the RE4/TE1 do, and shift down to the pixel's size on
+  write. Half-alpha blends now give 0x7F where they gave 0x80. With
+  `gr4-jit`, bilinear-textured triangles draw 5x faster than the
+  interpreter, up from 3x.
+- **IMPACT raster JIT (`gr4-jit`).** The registers that shape an IMPACT
+  primitive's pixel pipeline reduce to a 64-bit key, and Cranelift compiles
+  one shader per key. It covers fills, X lines, character stipple, transfer
+  lines, and GL triangles and lines with their tests, blending, texturing
+  and fog. Shaders are bit-exact with the interpreter, which a key-space
+  sweep proves board by board (`src/dev/mgras/rss_jit_tests.rs`). They are
+  2.5-6x faster on representative primitives. Shaders compile in the
+  background, and `mgras jit` in the monitor shows and switches the JIT. The
+  RSS and TE1 state is now plain `#[repr(C)]` data: `Option`s gave way to a
+  plain `Slot`, and the sampler and setup structs became flat.
 - **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
   `mips4` and `r5k` cargo features.** CHD images, the host camera, the
   Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built
@@ -120,6 +144,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### IP28, memory, and battery-backed state
 
+- **Embedded IP28 PROM fallback.** `src/prombinip28.rs` embeds the 512 KB
+  `070-1477-002` image. IP28 tries the configured PROM path, then
+  `070-1477-002.bin` in the working directory, then its embedded image.
+  New Machine defaults to **Use embedded PROM** for IP28, and the GUI treats
+  external PROM files as optional for all three profiles.
 - **2026-10-04 — IP28 512 MB banks** (`c16e18d`): the MEMCFG installed-size
   decoder accepts the PROM's `(size_field=31, rank=1)` encoding. Two 512 MB
   banks provide 1 GB; IRIX 6.5 reports 1024 MB after POST. The GUI offers
@@ -287,7 +316,7 @@ hashes are given where a change is easiest to understand by reading the commit.
   R10000 cache-operation semantics, 64 TLB entries, and 44-bit virtual
   addresses. Loads/stores/fetches use memory directly; shadow tag/data arrays
   answer CACHE operations and PROM diagnostics. Default Count is 97.5 MHz.
-  Requires an external IP28 PROM and IMPACT graphics for the IP28 kernel.
+  Requires IMPACT graphics for the IP28 kernel.
 - **2026-09-29 — CPU/cache correctness** (`a09186a`, `b7d2a18`, `70a5e39`):
   MTC0 retains full values for 64-bit CP0 registers, XContext fields follow
   the CPU's VA width, and Index_Store_Tag discards old line data without
@@ -463,8 +492,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   `[impact]` to values `validate()` accepts; the Newport heads control is
   hidden for GR2.
 - **2026-09-30 — IP28 / R10000 and IMPACT in the GUI.** The machine and CPU
-  dropdowns include IP28 and R10000. New Machine selects R10000, disables the
-  embedded PROM option, and presets IMPACT graphics for IP28. Initially gated
+  dropdowns include IP28 and R10000. New Machine selects R10000 and presets
+  IMPACT graphics for IP28. Initially gated
   by `ip28`; all profiles are built in after the October 1 feature cleanup.
 - **2026-09-30 — Unified graphics selection.** The picker writes
   `[graphics] board` for Newport, GR2 XZ/Extreme, or IMPACT Solid/High/Maximum;
@@ -547,8 +576,8 @@ hashes are given where a change is easiest to understand by reading the commit.
   default** after it broke Linux (`rules/jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md`).
 - `j2wp` whole-page compile, `jitv2_lockstep`, `jitv2_smc_check`,
   the `j2` monitor command (`clear`, `deny`, `pagewb`,
-  `html` physical code page visualiser, …) and the `jitv2_analyze`,
-  `jitv2_verify`, `jitv2_pcp_dump` tools.
+  `html` physical code page visualiser, …) and the `jitv2-analyze`,
+  `jitv2-verify`, `jitv2-pcp-dump` tools.
 - Status-bar feedback for JIT activity.
 - **The original tiered MIPS JIT was removed** (`33c4e68`), along with its
   `jit` feature, `IRIS_JIT*` environment variables and `rules/jit/`.
@@ -759,7 +788,7 @@ hashes are given where a change is easiest to understand by reading the commit.
 - `iris-ci rtc-save`, `cdrom-eject`, `cdrom-load`; `get`/`put` work under a
   `/bin/sh` guest shell.
 - Monitor: `ps2 type`/`enter`/`status`, `proc info`.
-- `chd_extract` tool.
+- `chd-extract` tool.
 - First R5000 support (slower than R4400 under the interpreter because every
   cache access probes two ways).
 - Enabled build features are printed at startup.
