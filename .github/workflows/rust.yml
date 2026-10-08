@@ -58,6 +58,17 @@ jobs:
       continue-on-error: ${{ matrix.informational }}
       run: cargo test --workspace --verbose
 
+    # The parallel-agent workflow: boot two isolated instances (`--instance N`)
+    # and drive each over its own CI serial socket. No IRIX media needed — the
+    # Indy PROM's command monitor is the serial endpoint. Catches regressions
+    # in instance derivation, the CI socket/serial path, and per-instance
+    # isolation that the unit tests alone would miss. Linux-only: the debug
+    # binaries it drives are the ones built above, and macOS/Windows results
+    # are informational here.
+    - name: Fleet parallel-agent test
+      if: runner.os == 'Linux'
+      run: test/fleet/run.sh target/debug/iris target/debug/iris-ci
+
   # The nightly/release CLI feature set (scripts/dist/lib.sh): a build check
   # only, so a platform-specific break in the Cranelift JITs or the lightning
   # interpreter path turns CI red before a nightly does.

@@ -1,0 +1,17 @@
+# Minimal machine for the parallel-agent (fleet) CI test: RAM and the SCC only.
+#
+# No SCSI targets at all — a missing scsi1.raw is fatal at startup, so the
+# `scsi` key must be present-but-empty. The test drives the PROM's command
+# monitor over the serial console; it never needs a disk.
+#
+# Same shape as cpu-tests/run/bare.toml, kept separate so this test does not
+# depend on the CPU suite's config.
+
+banks = [128, 128, 0, 0]
+headless = true
+no_audio = true
+
+[machine]
+profile = "indy_ip24"
+
+[scsi]
