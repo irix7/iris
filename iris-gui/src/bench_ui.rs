@@ -873,6 +873,8 @@ mod tests {
             wall_s: 30.0,
             suite_id: "blake3:0123456789abcdef".into(),
             settings: RunSettings::default(),
+            samples: 1,
+            mips_cv_pct: 0.0,
         }
     }
 
