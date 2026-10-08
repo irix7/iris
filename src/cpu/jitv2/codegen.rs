@@ -22,6 +22,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
 
 use crate::cpu::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
+use crate::cpu::jitv2::callout::{Callout, CalloutClobbers};
 use crate::cpu::jitv2::{ARENA_RESERVE_SIZE, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::cpu::mips_core::MipsCore;
 use crate::cpu::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStatus};
@@ -88,6 +89,14 @@ pub struct Codegen {
     /// and only when the code is relocation-free, so it can be loaded
     /// anywhere; `None` otherwise.
     last_blob: Option<(Vec<u8>, u32)>,
+    /// Union of every callout's declared [`CalloutClobbers`] for the most
+    /// recent successful `compile_region`/`compile_region_uncommitted` —
+    /// the total guest-register footprint codegen decided it must spill
+    /// around that region's JIT→Rust calls. #36 ships every callout
+    /// conservative, so this is `CalloutClobbers::CONSERVATIVE` (and emitted
+    /// code is unchanged); the per-hook fill (#37) shrinks it and the
+    /// forwarding/spill decisions that read it.
+    last_region_clobbers: CalloutClobbers,
     /// Set right before `compile_region` returns `None` iff that failure
     /// was `ModuleError::Allocation` — the `ArenaMemoryProvider` running out
     /// of its `ARENA_RESERVE_SIZE` reservation (real message observed live:
@@ -282,6 +291,14 @@ struct EmitCtx<'a, 'b> {
     /// this rides along for free instead of widening every signature on
     /// the path.
     cycles_pending: &'a mut u32,
+    /// Running union of every callout's declared [`CalloutClobbers`] emitted
+    /// while compiling one region — the input to codegen's spill/forwarding
+    /// decision, and what `Codegen::last_region_clobbers` reports after the
+    /// compile. Threaded exactly like `cycles_pending`: declared once in
+    /// `compile_region_uncommitted`'s pass-2 loop and borrowed `&mut` into
+    /// each per-instruction `EmitCtx`, so it survives across the fresh
+    /// `EmitCtx` built for every head instruction.
+    callout_clobbers: &'a mut CalloutClobbers,
 }
 
 /// Result of the block-allocation first pass: every visited instruction's
@@ -617,6 +634,7 @@ impl Codegen {
             mem_helpers: [None; MEM_HELPER_COUNT],
             last_code_size: 0,
             last_blob: None,
+            last_region_clobbers: CalloutClobbers::NONE,
             last_compile_ran_out_of_memory: false,
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
@@ -781,6 +799,7 @@ impl Codegen {
         self.func_ranges.clear();
         self.last_code_size = 0;
         self.last_blob = None;
+        self.last_region_clobbers = CalloutClobbers::NONE;
         self.last_compile_ran_out_of_memory = false;
         // `mem_helpers` is deliberately NOT cleared here. Shared helpers now
         // live in a permanent region owned by `Jitv2` (see
@@ -810,6 +829,16 @@ impl Codegen {
     /// `compile_region` call — see `last_code_size`'s own field doc comment.
     pub fn last_code_size(&self) -> u32 {
         self.last_code_size
+    }
+
+    /// The total guest-register footprint of the callouts in the most recent
+    /// successful compile — the union of every callout's declared clobber
+    /// masks, which codegen computed and fed to its spill/forward decision.
+    /// `CalloutClobbers::NONE` before any compile; `CONSERVATIVE` for every
+    /// region under the #36 all-clobbered default. See
+    /// `last_region_clobbers`'s own field doc comment.
+    pub fn last_region_clobbers(&self) -> CalloutClobbers {
+        self.last_region_clobbers
     }
 
     /// The most recent compile's machine code and alignment, if the
@@ -995,7 +1024,12 @@ impl Codegen {
         let word_offset_param = builder.append_block_param(exit_block, ir::types::I64);
         let exit_status_param = builder.append_block_param(exit_block, ir::types::I32);
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param);
+        // Discarded: this skeleton-only pass exists to prove block allocation,
+        // not to report a region's clobber footprint (it has no per-instruction
+        // semantics to report one from). The full `compile_region_uncommitted`
+        // path threads its real accumulator through the same helpers.
+        let mut skeleton_clobbers = CalloutClobbers::NONE;
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut skeleton_clobbers);
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
@@ -1012,7 +1046,7 @@ impl Codegen {
         let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
         let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut skeleton_clobbers);
         // None of the three sealed here: predecessors (every emit_exception_exit
         // call site, plus the two outer stages' own jumps into
         // exception_call_block) are established incrementally as later
@@ -1288,6 +1322,7 @@ impl Codegen {
             // usual `emit_check_mem_status` at the call site.
             let dead = builder.create_block();
             let mut unused_cycles = 0u32;
+            let mut unused_clobbers = CalloutClobbers::NONE;
             let mut hctx = EmitCtx {
                 builder: &mut builder,
                 module: &mut self.module,
@@ -1308,6 +1343,7 @@ impl Codegen {
                 // this is the same unreachable placeholder as the two above.
                 abs_exit_block: dead,
                 cycles_pending: &mut unused_cycles,
+                callout_clobbers: &mut unused_clobbers,
             };
 
             let status = match helper {
@@ -1396,6 +1432,11 @@ impl Codegen {
         let jit_consts = self.jit_consts;
         let mem_helpers = self.mem_helpers;
         let fr_mode = if compiled_for_fr1 { FrMode::Fr1 } else { FrMode::Fr0 };
+        // Cleared at entry so an early `None` decline (no emitter, stale-FR
+        // hazard) cannot leave a previous region's clobber footprint visible
+        // through `last_region_clobbers`; mirrors
+        // `last_decline_was_verifier_error`'s own reset-at-entry discipline.
+        self.last_region_clobbers = CalloutClobbers::NONE;
         #[cfg(feature = "developer")]
         { self.last_decline_was_verifier_error = false; }
         // Reject anything this pass doesn't support before touching
@@ -1630,7 +1671,8 @@ impl Codegen {
             // instruction's cycles_delta/cycles_flush bookkeeping begins,
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut unused_clobbers = CalloutClobbers::NONE;
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1661,7 +1703,8 @@ impl Codegen {
         // start, because the armed foreign-slot transfer was destroyed.
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut unused_clobbers = CalloutClobbers::NONE;
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1741,7 +1784,8 @@ impl Codegen {
             builder.switch_to_block(stub);
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+            let mut unused_clobbers = CalloutClobbers::NONE;
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1752,12 +1796,20 @@ impl Codegen {
         let fallback_status = builder.ins().iconst(ir::types::I32, crate::cpu::mips_exec::EXEC_FALLBACK as i64);
         builder.ins().return_(&[fallback_status]);
 
+        // Running union of every callout's declared clobber masks for this
+        // region. Declared before the shared exit/exception blocks (which are
+        // themselves callouts) so their masks join the same total, and reused
+        // across the per-instruction pass-2 `EmitCtx`es below — the same
+        // cross-iteration lifetime `cycles_pending` needs. Reported after the
+        // compile via `Codegen::last_region_clobbers`.
+        let mut callout_clobbers = CalloutClobbers::NONE;
+
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param);
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut callout_clobbers);
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut callout_clobbers);
         // Left unsealed until every emit_exception_exit call site below has
         // been emitted — same reasoning as exit_block above.
 
@@ -1875,7 +1927,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending, callout_clobbers: &mut callout_clobbers };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -2259,6 +2311,12 @@ impl Codegen {
                 }
             }
         }
+
+        // Record the region's total callout clobber footprint — the input
+        // codegen's spill/forward decisions were made from, and what
+        // `last_region_clobbers` reports. Under the #36 conservative default
+        // this is every GPR and FPR, i.e. emitted code is unchanged.
+        self.last_region_clobbers = callout_clobbers;
 
         // Pass 3: every block's predecessor set is now fully known.
         for &(_, block) in &instr_blocks {
@@ -2859,7 +2917,7 @@ fn emit_kill_entry(ctx: &mut EmitCtx, entry_offset_val: Value) {
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, entry_offset_val]);
+    emit_callout(ctx, Callout::KillEntry, sig_ref, callee, &[core_arg, entry_offset_val]);
 }
 
 /// Jump to the function's shared exit-to-interpreter block (`BlockSkeleton::
@@ -2966,7 +3024,7 @@ fn emit_interp_fallback_exit(ctx: &mut EmitCtx) {
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+    let call = emit_callout(ctx, Callout::InterpFallback, sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
     ctx.builder.ins().return_(&[status]);
 }
@@ -3035,7 +3093,7 @@ fn emit_interp_fallback_head(
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+    let call = emit_callout(ctx, Callout::InterpFallback, sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     // (3) status != EXEC_COMPLETE -> return it directly.
@@ -3143,7 +3201,7 @@ fn emit_fetch_verify(ctx: &mut EmitCtx) {
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, va_val, expected_val]);
+    let call = emit_callout(ctx, Callout::FetchVerify, sig_ref, callee, &[core_arg, va_val, expected_val]);
     let status = ctx.builder.inst_results(call)[0];
 
     let is_bad = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
@@ -3208,7 +3266,7 @@ fn emit_dev_trace_bp(ctx: &mut EmitCtx, origin: u32) {
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, pc_val, raw_val, origin_val]);
+    let call = emit_callout(ctx, Callout::DevTrace, sig_ref, callee, &[core_arg, pc_val, raw_val, origin_val]);
     let status = ctx.builder.inst_results(call)[0];
 
     let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
@@ -3285,7 +3343,7 @@ fn emit_lockstep_step(ctx: &mut EmitCtx, trust_live: bool) {
     sig.params.push(AbiParam::new(ir::types::I32)); // bd
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, pc_val, raw_val, bd_val]);
+    emit_callout(ctx, Callout::LockstepStep, sig_ref, callee, &[core_arg, pc_val, raw_val, bd_val]);
 }
 
 /// `jitv2_lockstep` compare bracket for an entry word / delay slot, called
@@ -3307,7 +3365,7 @@ fn emit_lockstep_compare_live(ctx: &mut EmitCtx) {
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+    let call = emit_callout(ctx, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
@@ -3386,7 +3444,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
     sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+    let call = emit_callout(ctx, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
     let status = ctx.builder.inst_results(call)[0];
 
     // On a divergence, bail to the monitor: EXEC_BREAKPOINT. core.pc/
@@ -3439,7 +3497,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
 /// whatever this function already wrote for real. A preamble bail (nothing
 /// staged this dispatch) is a harmless no-op, same as every other lockstep
 /// compare call.
-fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, consts: &JitConsts, core_ptr: Value, word_offset: Value, status: Value) {
+fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, consts: &JitConsts, core_ptr: Value, word_offset: Value, status: Value, callout_clobbers: &mut CalloutClobbers) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
@@ -3469,7 +3527,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
         sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
         let sig_ref = builder.import_signature(sig);
         let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
-        let call = builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+        let call = emit_callout_raw(builder, callout_clobbers, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
         let cmp_status = builder.inst_results(call)[0];
 
         // Divergence: lockstep_compare (mips_exec.rs) already restored
@@ -4228,7 +4286,7 @@ fn emit_mem_helper_call(ctx: &mut EmitCtx, addr: i64, vaddr: Value, third: Value
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, third]);
+    let call = emit_callout(ctx, Callout::MemoryHelper, sig_ref, callee, &[core_arg, vaddr, third]);
     ctx.builder.inst_results(call)[0]
 }
 
@@ -4447,6 +4505,53 @@ fn emit_hook_callee_raw(
     }
 }
 
+/// Emit one JIT→Rust callout, declaring its guest-register clobber set.
+///
+/// **Every** `call_indirect` into a `MipsCore` hook goes through this helper
+/// (or its raw-builder sibling for the shared blocks). It is the single
+/// place codegen consumes [`Callout::clobbers`]: it folds the declared
+/// read/write masks into the region's running [`CalloutClobbers`] — the
+/// input to the spill/forward decision ([`CalloutClobbers::spill_plan`]) —
+/// and documents the mask at each call so #37's per-hook fill is a
+/// one-function change.
+///
+/// #36 ships every hook conservative, so the accumulated set is
+/// `CalloutClobbers::CONSERVATIVE` (every GPR and FPR) and nothing about the
+/// emitted call differs from the pre-mask code: the masks are the seam, not
+/// yet a speedup.
+fn emit_callout(
+    ctx: &mut EmitCtx,
+    callout: Callout,
+    sig_ref: ir::SigRef,
+    callee: Value,
+    args: &[Value],
+) -> ir::Inst {
+    // Consume the declared masks: fold this call's guest-register footprint
+    // into the region total that `last_region_clobbers` reports and the
+    // spill/forward decision reads. Under the conservative default that
+    // decision is "spill everything" — exactly Cranelift's own opaque-call
+    // assumption — so no register is ever wrongly kept live across the call.
+    ctx.callout_clobbers.union_assign(callout.clobbers());
+    ctx.builder.ins().call_indirect(sig_ref, callee, args)
+}
+
+/// [`emit_callout`] for the shared per-function blocks, which are built with
+/// a bare `FunctionBuilder` rather than an `EmitCtx`. `clobbers` is the same
+/// region accumulator `EmitCtx::callout_clobbers` carries on the ordinary
+/// path, threaded in explicitly so the exception/exit blocks' callouts are
+/// part of the region's total footprint too.
+fn emit_callout_raw(
+    builder: &mut FunctionBuilder,
+    clobbers: &mut CalloutClobbers,
+    callout: Callout,
+    sig_ref: ir::SigRef,
+    callee: Value,
+    args: &[Value],
+) -> ir::Inst {
+    clobbers.union_assign(callout.clobbers());
+    builder.ins().call_indirect(sig_ref, callee, args)
+}
+
 /// One shared memory-access helper: a compiled function holding the guard +
 /// data path for one (kind, size, extend) combination, called from every
 /// access site instead of duplicating ~45 IR instructions there.
@@ -4576,7 +4681,7 @@ fn emit_mem_read_callout(ctx: &mut EmitCtx, vaddr: Value, size: MemSize, dst: Va
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, dst]);
+    let call = emit_callout(ctx, Callout::MemoryRead, sig_ref, callee, &[core_arg, vaddr, dst]);
     ctx.builder.inst_results(call)[0]
 }
 
@@ -4758,7 +4863,7 @@ fn emit_mem_write_callout(ctx: &mut EmitCtx, vaddr: Value, value: Value, size: M
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, vaddr, value]);
+    let call = emit_callout(ctx, Callout::MemoryWrite, sig_ref, callee, &[core_arg, vaddr, value]);
     ctx.builder.inst_results(call)[0]
 }
 
@@ -4785,7 +4890,7 @@ fn emit_mem_write_masked(ctx: &mut EmitCtx, aligned_addr: Value, val: Value, mas
     let sig_ref = ctx.builder.import_signature(sig);
 
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, aligned_addr, val, mask]);
+    let call = emit_callout(ctx, Callout::MemoryWriteMasked, sig_ref, callee, &[core_arg, aligned_addr, val, mask]);
     ctx.builder.inst_results(call)[0]
 }
 
@@ -4920,7 +5025,7 @@ fn emit_fpu_set_mode(ctx: &mut EmitCtx, rm: Value) {
     sig.params.push(AbiParam::new(ir::types::I32)); // rm
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, rm]);
+    emit_callout(ctx, Callout::FpuSetMode, sig_ref, callee, &[core_arg, rm]);
 }
 
 /// MFC1 rt, fs: rt = sign_extend32(fpr_w[fs]). Mirrors `exec_mfc1`.
@@ -5684,6 +5789,7 @@ fn emit_exception_call_block_body(
     status: Value,
     fault_pc: Value,
     bd: Value,
+    callout_clobbers: &mut CalloutClobbers,
 ) {
     let ptr_ty = module.target_config().pointer_type();
 
@@ -5705,7 +5811,7 @@ fn emit_exception_call_block_body(
     let sig_ref = builder.import_signature(sig);
 
     let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
-    builder.ins().call_indirect(sig_ref, callee, &[core_arg, status, fault_pc, bd]);
+    emit_callout_raw(builder, callout_clobbers, Callout::HandleException, sig_ref, callee, &[core_arg, status, fault_pc, bd]);
     let ret_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[ret_status]);
 }
@@ -7084,7 +7190,7 @@ fn emit_slot_semantics(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_P
         sig.returns.push(AbiParam::new(ir::types::I32));
         let sig_ref = ctx.builder.import_signature(sig);
         let core_arg = callout_core_arg(ctx);
-        let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg]);
+        let call = emit_callout(ctx, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
         let status = ctx.builder.inst_results(call)[0];
 
         let is_bp = ctx.builder.ins().icmp_imm_s(IntCC::Equal, status, crate::cpu::mips_exec::EXEC_BREAKPOINT as i64);
@@ -8077,7 +8183,7 @@ fn emit_fcvt_to_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_f64: bool, dst_i64: 
     sig.returns.push(AbiParam::new(i32t)); // trapped (nonzero) or not (0)
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
+    let call = emit_callout(ctx, Callout::FpuCvtToInt, sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_f64_val, dst_i64_val, rm]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -8114,7 +8220,7 @@ fn emit_fcvt_from_int(ctx: &mut EmitCtx, fr_mode: FrMode, src_i64: bool, dst_f64
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
+    let call = emit_callout(ctx, Callout::FpuCvtIntToFloat, sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val, src_i64_val, dst_f64_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -8166,7 +8272,7 @@ fn emit_fcvt_s_d(ctx: &mut EmitCtx, fr_mode: FrMode) {
     sig.returns.push(AbiParam::new(i32t));
     let sig_ref = ctx.builder.import_signature(sig);
     let core_arg = callout_core_arg(ctx);
-    let call = ctx.builder.ins().call_indirect(sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val]);
+    let call = emit_callout(ctx, Callout::FpuCvtDToS, sig_ref, callee, &[core_arg, fs_val, fd_val, fr1_val]);
     let trapped = ctx.builder.inst_results(call)[0];
     emit_trap_if_nonzero(ctx, trapped);
 }
@@ -10360,6 +10466,49 @@ mod tests {
             "inline memory should be on by default in a non-lockstep build");
     }
 
+    /// #36 plumbing: every callout's declared mask must reach codegen's
+    /// per-region clobber accumulator. Compile a region containing the two
+    /// commonest callouts (a load and a store) with the shipping defaults and
+    /// require the recorded clobber set to be fully conservative — i.e.
+    /// codegen consumed "all clobbered" and its spill decision is to spill
+    /// every guest register, exactly as the pre-mask behaviour implied.
+    #[test]
+    fn callout_masks_are_plumbed_to_codegen_as_conservative() {
+        use crate::cpu::jitv2::callout::GPR_COUNT;
+        use crate::cpu::mips_isa::{OP_LW, OP_SW};
+        fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+            (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+        }
+        let mut page = [0u32; ENTRIES_PER_PAGE];
+        page[0] = i_type(OP_LW, 1, 2, 0); // lw r2, 0(r1)
+        page[1] = i_type(OP_SW, 1, 2, 4); // sw r2, 4(r1)
+        page[2] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+        page[3] = 0;
+
+        let mut analyzer = Analyzer::new();
+        let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+        assert!(non_empty);
+        let mut instrs_owned = *instrs;
+
+        let mut codegen = Codegen::new();
+        // Default (unsupported) geometry: the inline memory fast path
+        // declines, so the load and store emit their real Rust callouts and
+        // the accumulator has something to record.
+        let _ = codegen.compile_region(&mut instrs_owned, 0, true, false)
+            .expect("lw/sw region must compile");
+
+        let clobbers = codegen.last_region_clobbers();
+        std::mem::forget(codegen);
+
+        assert!(clobbers.is_conservative(),
+            "#36 must plumb the conservative all-clobbered default through to codegen: {clobbers:?}");
+        assert!(clobbers.spill_plan().spills_all_gprs());
+        for reg in 0..GPR_COUNT {
+            assert!(clobbers.reads_gpr(reg) && clobbers.writes_gpr(reg),
+                "conservative plumbing must claim gpr{reg}");
+        }
+    }
+
     #[test]
     fn skeleton_allocates_one_block_per_visited_instruction() {
         let mut page = [0u32; ENTRIES_PER_PAGE];
@@ -10488,13 +10637,14 @@ mod tests {
                 // Test harness for preamble emitters only (see this
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
+                let mut unused_clobbers = CalloutClobbers::NONE;
                 let dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry::unsupported();
                 // This harness compiles against no real core, so hook targets
                 // must keep coming from `core_ptr` loads rather than being
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -10507,12 +10657,13 @@ mod tests {
             // hooks stay register-loaded here.
             let jit_consts = JitConsts::default();
             let mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT] = [None; MEM_HELPER_COUNT];
+            let mut harness_clobbers = CalloutClobbers::NONE;
             builder.switch_to_block(exit_block);
-            emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param);
+            emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param, &mut harness_clobbers);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);
-            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param);
+            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut harness_clobbers);
             builder.switch_to_block(abs_exit_block);
             emit_absolute_pc_exit_block_body(&mut builder, abs_exit_core_ptr, abs_exit_target);
 

@@ -9,6 +9,7 @@ pub mod pcache;
 pub mod isa;
 pub mod opcode_support;
 pub mod analyzer;
+pub mod callout;
 pub mod codegen;
 pub mod paged_memory;
 // Always compiled with jitv2: `j2 dumppcp`
