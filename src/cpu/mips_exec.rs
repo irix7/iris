@@ -9082,13 +9082,21 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
              verification would silently be OFF. The queue must not run under lockstep.");
         let mut ran_out_of_memory = false;
         if let Some(codegen) = codegen.as_mut() {
-            // Stamp the L1-D geometry the inline load/store fast path needs.
+            // Stamp the L1-D geometry the inline load/store path needs.
             // Done on every take rather than once at startup so a cache
             // reconfigure can't leave compiled code indexing the old shape;
             // it is a plain struct copy on a path that is already compiling.
-            // Stamp the L1-D geometry the inline load/store path needs. No
-            // helper build here — see the note in Jitv2::worker_loop.
             codegen.dc_geometry = self.cache.jit_dc_geometry();
+            // Shared helpers are permanent (see `Jitv2::ensure_perm_helpers`):
+            // built once per machine, outside every flush, and injected here
+            // with stable addresses — exactly as the async worker does at its
+            // own startup. Publishing the live geometry first keeps the
+            // permanent region built for the shape actually in use.
+            {
+                let j = self.jitv2.lock();
+                *j.dc_geometry.lock() = codegen.dc_geometry;
+                codegen.set_mem_helpers(j.ensure_perm_helpers());
+            }
             #[cfg(feature = "developer")]
             {
                 let stats = self.jitv2.lock().stats.clone();

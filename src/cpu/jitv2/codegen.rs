@@ -43,16 +43,20 @@ pub struct Codegen {
     /// before", which is always correct.
     pub jit_consts: JitConsts,
     /// Addresses of the shared memory-access helpers, indexed by
-    /// [`MemHelper::index`]. Emitted once into the arena's lowest range by
-    /// [`Codegen::emit_mem_helpers`] and force-sealed there, so every region
-    /// compiled afterwards can `call` them as a fixed address.
+    /// [`MemHelper::index`]. Emitted once into a permanent region's lowest
+    /// range by [`Codegen::emit_mem_helpers`] and force-sealed there, so every
+    /// region compiled afterwards can `call` them as a fixed address.
     ///
     /// `None` until helpers are built (or if building them failed), in which
     /// case codegen falls back to the duplicated inline guard — always
     /// correct, just larger.
     ///
-    /// Discarded together with everything else on a `mega_flush`, so no
-    /// stale address can outlive the arena it points into.
+    /// **Lifetime.** Helpers are *permanent*: the region that owns them is
+    /// `Jitv2::perm_helpers`, never reset by a page flush, and its addresses
+    /// are injected into every transient `Codegen` via
+    /// [`Codegen::set_mem_helpers`]. A transient `Codegen` therefore must not
+    /// clear this field on `reset()` (it doesn't — see `reset_inner`), so no
+    /// stale address can appear where a live one used to be.
     /// Stored as `usize`, not `*const u8`: `Codegen` is moved to a compile
     /// worker thread, and a raw pointer would make it `!Send`.
     mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT],
@@ -649,6 +653,24 @@ impl Codegen {
         self.paged_state.packing_stats()
     }
 
+    /// Addresses of this `Codegen`'s shared memory-access helpers — see the
+    /// `mem_helpers` field's own doc comment. `None`-valued slots mean that
+    /// helper was never built (or helpers are disabled); callers that inject
+    /// helpers from a permanent region (`Codegen::set_mem_helpers`) read this
+    /// to hand the addresses on.
+    pub fn mem_helpers(&self) -> [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT] {
+        self.mem_helpers
+    }
+
+    /// Install externally-owned shared-helper addresses — the permanent-region
+    /// path (see `Jitv2::ensure_perm_helpers`). The addresses point into a
+    /// `Codegen` that is never flushed, so they stay valid across this
+    /// `Codegen`'s own `reset()`/`reset_with_shared_arena()`, which no longer
+    /// clears the field (see `reset_inner`).
+    pub fn set_mem_helpers(&mut self, addrs: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT]) {
+        self.mem_helpers = addrs;
+    }
+
     /// The `(shared arena, paged state)` pair this `Codegen`'s own module is
     /// built on — for a caller that wants to build a *sibling* `Codegen`
     /// over the exact same arena (`new_with_shared_arena`) rather than
@@ -760,13 +782,15 @@ impl Codegen {
         self.last_code_size = 0;
         self.last_blob = None;
         self.last_compile_ran_out_of_memory = false;
-        // Old helper addresses point into the arena that was just freed.
-        // Dropped here, but NOT rebuilt: a forced seal mprotects a whole host
-        // page, which is only safe when nothing else can still be
-        // bump-allocating into it (see `worker_loop`'s note on
-        // `handle_request`'s single-caller contract). The flush *leader*
-        // rebuilds them while every other worker is parked at the barrier.
-        self.mem_helpers = [None; MEM_HELPER_COUNT];
+        // `mem_helpers` is deliberately NOT cleared here. Shared helpers now
+        // live in a permanent region owned by `Jitv2` (see
+        // `Jitv2::ensure_perm_helpers`), injected into this `Codegen` via
+        // `set_mem_helpers`; the arena this reset just freed holds only this
+        // `Codegen`'s own transient compiled regions, so the externally-owned
+        // helper addresses remain valid across the reset (and across every
+        // flush path, which rebuilds this `Codegen` on a fresh arena). A
+        // `Codegen` that never had helpers injected (unit tests, tools, an
+        // unsupported cache geometry) keeps its `None` slots, unchanged.
     }
 
     /// Number of functions compiled into this `Codegen`'s `JITModule` since

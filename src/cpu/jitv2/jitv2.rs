@@ -2222,6 +2222,40 @@ pub type PageSlot = u32;
 const NO_SLOT: u32 = u32::MAX;
 const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 
+/// The permanent half of the code arena split (see [`Jitv2::perm_helpers`]):
+/// a `Codegen` whose only job is to emit the shared memory-access helpers, kept
+/// alive for the whole process so nothing a page flush does can invalidate the
+/// addresses compiled regions call. See [`Jitv2::ensure_perm_helpers`].
+pub struct PermHelperRegion {
+    /// The helper-only `Codegen`, `None` until the first build (or when the
+    /// configured cache geometry does not support the inline path at all).
+    /// Owned here, never `reset()` — dropping it just leaks its sealed arena,
+    /// the same deliberate behaviour `Codegen`'s own doc comment describes.
+    codegen: Option<crate::cpu::jitv2::codegen::Codegen>,
+    /// The geometry the helpers were built against. A mismatch (a cache
+    /// reconfigure) forces a rebuild; the old region is left mapped because
+    /// regions compiled earlier still call into it.
+    geometry: Option<crate::cpu::mips_cache_v2::JitDcGeometry>,
+    /// The compile-time constants the helpers were built against — chiefly the
+    /// `MipsCore` address baked into hook calls. A mismatch (the core moved)
+    /// forces a rebuild for the same reason as a geometry change.
+    consts: crate::cpu::jitv2::codegen::JitConsts,
+    /// Cached addresses, mirroring the owning `Codegen`'s `mem_helpers` —
+    /// returned to callers without re-borrowing the `Codegen`.
+    addrs: [Option<core::num::NonZeroUsize>; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT],
+}
+
+impl Default for PermHelperRegion {
+    fn default() -> Self {
+        Self {
+            codegen: None,
+            geometry: None,
+            consts: crate::cpu::jitv2::codegen::JitConsts::default(),
+            addrs: [None; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT],
+        }
+    }
+}
+
 /// JIT v2 engine state embedded in the mips executor.
 ///
 /// Owns the [`PhysicalCodePage`] pool (§2.4): a single array, allocated once
@@ -2250,6 +2284,22 @@ const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 /// HashMap's own `RawTable` grow-and-rehash allocation directly above it),
 /// which is exactly the trigger this comment used to name. See [`PfnMap`].
 pub struct Jitv2 {
+    /// **Permanent** code region: the shared memory-access helpers built once
+    /// per `Jitv2` and never discarded by a page flush. Owned here rather
+    /// than by any one `Codegen` because every flush path (`flush_from_cpu_thread`
+    /// tears the whole compile pool down and rebuilds it; `run_leader_flush`
+    /// rebuilds each worker's `Codegen` on a fresh arena) replaces the
+    /// transient region wholesale — helpers living inside a worker's arena
+    /// would be thrown away with it. Keeping them outside the pool's lifecycle
+    /// is what lets a flush recycle compiled pages without discarding the
+    /// permanent region; the transient compiler obtains their (stable)
+    /// addresses through [`Self::ensure_perm_helpers`] and injects them via
+    /// `Codegen::set_mem_helpers`.
+    ///
+    /// The region is a dedicated `Codegen` used only for helpers — its own
+    /// arena, never reset. Rebuilt (leaking the previous region, whose code
+    /// live regions may still call) only if the cache geometry changes.
+    pub perm_helpers: Mutex<PermHelperRegion>,
     /// The full-capacity page pool, allocated once — see this struct's own
     /// doc comment. Indices are stable for the pool's entire lifetime,
     /// including across `mega_flush` (slots are reset/relinked in place, the
@@ -2363,6 +2413,7 @@ impl Jitv2 {
             pages[i].next = if i + 1 < capacity { (i + 1) as u32 } else { NO_SLOT };
         }
         Self {
+            perm_helpers: Mutex::new(PermHelperRegion::default()),
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
             pfn_to_slot: PfnMap::new(),
@@ -2373,6 +2424,57 @@ impl Jitv2 {
             jit_consts: Mutex::new(crate::cpu::jitv2::codegen::JitConsts::default()),
             stats: Arc::new(JitStats::default()),
         }
+    }
+
+    /// Ensure the permanent shared-helper region exists for the currently
+    /// published cache geometry and return its stable addresses.
+    ///
+    /// This is the permanent side of the arena lifetime split. The transient
+    /// compiler (`worker_loop` at startup, and the inline path) calls this
+    /// before compiling and injects the result with `Codegen::set_mem_helpers`;
+    /// because the region lives outside every `Codegen` the flush paths
+    /// replace, the addresses are identical before and after a flush.
+    ///
+    /// Returns all `None`s (and builds nothing) when the geometry does not
+    /// support the inline fast path — the same condition `emit_mem_helpers`
+    /// uses, so a `Codegen` whose helpers are `None` simply falls back to the
+    /// inlined guard.
+    ///
+    /// Rebuilds only when the geometry changed since the last build. The old
+    /// region is deliberately left mapped: regions compiled against it may
+    /// still call into it, so freeing it would be a use-after-free. That is
+    /// rare (a cache reconfigure) and bounded by the number of reconfigures.
+    pub fn ensure_perm_helpers(&self) -> [Option<core::num::NonZeroUsize>; crate::cpu::jitv2::codegen::MEM_HELPER_COUNT] {
+        use crate::cpu::jitv2::codegen::MEM_HELPER_COUNT;
+        let geometry = *self.dc_geometry.lock();
+        if !geometry.supported {
+            return [None; MEM_HELPER_COUNT];
+        }
+        let mut perm = self.perm_helpers.lock();
+        let consts = *self.jit_consts.lock();
+        if perm.codegen.is_some() && perm.geometry == Some(geometry) && perm.consts == consts {
+            return perm.addrs;
+        }
+        let mut cg = crate::cpu::jitv2::codegen::Codegen::new();
+        cg.dc_geometry = geometry;
+        cg.jit_consts = consts;
+        cg.emit_mem_helpers();
+        let addrs = cg.mem_helpers();
+        perm.geometry = Some(geometry);
+        perm.consts = consts;
+        perm.addrs = addrs;
+        // Keep the helper-only `Codegen` alive: its arena must stay mapped and
+        // executable for the process's lifetime, or every compiled region that
+        // calls a helper address would jump into unmapped memory.
+        perm.codegen = Some(cg);
+        addrs
+    }
+
+    /// `(used, reserved)` bytes of the permanent helper region — a diagnostic
+    /// proving the region does not grow across flushes. `(0, 0)` before the
+    /// first build or under an unsupported geometry.
+    pub fn perm_helper_stats(&self) -> (u64, u64) {
+        self.perm_helpers.lock().codegen.as_ref().map_or((0, 0), |cg| cg.packing_stats())
     }
 
     /// Release `slot` back to the free list.
@@ -3285,28 +3387,17 @@ impl CompileQueue {
         // load/store path. The worker owns `codegen` by value for its whole
         // life, so the CPU cannot stamp it directly — it goes through
         // `Jitv2::dc_geometry` instead.
+        //
+        // Helpers are *not* built here any more: they live in the permanent
+        // region (`Jitv2::perm_helpers`), built once and injected as stable
+        // addresses. Doing it under the same `Jitv2` lock as the geometry
+        // keeps the two consistent and means every worker, whatever the
+        // compile pool was rebuilt from, gets the identical addresses.
         if let Some(j) = jitv2.as_ref().and_then(|w| w.upgrade()) {
             let g = j.lock();
             codegen.dc_geometry = *g.dc_geometry.lock();
             codegen.jit_consts = *g.jit_consts.lock();
-        }
-        // First worker to get here builds the shared helpers into the arena's
-        // lowest range. Startup only — the flush path rebuilds them from the
-        // leader while everyone else is parked (see `run_leader_flush`).
-        //
-        // Serialized on a process-wide latch rather than done per worker: a
-        // forced seal mprotects a whole host page to RX, which is only safe
-        // when nothing else can still be bump-allocating into it (see this
-        // function's own note on `handle_request`'s single-caller contract).
-        // Every other worker waits here until the winner is done, so nobody
-        // allocates into that page mid-seal.
-        {
-            static HELPERS_BUILT: parking_lot::Mutex<bool> = parking_lot::Mutex::new(false);
-            let mut built = HELPERS_BUILT.lock();
-            if !*built {
-                codegen.emit_mem_helpers();
-                *built = true;
-            }
+            codegen.set_mem_helpers(g.ensure_perm_helpers());
         }
 
 
@@ -3440,15 +3531,14 @@ impl CompileQueue {
                     ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
-                // Build the shared memory helpers here and nowhere else.
-                // Every other worker is parked at the barrier and the fresh
-                // arena has had nothing else allocated into it, so this is
-                // the one moment a forced seal — which mprotects a whole
-                // host page to RX — cannot race another worker still
-                // bump-allocating into that page. Helpers land in the
-                // arena's lowest range; every region compiled afterwards
-                // sits above them and seals normally.
-                codegen.emit_mem_helpers();
+                // Helpers are NOT rebuilt here. They live in the permanent
+                // region (`Jitv2::perm_helpers`) and were injected into this
+                // `Codegen` at worker startup; `reset_with_shared_arena`
+                // deliberately preserves the field (see `Codegen::reset_inner`),
+                // so the exact same addresses remain valid against the fresh
+                // transient arena. Rebuilding them into the transient arena —
+                // what this used to do — is precisely the "a flush discards the
+                // shared helpers" behaviour the lifetime split removes.
                 {
                     let (mutex, cv) = &*barrier;
                     let mut state = mutex.lock();
@@ -5493,5 +5583,106 @@ mod tests {
     fn compile_queue_stop_without_start_is_a_noop() {
         let mut q = CompileQueue::new();
         q.stop(); // must not panic
+    }
+
+    /// A geometry that supports the inline load/store path — enough for
+    /// `emit_mem_helpers` to actually build the shared helpers. The exact
+    /// numbers only have to be internally consistent for *codegen*; nothing
+    /// here ever runs the emitted helper code.
+    fn supported_geometry_for_test() -> crate::cpu::mips_cache_v2::JitDcGeometry {
+        crate::cpu::mips_cache_v2::JitDcGeometry {
+            supported: true,
+            line_shift: 4,
+            num_lines_mask: 63,
+            data_mask: 0xFFF,
+            has_l2: true,
+            l2_line_shift: 4,
+            l2_num_lines_mask: 0xFFFF,
+            ways: 1,
+            num_lines_shift: 6,
+            tagless: false,
+        }
+    }
+
+    /// `comp::handle_request`'s `developer`-conditional `stats` parameter,
+    /// hidden so the test body reads the same in every build (mirrors the
+    /// wrapper in `comp.rs`'s own tests).
+    fn handle_request_for_permanent_helper_test(
+        req: &CompileRequest,
+        bus: &Arc<dyn BusDevice>,
+        an: &mut crate::cpu::jitv2::analyzer::Analyzer,
+        cg: &mut crate::cpu::jitv2::codegen::Codegen,
+    ) -> bool {
+        #[cfg(feature = "developer")]
+        {
+            let stats = JitStats::default();
+            crate::cpu::jitv2::comp::handle_request(req, bus, an, cg, &stats)
+        }
+        #[cfg(not(feature = "developer"))]
+        {
+            crate::cpu::jitv2::comp::handle_request(req, bus, an, cg)
+        }
+    }
+
+    /// Issue #38: split the code arena by lifetime. A flush must recycle
+    /// compiled pages while the permanent shared helpers survive untouched.
+    ///
+    /// The transient side is exercised with a real compile (`handle_request`
+    /// publishing an ADDIU region) and a real `Codegen::reset()` — the
+    /// per-worker flush-equivalent — and asserted to return to a fixed
+    /// footprint every cycle rather than accumulating. The permanent side is
+    /// the `Jitv2`-owned helper region: its addresses must be byte-identical
+    /// before and after every `mega_flush`, and its own arena footprint must
+    /// not grow. Together those are the two acceptance claims: helpers
+    /// survive, transients do not leak or exhaust.
+    #[test]
+    fn permanent_helpers_survive_flushes_and_transients_are_recycled() {
+        let mut jit = Jitv2::new(JITV2_INITIAL_PAGE_CAPACITY);
+        *jit.dc_geometry.lock() = supported_geometry_for_test();
+
+        let first = jit.ensure_perm_helpers();
+        assert!(first.iter().all(|a| a.is_some()),
+            "a supported geometry must build every shared helper");
+        let perm_stats = jit.perm_helper_stats();
+        assert!(perm_stats.1 > 0, "the permanent region must have committed an arena page");
+
+        // A transient compiler stamped with the permanent addresses, exactly
+        // as a real worker receives them at startup.
+        let bus: Arc<dyn BusDevice> = Arc::new(AddiuDevice(AtomicU64::new(0)));
+        let mut transient = crate::cpu::jitv2::codegen::Codegen::new();
+        transient.set_mem_helpers(first);
+        let mut an = crate::cpu::jitv2::analyzer::Analyzer::new();
+
+        let mut transient_baseline: Option<u64> = None;
+        for cycle in 0..64u64 {
+            // Compile a real region into the transient arena.
+            let gen_counter = AtomicU64::new(cycle);
+            let mut page = PhysicalCodePage::new(0, &gen_counter as *const AtomicU64);
+            page.mark_requested(0);
+            let req = CompileRequest { page: &mut page as *mut PhysicalCodePage, compiled_for_fr1: true };
+            let _ = handle_request_for_permanent_helper_test(&req, &bus, &mut an, &mut transient);
+            assert!(transient.packing_stats().1 > 0,
+                "a compiled region must occupy transient arena bytes (cycle {cycle})");
+
+            // A page flush: page pool reset, permanent region untouched.
+            jit.mega_flush();
+            let again = jit.ensure_perm_helpers();
+            assert_eq!(again, first,
+                "permanent helpers must keep identical addresses across a flush (cycle {cycle})");
+
+            // The transient side is recycled, not accumulated.
+            unsafe { transient.reset() };
+            transient.set_mem_helpers(first);
+            assert_eq!(transient.mem_helpers(), first,
+                "a reset transient Codegen must keep the externally-owned helper addresses");
+            let baseline = *transient_baseline.get_or_insert(transient.packing_stats().1);
+            assert_eq!(transient.packing_stats().1, baseline,
+                "a reset transient arena must return to a fixed footprint, not grow (cycle {cycle})");
+        }
+
+        assert_eq!(jit.perm_helper_stats(), perm_stats,
+            "the permanent arena must not grow across repeated flushes");
+        assert_eq!(jit.pages_used(), 0, "a flush must recycle every page-pool slot");
+        assert_eq!(jit.capacity(), JITV2_INITIAL_PAGE_CAPACITY);
     }
 }
