@@ -213,14 +213,21 @@ struct AudioOut {
     // the codec is disarmed/reset. Gates underrun counting so idle silence
     // (stream open, nothing enabled yet) isn't reported as an underrun.
     playing: Arc<AtomicBool>,
-    // Keep stream alive; dropped when AudioOut is dropped at stop().
-    _stream: cpal::Stream,
+    // Keep stream alive; dropped when AudioOut is dropped at stop(). `None`
+    // in tests that exercise the ring/backpressure path without a host device.
+    _stream: Option<cpal::Stream>,
 }
 
 // cpal::Stream is !Send/!Sync on some platforms (ALSA uses raw pointers internally),
 // but it is safe to hold inside a Mutex.
 unsafe impl Send for AudioOut {}
 unsafe impl Sync for AudioOut {}
+
+impl AudioOut {
+    /// Free stereo frames the ring can accept right now. This is the headroom
+    /// bounded-buffer backpressure sizes the per-wake read against.
+    fn free_frames(&self) -> usize { self.producer.slots() / 2 }
+}
 
 // Simple skip/repeat resampler using a fixed-point accumulator.
 // Produces output at `out_rate` from input at `in_rate`.
@@ -250,6 +257,18 @@ impl Resampler {
     }
 
     fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
+
+    /// Output stereo frames the next `push` will emit, without advancing any
+    /// state. Backpressure uses it to decide whether one more input frame fits
+    /// in the ring.
+    fn pending_frames(&self) -> usize {
+        if self.passthrough() { return 1; }
+        let out = self.out_rate as u64;
+        let mut acc = self.acc;
+        let mut n = 0usize;
+        while acc < out { n += 1; acc += self.in_rate as u64; }
+        n
+    }
 
     /// Push one input stereo pair; emits the output pairs it completes.
     fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
@@ -334,6 +353,17 @@ impl CodecAState {
                     rs.push(chunk[0], chunk[1], &mut o.producer);
                 }
             }
+        }
+    }
+
+    /// True when the host ring can accept one more input frame's worth of
+    /// output. With no host output there is nothing to bound, so the DMA drain
+    /// proceeds. This is the bounded-buffer backpressure gate: read only when
+    /// the ring has room, so a full ring stalls the read and stops CBP.
+    fn can_accept_frame(&self) -> bool {
+        match (&self.out, &self.resampler) {
+            (Some(o), Some(r)) => r.pending_frames() <= o.free_frames(),
+            _ => true,
         }
     }
 }
@@ -543,7 +573,7 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, c
             producer,
             underruns,
             playing,
-            _stream: stream,
+            _stream: Some(stream),
         });
     }
 
@@ -643,96 +673,38 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
         let prebuf_ms = self.audio_config.prebuf_ms;
+        let read_ahead_clamp = self.audio_config.read_ahead_clamp;
         let mut pacer = Pacer::new(pitch_rate);
 
         self.ca_state.lock().armed_ch = Some(dma_ch);
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
             let mut due = pacer.due();
-            // Keep within READ_AHEAD_MS of the position the guest last polled
-            // (see READ_AHEAD_MS); the rest stays due for the next wake.
-            if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
-                let words_per_frame: u64 = match mode { MODE_MONO => 1, MODE_QUAD => 4, _ => 2 };
-                let limit = (pitch_rate as u64 * READ_AHEAD_MS).div_ceil(1000);
-                let allowed = limit.saturating_sub(ahead_words / words_per_frame);
-                if due > allowed {
-                    pacer.give_back(due - allowed);
-                    due = allowed;
+            // Legacy open-loop clamp: keep within READ_AHEAD_MS of the position
+            // the guest last polled. Off by default — bounded-buffer
+            // backpressure in `drain_codec_a` replaces it. Retained behind
+            // `[audio] read_ahead_clamp` until recorded-audio validation.
+            if read_ahead_clamp {
+                if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
+                    let words_per_frame: u64 = match mode { MODE_MONO => 1, MODE_QUAD => 4, _ => 2 };
+                    let limit = (pitch_rate as u64 * READ_AHEAD_MS).div_ceil(1000);
+                    let allowed = limit.saturating_sub(ahead_words / words_per_frame);
+                    if due > allowed {
+                        pacer.give_back(due - allowed);
+                        due = allowed;
+                    }
                 }
             }
             if due == 0 {
                 return TimerReturn::Continue;
             }
             let mut st = ca_state.lock();
-            st.calls += 1;
-
-            // No audio output — still drain DMA so the kernel doesn't hang
-            // waiting for PDMA_CTRL_ACT to clear.
-            let stream_rate = match st.out.as_ref() {
-                Some(o) => o.stream_rate,
-                None => {
-                    for _ in 0..due {
-                        let _ = read_frame_from(&dma_client, mode);
-                    }
-                    return TimerReturn::Continue;
-                }
-            };
-
-            // (Re)build resampler if codec rate changed.
-            // Use codec B rate as the declared input rate (experiment).
-            if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
-                st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
-                dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
+            let moved = drain_codec_a(&mut st, &dma_client, mode, pitch_rate, rate, prebuf_ms, due);
+            drop(st);
+            // Frames the ring would not accept stay due: the read stalled, so
+            // CBP did not advance, and the pacer retries once the ring drains.
+            if moved < due {
+                pacer.give_back(due - moved);
             }
-
-            for _ in 0..due {
-                let frame = read_frame_from(&dma_client, mode);
-                if frame.is_some() { st.frames += 1; } else { st.dry_reads += 1; }
-                let was_prebuffering = st.prebuffering;
-
-                match frame {
-                    Some((l, r)) => {
-                        st.dry = 0;
-                        if !st.nonzero_seen && (l != 0 || r != 0) {
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
-                            st.nonzero_seen = true;
-                        }
-                        if st.prebuffering {
-                            // Accumulate before feeding the ring to prevent underrun.
-                            st.prebuf.push(l);
-                            st.prebuf.push(r);
-                            if st.prebuf.len() >= prebuf_samples(rate, prebuf_ms) {
-                                let samples = std::mem::take(&mut st.prebuf);
-                                st.push_to_ring(&samples);
-                                dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
-                                st.prebuffering = false;
-                            }
-                        } else {
-                            // Active: push directly.
-                            st.push_to_ring(&[l, r]);
-                        }
-                    }
-                    None => {
-                        st.dry += 1;
-                        if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
-                            // Flush whatever we buffered so far rather than waiting forever.
-                            let samples = std::mem::take(&mut st.prebuf);
-                            st.push_to_ring(&samples);
-                            dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
-                            st.prebuffering = false;
-                            st.dry = 0;
-                        }
-                    }
-                }
-
-                // Prebuffering just finished — real audio is now flowing into the ring,
-                // so the cpal callback can start treating an empty ring as a genuine underrun.
-                if was_prebuffering && !st.prebuffering {
-                    if let Some(o) = &st.out {
-                        o.playing.store(true, Ordering::Relaxed);
-                    }
-                }
-            }
-
             TimerReturn::Continue
         });
 
@@ -1208,6 +1180,104 @@ impl Hal2 {
     }
 }
 
+// ─── Codec A bounded read ─────────────────────────────────────────────────────
+
+/// Move up to `due` guest frames from the DMA channel into Codec A's host
+/// output, stopping early when the ring can accept no more. This is the
+/// bounded-buffer backpressure core: a full ring stalls the read (so `CBP`
+/// stops advancing) rather than coupling the drain to the guest's polls.
+///
+/// Returns the number of frames actually moved. The caller hands the remainder
+/// back to the pacer, so the stalled frames stay due and are delivered once the
+/// host drains. With no host output the DMA is drained unconditionally so the
+/// kernel waiting on `PDMA_CTRL_ACT` does not hang.
+fn drain_codec_a(
+    st: &mut CodecAState,
+    dma_client: &Arc<dyn DmaClient>,
+    mode: usize,
+    pitch_rate: u32,
+    rate: u32,
+    prebuf_ms: u64,
+    due: u64,
+) -> u64 {
+    st.calls += 1;
+
+    // No audio output — still drain DMA so the kernel doesn't hang waiting for
+    // PDMA_CTRL_ACT to clear.
+    let stream_rate = match st.out.as_ref() {
+        Some(o) => o.stream_rate,
+        None => {
+            for _ in 0..due {
+                let _ = read_frame_from(dma_client, mode);
+            }
+            return due;
+        }
+    };
+
+    // (Re)build resampler if codec rate changed.
+    if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
+        st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
+        dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
+    }
+
+    let mut moved = 0u64;
+    for _ in 0..due {
+        // Backpressure gate. While prebuffering the frames accumulate in a Vec,
+        // not the ring, so nothing to bound yet.
+        if !st.prebuffering && !st.can_accept_frame() {
+            break;
+        }
+        let frame = read_frame_from(dma_client, mode);
+        if frame.is_some() { st.frames += 1; } else { st.dry_reads += 1; }
+        let was_prebuffering = st.prebuffering;
+
+        match frame {
+            Some((l, r)) => {
+                st.dry = 0;
+                if !st.nonzero_seen && (l != 0 || r != 0) {
+                    dlog_dev!(LogModule::Hal2, "HAL2: Codec A first non-zero: l={} r={}", l, r);
+                    st.nonzero_seen = true;
+                }
+                if st.prebuffering {
+                    // Accumulate before feeding the ring to prevent underrun.
+                    st.prebuf.push(l);
+                    st.prebuf.push(r);
+                    if st.prebuf.len() >= prebuf_samples(rate, prebuf_ms) {
+                        let samples = std::mem::take(&mut st.prebuf);
+                        st.push_to_ring(&samples);
+                        dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed ({} frames)", samples.len() / 2);
+                        st.prebuffering = false;
+                    }
+                } else {
+                    // Active: push directly.
+                    st.push_to_ring(&[l, r]);
+                }
+            }
+            None => {
+                st.dry += 1;
+                if st.prebuffering && !st.prebuf.is_empty() && st.dry >= DRY_LIMIT {
+                    // Flush whatever we buffered so far rather than waiting forever.
+                    let samples = std::mem::take(&mut st.prebuf);
+                    st.push_to_ring(&samples);
+                    dlog_dev!(LogModule::Hal2, "HAL2: Codec A prebuf flushed (dry) after {} dry reads", st.dry);
+                    st.prebuffering = false;
+                    st.dry = 0;
+                }
+            }
+        }
+
+        // Prebuffering just finished — real audio is now flowing into the ring,
+        // so the cpal callback can start treating an empty ring as a genuine underrun.
+        if was_prebuffering && !st.prebuffering {
+            if let Some(o) = &st.out {
+                o.playing.store(true, Ordering::Relaxed);
+            }
+        }
+        moved += 1;
+    }
+    moved
+}
+
 // ─── DMA read helper (free function to avoid borrow issues in closures) ───────
 
 fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16)> {
@@ -1452,6 +1522,7 @@ impl Saveable for Hal2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traits::DmaStatus;
     use rtrb::RingBuffer;
 
     #[test]
@@ -1468,12 +1539,74 @@ mod tests {
 
     #[test]
     fn audio_config_drives_buffer_and_ring_sizes() {
-        let cfg = AudioConfig { prebuf_ms: 40, cpal_buffer_frames: Some(512) };
+        let cfg = AudioConfig { prebuf_ms: 40, cpal_buffer_frames: Some(512), ..AudioConfig::default() };
         let sizing = audio_output_sizing(&cfg, 48000);
         assert_eq!(sizing.buffer_size, cpal::BufferSize::Fixed(512));
         assert_eq!(sizing.ring_size, prebuf_samples(48000, 40) * RING_BUF_MULTIPLIER);
         // 40 ms of stereo at 48 kHz is twice the 20 ms default.
         assert_eq!(sizing.ring_size, 2 * prebuf_samples(48000, PREBUF_MS) * RING_BUF_MULTIPLIER);
+    }
+
+    /// A DMA client with an endless supply of samples and a read counter,
+    /// enough to observe how many frames the bounded drain actually moved.
+    struct CountingDma {
+        reads: AtomicU64,
+    }
+
+    impl DmaClient for CountingDma {
+        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Some((0x1234 << 8, DmaStatus::ok(), None))
+        }
+        fn write(&self, _val: u32, _eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+            (DmaStatus::ok(), None)
+        }
+    }
+
+    /// A host output backed by a real ring with no cpal stream, so the
+    /// backpressure path is exercisable without audio hardware.
+    fn test_output(frames: usize) -> (AudioOut, rtrb::Consumer<i16>) {
+        let (producer, consumer) = RingBuffer::<i16>::new(frames * 2);
+        let out = AudioOut {
+            stream_rate: 48000,
+            producer,
+            underruns: Arc::new(AtomicU64::new(0)),
+            playing: Arc::new(AtomicBool::new(false)),
+            _stream: None,
+        };
+        (out, consumer)
+    }
+
+    /// Bounded-buffer backpressure: a full ring stalls the codec read instead
+    /// of letting the open-loop pacer run into slots the guest has not filled.
+    #[test]
+    fn full_ring_stalls_the_codec_read() {
+        let cap = 8usize;
+        let (out, mut cons) = test_output(cap);
+        let mut st = CodecAState::new();
+        st.out = Some(out);
+        st.resampler = Some(Resampler::new(48000, 48000)); // passthrough
+
+        let dma = Arc::new(CountingDma { reads: AtomicU64::new(0) });
+        let client: Arc<dyn DmaClient> = dma.clone();
+
+        // prebuf_ms = 0 forces the initial prebuffer to flush on the first
+        // frame, so the ring fills and then stalls within one wake.
+        let moved = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, 100);
+        assert_eq!(moved, cap as u64, "ring capacity must bound one wake's drain");
+        assert_eq!(
+            dma.reads.load(Ordering::Relaxed),
+            cap as u64 * 2,
+            "a stereo frame is two 32-bit words; no read may run past the ring"
+        );
+
+        // Drain the host ring; the frames left due become deliverable again.
+        for _ in 0..cap {
+            assert!(cons.pop().is_ok());
+            assert!(cons.pop().is_ok());
+        }
+        let moved2 = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, 100);
+        assert_eq!(moved2, cap as u64, "the read resumes once the ring drains");
     }
 
     #[test]
