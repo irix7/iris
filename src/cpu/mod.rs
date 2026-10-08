@@ -10,6 +10,7 @@ pub mod mips_cache_v2;
 pub mod mips_cache_shadow;
 pub mod mips_exec;
 pub mod mips_exec_test;
+pub mod journal;
 pub mod guest_timer;
 pub mod mips_instr_stats;
 pub mod trace;

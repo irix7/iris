@@ -1450,6 +1450,95 @@ mod tests {
         assert_eq!(exec.exec(wait_instr), EXEC_COMPLETE);
     }
 
+    /// Issue #47: a short synthetic run — a few NOPs, an external IP2 line
+    /// that vectors as an interrupt exception, then more NOPs — must record
+    /// to a guest-cycle journal and replay to an identical event stream and
+    /// final cycle/PC. Drives the executor's own `step_int` path (the same
+    /// deterministic interpreter path `validate_snapshot_determinism`
+    /// single-steps) rather than a second execution mechanism.
+    #[test]
+    fn journal_records_and_replays_a_synthetic_run_with_an_interrupt() {
+        use crate::cpu::journal::{Journal, ReplayReport};
+        use std::sync::atomic::Ordering;
+
+        let start_pc = 0xFFFF_FFFF_8001_0000u64;
+        let setup = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>| {
+            // Kernel, interrupts enabled, IP2 unmasked (IM2) — so an IP2
+            // line is delivered as EXC_INT.
+            exec.core.pc = start_pc;
+            exec.core.cp0_status =
+                crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::CAUSE_IP2;
+            exec.core.cp0_cause = 0;
+            exec.core.hot.interrupts.store(0, Ordering::SeqCst);
+            exec.resync_privilege_state();
+        };
+        let mask = crate::cpu::mips_core::CAUSE_IP_MASK;
+
+        // ---- record ----
+        let (mut exec, _mem) = create_executor();
+        setup(&mut exec);
+        let mut j = Journal::new();
+        exec.journal_checkpoint(&mut j, "reset");
+        let mut last = (exec.core.hot.interrupts.load(Ordering::SeqCst) as u32) & mask;
+        exec.journal_record(&mut j, 3, &mut last); // 3 NOPs
+        exec.core
+            .hot
+            .interrupts
+            .fetch_or(crate::cpu::mips_core::CAUSE_IP2 as u64, Ordering::SeqCst);
+        exec.journal_record(&mut j, 20, &mut last); // interrupt + handler
+        let record_cycles = exec.core.hot.cycles;
+        let record_pc = exec.core.pc;
+
+        assert!(j.interrupts() >= 1, "run must observe the IP2 line: {}", j.summary());
+        assert!(j.exceptions() >= 1, "IP2 must vector as an exception: {}", j.summary());
+        assert_eq!(j.end_cycle(), record_cycles);
+
+        // ---- replay ----
+        let (mut exec2, _mem2) = create_executor();
+        setup(&mut exec2);
+        let observed = exec2.journal_replay(&j);
+
+        let report = ReplayReport::compare(&j, observed);
+        assert!(report.matches, "{}", report.summary());
+        assert_eq!(exec2.core.hot.cycles, record_cycles, "final cycle must match");
+        assert_eq!(exec2.core.pc, record_pc, "final PC must match");
+    }
+
+    /// A record run split into chunks with nothing between produces adjacent
+    /// `Delta` entries; replay must reproduce both boundaries verbatim rather
+    /// than merging them into one delta.
+    #[test]
+    fn journal_replay_reproduces_chunked_delta_boundaries() {
+        use crate::cpu::journal::{Event, Journal, ReplayReport};
+        use std::sync::atomic::Ordering;
+
+        let setup = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>| {
+            exec.core.pc = 0xFFFF_FFFF_8001_0000;
+            exec.core.cp0_status = crate::cpu::mips_core::STATUS_IE;
+            exec.core.cp0_cause = 0;
+            exec.core.hot.interrupts.store(0, Ordering::SeqCst);
+            exec.resync_privilege_state();
+        };
+
+        let (mut exec, _) = create_executor();
+        setup(&mut exec);
+        let mut j = Journal::new();
+        exec.journal_checkpoint(&mut j, "reset");
+        let mut last = 0u32;
+        exec.journal_record(&mut j, 3, &mut last);
+        exec.journal_record(&mut j, 4, &mut last);
+        assert!(
+            matches!(j.events(), [Event::Checkpoint { .. }, Event::Delta { cycles: 3 }, Event::Delta { cycles: 4 }]),
+            "chunked record must keep two deltas: {:?}",
+            j.events()
+        );
+
+        let (mut exec2, _) = create_executor();
+        setup(&mut exec2);
+        let report = ReplayReport::compare(&j, exec2.journal_replay(&j));
+        assert!(report.matches, "{}", report.summary());
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();

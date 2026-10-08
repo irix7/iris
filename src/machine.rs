@@ -1508,6 +1508,36 @@ impl Machine {
         self.cpu.state_digest()
     }
 
+    /// Load `name` with every peripheral thread stopped, then record `n`
+    /// retired guest cycles into a fresh guest-cycle journal (#47). The
+    /// opening checkpoint records the recording's origin, so the same call
+    /// after a later `load_snapshot_paused` replays from an identical
+    /// relative timeline even though `hot.cycles` is a process-wide counter.
+    pub fn journal_record_snapshot(
+        &mut self,
+        name: &str,
+        n: u64,
+    ) -> Result<crate::cpu::journal::Journal, String> {
+        self.load_snapshot_paused(name)?;
+        let mut j = crate::cpu::journal::Journal::new();
+        self.cpu.journal_checkpoint(&mut j, "snapshot")?;
+        let mut last = self.cpu.pending_interrupts();
+        self.cpu.journal_record(&mut j, n, &mut last)?;
+        Ok(j)
+    }
+
+    /// Load `name` paused and re-drive `recording`, returning a report that
+    /// says whether the replay reproduced the recording exactly.
+    pub fn journal_replay_snapshot(
+        &mut self,
+        name: &str,
+        recording: &crate::cpu::journal::Journal,
+    ) -> Result<crate::cpu::journal::ReplayReport, String> {
+        self.load_snapshot_paused(name)?;
+        let observed = self.cpu.journal_replay(recording)?;
+        Ok(crate::cpu::journal::ReplayReport::compare(recording, observed))
+    }
+
     /// Step exactly one architectural instruction and return how many
     /// `step()` retired (usually 1; can be 2+ under real JIT dispatch — see
     /// `MipsCpu::step_one_inline_counting_instructions`'s doc comment).

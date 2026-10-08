@@ -101,6 +101,23 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 1_000_000)]
         n: u64,
     },
+    /// Record a guest-cycle journal (issue #47) from a snapshot, for replay.
+    JournalRecord {
+        name: String,
+        /// Number of instructions to record (default 1_000_000).
+        #[arg(short = 'n', long, default_value_t = 1_000_000)]
+        n: u64,
+        /// Journal file (default saves/<name>/journal.txt).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// Replay a recorded journal and assert the event stream matches.
+    JournalReplay {
+        name: String,
+        /// Journal file (default saves/<name>/journal.txt).
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// Save the REX3 framebuffer to a PNG.
     Screenshot { path: PathBuf },
 
@@ -292,6 +309,8 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Diff     { a, b }     => cmd_diff(opts, &a, &b),
         Cmd::Gc                    => cmd_gc(opts),
         Cmd::Validate { name, n }  => cmd_validate(opts, &name, n),
+        Cmd::JournalRecord { name, n, path } => cmd_journal_record(opts, &name, n, path.as_deref()),
+        Cmd::JournalReplay { name, path } => cmd_journal_replay(opts, &name, path.as_deref()),
         Cmd::Screenshot { path }   => simple(opts, "screenshot", json!({"path": path.display().to_string()}), "screenshot"),
 
         Cmd::SerialSend { text, no_cr } => {
@@ -572,6 +591,43 @@ fn cmd_validate(opts: &Opts, name: &str, n: u64) -> Result<()> {
         // Validation surfaced a real divergence — exit with iris-error code so
         // scripts can branch on it.
         return Err(Error::Iris("non-deterministic".into()));
+    }
+    Ok(())
+}
+
+fn cmd_journal_record(opts: &Opts, name: &str, n: u64, path: Option<&std::path::Path>) -> Result<()> {
+    let mut args = json!({"name": name, "n_instructions": n});
+    if let Some(p) = path {
+        args["path"] = Value::String(p.display().to_string());
+    }
+    let data = send(opts, "journal-record", args)?;
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+        return Ok(());
+    }
+    if let Some(s) = data.get("summary").and_then(|v| v.as_str()) {
+        println!("journal-record: {}", s);
+    }
+    Ok(())
+}
+
+fn cmd_journal_replay(opts: &Opts, name: &str, path: Option<&std::path::Path>) -> Result<()> {
+    let mut args = json!({"name": name});
+    if let Some(p) = path {
+        args["path"] = Value::String(p.display().to_string());
+    }
+    let data = send(opts, "journal-replay", args)?;
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+        return Ok(());
+    }
+    if let Some(s) = data.get("summary").and_then(|v| v.as_str()) {
+        println!("{}", s);
+    }
+    if data.get("matches").and_then(|v| v.as_bool()) != Some(true) {
+        // A replay that doesn't equal its recording is a determinism bug —
+        // same exit-code contract as `validate`.
+        return Err(Error::Iris("replay diverged from recording".into()));
     }
     Ok(())
 }

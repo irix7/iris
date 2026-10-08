@@ -272,6 +272,8 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "scratch-clear" => cmd_scratch_clear(server),
         "scratch-info"  => cmd_scratch_info(server),
         "validate"      => cmd_validate(server, &req.args),
+        "journal-record" => cmd_journal_record(server, &req.args),
+        "journal-replay" => cmd_journal_replay(server, &req.args),
         "gc"            => cmd_gc(),
         "diff"          => cmd_diff(&req.args),
         "tree"          => cmd_tree(),
@@ -856,6 +858,78 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
             "pc": format!("0x{:016x}", report.state_a.pc),
         })),
         Err(e) => Response::err(format!("validate: {}", e)),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Guest-cycle record/replay journal (issue #47)
+// ----------------------------------------------------------------------------
+
+/// Resolve the `path` arg for the journal commands, defaulting to the
+/// snapshot's own directory so a record/replay pair needs no extra
+/// bookkeeping.
+fn journal_path_arg(args: &Value, name: &str, cmd: &str) -> Result<std::path::PathBuf, String> {
+    match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => validate_host_path(p).map_err(|e| format!("{}: {}", cmd, e)),
+        None => Ok(std::path::PathBuf::from(format!("saves/{}/journal.txt", name))),
+    }
+}
+
+fn cmd_journal_record(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("journal-record: missing 'name' arg"),
+    };
+    let n = args.get("n_instructions").and_then(|v| v.as_u64()).unwrap_or(1_000_000);
+    let path = match journal_path_arg(args, &name, "journal-record") {
+        Ok(p) => p,
+        Err(e) => return Response::err(e),
+    };
+
+    let result = server.with_machine_result(|m| m.journal_record_snapshot(&name, n));
+    match result {
+        Ok(j) => {
+            if let Err(e) = j.save(&path) {
+                return Response::err(format!("journal-record: save {}: {}", path.display(), e));
+            }
+            Response::data(serde_json::json!({
+                "entries": j.len(),
+                "interrupts": j.interrupts(),
+                "exceptions": j.exceptions(),
+                "end_cycle": j.end_cycle(),
+                "path": path.display().to_string(),
+                "summary": j.summary(),
+            }))
+        }
+        Err(e) => Response::err(format!("journal-record: {}", e)),
+    }
+}
+
+fn cmd_journal_replay(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("journal-replay: missing 'name' arg"),
+    };
+    let path = match journal_path_arg(args, &name, "journal-replay") {
+        Ok(p) => p,
+        Err(e) => return Response::err(e),
+    };
+    let recording = match crate::cpu::journal::Journal::load(&path) {
+        Ok(j) => j,
+        Err(e) => return Response::err(format!("journal-replay: load {}: {}", path.display(), e)),
+    };
+
+    let result = server.with_machine_result(|m| m.journal_replay_snapshot(&name, &recording));
+    match result {
+        Ok(report) => Response::data(serde_json::json!({
+            "matches": report.matches,
+            "summary": report.summary(),
+            "recorded_end_cycle": report.recorded_end_cycle,
+            "replayed_end_cycle": report.replayed_end_cycle,
+            "recorded_entries": report.recorded_len,
+            "replayed_entries": report.observed.len(),
+        })),
+        Err(e) => Response::err(format!("journal-replay: {}", e)),
     }
 }
 

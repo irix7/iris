@@ -3992,6 +3992,143 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         result
     }
 
+    // ------------------------------------------------------------------
+    // Guest-cycle record/replay journal (issue #47). See `cpu::journal`.
+    //
+    // All of these are opt-in: the executor carries no journal state, and
+    // the journal is passed in by the caller, so a run that never calls
+    // these pays nothing and cannot be perturbed.
+    // ------------------------------------------------------------------
+
+    /// Append a checkpoint fence to `j` at the current guest cycle.
+    pub fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) {
+        j.checkpoint(tag, self.core.hot.cycles);
+    }
+
+    /// Record up to `n` retired guest cycles into `j`, observing external
+    /// interrupt-line changes before each step and exceptions after it.
+    /// `last_pending` carries the recorder's view of the interrupt word
+    /// between calls, so a caller can record a chunk, raise an interrupt,
+    /// then record the next chunk.
+    ///
+    /// Uses `step_int` (the straight interpreter path) so `hot.cycles`
+    /// advances exactly once per architectural instruction — the same
+    /// deterministic base Count and the guest-time timer queue derive from.
+    pub fn journal_record(
+        &mut self,
+        j: &mut crate::cpu::journal::Journal,
+        n: u64,
+        last_pending: &mut u32,
+    ) {
+        let mut acc = 0u64;
+        let mut done = 0u64;
+        while done < n {
+            self.journal_observe_pending(j, &mut acc, last_pending);
+            let before = self.core.hot.cycles;
+            let status = self.step_int();
+            let retired = self.core.hot.cycles.wrapping_sub(before);
+            let step = retired.max(1);
+            acc += retired;
+            done += step;
+            self.journal_note_status(j, &mut acc, status);
+        }
+        j.delta(acc);
+    }
+
+    /// Re-drive a recording from the current CPU state, applying each
+    /// recorded interrupt-line change at the same guest-cycle boundary and
+    /// re-running the same number of retired cycles, then return the event
+    /// stream the replay actually produced. Callers compare it to the
+    /// recording (e.g. with [`crate::cpu::journal::ReplayReport::compare`]).
+    ///
+    /// The caller must start the machine in the state the recording's opening
+    /// checkpoint describes (a reset, or a restored snapshot); memory and
+    /// device state are not captured by the journal itself.
+    pub fn journal_replay(&mut self, recording: &crate::cpu::journal::Journal) -> crate::cpu::journal::Journal {
+        use crate::cpu::journal::Event;
+        let mut out = crate::cpu::journal::Journal::new();
+        let mut last_pending = (self.core.hot.interrupts.load(Ordering::Relaxed) as u32) & EXT_INT_MASK;
+        let mut acc = 0u64;
+        for ev in recording.events() {
+            match ev {
+                Event::Checkpoint { tag, .. } => {
+                    // Stamp the replay's own cycle so a wrong starting
+                    // snapshot shows up as a divergence rather than being
+                    // papered over with the recording's value.
+                    out.checkpoint(tag.clone(), self.core.hot.cycles);
+                }
+                Event::Interrupt { bits, .. } => {
+                    self.core.hot.interrupts.store(*bits as u64, Ordering::SeqCst);
+                }
+                Event::Delta { cycles } => {
+                    let mut done = 0u64;
+                    while done < *cycles {
+                        self.journal_observe_pending(&mut out, &mut acc, &mut last_pending);
+                        let before = self.core.hot.cycles;
+                        let status = self.step_int();
+                        let retired = self.core.hot.cycles.wrapping_sub(before);
+                        let step = retired.max(1);
+                        acc += retired;
+                        done += step;
+                        self.journal_note_status(&mut out, &mut acc, status);
+                    }
+                    // Close this delta at the same boundary the recorder did,
+                    // so two consecutive deltas (a record run split into
+                    // chunks) replay as two deltas rather than merging.
+                    if acc > 0 {
+                        out.delta(acc);
+                        acc = 0;
+                    }
+                }
+                // Produced by execution inside the `Delta` loop above; there
+                // is nothing to drive for it here.
+                Event::Exception { .. } => {}
+            }
+        }
+        if acc > 0 {
+            out.delta(acc);
+        }
+        out
+    }
+
+    /// Flush an accumulated delta and append an `Interrupt` entry when the
+    /// observed external-line word changed since the last step.
+    fn journal_observe_pending(
+        &self,
+        j: &mut crate::cpu::journal::Journal,
+        acc: &mut u64,
+        last_pending: &mut u32,
+    ) {
+        let pending = (self.core.hot.interrupts.load(Ordering::Relaxed) as u32) & EXT_INT_MASK;
+        if pending != *last_pending {
+            if *acc > 0 {
+                j.delta(*acc);
+                *acc = 0;
+            }
+            j.interrupt(self.core.hot.cycles, pending);
+            *last_pending = pending;
+        }
+    }
+
+    /// Flush an accumulated delta and append an `Exception` entry when the
+    /// just-retired step delivered one.
+    fn journal_note_status(
+        &self,
+        j: &mut crate::cpu::journal::Journal,
+        acc: &mut u64,
+        status: ExecStatus,
+    ) {
+        if status & EXEC_IS_EXCEPTION != 0 {
+            if *acc > 0 {
+                j.delta(*acc);
+                *acc = 0;
+            }
+            let code = (status & crate::cpu::mips_core::CAUSE_EXCCODE_MASK)
+                >> crate::cpu::mips_core::CAUSE_EXCCODE_SHIFT;
+            j.exception(self.core.hot.cycles, code);
+        }
+    }
+
     /// JIT-aware step: fetch, then run the real jitv2 dispatch gate inline
     /// (compile scheduling, inline compile, JIT entry). Deliberately does
     /// NOT run `step_preamble!` itself: cycles/timer/interrupt/breakpoint
@@ -11209,6 +11346,48 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Ok(executed)
     }
 
+    /// Append a checkpoint fence to `j` at the current guest cycle. See
+    /// `cpu::journal`.
+    pub fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) -> Result<(), String> {
+        let exec = self.try_lock_executor()?;
+        exec.journal_checkpoint(j, tag);
+        Ok(())
+    }
+
+    /// Record `n` retired guest cycles into `j` — see
+    /// `MipsExecutor::journal_record`. `last_pending` carries the interrupt
+    /// word view across calls.
+    pub fn journal_record(
+        &self,
+        j: &mut crate::cpu::journal::Journal,
+        n: u64,
+        last_pending: &mut u32,
+    ) -> Result<(), String> {
+        let mut exec = self.try_lock_executor()?;
+        exec.journal_record(j, n, last_pending);
+        Ok(())
+    }
+
+    /// Re-drive `recording` from the current CPU state and return the
+    /// observed event stream — see `MipsExecutor::journal_replay`.
+    pub fn journal_replay(&self, recording: &crate::cpu::journal::Journal) -> Result<crate::cpu::journal::Journal, String> {
+        let mut exec = self.try_lock_executor()?;
+        Ok(exec.journal_replay(recording))
+    }
+
+    /// Current guest cycle (`hot.cycles`).
+    pub fn current_cycle(&self) -> u64 {
+        self.try_lock_executor().map(|e| e.core.hot.cycles).unwrap_or(0)
+    }
+
+    /// Externally-driven pending interrupt word (Cause.IP positions).
+    pub fn pending_interrupts(&self) -> u32 {
+        self.try_lock_executor()
+            .map(|e| (e.core.hot.interrupts.load(Ordering::Relaxed) as u32)
+                & crate::cpu::mips_core::CAUSE_IP_MASK)
+            .unwrap_or(0)
+    }
+
     /// Step exactly one instruction and return how many architectural
     /// instructions it actually retired, per `core.hot.cycles`' delta.
     /// Ordinarily 1 (the interpreter's dispatch always retires exactly one
@@ -14605,6 +14784,12 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn load_elf(&self, path: &str) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
     fn step_n_inline(&self, n: u64) -> Result<u64, String>;
+    /// Guest-cycle record/replay journal (issue #47); see `cpu::journal`.
+    fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) -> Result<(), String>;
+    fn journal_record(&self, j: &mut crate::cpu::journal::Journal, n: u64, last_pending: &mut u32) -> Result<(), String>;
+    fn journal_replay(&self, recording: &crate::cpu::journal::Journal) -> Result<crate::cpu::journal::Journal, String>;
+    fn current_cycle(&self) -> u64;
+    fn pending_interrupts(&self) -> u32;
     #[cfg(feature = "developer")]
     fn step_one_inline_counting_instructions(&self) -> Result<usize, String>;
     fn state_digest(&self) -> Result<CpuStateDigest, String>;
@@ -14651,6 +14836,17 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
     fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
+    fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) -> Result<(), String> {
+        MipsCpu::journal_checkpoint(self, j, tag)
+    }
+    fn journal_record(&self, j: &mut crate::cpu::journal::Journal, n: u64, last_pending: &mut u32) -> Result<(), String> {
+        MipsCpu::journal_record(self, j, n, last_pending)
+    }
+    fn journal_replay(&self, recording: &crate::cpu::journal::Journal) -> Result<crate::cpu::journal::Journal, String> {
+        MipsCpu::journal_replay(self, recording)
+    }
+    fn current_cycle(&self) -> u64 { MipsCpu::current_cycle(self) }
+    fn pending_interrupts(&self) -> u32 { MipsCpu::pending_interrupts(self) }
     #[cfg(feature = "developer")]
     fn step_one_inline_counting_instructions(&self) -> Result<usize, String> {
         MipsCpu::step_one_inline_counting_instructions(self)
