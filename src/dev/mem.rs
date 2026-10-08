@@ -64,10 +64,14 @@ impl Memory {
     #[cfg(feature = "jitv2")]
     #[inline(always)]
     fn bump_gen(&self, addr: u32) {
-        let page = ((addr & self.addr_mask) as usize) / JITV2_PAGE_SIZE;
+        let addr = addr & self.addr_mask;
+        let page = (addr as usize) / JITV2_PAGE_SIZE;
         // Relaxed: the publish-side gen re-check (§6.5) re-reads this counter after its
         // own release fetch_or on entry_bits, so ordering is provided there, not here.
         self.gen[page].fetch_add(1, Ordering::Relaxed);
+        // Active-region SMC: an external/DMA write that lands on a compiled
+        // line of the executing page latches its `smc_hit` (no-op otherwise).
+        crate::cpu::jitv2::jitv2::note_phys_write(addr);
     }
 
     /// JIT v2: raw pointer to the generation counter for the page containing `addr`.
@@ -304,6 +308,12 @@ impl BusDevice for Memory {
                     self.gen[page].fetch_add(1, Ordering::Relaxed);
                 }
             }
+            // Active-region SMC: a DMA block write that overlaps a compiled line
+            // of the executing page latches its `smc_hit`.
+            crate::cpu::jitv2::jitv2::note_phys_write_range(
+                addr & self.addr_mask,
+                (buf.len().max(1) as u32) * 8,
+            );
         }
         BUS_OK
     }

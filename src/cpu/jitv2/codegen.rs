@@ -2148,6 +2148,11 @@ impl Codegen {
             if !skip_interrupt_preamble.contains(&word) {
                 emit_pending_interrupt_preamble(&mut ctx, exit_block, word);
             }
+            // Active-region SMC safe point — unconditional (unlike the
+            // interrupt preamble above): a self-modifying loop's store must be
+            // observed on the very next instruction, not deferred to the next
+            // coalesced run. The latch is a single byte, usually clear.
+            emit_smc_preamble(&mut ctx, exit_block, word);
             // Developer per-instruction hook (dt traceback + PC breakpoints),
             // right after the interrupt check — the same per-instruction point
             // the interpreter's step() does its trace/breakpoint work, so a
@@ -2867,6 +2872,106 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
     // next GPR read (which would defeat forwarding across every checked
     // instruction).
     ctx.forward.bless(continue_block);
+}
+
+/// Active-region SMC force-exit safe point, emitted before every compiled
+/// head instruction (mirroring `emit_pending_interrupt_preamble`'s
+/// placement): if `*core.jit_smc_hit` is set — a CPU inline store or an
+/// external/DMA write landed on a compiled line of the page this region is
+/// executing — clear the latch and bail with `EXEC_FALLBACK` at `word_offset`,
+/// so `step_jit` runs the interpreter here and the next dispatch sees the
+/// bumped page generation and recompiles.
+///
+/// This is what closes the "native loop patches its own body and branches
+/// backward" window: without it, a backward branch inside one compiled
+/// function never re-consults `is_runnable`. See
+/// `docs/research/b01-jit-smc.md`.
+fn emit_smc_preamble(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+    // `core.jit_smc_hit` is always a valid pointer (SMC_IDLE_HIT when no page
+    // is active), so no null check is needed.
+    let hit_ptr = ctx.builder.ins().load(
+        ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_smc_hit()));
+    let hit = ctx.builder.ins().load(ir::types::I8, mem, hit_ptr,
+        ir::immediates::Offset32::new(0));
+    let zero = ctx.builder.ins().iconst(ir::types::I8, 0);
+    let taken = ctx.builder.ins().icmp(IntCC::NotEqual, hit, zero);
+
+    let bail_block = ctx.builder.create_block();
+    let continue_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(taken, bail_block, &[], continue_block, &[]);
+
+    ctx.builder.switch_to_block(bail_block);
+    ctx.builder.set_cold_block(bail_block);
+    ctx.builder.seal_block(bail_block);
+    // Clear the latch before bailing: the region is about to exit and the next
+    // dispatch recompiles, so a stale latch would just force a redundant exit.
+    let zero2 = ctx.builder.ins().iconst(ir::types::I8, 0);
+    ctx.builder.ins().store(mem, zero2, hit_ptr, ir::immediates::Offset32::new(0));
+    emit_bail(ctx, exit_block, word_offset, EXEC_FALLBACK);
+
+    ctx.builder.switch_to_block(continue_block);
+    ctx.builder.seal_block(continue_block);
+    ctx.forward.bless(continue_block);
+}
+
+/// Store-side half of the active-region SMC probe, emitted in
+/// `emit_mem_write_split`'s inline fast path (the only store path that
+/// bypasses `write_data_impl`). Tests the store's 16-byte line against the
+/// executing page's `compiled_lines` bitmap and, on a hit, latches
+/// `*core.jit_smc_hit`. Leaves the builder positioned in a fresh continuation
+/// block (the caller's subsequent instructions continue there).
+fn emit_smc_store_latch(ctx: &mut EmitCtx, fast_phys: Value) {
+    let mem = MemFlagsData::trusted();
+    let ptr_ty = ctx.module.target_config().pointer_type();
+
+    // same = (fast_phys >> 12) == core.jit_active_pfn
+    let store_pfn64 = ctx.builder.ins().ushr_imm_s(fast_phys, 12);
+    let store_pfn = ctx.builder.ins().ireduce(ir::types::I32, store_pfn64);
+    let active_pfn = ctx.builder.ins().load(
+        ir::types::I32, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_active_pfn()));
+    let same = ctx.builder.ins().icmp(IntCC::Equal, active_pfn, store_pfn);
+
+    // line = (fast_phys >> LINE_SHIFT) & (LINES_PER_PAGE - 1)
+    let line = ctx.builder.ins().ushr_imm_s(fast_phys, crate::cpu::jitv2::LINE_SHIFT as i64);
+    let line = ctx.builder.ins().band_imm_s(line, (crate::cpu::jitv2::LINES_PER_PAGE as i64) - 1);
+
+    // word = *(core.jit_smc_lines + (line >> 6) * 8)
+    let word_index = ctx.builder.ins().ushr_imm_s(line, 6);
+    let word_off = ctx.builder.ins().imul_imm_s(word_index, 8);
+    let lines_ptr = ctx.builder.ins().load(
+        ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_smc_lines()));
+    let word_addr = ctx.builder.ins().iadd(lines_ptr, word_off);
+    let word = ctx.builder.ins().load(ir::types::I64, mem, word_addr,
+        ir::immediates::Offset32::new(0));
+
+    // hit = (word >> (line & 63)) & 1
+    let shift = ctx.builder.ins().band_imm_s(line, 63);
+    let bit = ctx.builder.ins().ushr(word, shift);
+    let bit = ctx.builder.ins().band_imm_s(bit, 1);
+    let hit = ctx.builder.ins().icmp_imm_s(IntCC::NotEqual, bit, 0);
+    let latch = ctx.builder.ins().band(same, hit);
+
+    let set_block = ctx.builder.create_block();
+    let cont_block = ctx.builder.create_block();
+    ctx.builder.ins().brif(latch, set_block, &[], cont_block, &[]);
+
+    ctx.builder.switch_to_block(set_block);
+    ctx.builder.set_cold_block(set_block);
+    ctx.builder.seal_block(set_block);
+    let hit_ptr = ctx.builder.ins().load(
+        ptr_ty, mem, ctx.core_ptr,
+        ir::immediates::Offset32::new(core_offset_of_jit_smc_hit()));
+    let one = ctx.builder.ins().iconst(ir::types::I8, 1);
+    ctx.builder.ins().store(mem, one, hit_ptr, ir::immediates::Offset32::new(0));
+    ctx.builder.ins().jump(cont_block, &[]);
+
+    ctx.builder.switch_to_block(cont_block);
+    ctx.builder.seal_block(cont_block);
 }
 
 /// Region-wide FR-mode guard: emitted once, in `entry_block`, only when the
@@ -4047,6 +4152,14 @@ fn core_offset_of_jit_tc_base() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_b
 fn core_offset_of_jit_tc_gen() -> i32 { std::mem::offset_of!(MipsCore, jit_tc_gen) as i32 }
 fn core_offset_of_jit_l2_tags() -> i32 { std::mem::offset_of!(MipsCore, jit_l2_tags) as i32 }
 
+/// Offsets of the active-region SMC force-exit state in `MipsCore` — see that
+/// field's doc comment. `jit_smc_lines` and `jit_smc_hit` are always-valid
+/// pointers (idle statics when no page is active), so the emitted store-side
+/// test is branchless apart from the final latch.
+fn core_offset_of_jit_active_pfn() -> i32 { std::mem::offset_of!(MipsCore, jit_active_pfn) as i32 }
+fn core_offset_of_jit_smc_lines() -> i32 { std::mem::offset_of!(MipsCore, jit_smc_lines) as i32 }
+fn core_offset_of_jit_smc_hit() -> i32 { std::mem::offset_of!(MipsCore, jit_smc_hit) as i32 }
+
 /// Byte offset of `L1DTag::ptag` / `::dirty`, and the tag stride. Taken with
 /// `offset_of!` (the type is `#[repr(C)]`) rather than hardcoded — see
 /// docs/jit-inline-memory.md §3.1.
@@ -4986,6 +5099,14 @@ fn emit_mem_write_split(
             ctx.builder.ins().store(mem, new_tag, tp, ir::immediates::Offset32::new(0));
         }
     }
+
+    // Active-region SMC: if this store hits a compiled line of the page
+    // currently executing, latch that page's `smc_hit` so the next
+    // per-instruction preamble force-exits and recompiles. This is the one
+    // store path that bypasses `write_data_impl`/`smc_note_write`; the callout
+    // path below already reaches it. Placed after the generation bump so the
+    // write's recompile-invalidation and its force-exit are ordered together.
+    emit_smc_store_latch(ctx, path.fast_phys);
 
     // The inline path cannot fault (the guard already checked every failure
     // condition), so its status is a constant that folds away — where the old

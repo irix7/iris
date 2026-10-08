@@ -209,6 +209,52 @@ pub const ENTRIES_PER_PAGE: usize = (PAGE_SIZE / 4) as usize;
 /// u64 words needed for a 1-bit-per-entry bitmap over `ENTRIES_PER_PAGE` offsets.
 pub const BITMAP_WORDS: usize = ENTRIES_PER_PAGE / 64;
 
+/// SMC compiled-line granularity: one bit marks a 16-byte line (4 guest
+/// instructions) that some published compiled region actually covers. 16 B is
+/// the R4400 I$ line; using it as the common denominator also covers the
+/// R5000's 32 B line (a write to any quarter of a 32 B line marks the line
+/// containing it), at the cost of a finer-than-necessary match on R5000.
+///
+/// A write only has to match a *compiled* line, not the whole 4 KiB page, to
+/// be treated as self-modifying code — this is the correlation the SMC probe
+/// was missing (§7 as-built "staleness window"; `docs/research/b01-jit-smc.md`).
+pub const LINE_SHIFT: u32 = 4;
+/// Number of 16-byte lines in a page.
+pub const LINES_PER_PAGE: usize = (PAGE_SIZE as usize) >> LINE_SHIFT;
+/// u64 words needed for a 1-bit-per-line bitmap over `LINES_PER_PAGE` lines.
+pub const LINE_BITMAP_WORDS: usize = LINES_PER_PAGE / 64;
+
+/// One line's bit index within the interleaved word bitmap.
+#[inline]
+fn line_bit(line: usize) -> u64 {
+    1u64 << (line & 63)
+}
+
+/// Build a compiled-line bitmap from a compile's `used` word bitmap (`used` is
+/// one bit per decoded guest word — see `CompileSnapshot::used`). A line is
+/// marked iff any word in it was decoded, i.e. the region actually covers it.
+pub fn lines_from_used(used: &[u64; BITMAP_WORDS]) -> [u64; LINE_BITMAP_WORDS] {
+    let mut lines = [0u64; LINE_BITMAP_WORDS];
+    for (w, &word) in used.iter().enumerate() {
+        let mut bits = word;
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let word_index = w * 64 + b; // 0..ENTRIES_PER_PAGE
+            let line = word_index >> (LINE_SHIFT - 2); // 4 words = 16 B
+            lines[line >> 6] |= line_bit(line);
+        }
+    }
+    lines
+}
+
+/// Build a compiled-line bitmap from a set of published entry offsets only.
+/// Used by the test-facing `publish` shim; the production path passes the
+/// fuller `used`-derived bitmap via `publish_with_lines`.
+pub fn lines_from_entries(entries: &[u64; BITMAP_WORDS]) -> [u64; LINE_BITMAP_WORDS] {
+    lines_from_used(entries)
+}
+
 // ============================================================================
 // Local Tunables & Sentinels
 // ============================================================================
@@ -600,6 +646,63 @@ impl JitStats {
 /// that scenario correct or fast, just of not crashing on it.
 static NEVER_COMPILABLE_GEN: AtomicU64 = AtomicU64::new(0);
 
+/// The page whose compiled code a CPU executor is currently running, published
+/// so RAM writers that are *not* on the CPU thread (DMA engines, device
+/// threads) can still run the SMC line probe against it: see
+/// [`note_phys_write`]. Null when no page is active. `PhysicalCodePage`
+/// addresses are stable for a process's lifetime (the page pool never
+/// reallocates a slot — [`Jitv2`] pre-allocates its capacity and reuses slots
+/// via `reset_to_unclaimed`), so a raw pointer is safe to hold here.
+///
+/// One `Machine` per process (CLAUDE.md), so a single global is coherent; CPU
+/// stores in tests use their own mock RAM devices and never reach
+/// [`note_phys_write`], so parallel test executors cannot cross-contaminate
+/// each other's active-page field.
+static ACTIVE_SMC_PAGE: std::sync::atomic::AtomicPtr<PhysicalCodePage> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Publish (or clear) the executor's active page for the DMA-side SMC probe.
+/// Called from `MipsExecutor::set_pcp`/`clear_pcp`, never directly.
+pub fn set_active_smc_page(page: *mut PhysicalCodePage) {
+    ACTIVE_SMC_PAGE.store(page, Ordering::Release);
+}
+
+/// A zeroed lines bitmap compiled code uses when no page is active, so
+/// `MipsCore::jit_smc_lines` is always a valid pointer (the inline-store SMC
+/// test is branchless — no null check, §7's "cheap pointer/bitmap test").
+pub static SMC_IDLE_LINES: [AtomicU64; LINE_BITMAP_WORDS] =
+    [const { AtomicU64::new(0) }; LINE_BITMAP_WORDS];
+
+/// The idle `smc_hit` byte `MipsCore::jit_smc_hit` points at when no page is
+/// active — same always-valid reasoning as [`SMC_IDLE_LINES`].
+pub static SMC_IDLE_HIT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// DMA/device-side SMC probe (radar: `docs/research/b01-jit-smc.md`
+/// Recommendation 3). Called from the RAM devices' write paths, which run on
+/// device threads and have no `MipsCore` to consult — it resolves the active
+/// page from [`ACTIVE_SMC_PAGE`] and latches that page's `smc_hit` when the
+/// write lands on a compiled line. The running region's next preamble then
+/// force-exits and recompiles. A no-op when no page is active.
+#[inline]
+pub fn note_phys_write(phys: u32) {
+    let page = ACTIVE_SMC_PAGE.load(Ordering::Acquire);
+    if !page.is_null() {
+        // SAFETY: the pointer is only ever published for a claimed, stable
+        // page slot (see ACTIVE_SMC_PAGE's doc comment).
+        unsafe { (*page).note_write(phys); }
+    }
+}
+
+/// [`note_phys_write`] for a `[phys, phys+len)` DMA block write.
+#[inline]
+pub fn note_phys_write_range(phys: u32, len: u32) {
+    let page = ACTIVE_SMC_PAGE.load(Ordering::Acquire);
+    if !page.is_null() {
+        // SAFETY: as `note_phys_write`.
+        unsafe { (*page).note_write_range(phys, len); }
+    }
+}
+
 /// Per-physical-page code cache metadata (§13.1 — one compiled function per
 /// page, internal dispatch by entry offset, superseding the old one-function-
 /// per-entry `JitEntry` table). One instance per physical RAM/ROM page that
@@ -638,6 +741,20 @@ pub struct PhysicalCodePage {
     /// Authoritative for dispatch together with `entry_gen` — see
     /// `is_runnable`.
     compiled: EntryBitmap,
+    /// 16-byte lines the installed `func` actually covers (union of every
+    /// decoded word, from the compile's `used` bitmap). The write side tests
+    /// a store's line against this so a write that only touches data sharing
+    /// the page is *not* mistaken for self-modifying code. Written under
+    /// `publish_lock` together with `func`/`compiled`/`entry_gen`; cleared by
+    /// `reset_entries_and_bitmaps`.
+    compiled_lines: [AtomicU64; LINE_BITMAP_WORDS],
+    /// Set (by a CPU store or an external/DMA write) when a write landed on a
+    /// compiled line while this page was the one being executed. The compiled
+    /// code observes and clears it at its next per-instruction preamble and
+    /// force-exits the region, which then recompiles against the new bytes.
+    /// Cross-thread: a DMA writer sets it from a device thread, so it is an
+    /// atomic rather than a plain byte.
+    smc_hit: std::sync::atomic::AtomicU8,
     /// The page's one compiled function, or null if nothing has published
     /// yet. Validity is owned by `compiled`'s bits together with `entry_gen`
     /// matching `current_gen()` — see `is_runnable`.
@@ -1165,6 +1282,8 @@ impl PhysicalCodePage {
             requested: new_bitmap(),
             denied: new_bitmap_all_set(),
             compiled: new_bitmap(),
+            compiled_lines: std::array::from_fn(|_| AtomicU64::new(0)),
+            smc_hit: std::sync::atomic::AtomicU8::new(0),
             func: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             func_fr1: std::sync::atomic::AtomicBool::new(false),
             entry_gen: AtomicU64::new(0),
@@ -1215,6 +1334,8 @@ impl PhysicalCodePage {
         // (inverted sense: 0 means "still eligible" would make every reset
         // page permanently denylisted everywhere).
         for word in self.denied.iter() { word.store(u64::MAX, Ordering::Relaxed); }
+        for word in self.compiled_lines.iter() { word.store(0, Ordering::Relaxed); }
+        self.smc_hit.store(0, Ordering::Relaxed);
         self.func.store(std::ptr::null_mut(), Ordering::Relaxed);
         self.func_fr1.store(false, Ordering::Relaxed);
         // The snapshot describes the `func` just dropped — see
@@ -1754,6 +1875,83 @@ impl PhysicalCodePage {
         bitmap_snapshot(&self.denied)
     }
 
+    /// Overwrite the compiled-line bitmap for the function a publish is about
+    /// to install. Called under `publish_lock` by [`Self::publish_with_lines`],
+    /// so the lines and `func`/`compiled`/`entry_gen` always describe one
+    /// compile. `lines` is the union of every word the region decoded
+    /// (`lines_from_used`), not just its published entries — a self-modifying
+    /// loop patching a non-entry instruction in its own body must still match.
+    #[inline]
+    pub fn set_compiled_lines(&self, lines: &[u64; LINE_BITMAP_WORDS]) {
+        for i in 0..LINE_BITMAP_WORDS {
+            self.compiled_lines[i].store(lines[i], Ordering::Release);
+        }
+    }
+
+    /// Raw pointer to the compiled-line bitmap, for `MipsCore::jit_smc_lines`
+    /// so compiled code can test a store's line without an extra indirection.
+    /// Stable for the page's lifetime (the pool never reallocates a slot).
+    #[inline]
+    pub fn compiled_lines_ptr(&self) -> *const AtomicU64 {
+        self.compiled_lines.as_ptr()
+    }
+
+    /// Raw pointer to this page's `smc_hit` byte, for `MipsCore::jit_smc_hit`
+    /// (the preamble reads it to force-exit on an external/DMA write).
+    #[inline]
+    pub fn smc_hit_ptr(&self) -> *const std::sync::atomic::AtomicU8 {
+        &self.smc_hit as *const _
+    }
+
+    /// The raw `smc_hit` byte, for callers that hold the page directly.
+    #[inline]
+    pub fn smc_hit(&self) -> bool {
+        self.smc_hit.load(Ordering::Acquire) != 0
+    }
+
+    /// The SMC probe: does `phys` (translated physical address) land on a
+    /// 16-byte line this page currently executes? Returns `true` and latches
+    /// `smc_hit` when it does. A write to data sharing the page but outside
+    /// every compiled line returns `false` and latches nothing — the
+    /// line-granular correlation `rules/jitv2/smc-writes-to-executing-page.md`
+    /// asks for.
+    #[inline]
+    pub fn note_write(&self, phys: u32) -> bool {
+        if (phys >> 12) != self.pfn {
+            return false;
+        }
+        let line = ((phys >> LINE_SHIFT) as usize) & (LINES_PER_PAGE - 1);
+        let hit = self.compiled_lines[line >> 6].load(Ordering::Acquire) & line_bit(line) != 0;
+        if hit {
+            self.smc_hit.store(1, Ordering::Release);
+        }
+        hit
+    }
+
+    /// [`Self::note_write`] for a `[phys, phys+len)` range (a DMA block write):
+    /// latches `smc_hit` if any compiled line the range covers is on this page.
+    /// Leaves the line granularity intact — a block write to uncompiled parts
+    /// of the page does not force an exit.
+    #[inline]
+    pub fn note_write_range(&self, phys: u32, len: u32) -> bool {
+        let base = self.pfn << 12;
+        let end = phys.saturating_add(len.max(1));
+        if end <= base || phys >= base.saturating_add(PAGE_SIZE) {
+            return false;
+        }
+        let lo = phys.max(base);
+        let hi = end.min(base.saturating_add(PAGE_SIZE));
+        let first = ((lo - base) >> LINE_SHIFT) as usize;
+        let last = (((hi - 1 - base) >> LINE_SHIFT) as usize).min(LINES_PER_PAGE - 1);
+        for line in first..=last {
+            if self.compiled_lines[line >> 6].load(Ordering::Acquire) & line_bit(line) != 0 {
+                self.smc_hit.store(1, Ordering::Release);
+                return true;
+            }
+        }
+        false
+    }
+
     /// `comp.rs`'s `prepare_multi_entry_compile` candidate set, computed in
     /// one pass: `(requested | compiled) & denied` per word (`denied`'s raw,
     /// inverted sense — a set bit there means "still eligible", so ANDing
@@ -1846,6 +2044,28 @@ impl PhysicalCodePage {
         code_size: u32,
         fr1: bool,
     ) -> bool {
+        // Test/shim entry point: derive the compiled-line set from the
+        // published entries alone. The production compile paths know the
+        // fuller `used` set (every decoded word) and call
+        // `publish_with_lines` so a self-modifying write to a non-entry word
+        // is still caught.
+        let lines = lines_from_entries(new_entries);
+        self.publish_with_lines(new_entries, &lines, func, snap_gen, instr_count, code_size, fr1)
+    }
+
+    /// [`Self::publish`] with an explicit compiled-line bitmap
+    /// (`lines_from_used` over the compile's `used` word set). See
+    /// [`Self::set_compiled_lines`].
+    pub fn publish_with_lines(
+        &self,
+        new_entries: &[u64; BITMAP_WORDS],
+        lines: &[u64; LINE_BITMAP_WORDS],
+        func: *const (),
+        snap_gen: u64,
+        instr_count: usize,
+        code_size: u32,
+        fr1: bool,
+    ) -> bool {
         let _guard = self.publish_lock.lock();
 
         if self.current_gen() > snap_gen {
@@ -1865,6 +2085,10 @@ impl PhysicalCodePage {
         if same_gen && !mode_switch && bitmap_is_subset_of(new_entries, &self.compiled) {
             return false; // some other compile already published everything this one covers, for this same generation and mode
         }
+
+        // The compiled-line set describes the function being installed, so it
+        // is written under the same lock as `func`/`compiled`/`entry_gen`.
+        self.set_compiled_lines(lines);
 
         // Safety: `func` is a raw pointer write behind `&self` — sound
         // because no concurrent reader trusts it without first Acquire-
@@ -3806,6 +4030,64 @@ mod tests {
         let mut page = Box::new(PhysicalCodePage::new(UNCLAIMED_PFN, std::ptr::null()));
         page.claim(0x1234, std::ptr::null(), fr1);
         page
+    }
+
+    /// The compiled-line bitmap is a 16-byte-line projection of a compile's
+    /// `used` word bitmap: every word that was decoded marks its line.
+    #[test]
+    fn lines_from_used_maps_words_to_16b_lines() {
+        let mut used = [0u64; BITMAP_WORDS];
+        // Words 0 and 3 -> line 0; word 4 -> line 1; word 64 -> line 16.
+        used[0] = (1 << 0) | (1 << 3) | (1 << 4);
+        used[1] = 1 << 0;
+        let lines = lines_from_used(&used);
+        assert_eq!(lines[0], (1u64 << 0) | (1u64 << 1) | (1u64 << 16),
+            "one line per four words, 16-byte lines");
+        assert_eq!(lines[1..], [0, 0, 0]);
+    }
+
+    /// The SMC probe is line-granular: a write to a compiled line latches
+    /// `smc_hit`, a write to a different (or uncompiled) line does not. This
+    /// is the correlation `rules/jitv2/smc-writes-to-executing-page.md` asks
+    /// for — data sharing the code page must not be mistaken for SMC.
+    #[test]
+    fn smc_note_write_matches_only_compiled_lines() {
+        let page = claimed_page(false);
+        let mut lines = [0u64; LINE_BITMAP_WORDS];
+        lines[0] = 1 << 0; // line 0 only
+        page.set_compiled_lines(&lines);
+        let base = 0x1234u32 << 12;
+
+        assert!(page.note_write(base), "write to the compiled line 0 must hit");
+        assert!(page.smc_hit(), "a hit must latch smc_hit");
+
+        page.smc_hit.store(0, Ordering::Relaxed);
+        assert!(!page.note_write(base + 16), "line 1 is not compiled: no hit");
+        assert!(!page.smc_hit(), "an uncompiled-line write must not latch smc_hit");
+
+        assert!(!page.note_write((0x1235u32) << 12), "a write to another page must not hit");
+    }
+
+    /// A DMA block write spanning several lines hits if any covered line is
+    /// compiled, and stays silent for a range entirely outside the compiled
+    /// lines.
+    #[test]
+    fn smc_note_write_range_matches_any_compiled_line() {
+        let mut page = claimed_page(false);
+        let mut lines = [0u64; LINE_BITMAP_WORDS];
+        lines[0] = 1 << 5; // line 5, bytes 0x50..=0x5F
+        page.set_compiled_lines(&lines);
+        let base = 0x1234u32 << 12;
+
+        assert!(!page.note_write_range(base, 0x50), "range ends before line 5");
+        assert!(!page.smc_hit());
+        assert!(page.note_write_range(base + 0x40, 0x20), "range covers line 5");
+        assert!(page.smc_hit());
+
+        // A reset drops the compiled-line map and the latch.
+        page.reset_compiled_state();
+        assert!(!page.note_write(base + 0x50), "reset clears compiled_lines");
+        assert!(!page.smc_hit(), "reset clears smc_hit");
     }
 
     /// A page recycled between processes of different ABIs (o32 FR=0 ->

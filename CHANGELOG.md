@@ -324,6 +324,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### JIT v2
 
+- **2026-10-09 — Active-region SMC detection and force-exit** (#39): a
+  per-page compiled-line bitmap (16-byte lines, plus a range form for block
+  writes) correlates a write with the code a region actually executes instead
+  of the whole 4 KiB page. CPU inline/interpreter stores and DMA/`PpMemory`
+  writes latch the executing page's `smc_hit`, and a new per-instruction
+  compiled-code preamble force-exits the region (`EXEC_FALLBACK`) so the next
+  dispatch sees the bumped generation and recompiles — closing the native
+  self-modifying-loop window where a backward branch kept running stale code.
+  See [B01 research](docs/research/b01-jit-smc.md).
 - **2026-09-21 — Whole-page compilation becomes the only implementation**
   (`8dfc365`): remove per-entry compilation; `j2wp` remains a compatibility
   alias for `jitv2`. Flushes no longer requeue preserved entry sets, and

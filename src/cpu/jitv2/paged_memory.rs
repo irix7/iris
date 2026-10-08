@@ -262,6 +262,9 @@ pub struct PublishInfo {
     /// Every entry offset this compile covers. Consumed by
     /// `PhysicalCodePage::publish(new_entries, ...)`.
     pub new_entries: [u64; crate::cpu::jitv2::BITMAP_WORDS],
+    /// 16-byte compiled lines the region covers (`lines_from_used`), consumed
+    /// by `PhysicalCodePage::publish_with_lines` for active-region SMC.
+    pub lines: [u64; crate::cpu::jitv2::LINE_BITMAP_WORDS],
     pub gen_snap: u64,
     pub instr_count: usize,
     pub code_size: u32,
@@ -287,6 +290,7 @@ impl PublishInfo {
         Self {
             page: std::ptr::null_mut(),
             new_entries: [0u64; crate::cpu::jitv2::BITMAP_WORDS],
+            lines: [0u64; crate::cpu::jitv2::LINE_BITMAP_WORDS],
             gen_snap: 0,
             instr_count: 0,
             code_size: 0,

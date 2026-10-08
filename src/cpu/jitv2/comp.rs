@@ -505,7 +505,8 @@ pub fn handle_request(
             // `func` currently installed, and `publish`'s two early-outs
             // (stale gen, subsumed) leave someone else's code in place.
             page.stage_compile_snapshot(&inputs.words, &inputs.used, &new_entries, gen_snap, req.compiled_for_fr1);
-            if page.publish(&new_entries, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1) {
+            let lines = crate::cpu::jitv2::jitv2::lines_from_used(&inputs.used);
+            if page.publish_with_lines(&new_entries, &lines, jit_fn as *const (), gen_snap, instr_count, code_size, req.compiled_for_fr1) {
                 page.clear_requested_bits(&new_entries);
                 page.commit_compile_snapshot(gen_snap, &new_entries, req.compiled_for_fr1);
             }
@@ -736,7 +737,9 @@ pub fn handle_request_deferred(
             // sweeps run — see `Codegen::last_finalize_failed`'s own doc
             // comment for the real bug this distinction fixes.
             let publish = crate::cpu::jitv2::paged_memory::PublishInfo {
-                page: req.page, new_entries, gen_snap, instr_count, code_size,
+                page: req.page, new_entries,
+                lines: crate::cpu::jitv2::jitv2::lines_from_used(&inputs.used),
+                gen_snap, instr_count, code_size,
                 compiled_for_fr1: req.compiled_for_fr1,
                 jit_fn: None,
             };
@@ -810,7 +813,7 @@ fn publish_all(sealed: &[crate::cpu::jitv2::paged_memory::PublishInfo]) {
         // see the comment there for why this plus `publish`'s `gen_snap` check
         // covers every case. Deferred entries sat in the seal queue for even
         // longer than an inline compile, so the window is wider here.
-        if page.publish(&entry.new_entries, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
+        if page.publish_with_lines(&entry.new_entries, &entry.lines, jit_fn as *const (), entry.gen_snap, entry.instr_count, entry.code_size, entry.compiled_for_fr1) {
             page.clear_requested_bits(&entry.new_entries);
             // Vouch for the record `handle_request_deferred` staged for this
             // compile — matched by `gen_snap`+`new_entries`, so a record

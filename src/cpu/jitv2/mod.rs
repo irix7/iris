@@ -24,7 +24,7 @@ pub mod equiv_test;
 pub use jitv2::{
     CodeSizeBucket, CompileQueue, CompileRequest, JitFn, JitStats, Jitv2, PageSlot, Pfn, PhysicalCodePage,
     ARENA_RESERVE_SIZE, BITMAP_WORDS, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES, COMPILE_QUEUE_CAPACITY,
-    ENTRIES_PER_PAGE, JITV2_INITIAL_PAGE_CAPACITY, PAGE_SIZE,
+    ENTRIES_PER_PAGE, JITV2_INITIAL_PAGE_CAPACITY, PAGE_SIZE, LINE_BITMAP_WORDS, LINE_SHIFT, LINES_PER_PAGE,
     min_calls_before_compile, set_min_calls_before_compile,
 };
 pub use paged_memory::{PagedArenaMemoryProvider, PagedArenaState};

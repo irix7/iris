@@ -17,7 +17,7 @@
 mod tests {
     use crate::cpu::jitv2::analyzer::Analyzer;
     use crate::cpu::jitv2::codegen::Codegen;
-    use crate::cpu::jitv2::{JitFn, ENTRIES_PER_PAGE, PAGE_SIZE};
+    use crate::cpu::jitv2::{JitFn, ENTRIES_PER_PAGE, LINE_BITMAP_WORDS, PAGE_SIZE};
     use crate::cpu::mips_core::MipsCore;
     use crate::cpu::mips_exec::{MipsCpuConfig, MipsExecutor};
     use crate::cpu::mips_tlb::PassthroughTlb;
@@ -901,6 +901,114 @@ mod tests {
         // default (`j2 fallback`, see FALLBACK_ENABLED's own doc comment).
         assert_eq!(hits[1].2, crate::cpu::mips_exec::InstrOrigin::FallbackSuccessor,
             "second arrival (the loop back-edge) re-enters the same external dispatch head as the first arrival, so it reads the same static tag — FallbackSuccessor, not a runtime-tracked distinction");
+    }
+
+    /// Active-region SMC force-exit. A compiled region whose active page has a
+    /// latched `smc_hit` (a CPU or DMA write landed on one of its compiled
+    /// lines) must bail with `EXEC_FALLBACK` at the first per-instruction
+    /// preamble that runs, clearing the latch — rather than continuing to
+    /// execute stale code through a native back-edge. With the latch clear the
+    /// same region runs to completion.
+    ///
+    /// Uses a two-instruction region so the check is exercised on an inner
+    /// word (the entry word's external-dispatch path deliberately bypasses its
+    /// own preamble under `skip_entry_preamble`; the next dispatch's gen check
+    /// covers that case).
+    ///
+    /// Not run under `jitv2_lockstep`: that mode wraps every word in the
+    /// interpreter-reference lockstep bracket, whose own dispatch changes the
+    /// status a direct `jit_fn` call returns; the force-exit mechanism itself
+    /// is a plain codegen property and is verified here without that harness.
+    #[test]
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    fn smc_hit_forces_region_exit_at_the_next_preamble() {
+        let pc = 0xFFFF_FFFF_8000_5000u64;
+        let entry0 = ((pc & 0xFFF) / 4) as u16;
+        // word0: nop (entry, preamble skipped on external dispatch)
+        // word1: addiu r2, r0, 0x2a (preamble runs; must be skipped on bail)
+        let addiu = make_i(crate::cpu::mips_isa::OP_ADDIU, 0, 2, 0x2a);
+        let page = [
+            (entry0, 0u32),
+            (entry0 + 1, addiu),
+            (entry0 + 2, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        let mut page_words = [0u32; ENTRIES_PER_PAGE];
+        for &(w, raw) in &page { page_words[w as usize] = raw; }
+        let page_base = (pc & !(PAGE_SIZE as u64 - 1)) as u32;
+        let mut analyzer = Analyzer::new();
+        let (walked, non_empty) = analyzer.walk_bounded(&page_words, entry0, page_base, 2);
+        assert!(non_empty, "entry must be compilable");
+        let mut instrs = *walked;
+        let mut codegen = Codegen::new();
+        // skip_entry_preamble=true, as production uses: the entry word's own
+        // preamble is bypassed on external dispatch, so the latch is observed
+        // on the inner word — exactly the stale-loop case.
+        let jit_fn: JitFn = codegen.compile_region(&mut instrs, entry0, true, true)
+            .expect("two-instruction region must compile");
+
+        let (exec, mem) = seeded_executor([0u64; 32], pc);
+        let mut exec = Box::new(exec);
+        let phys_base = (page_base & 0x1FFF_FFFF) as u64;
+        for &(w, raw) in &page {
+            mem.set_word(page_base as u64 + (w as u64) * 4, raw);
+            mem.set_word(phys_base + (w as u64) * 4, raw);
+        }
+        exec.install_jit_hooks();
+
+        // Latch the active page's SMC hit and point the core at it.
+        let hit = std::sync::atomic::AtomicU8::new(1);
+        exec.core.jit_smc_hit = &hit as *const _;
+
+        let status = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        assert_eq!(status, crate::cpu::mips_exec::EXEC_FALLBACK,
+            "a latched SMC hit must force the region to bail");
+        assert_eq!(exec.core.gpr[2], 0, "the post-latch instruction must not have executed");
+        assert_eq!(hit.load(std::sync::atomic::Ordering::Relaxed), 0,
+            "the bail clears the latch so the region can make progress next dispatch");
+
+        // Latch clear: the same region runs normally. (The bail left core.pc
+        // at the inner word; re-enter from the region entry, as the dispatcher
+        // would after recompiling.)
+        exec.core.pc = pc;
+        let status2 = unsafe { jit_fn(&mut exec.core as *mut MipsCore) };
+        assert_eq!(status2, crate::cpu::mips_exec::EXEC_COMPLETE);
+        assert_eq!(exec.core.gpr[2], 0x2a, "the instruction executes once the latch is clear");
+
+        std::mem::forget(codegen);
+    }
+
+    /// Interpreter store-path integration: a guest store whose translated
+    /// physical address lands on a compiled line of the page the executor is
+    /// executing latches that page's `smc_hit`; a store to an uncompiled line
+    /// of the same page does not. Exercises the `write_data_impl` ->
+    /// `smc_note_write` wiring (the JIT callout path runs through the same
+    /// `write_data_impl`; the inline path is covered by the codegen latch).
+    #[test]
+    fn interpreter_store_latches_smc_hit_on_a_compiled_line() {
+        let pc = 0xFFFF_FFFF_8000_6000u64;
+        let (mut exec, _mem) = seeded_executor([0u64; 32], pc);
+        let phys_base = (pc as u32) & 0x1FFF_FFFF & !(PAGE_SIZE as u32 - 1);
+        let pfn = phys_base / PAGE_SIZE;
+        let page = {
+            let mut jit = exec.jitv2.lock();
+            let slot = jit.page_for(pfn, phys_base, exec.sysad.as_ref(), false)
+                .expect("fresh pool must have room for one page");
+            jit.page_ptr(slot)
+        };
+        let mut lines = [0u64; LINE_BITMAP_WORDS];
+        lines[0] = 1 << 2; // line 2: bytes 0x20..=0x2F
+        unsafe { (*page).set_compiled_lines(&lines); }
+        exec.pcp = page;
+        exec.core.cur_code_pfn = pfn;
+
+        exec.write_data::<4>(pc + 0x30, 0xdead_beef);
+        assert!(!unsafe { (*page).smc_hit() },
+            "a write outside every compiled line must not latch smc_hit");
+
+        exec.write_data::<4>(pc + 0x20, 0x1122_3344);
+        assert!(unsafe { (*page).smc_hit() },
+            "a write on a compiled line must latch smc_hit");
     }
 
     /// Diagnostic (not a strict regression gate): loads the REAL page

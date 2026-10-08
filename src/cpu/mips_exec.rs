@@ -1704,6 +1704,30 @@ unsafe fn exec_from_core<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void) -> *m
     }
 }
 
+/// Mirror the executor's active `PhysicalCodePage` into the `MipsCore` fields
+/// compiled code reads at its SMC safe points (`jit_active_pfn`,
+/// `jit_smc_lines`, `jit_smc_hit`) and publish it for the DMA-side probe
+/// (`jitv2::jitv2::note_phys_write`). Kept as one free function so the direct
+/// assignments in `jitv2_track_pcp` (which hold the `Jitv2` lock and cannot
+/// call `&mut self` methods) stay in lockstep with `set_pcp`.
+#[cfg(feature = "jitv2")]
+#[inline]
+fn sync_smc_active(core: &mut MipsCore, page: *mut crate::cpu::jitv2::PhysicalCodePage) {
+    if page.is_null() {
+        core.jit_active_pfn = u32::MAX;
+        core.jit_smc_lines = crate::cpu::jitv2::jitv2::SMC_IDLE_LINES.as_ptr();
+        core.jit_smc_hit = &crate::cpu::jitv2::jitv2::SMC_IDLE_HIT as *const _;
+    } else {
+        // SAFETY: `page` is a claimed pool slot; pfn/pointers are stable.
+        unsafe {
+            core.jit_active_pfn = (*page).pfn;
+            core.jit_smc_lines = (*page).compiled_lines_ptr();
+            core.jit_smc_hit = (*page).smc_hit_ptr();
+        }
+    }
+    crate::cpu::jitv2::jitv2::set_active_smc_page(page);
+}
+
 #[cfg(feature = "jitv2")]
 unsafe extern "C" fn jit_read8<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, va: u64, dst: *mut u64) -> u32 {
     let exec = unsafe { &mut *exec_from_core::<T, C>(ctx) };
@@ -3406,6 +3430,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         } else {
             unsafe { (*page).pfn }
         };
+        sync_smc_active(&mut self.core, page);
     }
 
     /// Drop the currently tracked code page — the `null` counterpart to
@@ -3415,6 +3440,26 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline]
     fn clear_pcp(&mut self) {
         self.set_pcp(std::ptr::null_mut());
+    }
+
+    /// Active-region SMC probe for an interpreter/CPU store: if `phys` lands on
+    /// a compiled line of the page currently executing, latch that page's
+    /// `smc_hit` so the running region force-exits at its next per-instruction
+    /// preamble. Line-granular — a write to data sharing the code page but
+    /// outside every compiled line is not SMC and latches nothing.
+    ///
+    /// The JIT inline store fast path bypasses this and is instrumented
+    /// directly in codegen (`emit_mem_write_split`); the JIT callout store path
+    /// reaches it through [`Self::write_data_impl`]. External/DMA writers reach
+    /// the same page latch through [`crate::cpu::jitv2::jitv2::note_phys_write`].
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn smc_note_write(&mut self, phys: u64) {
+        if self.pcp.is_null() {
+            return;
+        }
+        // SAFETY: `pcp` is a claimed, stable pool slot (see `set_pcp`).
+        unsafe { (*self.pcp).note_write(phys as u32); }
     }
 
     /// Capture the page pool's array base pointers for the lock-free
@@ -3496,6 +3541,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         if let Some(page) = self.jitv2_lookup_page_fast(pfn) {
             self.pcp = page;
             self.core.cur_code_pfn = pfn;
+            sync_smc_active(&mut self.core, page);
             debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
                 "jitv2_track_pcp fast path: pfn_map[{:#x}] pointed at a slot whose own pfn is {:#x}",
                 pfn, unsafe { (*self.pcp).pfn });
@@ -3520,6 +3566,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // exact without the borrow.
                 self.pcp = jit.page_ptr(slot);
                 self.core.cur_code_pfn = pfn;
+                sync_smc_active(&mut self.core, self.pcp);
                 // `pfn` here is the real physical frame number (`phys_addr`
                 // is post-translation, from nanotlb_translate's successful
                 // result — never a virtual page) — this must match the slot
@@ -3555,6 +3602,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // hit path above; `pfn` is what `set_pcp` would mirror.
                 self.pcp = jit.page_ptr(slot);
                 self.core.cur_code_pfn = pfn;
+                sync_smc_active(&mut self.core, self.pcp);
                 debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
                     "jitv2_track_pcp (post-flush retry): page_for({:#x}) returned a slot whose own pfn is {:#x}",
                     pfn, unsafe { (*self.pcp).pfn });
@@ -5268,6 +5316,14 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         #[cfg(all(feature = "jitv2", feature = "jitv2_smc_check"))]
         if !DEBUG {
             self.smc_check_write(virt_addr, phys_addr, SIZE);
+        }
+
+        // Active-region SMC force-exit: latch the executing page's `smc_hit`
+        // when this store lands on a compiled line, before the write commits.
+        // `DEBUG` (monitor/tooling) writes are excluded, same as the probe.
+        #[cfg(feature = "jitv2")]
+        if !DEBUG {
+            self.smc_note_write(phys_addr);
         }
 
         // Track memory write for undo if it's to lomem/himem (production only)

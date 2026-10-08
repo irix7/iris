@@ -306,6 +306,9 @@ impl PpMemory {
         // Relaxed for the same reason `Memory::bump_gen` is: the publish-side
         // re-check provides the ordering (jit-v2-design.md §6.5).
         unsafe { (*self.gen_base.add(page)).fetch_add(1, Ordering::Relaxed) };
+        // Active-region SMC: an external/DMA write that lands on a compiled
+        // line of the executing page latches its `smc_hit` (no-op otherwise).
+        crate::cpu::jitv2::jitv2::note_phys_write(self.off(addr) as u32);
     }
 
     /// JIT v2: raw pointer to the generation counter for `addr`'s page.
@@ -585,6 +588,12 @@ impl BusDevice for PpMemory {
                     bump(page);
                 }
             }
+            // Active-region SMC: a DMA block write overlapping a compiled line
+            // of the executing page latches its `smc_hit`.
+            crate::cpu::jitv2::jitv2::note_phys_write_range(
+                self.off(addr) as u32,
+                (buf.len().max(1) as u32) * 8,
+            );
         }
         BUS_OK
     }

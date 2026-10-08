@@ -796,6 +796,25 @@ pub struct MipsCore {
     /// hitting the page currently being executed/compiled.
     #[cfg(feature = "jitv2")]
     pub cur_code_pfn: u32,
+    /// Active-region SMC force-exit state, mirrored from the executor's `pcp`
+    /// alongside `cur_code_pfn` (see `set_pcp`). Compiled code reads these at
+    /// its per-instruction preamble and, under `jitv2`, the inline store
+    /// emitter tests them before writing:
+    ///
+    /// - `jit_active_pfn`: this active page's PFN, or `u32::MAX` when none.
+    /// - `jit_smc_lines`: this active page's compiled-line bitmap (always a
+    ///   valid pointer — points at the shared [`crate::cpu::jitv2::jitv2::SMC_IDLE_LINES`]
+    ///   when no page is active, so a branchless test never null-derefs).
+    /// - `jit_smc_hit`: this active page's `smc_hit` byte (always valid,
+    ///   [`crate::cpu::jitv2::jitv2::SMC_IDLE_HIT`] when inactive). A CPU
+    ///   inline store or an external/DMA writer latches this; the preamble
+    ///   observes and clears it.
+    #[cfg(feature = "jitv2")]
+    pub jit_active_pfn: u32,
+    #[cfg(feature = "jitv2")]
+    pub jit_smc_lines: *const AtomicU64,
+    #[cfg(feature = "jitv2")]
+    pub jit_smc_hit: *const std::sync::atomic::AtomicU8,
     /// Set by `exec_syscall` when the exception it raises is delivered,
     /// cleared by `handle_exception` on delivery of any *other* exception
     /// (so a syscall handler that itself faults, or gets interrupted, before
@@ -1332,6 +1351,12 @@ impl MipsCore {
             jit_trigger: false,
             #[cfg(feature = "jitv2")]
             cur_code_pfn: u32::MAX, // no page tracked yet
+            #[cfg(feature = "jitv2")]
+            jit_active_pfn: u32::MAX,
+            #[cfg(feature = "jitv2")]
+            jit_smc_lines: crate::cpu::jitv2::jitv2::SMC_IDLE_LINES.as_ptr(),
+            #[cfg(feature = "jitv2")]
+            jit_smc_hit: &crate::cpu::jitv2::jitv2::SMC_IDLE_HIT as *const _,
             #[cfg(feature = "jitv2")]
             syscall_pending: false,
             cp0_index: 0,
