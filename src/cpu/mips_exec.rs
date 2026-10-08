@@ -4993,6 +4993,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             }
 
             let r = self.cache.fetch(virt_addr, phys_addr as u64);
+            // VCEI can only come out of the functional cache model, which is
+            // selected only under `accurate-cache`. The default shadow never
+            // raises it, so the bookkeeping is compiled out with the raise.
+            #[cfg(feature = "accurate-cache")]
             if !DEBUG && r.status == exec_exception(EXC_VCEI) {
                 self.core.cp0_badvaddr = virt_addr;
             }

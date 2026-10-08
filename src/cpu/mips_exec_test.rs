@@ -4993,6 +4993,7 @@ mod tests {
         assert_eq!(mem.get_word(8), lw);
     }
 
+    #[cfg(feature = "accurate-cache")]
     #[test]
     fn test_virtual_coherency_exception() {
         #[allow(unused_imports)]
@@ -5042,6 +5043,39 @@ mod tests {
         let result = exec.cache.fetch(virt2, phys_addr + 0x1000);
         assert_eq!(result.status, crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_VCEI),
                    "Second fetch with different virtual index should trigger VCEI");
+    }
+
+    /// Issue #35: without `accurate-cache`, even the functional R4400 model
+    /// must not raise VCE. The shadow never selects it, so this builds the
+    /// functional cache directly and presents the same aliasing pattern the
+    /// `accurate-cache` test does, asserting the two probes now return data
+    /// rather than VCE — i.e. the raise sites are compiled out.
+    #[cfg(not(feature = "accurate-cache"))]
+    #[test]
+    fn the_default_build_does_not_raise_vce() {
+        use crate::cpu::mips_tlb::PassthroughTlb;
+        use crate::traits::{BUS_OK, BUS_VCE};
+
+        let (exec, mem) = create_executor_with_r4000cache();
+        let phys_addr = 0x100000u64;
+        let virt1 = phys_addr;
+        let virt2 = phys_addr ^ 0x1000;
+
+        mem.set_word(phys_addr, 0xDEADBEEF);
+        let first = exec.cache.read::<4>(virt1, phys_addr);
+        assert_eq!(first.status, BUS_OK, "first data access should succeed");
+        let second = exec.cache.read::<4>(virt2, phys_addr);
+        assert_ne!(second.status, BUS_VCE, "the default build must not raise VCED");
+
+        mem.set_word(phys_addr + 0x1000, 0x00000000);
+        let fetch1 = exec.cache.fetch(virt1, phys_addr + 0x1000);
+        assert_eq!(fetch1.status, crate::cpu::mips_exec::EXEC_COMPLETE, "first fetch should succeed");
+        let fetch2 = exec.cache.fetch(virt2, phys_addr + 0x1000);
+        assert_ne!(
+            fetch2.status,
+            crate::cpu::mips_exec::exec_exception_const(crate::cpu::mips_exec::EXC_VCEI),
+            "the default build must not raise VCEI"
+        );
     }
 
     // Tests verifying correctness of pre-processed imm field in DecodedInstr.

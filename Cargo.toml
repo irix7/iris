@@ -146,6 +146,14 @@ tcache = []
 # Panics at the exact diverging access instead of letting corruption surface as
 # a guest crash much later. Very slow; diagnostic only.
 tcache_verify = ["tcache"]
+# Accurate cache (issue #35): select the functional two-level cache model
+# (mips_cache_v2) for the R4400 and R5000 and raise Virtual Coherency
+# Exceptions (VCEI/VCED). OFF by default — every CPU runs the observation-only
+# shadow (mips_cache_shadow), whose loads, stores and fetches bypass the cache
+# arrays and never raise VCE. The R10000 keeps its shadow either way. Accurate
+# is 3-4x slower on memory-bound kernels; it exists for the cpu-tests
+# write-back cache checks and for a future guest that needs them.
+accurate-cache = []
 default = ["tlbvmap", "rexdiag"]
 # Cranelift-based JIT compiler for REX3 graphics draw shaders.
 rex-jit = ["cranelift-codegen", "cranelift-frontend", "cranelift-jit", "cranelift-module", "cranelift-native"]

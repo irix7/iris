@@ -31,6 +31,8 @@ use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
 use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
+#[cfg(feature = "accurate-cache")]
+use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
 use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R5000ShadowCache, R10000ShadowCache};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
@@ -44,13 +46,28 @@ use crate::hptimer::TimerManager;
 ///
 /// The `build_cpu!` match further down names these same types; this function is
 /// the one place the *choice* lives, so it can be asserted in a unit test
-/// without building a `Machine` (the process is allowed only one). #35 will
-/// grow an `accurate-cache` arm here.
+/// without building a `Machine` (the process is allowed only one).
+///
+/// Default: every CPU runs the observation-only shadow. Under the opt-in
+/// `accurate-cache` feature (#35) the R4400 and R5000 run the functional
+/// `mips_cache_v2` model instead; the R10000 keeps its shadow — it has no
+/// functional data path and is out of scope for the feature.
 pub(crate) fn selected_cache_model(cpu: crate::config::CpuModel) -> &'static str {
-    match cpu {
-        crate::config::CpuModel::R4400 => <R4400ShadowCache as CacheCpuModel>::CACHE_MODEL,
-        crate::config::CpuModel::R5000 => <R5000ShadowCache as CacheCpuModel>::CACHE_MODEL,
-        crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+    #[cfg(feature = "accurate-cache")]
+    {
+        match cpu {
+            crate::config::CpuModel::R4400 => <R4400Cache as CacheCpuModel>::CACHE_MODEL,
+            crate::config::CpuModel::R5000 => <R5000Cache as CacheCpuModel>::CACHE_MODEL,
+            crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+        }
+    }
+    #[cfg(not(feature = "accurate-cache"))]
+    {
+        match cpu {
+            crate::config::CpuModel::R4400 => <R4400ShadowCache as CacheCpuModel>::CACHE_MODEL,
+            crate::config::CpuModel::R5000 => <R5000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+            crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+        }
     }
 }
 
@@ -840,11 +857,18 @@ impl Machine {
         Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
 
-        // Every CPU now runs the observation-only shadow cache: out of the data
-        // path entirely, with tag and data arrays that exist only to answer
-        // CACHE ops and the PROM's diagnostics. See mips_cache_shadow.rs. The
-        // functional `mips_cache_v2` model stays in the tree (#35 will make it
-        // an opt-in `accurate-cache` feature).
+        // Default: every CPU runs the observation-only shadow cache — out of
+        // the data path entirely, with tag and data arrays that exist only to
+        // answer CACHE ops and the PROM's diagnostics. See mips_cache_shadow.rs.
+        // Under the opt-in `accurate-cache` feature (#35) the R4400 and R5000
+        // run the functional `mips_cache_v2` model instead, which raises VCE.
+        #[cfg(feature = "accurate-cache")]
+        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
+            crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
+            crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
+        };
+        #[cfg(not(feature = "accurate-cache"))]
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
             crate::config::CpuModel::R4400 => build_cpu!(R4400ShadowCache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000ShadowCache),
@@ -2362,18 +2386,22 @@ impl Device for SystemController {
 mod controller_lifetime_tests {
     use super::*;
 
-    /// Issue #34: the CPU selector picks the observation-only shadow for the
-    /// R4400 and R5000, as it already did for the R10000. Geometry is asserted
+    /// Issue #34/#35: the CPU selector picks the observation-only shadow by
+    /// default and the functional cache under `accurate-cache`, for the R4400
+    /// and R5000. The R10000 keeps its shadow either way. Geometry is asserted
     /// against the functional models in `mips_cache_shadow`'s own tests.
     #[test]
-    fn the_cpu_selector_chooses_the_shadow_for_r4400_and_r5000() {
-        for cpu in [
-            crate::config::CpuModel::R4400,
-            crate::config::CpuModel::R5000,
-            crate::config::CpuModel::R10000,
-        ] {
-            assert_eq!(selected_cache_model(cpu), "shadow", "{cpu:?}");
-        }
+    fn the_cpu_selector_matches_the_cache_feature() {
+        use crate::config::CpuModel;
+
+        #[cfg(feature = "accurate-cache")]
+        let (r4400, r5000) = ("functional", "functional");
+        #[cfg(not(feature = "accurate-cache"))]
+        let (r4400, r5000) = ("shadow", "shadow");
+
+        assert_eq!(selected_cache_model(CpuModel::R4400), r4400);
+        assert_eq!(selected_cache_model(CpuModel::R5000), r5000);
+        assert_eq!(selected_cache_model(CpuModel::R10000), "shadow");
     }
 
     fn build_machine() -> Box<Machine> {
