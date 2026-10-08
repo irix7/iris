@@ -5,10 +5,15 @@ Reads `data/bench_history.json` (produced by tools/bench_history.py) and emits:
 
   * `data/bench_cells.svg`  — grouped bar chart of the latest run's four cells
                               (guest MIPS and DMIPS per cell).
+  * `data/bench_history.svg` — the same four cells over every recorded run
+                              (since the beginning), one panel per cell, points
+                              coloured by host CPU and lines broken at host
+                              changes so host-to-host steps aren't read as code
+                              regressions.
   * `data/bench_history.md` — a table of every recorded run, grouped by host.
 
 It also rewrites the README section between the `<!-- BENCHMARKS -->` markers,
-embedding the SVG and the table. If `GROQ_API_KEY` is set it additionally asks
+embedding the SVGs and the table. If `GROQ_API_KEY` is set it additionally asks
 Groq for a short natural-language analysis paragraph (falling back to a
 deterministic summary when the call fails or the key is absent).
 
@@ -31,12 +36,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HISTORY = REPO_ROOT / "data" / "bench_history.json"
 SVG = REPO_ROOT / "data" / "bench_cells.svg"
+HIST_SVG = REPO_ROOT / "data" / "bench_history.svg"
 HIST_MD = REPO_ROOT / "data" / "bench_history.md"
 README = REPO_ROOT / "README.md"
 
 MARKER = "<!-- BENCHMARKS -->"
 CELLS = ["r4400-interp", "r4400-jitv2", "r5000-interp", "r5000-jitv2"]
 COLORS = {"interp": "#5b8db8", "jitv2": "#c9763f"}
+# One colour per distinct host CPU, assigned in first-seen order. Shared MIPS is
+# not comparable across hosts, so the history chart colours by host and breaks
+# each run of points where the host changes.
+HOST_COLORS = ["#3b7dd8", "#c9763f", "#4caf50", "#9c27b0",
+               "#607d8b", "#e64a19", "#009688", "#795548"]
 
 
 def load():
@@ -119,6 +130,143 @@ def bar_chart_svg(entry):
     lx += 112
     parts.append(f'<rect x="{lx}" y="{H - 14}" width="12" height="12" fill="#9aa7b0"/>')
     parts.append(f'<text x="{lx + 16}" y="{H - 3}" font-size="12" fill="#333">DMIPS</text>')
+
+    parts.append("</svg>")
+    return "\n".join(parts)
+
+
+def _short_host(cpu):
+    """A compact host label for the history legend."""
+    cpu = (cpu or "?").replace("(R)", "").replace("(TM)", "")
+    for drop in ("CPU", "Processor", "@"):
+        cpu = cpu.replace(drop, " ")
+    bits = cpu.split()
+    if bits and bits[0] in ("AMD", "Intel", "ARM"):
+        bits = bits[1:]
+    return " ".join(bits[:3]) or "?"
+
+
+def history_svg(entries):
+    """Time series of every recorded run, grouped by CPU (R4400 / R5000).
+
+    One panel per CPU group, each with an interpreter and a jitv2 line. Raw MIPS
+    is only comparable within one host, so a line breaks where the host CPU
+    changes and the host strip along the bottom colours which runs shared a host.
+    The y-axis is logarithmic so a slow interpreter point and a fast JIT point
+    share one panel.
+    """
+    import math
+
+    entries = sorted(entries, key=lambda e: e["date"])
+    n = len(entries)
+    if n == 0:
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
+
+    hosts = []
+    for e in entries:
+        h = e["host"].get("cpu", "?")
+        if h not in hosts:
+            hosts.append(h)
+    host_color = {h: HOST_COLORS[i % len(HOST_COLORS)] for i, h in enumerate(hosts)}
+
+    groups = [("R4400", ["r4400-interp", "r4400-jitv2"]),
+              ("R5000", ["r5000-interp", "r5000-jitv2"])]
+
+    ymin, ymax = 20.0, 2000.0
+    logspan = math.log10(ymax / ymin)
+
+    W = 880
+    pad_l, pad_r, pad_t = 84, 18, 104
+    panel_h, gap = 150, 34
+    plot_w = W - pad_l - pad_r
+    host_gap, host_band, xlabel_h = 14, 12, 46
+    ngroup = len(groups)
+    H = pad_t + ngroup * (panel_h + gap) - gap + host_gap + host_band + xlabel_h
+    grid_values = [20, 50, 100, 200, 500, 1000, 2000]
+
+    def xpos(i):
+        return pad_l + plot_w * (i + 0.5) / n
+
+    def panel_top(j):
+        return pad_t + j * (panel_h + gap)
+
+    def yval(j, v):
+        frac = math.log10(max(v, ymin) / ymin) / logspan
+        return panel_top(j) + (1 - frac) * panel_h
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+             f'viewBox="0 0 {W} {H}" font-family="system-ui,sans-serif">']
+    parts.append(f'<text x="{pad_l}" y="26" font-size="17" font-weight="600" fill="#222">'
+                 f'Guest MIPS across all {n} recorded runs — grouped by CPU</text>')
+    parts.append(f'<text x="{pad_l}" y="44" font-size="12" fill="#666">'
+                 f'log scale · a line breaks where the host CPU changes (host strip, bottom)</text>')
+
+    lx = pad_l
+    for label, color in (("interp", COLORS["interp"]), ("jitv2", COLORS["jitv2"])):
+        parts.append(f'<rect x="{lx}" y="56" width="10" height="10" fill="{color}"/>')
+        parts.append(f'<text x="{lx + 14}" y="65" font-size="11" fill="#444">{label}</text>')
+        lx += 14 + 7 * len(label) + 22
+
+    lx = pad_l
+    for h in hosts:
+        label = _short_host(h)
+        parts.append(f'<rect x="{lx:.1f}" y="78" width="10" height="10" fill="{host_color[h]}"/>')
+        parts.append(f'<text x="{lx + 14:.1f}" y="87" font-size="11" fill="#444">{label}</text>')
+        lx += 14 + 7 * len(label) + 16
+
+    band_y = panel_top(ngroup - 1) + panel_h + host_gap
+
+    # Host-change separators span the panels, drawn first so points sit on top.
+    for i in range(1, n):
+        if entries[i]["host"].get("cpu", "?") != entries[i - 1]["host"].get("cpu", "?"):
+            x = pad_l + plot_w * i / n
+            parts.append(f'<line x1="{x:.1f}" y1="{pad_t - 4}" x2="{x:.1f}" '
+                         f'y2="{band_y + host_band:.1f}" stroke="#dddddd" stroke-width="1" '
+                         f'stroke-dasharray="3,3"/>')
+
+    for j, (title, cells) in enumerate(groups):
+        top = panel_top(j)
+        parts.append(f'<rect x="{pad_l}" y="{top:.1f}" width="{plot_w}" height="{panel_h}" '
+                     f'fill="#fbfbfb" stroke="#eeeeee"/>')
+        for gv in grid_values:
+            yy = yval(j, gv)
+            parts.append(f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{W - pad_r}" y2="{yy:.1f}" '
+                         f'stroke="#e9e9e9" stroke-width="1"/>')
+            parts.append(f'<text x="{pad_l - 8}" y="{yy + 4:.1f}" font-size="10" fill="#999" '
+                         f'text-anchor="end">{gv}</text>')
+        parts.append(f'<text x="{pad_l + 8}" y="{top + 18:.1f}" font-size="13" '
+                     f'font-weight="600" fill="#333">{title}</text>')
+
+        for name in cells:
+            color = COLORS["interp"] if "interp" in name else COLORS["jitv2"]
+            prev = None
+            for i, e in enumerate(entries):
+                c = next((c for c in e["cells"] if c["name"] == name), None)
+                if c is None or c.get("mips") is None:
+                    prev = None
+                    continue
+                x, y = xpos(i), yval(j, _num(c["mips"]))
+                h = e["host"].get("cpu", "?")
+                if prev is not None and prev[2] == h:
+                    parts.append(f'<line x1="{prev[0]:.1f}" y1="{prev[1]:.1f}" x2="{x:.1f}" '
+                                 f'y2="{y:.1f}" stroke="{color}" stroke-width="1.8"/>')
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.4" fill="{color}" '
+                             f'stroke="#ffffff" stroke-width="1"/>')
+                prev = (x, y, h)
+
+    # Host strip: one coloured cell per run, under the panels.
+    seg = plot_w / n
+    for i, e in enumerate(entries):
+        h = e["host"].get("cpu", "?")
+        parts.append(f'<rect x="{pad_l + i * seg:.1f}" y="{band_y}" width="{seg:.1f}" '
+                     f'height="{host_band}" fill="{host_color[h]}"/>')
+
+    base = band_y + host_band
+    for i, e in enumerate(entries):
+        x = xpos(i)
+        parts.append(f'<text x="{x:.1f}" y="{base + 16:.1f}" font-size="10" fill="#666" '
+                     f'text-anchor="end" transform="rotate(-45 {x:.1f} {base + 16:.1f})">'
+                     f'{e["date"][5:10]}</text>')
 
     parts.append("</svg>")
     return "\n".join(parts)
@@ -219,7 +367,12 @@ def readme_block(entry, entries, analysis):
     parts.append("|---|---|---:|---:|---:|---:|")
     parts.append(cells)
     parts.append("")
-    parts.append(f"Full history: [data/bench_history.md](data/bench_history.md) "
+    parts.append(f"History — all {len(entries)} recorded runs, grouped by CPU "
+                 f"(interpreter vs jitv2; a line breaks where the host CPU changes):")
+    parts.append("")
+    parts.append("![benchmark history](data/bench_history.svg)")
+    parts.append("")
+    parts.append(f"Full history table: [data/bench_history.md](data/bench_history.md) "
                  f"({len(entries)} runs). Regenerated from `data/bench_history.json` "
                  f"by `tools/bench_graphs.py`.")
     parts.append("")
@@ -253,6 +406,9 @@ def main():
 
     SVG.write_text(bar_chart_svg(entry) + "\n")
     print(f"wrote {SVG.name}")
+
+    HIST_SVG.write_text(history_svg(entries) + "\n")
+    print(f"wrote {HIST_SVG.name}")
 
     HIST_MD.write_text(history_md(entries))
     print(f"wrote {HIST_MD.name}")
