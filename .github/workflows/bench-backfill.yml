@@ -1,0 +1,84 @@
+# One-time benchmark backfill.
+#
+# Benchmarks historical EMULATOR builds with the CURRENT harness to build a
+# speed history of the code. It runs as a single job on a single runner, so
+# every point in the backfill shares one host and is directly comparable; the
+# apparatus (suite + iris-bench + host baseline) is fixed at the checked-out
+# commit and only the emulator varies. See tools/bench-backfill.sh.
+#
+# Trigger from Actions → "Benchmark backfill" → Run workflow. Pick a range small
+# enough to finish inside the job timeout: each commit costs one release build
+# (registry deps are cached after the first) plus `repeat` suite runs. Start
+# with a range of ~10–30 commits and repeat 3.
+name: Benchmark backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: "git rev-list spec, oldest..newest (e.g. main~30..main)"
+        required: true
+        default: "main~30..main"
+      step:
+        description: "Take every Nth commit"
+        required: true
+        default: "1"
+      cpu:
+        description: "Emulated CPU (r4400 or r5000)"
+        required: true
+        default: "r4400"
+      engine:
+        description: "interp or jitv2 (jitv2 only where the commit supports it)"
+        required: true
+        default: "interp"
+      repeat:
+        description: "Samples per commit"
+        required: true
+        default: "3"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  backfill:
+    name: Backfill benchmark history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The whole history: the backfill checks out old commits to build them.
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Backfill
+        env:
+          BACKFILL_REPEAT: ${{ inputs.repeat }}
+        run: |
+          tools/bench-backfill.sh \
+            "${{ inputs.spec }}" "${{ inputs.step }}" \
+            "${{ inputs.cpu }}" "${{ inputs.engine }}" \
+            2>&1 | tee bench-backfill.log
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-backfill-log
+          path: bench-backfill.log
+          if-no-files-found: ignore
+
+      - name: Record history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ README.md
+          if git diff --cached --quiet; then echo "no history to record"; exit 0; fi
+          git commit -m "bench: backfill benchmark history [skip ci]"
+          git push
