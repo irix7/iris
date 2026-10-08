@@ -65,11 +65,16 @@ def parse_report(md: str) -> dict:
             if not cols or cols == header:
                 continue
             row = dict(zip(header, cols))
+            name = row.get("cell")
+            # Only emulated cells belong in the history; the host runs (plain or
+            # the per-cell `<cell>-host` baselines) are the normaliser, not data.
+            if not name or name == "host" or name.endswith("-host"):
+                continue
             # accuracy: "100.0% (40/40)"
             acc = re.match(r"([\d.]+)%\s*\((\d+)/(\d+)\)", row.get("accuracy", ""))
             cells.append(
                 {
-                    "name": row.get("cell"),
+                    "name": name,
                     "cpu": row.get("CPU"),
                     "features": row.get("features", ""),
                     "accuracy": float(acc.group(1)) if acc else None,
@@ -77,11 +82,51 @@ def parse_report(md: str) -> dict:
                     "dmips": _f(row.get("DMIPS")),
                     "whet": _f(row.get("whet/s")),
                     "linpack": _f(row.get("LINPACK MFLOPS")),
+                    # Fraction of the same runner's native rate. Absent on
+                    # reports recorded before the per-cell host baseline existed.
+                    "efficiency": _f(row.get("efficiency")),
                 }
             )
     if not cells:
         raise ValueError("no `## Cells` table found in report")
+    groups = parse_groups(md)
+    for c in cells:
+        if c["name"] in groups:
+            c["groups"] = groups[c["name"]]
     return {"host": host, "cells": cells}
+
+
+def parse_groups(md: str) -> dict:
+    """Parse the `## Efficiency by group` table into {cell: {group: efficiency}}.
+
+    Empty when the report had no host baseline (the table is only emitted then).
+    """
+    lines = md.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if l.startswith("## Efficiency by group")), None)
+    if start is None:
+        return {}
+    header = None
+    out: dict = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.strip().startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cols if c):
+            continue
+        if header is None:
+            header = cols  # ["group", cell, cell, ...]
+            continue
+        if len(cols) != len(header):
+            continue
+        group = cols[0]
+        for cell, val in zip(header[1:], cols[1:]):
+            v = _f(val)
+            if v is not None:
+                out.setdefault(cell, {})[group] = v
+    return out
 
 
 def _f(s):

@@ -116,7 +116,7 @@ fn suite_id_of(elf: &Path) -> Result<String, String> {
     Ok(iris::benchsuite::suite_id_of(&bytes))
 }
 
-fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
+fn run_host(exe: &Path, timeout_s: u64, label: &str) -> Result<Run, String> {
     if !exe.exists() {
         return Err(format!("no host build at {} — run `make -C bench hostbench`", exe.display()));
     }
@@ -127,7 +127,7 @@ fn run_host(exe: &Path, timeout_s: u64) -> Result<Run, String> {
     let mut p = parse_block(&stdout)?;
     p.machine.cpu = "host".to_string();
     Ok(Run {
-        cell: "host".to_string(),
+        cell: label.to_string(),
         features: Vec::new(),
         machine: p.machine,
         host: host_info(),
@@ -311,7 +311,7 @@ fn newest_result(dir: &Path) -> Result<PathBuf, String> {
     for e in rd.flatten() {
         let p = e.path();
         if p.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
-        if p.file_stem().and_then(|s| s.to_str()) == Some("host") { continue; }
+        if p.file_stem().and_then(|s| s.to_str()).map_or(false, is_host_cell) { continue; }
         let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
         if best.as_ref().map_or(true, |(t, _)| m > *t) { best = Some((m, p)); }
     }
@@ -588,9 +588,64 @@ fn fmt_ratio(a: f64, b: f64) -> String {
     if r >= 100.0 { format!("{:.0}x", r) } else { format!("{:.2}x", r) }
 }
 
+/// The host run measured on the same runner as `run`: a `<cell>-host` run if
+/// one is present (the per-cell baseline the CI now records), else the plain
+/// `host` run. Pairing by cell matters because the four cells run as separate
+/// CI jobs on separate runners.
+fn host_for<'a>(runs: &'a [Run], run: &Run) -> Option<&'a Run> {
+    let want = format!("{}-host", run.cell);
+    runs.iter().find(|r| r.cell == want)
+        .or_else(|| runs.iter().find(|r| r.cell == "host"))
+}
+
+/// Fraction of the host's own rate, geometric-mean over the kernels both ran.
+/// Numerator and denominator are both measured on the same runner, so the
+/// runner's speed cancels — this is the host-normalised number, comparable
+/// across runners and over time. 1.0 means as fast as native.
+fn efficiency(run: &Run, host: &Run) -> Option<f64> {
+    let mut logsum = 0.0f64;
+    let mut n = 0u32;
+    for row in &run.rows {
+        if let Some(h) = host.row(&row.name) {
+            let (hr, gr) = (h.rate(), row.rate());
+            if hr > 0.0 && gr > 0.0 {
+                logsum += (gr / hr).ln();
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { None } else { Some((logsum / n as f64).exp()) }
+}
+
+/// The kernel groups the suite tags rows with (`int/`, `fpu/`, `mem/`, …), in
+/// report order. A single aggregate can hide a change that speeds one subsystem
+/// while slowing another, so the report breaks efficiency down by group too.
+const GROUPS: &[&str] = &["int", "fpu", "mem", "imaging", "codec", "sys"];
+
+/// [`efficiency`] restricted to one kernel group.
+fn group_efficiency(run: &Run, host: &Run, group: &str) -> Option<f64> {
+    let mut logsum = 0.0f64;
+    let mut n = 0u32;
+    for row in &run.rows {
+        if row.name.split('/').next() != Some(group) { continue; }
+        if let Some(h) = host.row(&row.name) {
+            let (hr, gr) = (h.rate(), row.rate());
+            if hr > 0.0 && gr > 0.0 {
+                logsum += (gr / hr).ln();
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { None } else { Some((logsum / n as f64).exp()) }
+}
+
+fn is_host_cell(cell: &str) -> bool {
+    cell == "host" || cell.ends_with("-host")
+}
+
 fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
     let mut o = String::new();
-    let emulated: Vec<&Run> = runs.iter().filter(|r| r.cell != "host").collect();
+    let emulated: Vec<&Run> = runs.iter().filter(|r| !is_host_cell(&r.cell)).collect();
     let host = runs.iter().find(|r| r.cell == "host");
     let base = baseline
         .and_then(|b| runs.iter().find(|r| r.cell == b))
@@ -606,22 +661,55 @@ fn markdown(runs: &[Run], baseline: Option<&str>) -> String {
 
     // ── per-cell summary ────────────────────────────────────────────────────
     o.push_str("## Cells\n\n");
-    o.push_str("| cell | features | CPU | accuracy | guest MIPS | DMIPS | whet/s | LINPACK MFLOPS | timed | wall |\n");
-    o.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|\n");
+    o.push_str("| cell | features | CPU | accuracy | guest MIPS | DMIPS | whet/s | LINPACK MFLOPS | efficiency | timed | wall |\n");
+    o.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
     for r in runs {
         let feats = if r.features.is_empty() { "-".to_string() } else { r.features.join(" ") };
+        // Fraction of the same runner's native rate (host-normalised); only an
+        // emulated cell can have one.
+        let eff = if is_host_cell(&r.cell) {
+            None
+        } else {
+            host_for(runs, r).and_then(|h| efficiency(r, h))
+        };
         o.push_str(&format!(
-            "| {} | {} | {} | {:.1}% ({}/{}) | {} | {} | {} | {} | {:.1} s | {:.1} s |\n",
+            "| {} | {} | {} | {:.1}% ({}/{}) | {} | {} | {} | {} | {} | {:.1} s | {:.1} s |\n",
             r.cell, feats, r.machine.cpu,
             r.accuracy(), r.matched, r.checked,
             if r.mips() > 0.0 { format!("{:.1}", r.mips()) } else { "n/a".into() },
             r.dmips().map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into()),
             r.whet_loops().map(|v| format!("{:.0}", v)).unwrap_or_else(|| "-".into()),
             r.linpack_mflops().map(|v| format!("{:.2}", v)).unwrap_or_else(|| "-".into()),
+            eff.map(|e| format!("{:.4}", e)).unwrap_or_else(|| "-".into()),
             r.total_ns as f64 / 1e9, r.wall_s,
         ));
     }
     o.push('\n');
+
+    // ── efficiency by group ─────────────────────────────────────────────────
+    // Only meaningful with a host run: this is guest-rate over the same runner's
+    // native rate, per kernel group. The aggregate can hide a change that helps
+    // one subsystem and hurts another, so the report exposes each group.
+    if host.is_some() && !emulated.is_empty() {
+        o.push_str("## Efficiency by group\n\n");
+        o.push_str("Fraction of this runner's native rate, geometric-mean per kernel group \
+                    (host-normalised; comparable across runners).\n\n");
+        o.push_str("| group |");
+        for r in &emulated { o.push_str(&format!(" {} |", r.cell)); }
+        o.push_str("\n|---|");
+        for _ in &emulated { o.push_str("---:|"); }
+        o.push('\n');
+        for g in GROUPS {
+            o.push_str(&format!("| {} |", g));
+            for r in &emulated {
+                let e = host_for(runs, r).and_then(|h| group_efficiency(r, h, g));
+                o.push_str(&format!(" {} |",
+                    e.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "-".into())));
+            }
+            o.push('\n');
+        }
+        o.push('\n');
+    }
 
     // ── accuracy detail ─────────────────────────────────────────────────────
     let mut any_bad = false;
@@ -844,6 +932,10 @@ enum Cmd {
         out: Option<PathBuf>,
         #[arg(long, default_value_t = 600)]
         timeout: u64,
+        /// Name this result. The per-cell baselines use `<cell>-host` so the
+        /// report can pair each emulated cell with the host run on its runner.
+        #[arg(long, default_value = "host")]
+        label: String,
     },
 
     /// Build every CPU x engine cell and run all of them.
@@ -1004,10 +1096,10 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Host { exe, out, timeout } => {
+        Cmd::Host { exe, out, timeout, label } => {
             let exe = exe.unwrap_or_else(|| repo_relative("bench/build/irisbench-host"));
             let out = out.unwrap_or_else(default_out);
-            let run = run_host(&exe, timeout)?;
+            let run = run_host(&exe, timeout, &label)?;
             let path = save(&run, &out)?;
             print!("{}", text_summary(std::slice::from_ref(&run)));
             println!("wrote {}", path.display());
@@ -1085,7 +1177,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             if !no_host {
                 println!("== host ==");
                 let exe = root.join("bench/build/irisbench-host");
-                match run_host(&exe, timeout) {
+                match run_host(&exe, timeout, "host") {
                     Ok(run) => { let p = save(&run, &out)?; println!("  wrote {}", p.display()); }
                     Err(e) => eprintln!("  host baseline skipped: {}", e),
                 }

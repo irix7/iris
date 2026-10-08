@@ -240,6 +240,15 @@ jobs:
             || { echo "::error::cpu-tests ran $got, expected cpu=$want"; exit 1; }
           grep -E '^ RESULT:' build/run.log
 
+      # Per-cell host baseline: the same kernels, natively, on THIS runner.
+      # The report divides each emulated cell by its own `<cell>-host` run, so
+      # the host-normalised efficiency is comparable across the four runners
+      # (each cell runs as its own job, on its own machine).
+      - name: Host baseline (this runner)
+        run: |
+          make -C bench hostbench
+          ./target/release/iris-bench host --label "${{ matrix.cpu }}-${{ matrix.engine }}-host"
+
       # ── bench ────────────────────────────────────────────────────────────
       #
       # --iris is required, not decorative: without it `run` measures this
@@ -434,7 +443,7 @@ jobs:
           python3 tools/bench_graphs.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/bench_history.json data/bench_cells.svg data/bench_history.svg data/bench_history.md README.md
+          git add data/bench_history.json data/bench_cells.svg data/bench_history.svg data/bench_history_eff.svg data/bench_history.md README.md
           if git diff --cached --quiet; then echo "no changes to record"; exit 0; fi
           git commit -m "bench: record CI results and regenerate graphs [skip ci]"
           git push

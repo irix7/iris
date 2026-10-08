@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HISTORY = REPO_ROOT / "data" / "bench_history.json"
 SVG = REPO_ROOT / "data" / "bench_cells.svg"
 HIST_SVG = REPO_ROOT / "data" / "bench_history.svg"
+HIST_EFF_SVG = REPO_ROOT / "data" / "bench_history_eff.svg"
 HIST_MD = REPO_ROOT / "data" / "bench_history.md"
 README = REPO_ROOT / "README.md"
 
@@ -146,14 +147,15 @@ def _short_host(cpu):
     return " ".join(bits[:3]) or "?"
 
 
-def history_svg(entries):
+def history_svg(entries, metric="mips"):
     """Time series of every recorded run, grouped by CPU (R4400 / R5000).
 
-    One panel per CPU group, each with an interpreter and a jitv2 line. Raw MIPS
-    is only comparable within one host, so a line breaks where the host CPU
-    changes and the host strip along the bottom colours which runs shared a host.
-    The y-axis is logarithmic so a slow interpreter point and a fast JIT point
-    share one panel.
+    `metric="mips"` plots raw guest MIPS on a log axis and breaks a line where
+    the host CPU changes, because raw MIPS is only comparable within one host.
+    `metric="efficiency"` plots the host-normalised fraction of the runner's own
+    native rate, which cancels the host, so those lines connect across host
+    changes. A coloured host strip under the panels still shows which runs
+    shared a host.
     """
     import math
 
@@ -172,9 +174,6 @@ def history_svg(entries):
     groups = [("R4400", ["r4400-interp", "r4400-jitv2"]),
               ("R5000", ["r5000-interp", "r5000-jitv2"])]
 
-    ymin, ymax = 20.0, 2000.0
-    logspan = math.log10(ymax / ymin)
-
     W = 880
     pad_l, pad_r, pad_t = 84, 18, 104
     panel_h, gap = 150, 34
@@ -182,7 +181,6 @@ def history_svg(entries):
     host_gap, host_band, xlabel_h = 14, 12, 46
     ngroup = len(groups)
     H = pad_t + ngroup * (panel_h + gap) - gap + host_gap + host_band + xlabel_h
-    grid_values = [20, 50, 100, 200, 500, 1000, 2000]
 
     def xpos(i):
         return pad_l + plot_w * (i + 0.5) / n
@@ -190,16 +188,50 @@ def history_svg(entries):
     def panel_top(j):
         return pad_t + j * (panel_h + gap)
 
-    def yval(j, v):
-        frac = math.log10(max(v, ymin) / ymin) / logspan
-        return panel_top(j) + (1 - frac) * panel_h
+    # Metric-specific scale, title and line-breaking. Raw MIPS is only comparable
+    # within a host; host-normalised efficiency cancels the host, so its lines
+    # connect across host changes.
+    if metric == "mips":
+        title = f"Guest MIPS across all {n} recorded runs — grouped by CPU"
+        subtitle = "log scale · a line breaks where the host CPU changes (host strip, bottom)"
+        ymin, ymax = 20.0, 2000.0
+        logspan = math.log10(ymax / ymin)
+        grid_values = [20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0]
+        break_on_host = True
+
+        def yval(j, v):
+            frac = math.log10(max(v, ymin) / ymin) / logspan
+            return panel_top(j) + (1 - frac) * panel_h
+
+        def fmt_grid(v):
+            return f"{v:.0f}"
+    else:
+        title = f"Host-normalised efficiency (all {n} recorded runs) — grouped by CPU"
+        subtitle = ("fraction of the runner's own native rate; host-independent, "
+                    "so lines connect across host changes")
+        vals = [_num(c.get(metric)) for e in entries for c in e["cells"]
+                if c.get(metric) is not None]
+        lo = min(vals) if vals else 0.0
+        hi = max(vals) if vals else 1.0
+        span = max(hi - lo, hi * 0.1, 1e-6)
+        ymin = max(0.0, lo - span * 0.1)
+        ymax = hi + span * 0.1
+        grid_values = [ymin + (ymax - ymin) * k / 4 for k in range(5)]
+        break_on_host = False
+
+        def yval(j, v):
+            frac = (v - ymin) / (ymax - ymin) if ymax > ymin else 0.0
+            return panel_top(j) + (1 - frac) * panel_h
+
+        def fmt_grid(v):
+            return f"{v:.3f}" if ymax <= 1.0 else f"{v:.1f}"
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="system-ui,sans-serif">']
     parts.append(f'<text x="{pad_l}" y="26" font-size="17" font-weight="600" fill="#222">'
-                 f'Guest MIPS across all {n} recorded runs — grouped by CPU</text>')
+                 f'{title}</text>')
     parts.append(f'<text x="{pad_l}" y="44" font-size="12" fill="#666">'
-                 f'log scale · a line breaks where the host CPU changes (host strip, bottom)</text>')
+                 f'{subtitle}</text>')
 
     lx = pad_l
     for label, color in (("interp", COLORS["interp"]), ("jitv2", COLORS["jitv2"])):
@@ -233,7 +265,7 @@ def history_svg(entries):
             parts.append(f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{W - pad_r}" y2="{yy:.1f}" '
                          f'stroke="#e9e9e9" stroke-width="1"/>')
             parts.append(f'<text x="{pad_l - 8}" y="{yy + 4:.1f}" font-size="10" fill="#999" '
-                         f'text-anchor="end">{gv}</text>')
+                         f'text-anchor="end">{fmt_grid(gv)}</text>')
         parts.append(f'<text x="{pad_l + 8}" y="{top + 18:.1f}" font-size="13" '
                      f'font-weight="600" fill="#333">{title}</text>')
 
@@ -242,12 +274,12 @@ def history_svg(entries):
             prev = None
             for i, e in enumerate(entries):
                 c = next((c for c in e["cells"] if c["name"] == name), None)
-                if c is None or c.get("mips") is None:
+                if c is None or c.get(metric) is None:
                     prev = None
                     continue
-                x, y = xpos(i), yval(j, _num(c["mips"]))
+                x, y = xpos(i), yval(j, _num(c.get(metric)))
                 h = e["host"].get("cpu", "?")
-                if prev is not None and prev[2] == h:
+                if prev is not None and (not break_on_host or prev[2] == h):
                     parts.append(f'<line x1="{prev[0]:.1f}" y1="{prev[1]:.1f}" x2="{x:.1f}" '
                                  f'y2="{y:.1f}" stroke="{color}" stroke-width="1.8"/>')
                 parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.4" fill="{color}" '
@@ -270,6 +302,11 @@ def history_svg(entries):
 
     parts.append("</svg>")
     return "\n".join(parts)
+
+
+def has_efficiency(entries) -> bool:
+    """True once any recorded cell carries a host-normalised efficiency."""
+    return any(c.get("efficiency") is not None for e in entries for c in e["cells"])
 
 
 def history_md(entries):
@@ -372,6 +409,12 @@ def readme_block(entry, entries, analysis):
     parts.append("")
     parts.append("![benchmark history](data/bench_history.svg)")
     parts.append("")
+    if has_efficiency(entries):
+        parts.append("Host-normalised efficiency (the runner's own native rate = 1.0); "
+                     "because the host cancels, this is comparable across different CI runners:")
+        parts.append("")
+        parts.append("![host-normalised efficiency history](data/bench_history_eff.svg)")
+        parts.append("")
     parts.append(f"Full history table: [data/bench_history.md](data/bench_history.md) "
                  f"({len(entries)} runs). Regenerated from `data/bench_history.json` "
                  f"by `tools/bench_graphs.py`.")
@@ -407,8 +450,12 @@ def main():
     SVG.write_text(bar_chart_svg(entry) + "\n")
     print(f"wrote {SVG.name}")
 
-    HIST_SVG.write_text(history_svg(entries) + "\n")
+    HIST_SVG.write_text(history_svg(entries, "mips") + "\n")
     print(f"wrote {HIST_SVG.name}")
+
+    if has_efficiency(entries):
+        HIST_EFF_SVG.write_text(history_svg(entries, "efficiency") + "\n")
+        print(f"wrote {HIST_EFF_SVG.name}")
 
     HIST_MD.write_text(history_md(entries))
     print(f"wrote {HIST_MD.name}")
