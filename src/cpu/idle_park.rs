@@ -297,6 +297,71 @@ mod tests {
             core.hot.cycles
         );
     }
+
+    /// Park to a single guest-time deadline and return the host wall-clock
+    /// latency *after* that deadline at which `park` returned: the measured
+    /// sleep minus the sleep the deadline asked for.
+    ///
+    /// `park` cannot return before its deadline (it loops until `hot.cycles`
+    /// has advanced to it), and `park_timeout` only overshoots, so the
+    /// difference is the wake latency attributable to the park mechanism, in
+    /// host nanoseconds — the figure issue #68 asks for. A spurious `wake`
+    /// from another test only costs an extra loop iteration, not an early
+    /// return, because the exit test is the deadline, not the timer.
+    fn host_wake_latency_after_deadline(lead_cycles: u64) -> Duration {
+        use crate::cpu::guest_timer::{GuestTimers, PIT_CH0};
+        use crate::cpu::mips_core::CyclesPtr;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.cp0_compare = 1; // park returns immediately while this is zero
+        let timers = Arc::new(GuestTimers::new(CyclesPtr::new(
+            &core.hot.cycles as *const u64,
+        )));
+        // The queue deadline is the soonest armed timer; Compare is parked far
+        // out so it cannot mask the measurement.
+        timers.schedule(PIT_CH0, lead_cycles, 0, None);
+        core.guest_timers = Some(timers);
+        core.count_fire_cycle = u64::MAX;
+
+        let intended = Duration::from_nanos(park_timeout_nanos(&core));
+        let running = AtomicBool::new(true);
+        let st = IdleParkState::default();
+        let start = Instant::now();
+        st.park(&mut core, &running);
+        start.elapsed().saturating_sub(intended)
+    }
+
+    /// A bounded host wall-clock wake latency to the next guest deadline.
+    ///
+    /// The park targets the soonest queue deadline (a PIT channel); the test
+    /// asserts the CPU thread wakes within `LIMIT` of it. The deadline is
+    /// 300 us of guest time (30 000 cycles at `NS_PER_GUEST_CYCLE`), well
+    /// under the old fixed 1 ms slice, so a park that reverted to the slice
+    /// would overshoot it by ~700 us and fail. Measured intrinsic overshoot on
+    /// an idle dev host is ~60-75 us; the bound is the *best* of several
+    /// samples because a `park_timeout` is a futex wait and a loaded CI runner
+    /// can schedule the wake late for reasons the emulator does not control.
+    #[test]
+    fn host_wake_latency_after_the_guest_deadline_is_bounded() {
+        const LEAD_CYCLES: u64 = 30_000; // 300 us of guest time
+        const LIMIT: Duration = Duration::from_micros(500);
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let latency = host_wake_latency_after_deadline(LEAD_CYCLES);
+            if latency < LIMIT {
+                return;
+            }
+            seen.push(latency);
+        }
+        panic!(
+            "host wake latency {seen:?} after a {LEAD_CYCLES}-cycle guest deadline, \
+             all at or above {LIMIT:?}"
+        );
+    }
 }
 
 #[cfg(test)]

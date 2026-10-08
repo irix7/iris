@@ -37,3 +37,26 @@ which is exactly the cost the flag exists to avoid.
 `an_interrupt_ends_the_park_without_waiting_out_the_slice` sweeps the interrupt
 across the slice, so it cannot pass on an interrupt that happened to land just
 before a boundary.
+
+## Wake latency to a guest-timer deadline (#68)
+
+Once #43 armed guest-time deadlines, `park` no longer sleeps a fixed
+`SLICE_NS` when a deadline is due: it sleeps to the soonest `hot.cycles`
+deadline (Compare or a queued 8254 PIT timer). The figure that matters is the
+host wall-clock time *after* that deadline at which the CPU thread wakes —
+the observed sleep minus the sleep the deadline asked for. `park` cannot
+return before `hot.cycles` reaches the deadline, so a spurious `wake` costs an
+extra loop iteration, not an early return.
+
+`host_wake_latency_after_the_guest_deadline_is_bounded` measures it for a
+300 us guest deadline (30 000 cycles) and bounds the **best of five** samples:
+
+| deadline | intrinsic overshoot (idle dev host) | bound |
+|---|---|---|
+| 300 us | ~60-75 us | 500 us |
+
+Best-of-five because a `park_timeout` is a futex wait: a loaded host schedules
+the wake late for reasons the emulator does not control (a busy dev box showed
+outliers up to ~6 ms). The bound is deliberately under the retired 1 ms slice,
+so a park that reverted to slice parking (~700 us overshoot on a 300 us
+deadline) fails the test.
