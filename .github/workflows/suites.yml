@@ -241,7 +241,7 @@ jobs:
           # A build whose cargo features did not take would run the wrong CPU
           # and invert every mips4 expectation with no other indication. The
           # guest's banner is authoritative: it reads the CPU out of PRId.
-          want=$(echo '${{ matrix.cpu }}' | tr 'a-z' 'A-Z')
+          want=$(echo '${{ matrix.cpu }}' | tr '[:lower:]' '[:upper:]')
           got=$(grep -o 'cpu=[A-Za-z0-9]*' build/run.log | head -1)
           [ "$got" = "cpu=$want" ] \
             || { echo "::error::cpu-tests ran $got, expected cpu=$want"; exit 1; }
@@ -354,6 +354,10 @@ jobs:
       # cell by design — see rules/testing/tcache-discards-dirty-data-semantics.md.
       # Otherwise the engines match check-for-check.
       #
+      # The opt-in `accurate-cache` build keeps the functional model and so
+      # passes that test; it runs in its own job below with its own baseline —
+      # the same 126/110 less those 2 checks, i.e. 124/108.
+      #
       # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100
       # and both cells are past it.
       - name: Result
@@ -395,6 +399,132 @@ jobs:
             cpu-tests/build/dump.json
             bench/build/run.log
             bench/build/results/*.json
+          if-no-files-found: ignore
+
+  # The opt-in `accurate-cache` build (#35): the R4400/R5000 run the functional
+  # `mips_cache_v2` model and raise VCE, where every default cell runs the
+  # observation-only shadow. Only the cache group can tell the two models
+  # apart, so this is its own job over cpu-tests alone rather than a fifth
+  # `run` axis — a matrix axis would drag a bench run and a per-runner host
+  # baseline along with each accurate cell, and bench measures the shipping
+  # configuration, not a deliberately non-default cache.
+  #
+  # It is the same guest binary as every other cell; what changes is the
+  # emulator's cache. The one guest-visible difference is the test this cell
+  # exists to prove: cache/hit_inv_discards needs private dirty lines, which
+  # the shadow (and jitv2's tcache) do not keep, so it fails its 2 checks in
+  # every default cell — rules/testing/tcache-discards-dirty-data-semantics.md.
+  # The functional model keeps them and must pass.
+  accurate-cache:
+    name: accurate-cache / ${{ matrix.cpu }}
+    needs: guests
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [r4400, r5000]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: guest-elfs
+          path: .
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The feature is the whole point of the cell, and cargo would happily
+      # build the default shadow machine if the flag were dropped. The guest
+      # banner below proves the run used the CPU it was asked for; the
+      # selected_cache_model unit test proves the flag selects the functional
+      # model (src/machine.rs).
+      - name: Build IRIS (accurate-cache)
+        run: cargo build --release --bin iris --features accurate-cache
+
+      # Same run, accounting and banner check as the `run` job's cpu-tests
+      # step. Records the count rather than exiting on it so the baseline gate
+      # below gives the one meaningful message; a timeout or a missing DONE
+      # token is the harness breaking, not the emulator, and fails here.
+      - name: cpu-tests (accurate-cache)
+        run: |
+          cd cpu-tests
+          chmod +x build/cputest.elf
+          timeout 900 ../target/release/iris \
+            --config run/bare.toml \
+            --cpu ${{ matrix.cpu }} \
+            --load-elf build/cputest.elf \
+            --test-device --test-device-dump build/dump.json \
+            --headless --noaudio 2>&1 | tee build/run.log
+          rc=${PIPESTATUS[0]}
+          echo "CPUTEST_RC=$rc" >> "$GITHUB_ENV"
+          failed=$(grep -oE '^ RESULT: [0-9]+ checks passed, [0-9]+ failed' build/run.log \
+                   | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')
+          echo "CPUTEST_FAILED=${failed:-}" >> "$GITHUB_ENV"
+          if [ "$rc" = "124" ]; then echo "::error::cpu-tests timed out"; exit 1; fi
+          grep -q 'IRIS-CPUTEST-DONE' build/run.log \
+            || { echo "::error::cpu-tests never printed its DONE token"; exit 1; }
+          want=$(echo '${{ matrix.cpu }}' | tr '[:lower:]' '[:upper:]')
+          got=$(grep -o 'cpu=[A-Za-z0-9]*' build/run.log | head -1)
+          [ "$got" = "cpu=$want" ] \
+            || { echo "::error::cpu-tests ran $got, expected cpu=$want"; exit 1; }
+          grep -E '^ RESULT:' build/run.log
+
+      # The acceptance criterion, asserted by name so a regression is not just
+      # a bare +2 in the count. The harness prints PASS on the test's padded
+      # name line only when every check passed.
+      - name: cache/hit_inv_discards passes under accurate-cache
+        run: |
+          grep -qE 'cache/hit_inv_discards.*PASS' cpu-tests/build/run.log \
+            || { echo "::error::cache/hit_inv_discards did not PASS under accurate-cache:"; \
+                 grep 'cache/hit_inv_discards' cpu-tests/build/run.log || true; exit 1; }
+
+      # The accurate-cache baseline is the default cells' 126/110 less the 2
+      # hit_inv_discards checks: this is exactly the functional model the
+      # interpreter ran before #34 made the shadow the default, when suites.yml
+      # carried 124/108 for the interpreter. Same gate as the default cells —
+      # more is a regression, fewer means a gap closed and asks for this number
+      # to come down.
+      #
+      #            accurate-cache
+      #   r4400          124
+      #   r5000          108
+      - name: Result
+        if: always()
+        env:
+          CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && 124 || 108 }}
+        run: |
+          {
+            echo "### accurate-cache / ${{ matrix.cpu }}"
+            echo '```'
+            grep -E '^ RESULT:' cpu-tests/build/run.log 2>/dev/null || echo " cpu-tests: no result"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "${CPUTEST_FAILED:-}" ]; then
+            echo "::error::cpu-tests (accurate-cache) recorded no result"
+            exit 1
+          fi
+          if [ "$CPUTEST_FAILED" -gt "$CPUTEST_BASELINE" ]; then
+            echo "::error::cpu-tests (accurate-cache) reported $CPUTEST_FAILED failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_FAILED - CPUTEST_BASELINE )) new"
+            exit 1
+          fi
+          if [ "$CPUTEST_FAILED" -lt "$CPUTEST_BASELINE" ]; then
+            echo "::notice::cpu-tests (accurate-cache) improved to $CPUTEST_FAILED failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
+            echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: suites-accurate-cache-${{ matrix.cpu }}
+          path: |
+            cpu-tests/build/run.log
+            cpu-tests/build/dump.json
           if-no-files-found: ignore
 
   report:
