@@ -1391,27 +1391,53 @@ fn gl_clip_by_wid() {
     assert_ne!(gl_px(g, 300, 150), 0xff, "other CID: not drawn");
 }
 
-/// A stale FIN3 must not satisfy a new Finish wait. The kernel restores a
-/// context's saved FIN3 (0x6B000 = 1), or an older Finish raises it late;
-/// with a deep FIFO the waiting client would then swap a frame the HQ has not
-/// drawn yet, and stay one frame behind (ideas flicker). FIN3 reads as clear
-/// while a Finish is still queued.
+/// A stale FIN3 must not satisfy a new Finish wait, and with a deep FIFO
+/// several Finishes can be in flight at once: FIN3 must stay clear until the
+/// *last* queued Finish has executed (the sequence target names the Nth, not
+/// the first). The kernel restores a context's saved FIN3 (0x6B000 = 1) or an
+/// older Finish raises it late; either way a wait that passes early makes
+/// SwapBuffers flip to a buffer the HQ has not drawn yet, and the pipeline
+/// stays one frame behind (ideas flicker).
+///
+/// To make "still queued" deterministic rather than a race with the engine,
+/// the HQ2 is parked mid-command: a pixel DMA read larger than the GEDMA ring
+/// (no reader) blocks it in `gedma_push`, so the Finishes behind it cannot
+/// run until the ring's stall limit expires.
 #[test]
 fn fin3_waits_for_queued_finish() {
+    use super::hq2::*;
+    let g = live_gr2(Gr2Variant::Xz);
+    w32(g, 0x6b000, 1); // stale FIN3, as a context restore leaves it
+    // 40,000 words out (> GEDMA_OUT_WORDS), so the HQ2 blocks producing them.
+    cmd(g, HQ2_2D_DMA_READ_PIXELS, 0);
+    for v in [0, 400, 400, 100, 0, 0] { cmd(g, 0, v); }
+    const N: usize = 4;
+    for _ in 0..N {
+        cmd(g, 0x0a3, 0);
+    }
+    // The last queued Finish is the target: FIN3 is not visible yet, even
+    // though a stale flag is set and earlier Finishes may complete first.
+    assert_eq!(r32(g, 0x6a040) & 1, 0, "FIN3 hidden while any of {N} finishes is queued");
+    // Drain the parked transfer so the Finishes can run (no 2 s stall wait).
+    for _ in 0..400 * 100 { let _ = r32(g, 0x6a068); }
+    g.wait_idle();
+    assert_eq!(r32(g, 0x6a040) & 1, 1, "FIN3 set once the Nth Finish has executed");
+}
+
+/// The per-engine sequence counters and the FIN2 wait guard round-trip
+/// through a snapshot: a restored board keeps the same notion of which
+/// queued command still has to execute for FIN2/FIN3 to read ready.
+#[test]
+fn sequence_counters_and_wait_guard_round_trip() {
     let g = live_gr2(Gr2Variant::Xz);
     gl_setup_window(g);
-    let fl = |v: f32| v.to_bits();
-    w32(g, 0x6b000, 1); // stale FIN3, as a context restore leaves it
-    // A frame's worth of work, then Finish.
-    for _ in 0..4000 {
-        for v in [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.0f32] { cmd(g, 0x037, fl(v)); }
-    }
-    cmd(g, 0x0a3, 0);
-    let early = r32(g, 0x6a040) & 1;
-    g.wait_idle();
-    let late = r32(g, 0x6a040) & 1;
-    assert_eq!(early, 0, "FIN3 hidden while the Finish is queued");
-    assert_eq!(late, 1, "FIN3 set once the Finish has executed");
+    w32(g, 0x6b000, 1); // FIN3 latched by a context restore
+    w32(g, 0x6a04c, 0); // arm FIN2; fin2_target = current queue depth
+    let saved = g.save_state();
+    let h = live_gr2(Gr2Variant::Xz);
+    h.load_state(&saved).expect("load_state");
+    assert_eq!(saved, h.save_state(), "GR2 sequence/guard state must round-trip");
+    assert_eq!(r32(h, 0x6a040) & 1, 1, "the restored board still reports the latched FIN3");
 }
 
 /// IRIS GL zclear() (atlantis trace): 0x09F = 0x00FFFFFF clears Z to the far

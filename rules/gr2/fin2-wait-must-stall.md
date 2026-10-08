@@ -28,6 +28,15 @@ raises FIN2 before it consumes the entry and drops hq_busy); sampling after
 lost the race in about one run in three. Test:
 `kernel_pixel_dma_fin2_poll_waits_for_hq`.
 
+The stall is sequence-driven, not host-wallclock driven (FIN2/FIN3/GEDMA
+readiness share the HQ2/RE3 `queued_seq`/`executed_seq` counters). The ack
+records `fin2_target` (the queue depth); FIN2 shows once
+`hq_executed_seq >= fin2_target` and the flag is set, and the read returns
+busy while the HQ2 is still behind. The progress-based `FIN2_STALL_LIMIT`
+remains as a backstop, now measured from the executed-sequence counters
+moving. The counters and the wait guard are saved with the board so a
+snapshot keeps the same notion of which command is done.
+
 Related: fin3-must-track-pending-finish.md (the opposite problem: a stale
 FIN3 seen too early).
 

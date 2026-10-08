@@ -49,7 +49,7 @@ use crate::disp::Rex3Screen;
 use crate::gfifo::GFifo;
 use crate::cpu::mips_core::CyclesPtr;
 use crate::dev::ng1::rex3::Renderer;
-use crate::snapshot::{get_field, hex_u32, load_u32_slice, load_u8_slice, toml_u32, u32_slice_to_toml, u8_slice_to_toml};
+use crate::snapshot::{get_field, hex_u32, hex_u64, load_u32_slice, load_u8_slice, toml_u32, toml_u64, u32_slice_to_toml, u8_slice_to_toml};
 use crate::traits::{BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Device, Resettable, Saveable, BUS_BUSY, BUS_OK};
 
 use bt457::Bt457;
@@ -155,12 +155,24 @@ pub struct Gr2 {
     regs: UnsafeCell<Gr2Regs>,
     re3: UnsafeCell<Re3>,
     hq_engine: UnsafeCell<Hq2Engine>,
-    /// Finish / 2D sync tokens (0x0A3, 0x155) the CPU has queued that the HQ2
-    /// has not executed yet. FIN3 reads as clear while any is pending: with
-    /// our deep FIFO an older Finish would otherwise raise FIN3 for a newer
-    /// wait, and the pipeline would run a whole frame behind every swap
-    /// (ideas flicker, IRIX 6.5.22). See rules/gr2/fin3-must-track-pending-finish.md.
-    fin3_pending: AtomicU32,
+    /// Monotonic sequence counters per engine. Every word queued on an engine's
+    /// FIFO is assigned the next `queued_seq`; the engine advances
+    /// `executed_seq` as it consumes words. FIN2/FIN3 and GEDMA readiness are
+    /// `executed_seq >= target_seq`, where the target names the command the
+    /// caller waits on; the latched FIN2/FIN3 level flags and the old
+    /// `fin3_pending` count are gone. See rules/gr2/fin3-must-track-pending-finish.md
+    /// and rules/gr2/fin2-wait-must-stall.md.
+    hq_queued_seq: AtomicU64,
+    hq_executed_seq: AtomicU64,
+    re3_queued_seq: AtomicU64,
+    re3_executed_seq: AtomicU64,
+    /// Sequence of the last queued Finish (0x0A3 / 0x155). FIN3 reads clear
+    /// until it executes so a stale restored flag cannot satisfy a new wait;
+    /// SEQ_NONE means none is queued (a restored flag shows at once).
+    fin3_target: AtomicU64,
+    /// Sequence of the last queued command that streams words out of
+    /// HQ2_GEDMA (context save 0x1E1, pixel DMA reads 0x152 / 0x0AC).
+    gedma_target: AtomicU64,
     /// Set when the kernel acks FIN2 (write to 0x6A04C), which it does right
     /// before issuing a FIN2 command (pixel DMA 0x147, context save/restore)
     /// and polling version bit 1 in a counted loop (100,000 x us_delay(1) for
@@ -171,6 +183,10 @@ pub struct Gr2 {
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
     /// rules/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
+    /// The FIN2 wait's sequence target: the queue depth at the ack (the
+    /// command about to be queued), or the executed sequence for a restored
+    /// flag. FIN2 reads clear until `hq_executed_seq` reaches it.
+    fin2_target: AtomicU64,
     /// Host time (fin2_clock ns) of the last progress seen by a stalled FIN2
     /// poll since the wait was armed (0 = no stalled poll yet). The stall
     /// gives up after FIN2_STALL_LIMIT without progress, so a pipeline that
@@ -255,6 +271,9 @@ impl Gr2 {
             addr_of_mut!((*p).cycles).write(Cell::new(CyclesPtr::dangling()));
             addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
             addr_of_mut!((*p).trace_mask).write(AtomicU32::new(0));
+            addr_of_mut!((*p).fin3_target).write(AtomicU64::new(SEQ_NONE));
+            addr_of_mut!((*p).gedma_target).write(AtomicU64::new(SEQ_NONE));
+            addr_of_mut!((*p).fin2_target).write(AtomicU64::new(SEQ_NONE));
             let a = a.assume_init();
             a.power_on();
             a
@@ -312,11 +331,75 @@ impl Gr2 {
             && !self.re3_busy.load(Ordering::Acquire)
     }
 
+    /// Words the HQ2 / RE3 engine has executed (consumed) so far.
+    fn hq_executed(&self) -> u64 { self.hq_executed_seq.load(Ordering::Acquire) }
+    fn re3_executed(&self) -> u64 { self.re3_executed_seq.load(Ordering::Acquire) }
+
+    /// Push one HQ2 FIFO word and assign it the next queued sequence. A Finish
+    /// or GEDMA command records its sequence as that wait's target *before* the
+    /// word can be executed, so the engine never raises the flag without the
+    /// target naming it. The reservation is rolled back if the FIFO is full
+    /// (the caller's store retries).
+    fn hq_push_word(&self, index: u32, val: u64) -> bool {
+        let seq = self.hq_queued_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        if is_fin3_token(index) {
+            self.fin3_target.store(seq, Ordering::Release);
+        }
+        if is_gedma_token(index) {
+            self.gedma_target.store(seq, Ordering::Release);
+        }
+        if !self.hq_fifo.try_push(index, val) {
+            self.hq_queued_seq.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        Self::wake(&self.hq_thread);
+        true
+    }
+
+    /// Two consecutive HQ2 words as one atomic push (`write64`), sequences
+    /// `base + 1` and `base + 2`.
+    fn hq_push2_words(&self, i0: u32, v0: u64, i1: u32, v1: u64) -> bool {
+        let base = self.hq_queued_seq.fetch_add(2, Ordering::AcqRel);
+        if is_fin3_token(i0) {
+            self.fin3_target.store(base + 1, Ordering::Release);
+        }
+        if is_fin3_token(i1) {
+            self.fin3_target.store(base + 2, Ordering::Release);
+        }
+        if is_gedma_token(i0) {
+            self.gedma_target.store(base + 1, Ordering::Release);
+        }
+        if is_gedma_token(i1) {
+            self.gedma_target.store(base + 2, Ordering::Release);
+        }
+        if !self.hq_fifo.try_push2(i0, v0, i1, v1) {
+            self.hq_queued_seq.fetch_sub(2, Ordering::AcqRel);
+            return false;
+        }
+        Self::wake(&self.hq_thread);
+        true
+    }
+
+    /// FIN3 is ready once the awaited Finish has executed. No queued Finish
+    /// (`fin3_target == SEQ_NONE`) leaves a restored flag visible at once.
+    fn fin3_ready(&self) -> bool {
+        let t = self.fin3_target.load(Ordering::Acquire);
+        t == SEQ_NONE || self.hq_executed() >= t
+    }
+
+    /// FIN2 is ready once the awaited command has executed; a restored flag
+    /// (target set to the executed sequence) is ready at once.
+    fn fin2_seq_ready(&self) -> bool {
+        let t = self.fin2_target.load(Ordering::Acquire);
+        t == SEQ_NONE || self.hq_executed() >= t
+    }
+
     /// A FIN2 poll may stall: true until the HQ2 and RE3 have made no
-    /// progress for FIN2_STALL_LIMIT (Gr2::fin2_armed_ns).
+    /// progress for FIN2_STALL_LIMIT (Gr2::fin2_armed_ns). Progress is the
+    /// engine sequence counters moving, not host time from the first poll.
     fn fin2_stall_ok(&self) -> bool {
         let now = fin2_clock().max(1);
-        let pos = (self.hq_fifo.consumed() as u64) ^ ((self.re3_fifo.consumed() as u64) << 32);
+        let pos = self.hq_executed() ^ self.re3_executed().rotate_left(32);
         if self.fin2_progress.swap(pos, Ordering::AcqRel) != pos {
             self.fin2_armed_ns.store(now, Ordering::Release);
             return true;
@@ -429,8 +512,13 @@ impl Gr2 {
             0x6a068 => {
                 // Sample "HQ2 has work" before looking at the port: a word
                 // is pushed before the HQ2 goes idle, so an idle HQ2 seen
-                // here means every word it produced is visible below.
-                let working = !self.hq_fifo.is_empty() || self.hq_busy.load(Ordering::Acquire);
+                // here means every word it produced is visible below. The
+                // producing command's sequence target covers the window
+                // before the ring's first word lands.
+                let target = self.gedma_target.load(Ordering::Acquire);
+                let working = !self.hq_fifo.is_empty()
+                    || self.hq_busy.load(Ordering::Acquire)
+                    || (target != SEQ_NONE && self.hq_executed() < target);
                 match self.gedma_pop() {
                     Some(v) => v,
                     // Not produced yet: the request is queued or running.
@@ -441,7 +529,7 @@ impl Gr2 {
                     }
                 }
             }
-            0x6b000 => if self.fin3_pending.load(Ordering::Acquire) != 0 { 0 } else { r.hq.fin[hq2::FIN3].load(Ordering::Acquire) },
+            0x6b000 => if !self.fin3_ready() { 0 } else { r.hq.fin[hq2::FIN3].load(Ordering::Acquire) },
             HQREGS..HQREGS_END => {
                 // Sample "HQ2 has work" before reading the register: the HQ2
                 // raises FIN2 before it consumes the entry and drops
@@ -449,22 +537,32 @@ impl Gr2 {
                 // every FIN2 it raised (sampling after would race).
                 let hq_working = off - HQREGS == hq2::HQ_VERSION
                     && (!self.hq_fifo.is_empty() || self.hq_busy.load(Ordering::Acquire));
-                let v = r.hq.read(off - HQREGS);
+                let mut v = r.hq.read(off - HQREGS);
                 if off - HQREGS == hq2::HQ_VERSION {
+                    // FIN2: the ack records the read point (fin2_target); the
+                    // flag is only shown once the awaited command has
+                    // executed. While the HQ2 is still behind the read, the
+                    // read stalls so the kernel's first poll after the DMA
+                    // sees FIN2 instead of spending its poll budget.
+                    let fin2 = v & 2 != 0;
+                    let fin2_ready = fin2 && self.fin2_seq_ready();
                     if self.fin2_wait.load(Ordering::Acquire) != 0 {
-                        if v & 2 != 0 {
+                        if fin2_ready {
                             self.fin2_wait.store(0, Ordering::Release);
                         } else if hq_working && self.fin2_stall_ok() {
-                            // FIN2 awaited and the HQ2 is still working: the
-                            // read waits for it instead of spending the
-                            // kernel's poll budget. With the HQ2 idle and no
-                            // FIN2, the kernel times out as on hardware.
                             return BusRead32::busy();
                         }
                     }
-                    if self.fin3_pending.load(Ordering::Acquire) != 0 {
-                        return BusRead32::ok(v & !1);
+                    if fin2 && !fin2_ready {
+                        v &= !2;
                     }
+                    // FIN3: hide the flag until the last queued Finish (the
+                    // sequence target) has executed, so a stale restored flag
+                    // cannot satisfy a new wait.
+                    if !self.fin3_ready() {
+                        v &= !1;
+                    }
+                    return BusRead32::ok(v);
                 }
                 v
             }
@@ -515,20 +613,9 @@ impl Gr2 {
         match off {
             SHRAM..SHRAM_END => r.shram[(off >> 2) as usize] = val,
             FIFO..FIFO_END => {
-                let idx = (off - FIFO) >> 2;
-                let fin = is_fin3_token(idx);
-                if fin {
-                    // Counted before the push so the HQ can never see the
-                    // token before the counter includes it.
-                    self.fin3_pending.fetch_add(1, Ordering::AcqRel);
-                }
-                if !self.hq_fifo.try_push(idx, val as u64) {
-                    if fin {
-                        self.fin3_pending.fetch_sub(1, Ordering::AcqRel);
-                    }
+                if !self.hq_push_word((off - FIFO) >> 2, val as u64) {
                     return BUS_BUSY;
                 }
-                Self::wake(&self.hq_thread);
             }
             HQUCODE..HQUCODE_END => r.hq.ucode[((off - HQUCODE) >> 2) as usize] = val,
             GEWIN..GEWIN_END => r.ge.write(((off - GEWIN) >> 10) as usize, ((off >> 2) & 0xff) as usize, val),
@@ -536,27 +623,32 @@ impl Gr2 {
             // a command waiting for DMA data (context restore, pixel writes)
             // receives them in order with its FIFO arguments.
             0x6a068 => {
-                if !self.hq_fifo.try_push(hq2::HQ_TOKEN_GEDMA, val as u64) {
+                if !self.hq_push_word(hq2::HQ_TOKEN_GEDMA, val as u64) {
                     return BUS_BUSY;
                 }
-                Self::wake(&self.hq_thread);
             }
             // FIN3 write port (HQ2.h): Xsgi writes 0 after seeing FIN3;
-            // the kernel restores a context's saved FIN3 here.
+            // the kernel restores a context's saved FIN3 here. The flag is
+            // latched, but a queued Finish still gates it (fin3_target), so a
+            // restore during a wait does not satisfy that wait.
             0x6b000 => r.hq.fin[hq2::FIN3].store(val & 1, Ordering::Release),
             // unstall: restart the microcode. The marker keeps the restart
             // ordered with the FIFO words that follow it (start argument).
             0x6a078 => {
-                if !self.hq_fifo.try_push(hq2::HQ_TOKEN_UNSTALL, 0) {
+                if !self.hq_push_word(hq2::HQ_TOKEN_UNSTALL, 0) {
                     return BUS_BUSY;
                 }
                 r.hq.write(off - HQREGS, val, &mut r.ge);
-                Self::wake(&self.hq_thread);
             }
             HQREGS..HQREGS_END => {
                 if off - HQREGS == hq2::HQ_FIN2 {
                     self.fin2_armed_ns.store(0, Ordering::Release);
                     self.fin2_wait.store(1, Ordering::Release);
+                    // The ack (0) waits for the command the kernel queues
+                    // next; a non-zero write restores an already-true flag.
+                    let target = if val == 0 { self.hq_queued_seq.load(Ordering::Acquire) }
+                                 else { self.hq_executed() };
+                    self.fin2_target.store(target, Ordering::Release);
                 }
                 r.hq.write(off - HQREGS, val, &mut r.ge)
             }
@@ -615,14 +707,20 @@ impl Gr2 {
         if !self.re3_fifo.try_push(reg as u32, val as u64) {
             return BUS_BUSY;
         }
+        self.re3_queued_seq.fetch_add(1, Ordering::Release);
         Self::wake(&self.re3_thread);
         BUS_OK
     }
 
-    /// RE3 register reads see the pipeline's result, so they wait (bus retry)
-    /// until everything queued ahead of them has executed.
+    /// RE3 register reads see the pipeline's result, so they sync to the read
+    /// point: wait (bus retry) until everything queued ahead of them has
+    /// executed, checked against the engine's sequence counters.
     fn re3_read(&self, reg: usize) -> BusRead32 {
-        if !self.idle() {
+        let read_point = self.re3_queued_seq.load(Ordering::Acquire);
+        if self.re3_executed_seq.load(Ordering::Acquire) < read_point
+            || !self.re3_fifo.is_empty()
+            || self.re3_busy.load(Ordering::Acquire)
+        {
             return BusRead32::busy();
         }
         // SAFETY: both FIFOs are drained and both engines idle, so the RE3
@@ -634,6 +732,7 @@ impl Gr2 {
             if !self.re3_fifo.try_push(re3::RE3_OP_READ_ADVANCE, 0) {
                 return BusRead32::busy();
             }
+            self.re3_queued_seq.fetch_add(1, Ordering::Release);
             Self::wake(&self.re3_thread);
         }
         BusRead32::ok(v)
@@ -646,6 +745,7 @@ impl Gr2 {
         impl Re3Sink for Sink<'_> {
             fn reg(&mut self, reg: usize, val: u32) {
                 self.0.re3_fifo.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
+                self.0.re3_queued_seq.fetch_add(1, Ordering::Release);
                 Gr2::wake(&self.0.re3_thread);
             }
             fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
@@ -654,6 +754,7 @@ impl Gr2 {
                 while !self.0.re3_fifo.try_push2(re3::RE3_OP_COPY_A, a, re3::RE3_OP_COPY_B, b) {
                     std::hint::spin_loop();
                 }
+                self.0.re3_queued_seq.fetch_add(2, Ordering::Release);
                 Gr2::wake(&self.0.re3_thread);
             }
             fn finish(&mut self, flag: usize) {
@@ -679,6 +780,7 @@ impl Gr2 {
             }
             fn op(&mut self, op: u32, val: u64) {
                 self.0.re3_fifo.push(op, val);
+                self.0.re3_queued_seq.fetch_add(1, Ordering::Release);
                 Gr2::wake(&self.0.re3_thread);
             }
             fn read_image(&mut self, req: &hq2::ReadImage, dest: hq2::ReadDest) {
@@ -729,12 +831,9 @@ impl Gr2 {
                 } else {
                     engine.push(index, val as u32, &mut sink, None);
                 }
-                if is_fin3_token(index) {
-                    // Executed (FIN3 raised if it was a Finish): no longer
-                    // pending. Saturating: tests and replays push directly.
-                    let _ = self.fin3_pending.try_update(Ordering::AcqRel, Ordering::Acquire,
-                        |n| Some(n.saturating_sub(1)));
-                }
+                // One more word executed; a finish/readiness target is
+                // satisfied once this reaches its sequence.
+                self.hq_executed_seq.fetch_add(1, Ordering::Release);
                 self.hq_fifo.consume();
                 backoff.reset();
             } else {
@@ -815,6 +914,7 @@ impl Gr2 {
                 if drew {
                     self.dirty.store(true, Ordering::Relaxed);
                 }
+                self.re3_executed_seq.fetch_add(1, Ordering::Release);
                 self.re3_fifo.consume();
                 backoff.reset();
             } else {
@@ -888,17 +988,9 @@ impl BusDevice for Gr2 {
         if (FIFO..FIFO_END).contains(&off) {
             // Both words or neither: a retried store must not push the first twice.
             let idx = (off - FIFO) >> 2;
-            let fins = is_fin3_token(idx) as u32 + is_fin3_token(idx + 1) as u32;
-            if fins != 0 {
-                self.fin3_pending.fetch_add(fins, Ordering::AcqRel);
-            }
-            if !self.hq_fifo.try_push2(idx, hi as u64, idx + 1, lo as u64) {
-                if fins != 0 {
-                    self.fin3_pending.fetch_sub(fins, Ordering::AcqRel);
-                }
+            if !self.hq_push2_words(idx, hi as u64, idx + 1, lo as u64) {
                 return BUS_BUSY;
             }
-            Self::wake(&self.hq_thread);
             return BUS_OK;
         }
         if (RE3_REGS..RE3_REGS_END).contains(&off) {
@@ -906,6 +998,7 @@ impl BusDevice for Gr2 {
             if !self.re3_fifo.try_push2(reg, hi as u64, reg + 1, lo as u64) {
                 return BUS_BUSY;
             }
+            self.re3_queued_seq.fetch_add(2, Ordering::Release);
             Self::wake(&self.re3_thread);
             return BUS_OK;
         }
@@ -946,11 +1039,17 @@ impl Device for Gr2 {
         }
         // Discard the exit sentinels (and anything behind them).
         self.hq_fifo.reset();
-        self.fin3_pending.store(0, Ordering::Release);
+        self.re3_fifo.reset();
+        self.hq_queued_seq.store(0, Ordering::Release);
+        self.hq_executed_seq.store(0, Ordering::Release);
+        self.re3_queued_seq.store(0, Ordering::Release);
+        self.re3_executed_seq.store(0, Ordering::Release);
+        self.fin3_target.store(SEQ_NONE, Ordering::Release);
+        self.gedma_target.store(SEQ_NONE, Ordering::Release);
+        self.fin2_target.store(SEQ_NONE, Ordering::Release);
         self.fin2_wait.store(0, Ordering::Release);
         let head = self.gedma_out_head.load(Ordering::Acquire);
         self.gedma_out_tail.store(head, Ordering::Release);
-        self.re3_fifo.reset();
     }
 
     fn is_running(&self) -> bool {
@@ -989,6 +1088,9 @@ impl Saveable for Gr2 {
         t.insert("hq_gepc".into(), hex_u32(r.hq.gepc));
         t.insert("hq_numge".into(), hex_u32(r.hq.numge));
         t.insert("hq_running".into(), hex_u32(r.hq.running));
+        t.insert("hq_fin1".into(), hex_u32(r.hq.fin[hq2::FIN1].load(Ordering::Acquire)));
+        t.insert("hq_fin2".into(), hex_u32(r.hq.fin[hq2::FIN2].load(Ordering::Acquire)));
+        t.insert("hq_fin3".into(), hex_u32(r.hq.fin[hq2::FIN3].load(Ordering::Acquire)));
         t.insert("vc1_regs".into(), u8_slice_to_toml(&r.vc1.regs));
         t.insert("vc1_sram".into(), u8_slice_to_toml(&r.vc1.sram));
         t.insert("vc1_sysctl".into(), hex_u32(r.vc1.sysctl as u32));
@@ -1001,6 +1103,16 @@ impl Saveable for Gr2 {
             t.insert(format!("dac{i}_palette"), u8_slice_to_toml(&d.palette));
             t.insert(format!("dac{i}_ctrl"), u8_slice_to_toml(&[d.readmask, d.blinkmask, d.cmd, d.test]));
         }
+        // Engine sequence counters and the FIN2/FIN3/GEDMA wait state, so a
+        // restored snapshot keeps the same notion of which command is done.
+        t.insert("hq_queued_seq".into(), hex_u64(self.hq_queued_seq.load(Ordering::Acquire)));
+        t.insert("hq_executed_seq".into(), hex_u64(self.hq_executed_seq.load(Ordering::Acquire)));
+        t.insert("re3_queued_seq".into(), hex_u64(self.re3_queued_seq.load(Ordering::Acquire)));
+        t.insert("re3_executed_seq".into(), hex_u64(self.re3_executed_seq.load(Ordering::Acquire)));
+        t.insert("fin2_wait".into(), hex_u32(self.fin2_wait.load(Ordering::Acquire)));
+        t.insert("fin2_target".into(), hex_u64(self.fin2_target.load(Ordering::Acquire)));
+        t.insert("fin3_target".into(), hex_u64(self.fin3_target.load(Ordering::Acquire)));
+        t.insert("gedma_target".into(), hex_u64(self.gedma_target.load(Ordering::Acquire)));
         toml::Value::Table(t)
     }
 
@@ -1012,6 +1124,9 @@ impl Saveable for Gr2 {
         if let Some(x) = get_field(v, "hq_gepc") { r.hq.gepc = toml_u32(x).unwrap_or(0); }
         if let Some(x) = get_field(v, "hq_numge") { r.hq.numge = toml_u32(x).unwrap_or(0); }
         if let Some(x) = get_field(v, "hq_running") { r.hq.running = toml_u32(x).unwrap_or(0); }
+        if let Some(x) = get_field(v, "hq_fin1") { r.hq.fin[hq2::FIN1].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "hq_fin2") { r.hq.fin[hq2::FIN2].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "hq_fin3") { r.hq.fin[hq2::FIN3].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
         if let Some(x) = get_field(v, "vc1_regs") { load_u8_slice(x, &mut r.vc1.regs); }
         if let Some(x) = get_field(v, "vc1_sram") { load_u8_slice(x, &mut r.vc1.sram); }
         if let Some(x) = get_field(v, "vc1_sysctl") { r.vc1.sysctl = toml_u32(x).unwrap_or(0) as u8; }
@@ -1028,14 +1143,24 @@ impl Saveable for Gr2 {
                 (d.readmask, d.blinkmask, d.cmd, d.test) = (c[0], c[1], c[2], c[3]);
             }
         }
+        if let Some(x) = get_field(v, "hq_queued_seq") { self.hq_queued_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "hq_executed_seq") { self.hq_executed_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "re3_queued_seq") { self.re3_queued_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "re3_executed_seq") { self.re3_executed_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "fin2_wait") { self.fin2_wait.store(toml_u32(x).unwrap_or(0), Ordering::Release); }
+        if let Some(x) = get_field(v, "fin2_target") { self.fin2_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
+        if let Some(x) = get_field(v, "fin3_target") { self.fin3_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
+        if let Some(x) = get_field(v, "gedma_target") { self.gedma_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
         self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
 
-/// FIFO tokens that raise FIN3 when executed (GL Finish, 2D sync).
 /// Longest a version read stalls for an awaited FIN2 (see Gr2::fin2_wait).
 const FIN2_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// "No sequence target": the corresponding wait is not pending.
+const SEQ_NONE: u64 = u64::MAX;
 
 /// Monotonic host nanoseconds for the FIN2 stall limit.
 fn fin2_clock() -> u64 {
@@ -1045,4 +1170,11 @@ fn fin2_clock() -> u64 {
 
 fn is_fin3_token(idx: u32) -> bool {
     idx == hq2::GL_FINISH || idx == hq2::HQ_GL_FIN3
+}
+
+/// FIFO tokens whose command streams words out of the HQ2_GEDMA read port.
+/// Their sequence becomes the GEDMA read's target, so a read that beats the
+/// HQ2 waits instead of reporting an overrun.
+fn is_gedma_token(idx: u32) -> bool {
+    matches!(idx, hq2::GE_CX_SAVE_MAIN | hq2::HQ2_2D_DMA_READ_PIXELS | hq2::HQ2_GL_DMA_READ)
 }

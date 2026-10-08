@@ -19,7 +19,12 @@ path plus GR2 token and XMAP events in one file; kept on the
 equalled the CPU-written sequence shifted by one frame, while the kernel's
 unmap / fault / retrace flip / revalidate sequence was correct.
 
-Fix (src/dev/gr2/mod.rs, `fin3_pending`): count 0x0A3 / 0x155 tokens when the
-CPU queues them, count down when the HQ executes them; `version` bit 0 and the
-0x6B000 read show FIN3 only when none is pending. Test:
-`fin3_waits_for_queued_finish`.
+Fix (src/dev/gr2/mod.rs): a monotonic `fin3_target` sequence. Every HQ2 FIFO
+word is assigned the next `hq_queued_seq` and each 0x0A3 / 0x155 token records
+its sequence; `version` bit 0 and the 0x6B000 read show FIN3 only once
+`hq_executed_seq >= fin3_target` (and with several Finishes in flight the
+target names the last one, so FIN3 stays clear until the Nth executes). The
+earlier version counted 0x0A3 / 0x155 with `fin3_pending`, which worked but
+was not saveable and did not fit the shared FIN2/GEDMA sequence model. The
+flag itself is still latched (`fin[FIN3]`), gated by the sequence. Test:
+`fin3_waits_for_queued_finish` (N-finish deep-FIFO case).
