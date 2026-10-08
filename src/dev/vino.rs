@@ -1521,6 +1521,59 @@ mod tests {
         }
     }
 
+    /// End-to-end frame-buffer memory for the 6.5 descriptor-chain target test:
+    /// serves 32-bit descriptor reads and records 64-bit DMA writes, so a real
+    /// `vinoBuildJumpBugDAPS`-shaped chain can be walked by the device.
+    struct FrameMem {
+        words:  Mutex<std::collections::HashMap<u32, u32>>,
+        writes: Mutex<Vec<(u32, u64)>>,
+    }
+    impl FrameMem {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                words:  Mutex::new(std::collections::HashMap::new()),
+                writes: Mutex::new(Vec::new()),
+            })
+        }
+        fn poke(&self, addr: u32, word: u32) { self.words.lock().insert(addr, word); }
+        fn read_word(&self, addr: u32) -> u32 { *self.words.lock().get(&addr).unwrap_or(&0) }
+        fn writes(&self) -> Vec<(u32, u64)> { self.writes.lock().clone() }
+    }
+    impl BusDevice for FrameMem {
+        fn read32(&self, addr: u32) -> BusRead32 { BusRead32::ok(self.read_word(addr)) }
+        fn write64(&self, addr: u32, val: u64) -> u32 {
+            self.writes.lock().push((addr, val));
+            BUS_OK
+        }
+    }
+
+    /// The 6.5 kernel's jump-bug chain lives at `TABLE_BASE` and captures into a
+    /// linear 640x480x4 buffer starting at `DATA_BASE` (300 x 4 KiB pages).
+    const CHAIN_TABLE_BASE: u32 = 0x0861_e000;
+    const CHAIN_DATA_BASE:  u32 = 0x0900_0000;
+    const CHAIN_DATA_PAGES:  usize = 300;
+
+    /// Lay out a `vinoBuildJumpBugDAPS`-shaped chain: groups of four descriptor
+    /// slots — three data-page descriptors then a JUMP to the next group —
+    /// terminating in a STOP. Returns the number of data descriptors written.
+    fn build_jump_bug_chain(mem: &FrameMem) -> usize {
+        let groups = CHAIN_DATA_PAGES / 3; // 100 groups -> 300 data descriptors
+        for g in 0..groups {
+            let group = CHAIN_TABLE_BASE + (g as u32) * 16;
+            for k in 0..3u32 {
+                let page = CHAIN_DATA_BASE + ((g as u32) * 3 + k) * 0x1000;
+                mem.poke(group + k * 4, page);
+            }
+            let tail = if g + 1 < groups {
+                desc::JUMP_BIT as u32 | (CHAIN_TABLE_BASE + ((g as u32) + 1) * 16)
+            } else {
+                desc::STOP_BIT as u32 // terminating STOP
+            };
+            mem.poke(group + 12, tail);
+        }
+        CHAIN_DATA_PAGES
+    }
+
     /// UYVY field where each pair stores a deterministic pattern:
     ///   pix[i + 0] = 0x80 | pair_id   (U)
     ///   pix[i + 1] = 0x10 | pair_id   (Y0 — even-x luma)
@@ -1868,5 +1921,111 @@ mod tests {
         let p = &field.pixels;
         assert_eq!(&bytes[..],
                    &[p[0], p[1], p[2], p[5], p[8], p[9], p[10], p[13]][..]);
+    }
+
+    /// END-TO-END TARGET (issue #55). Encodes the acceptance criterion from
+    /// `docs/vino-descriptor-plan.md` §4: an IRIX 6.5 `vidtomem` capture must
+    /// walk the kernel's `vinoBuildJumpBugDAPS` chain to its STOP and produce a
+    /// clean, gap-free 640x480 frame — pixel production (`render_and_pump`)
+    /// separated from descriptor consumption (`descriptor_fetch` /
+    /// `shift_descriptors` / `page_index_w`), with exactly one `CHA_DESC` for
+    /// the frame and `end_of_field`'s odd-advance moving `start_desc_ptr`.
+    ///
+    /// It is `#[ignore]`d because it is the failing target, not a regression:
+    /// the shipped model is pixel-driven (`render_and_pump` stops at the clipped
+    /// rectangle, the cursor is rewound per field, and `CH_DESC_TABLE_PTR`
+    /// reports a hard-coded `FIELD_DESC_SPAN = 0x780`), so it cannot satisfy a
+    /// chain-walk clean frame. Run it with:
+    ///   `cargo test -p iris --lib vino_6_5_vidtomem -- --ignored --nocapture`
+    #[test]
+    #[ignore = "target for #55: fails until the descriptor engine lands"]
+    fn vino_6_5_vidtomem_capture_yields_clean_frame() {
+        const W: u32 = 640;
+        const H: u32 = 480;
+        let row_bytes  = W * 4;                 // RGBA32: 4 bytes/pixel
+        let line_size  = (row_bytes - 8) & 0x0FF8;
+
+        let vino = Vino::new();
+        let mem  = FrameMem::new();
+        vino.set_phys(mem.clone());
+        let data_pages = build_jump_bug_chain(&mem);
+
+        // 6.5 interlaced RGBA capture on channel A, field + DESC interrupts on.
+        {
+            let mut st = vino.state.lock();
+            st.control = ctrl::CHA_DMA_EN | ctrl::CHA_INTERLEAVE_EN
+                       | ctrl::CHA_COLOR_SPACE_RGB
+                       | ctrl::CHA_FIELD_INT_EN | ctrl::CHA_DESC_INT_EN;
+            let chan = &mut st.channels[0];
+            chan.line_size      = line_size;
+            chan.clip_start     = 0;
+            chan.clip_end       = (W & clip::X_MASK)
+                                | ((H & clip::YEVEN_MASK) << clip::YEVEN_SHIFT)
+                                | ((H & clip::YODD_MASK)  << clip::YODD_SHIFT);
+            chan.frame_rate     = 0;
+            chan.start_desc_ptr = CHAIN_TABLE_BASE;
+            chan.next_desc_ptr  = CHAIN_TABLE_BASE;
+            chan.page_index     = 0;
+        }
+        // Program the registers too, so the descriptor cache loads the chain
+        // head exactly as the kernel programs it.
+        vino.write_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR, CHAIN_TABLE_BASE);
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC,   CHAIN_TABLE_BASE);
+
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+        let mut even = make_field(W, H);
+        even.parity = FieldParity::Even;
+        let mut odd  = make_field(W, H);
+        odd.parity  = FieldParity::Odd;
+
+        vino.pump_field(0, &even, &mem_dyn);
+        vino.pump_field(0, &odd,  &mem_dyn);
+
+        // (1) The chain's STOP completes the frame exactly once and disables DMA.
+        {
+            let st = vino.state.lock();
+            assert_ne!(st.int_status & isr::CHA_DESC, 0,
+                "the chain STOP must raise exactly one CHA_DESC for the frame");
+            assert_eq!(st.control & ctrl::CHA_DMA_EN, 0,
+                "consuming the STOP descriptor must disable channel A DMA");
+        }
+
+        // (2) Descriptor consumption, not the pixel rectangle, drives the ring:
+        // `end_of_field`'s odd-field advance must move `start_desc_ptr` off the
+        // chain base (MAME `end_of_field`; plan §3.4). The pixel-driven model
+        // rewinds and leaves it pinned at the base.
+        {
+            let st = vino.state.lock();
+            assert_ne!(st.channels[0].start_desc_ptr, CHAIN_TABLE_BASE,
+                "descriptor engine must advance start_desc_ptr across the chain walk");
+        }
+
+        // (3) The engine walked the whole chain: every data page written.
+        let writes = mem.writes();
+        let mut page_hits = std::collections::BTreeMap::<u32, usize>::new();
+        for (addr, _) in &writes {
+            *page_hits.entry(*addr & !0x0FFF).or_default() += 1;
+        }
+        for p in 0..data_pages {
+            let page = CHAIN_DATA_BASE + (p as u32) * 0x1000;
+            assert!(page_hits.get(&page).copied().unwrap_or(0) > 0,
+                "chain data page {:#010x} ({}/{}) was never written — the walk \
+                 stopped at the pixel count instead of the STOP",
+                page, p + 1, data_pages);
+        }
+
+        // (4) The captured buffer is a clean, contiguous full frame: every byte
+        // address in [DATA_BASE, DATA_BASE + W*H*4) is covered exactly once.
+        let mut addrs: Vec<u32> = writes.iter().map(|(a, _)| *a).collect();
+        addrs.sort_unstable();
+        let frame_dwords = (W as usize * H as usize * 4) / 8;
+        assert_eq!(addrs.len(), frame_dwords,
+            "a clean 640x480x4 frame is exactly {} dwords", frame_dwords);
+        let mut expected = CHAIN_DATA_BASE;
+        for a in &addrs {
+            assert_eq!(*a, expected,
+                "frame buffer has a gap/overlap at {:#010x}", a);
+            expected = expected.wrapping_add(8);
+        }
     }
 }
