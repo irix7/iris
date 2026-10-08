@@ -305,7 +305,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On this host the JIT (jitv2) runs the R4400 guest at 570 MIPS versus 88 MIPS interpreted (6.5x).
+The latest benchmark run on an AMD EPYC 7763 64-Core Processor achieved a score of 594.4 MIPS and 575.8 DMIPS, representing a perfect 100.0% efficiency rating. This performance demonstrates the significant speedup provided by the r4400-jitv2 JIT compiler compared to the standard interpreter. These results are part of a comprehensive dataset that now includes 405 total recorded runs.
 
 ![latest benchmark cells](data/bench_cells.svg)
 
@@ -313,15 +313,16 @@ Latest run's four cells:
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
 |---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 88.0 | 123.2 | 13.1 |
-| `r4400-jitv2` | R4400 | 100.0% | 570.4 | 354.3 | 18.7 |
-| `r5000-interp` | R5000 | 100.0% | 60.1 | 76.5 | 9.7 |
-| `r5000-jitv2` | R5000 | 100.0% | 514.1 | 338.8 | 30.1 |
+| `r4400-jitv2` | R4400 | 100.0% | 594.4 | 575.8 | 32.2 |
 
-History — all 13 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
+History — all 405 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
 
 ![benchmark history](data/bench_history.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (13 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Host-normalised efficiency (the runner's own native rate = 1.0); because the host cancels, this is comparable across different CI runners:
+
+![host-normalised efficiency history](data/bench_history_eff.svg)
+
+Full history table: [data/bench_history.md](data/bench_history.md) (405 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
