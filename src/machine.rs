@@ -30,8 +30,8 @@ const IP28_COUNT_HZ: u64 = 97_500_000;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
+use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R5000ShadowCache, R10000ShadowCache};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -39,6 +39,20 @@ use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, enabled_features};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
 use crate::hptimer::TimerManager;
+
+/// Which cache model `Machine::new` selects for a CPU.
+///
+/// The `build_cpu!` match further down names these same types; this function is
+/// the one place the *choice* lives, so it can be asserted in a unit test
+/// without building a `Machine` (the process is allowed only one). #35 will
+/// grow an `accurate-cache` arm here.
+pub(crate) fn selected_cache_model(cpu: crate::config::CpuModel) -> &'static str {
+    match cpu {
+        crate::config::CpuModel::R4400 => <R4400ShadowCache as CacheCpuModel>::CACHE_MODEL,
+        crate::config::CpuModel::R5000 => <R5000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+        crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
+    }
+}
 
 pub fn emulator_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -292,8 +306,8 @@ impl Machine {
         // Keyed on the configured CPU, not on a cargo feature: the model is a
         // runtime choice, so a feature gate here silently stopped firing.
         let model_has_l2 = match cfg_cpu_model {
-            crate::config::CpuModel::R4400 => <R4400Cache as MipsCache>::L2_SIZE > 0,
-            crate::config::CpuModel::R5000 => <R5000Cache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R4400 => <R4400ShadowCache as MipsCache>::L2_SIZE > 0,
+            crate::config::CpuModel::R5000 => <R5000ShadowCache as MipsCache>::L2_SIZE > 0,
             crate::config::CpuModel::R10000 => <R10000ShadowCache as MipsCache>::L2_SIZE > 0,
         };
         if !model_has_l2 {
@@ -776,6 +790,12 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         macro_rules! build_cpu { ($cache:ty) => {{
+        debug_assert_eq!(
+            <$cache as CacheCpuModel>::CACHE_MODEL,
+            selected_cache_model(cfg_cpu_model),
+            "the CPU selector and the cache-model choice disagree for {:?}",
+            cfg_cpu_model,
+        );
         let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
@@ -820,9 +840,14 @@ impl Machine {
         Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
 
+        // Every CPU now runs the observation-only shadow cache: out of the data
+        // path entirely, with tag and data arrays that exist only to answer
+        // CACHE ops and the PROM's diagnostics. See mips_cache_shadow.rs. The
+        // functional `mips_cache_v2` model stays in the tree (#35 will make it
+        // an opt-in `accurate-cache` feature).
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
-            crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
-            crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
+            crate::config::CpuModel::R4400 => build_cpu!(R4400ShadowCache),
+            crate::config::CpuModel::R5000 => build_cpu!(R5000ShadowCache),
             // IP28 uses the shadow cache: out of the data path entirely, with
             // tag and data arrays that exist only to answer CACHE ops and the
             // PROM's diagnostics. See mips_cache_shadow.rs.
@@ -2336,6 +2361,20 @@ impl Device for SystemController {
 #[cfg(test)]
 mod controller_lifetime_tests {
     use super::*;
+
+    /// Issue #34: the CPU selector picks the observation-only shadow for the
+    /// R4400 and R5000, as it already did for the R10000. Geometry is asserted
+    /// against the functional models in `mips_cache_shadow`'s own tests.
+    #[test]
+    fn the_cpu_selector_chooses_the_shadow_for_r4400_and_r5000() {
+        for cpu in [
+            crate::config::CpuModel::R4400,
+            crate::config::CpuModel::R5000,
+            crate::config::CpuModel::R10000,
+        ] {
+            assert_eq!(selected_cache_model(cpu), "shadow", "{cpu:?}");
+        }
+    }
 
     fn build_machine() -> Box<Machine> {
         // Machine::new needs more stack than a test thread has (see main.rs).

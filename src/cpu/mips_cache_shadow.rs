@@ -285,11 +285,21 @@ impl<
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     // The R10000 implements 44 virtual address bits where the R4x00 implements
-    // 40; the shadow cache is only used for it, but key this off the same flag
-    // that selects its cache encodings rather than asserting it unconditionally.
+    // 40; key this off the same flag that selects its cache encodings rather
+    // than asserting it unconditionally.
     const VA_BITS: u32 = if R10K_OPS { 44 } else { 40 };
-    const NAME: &'static str = "shadow";
+    // Snapshot identity. It must be distinct per CPU even though all three now
+    // share this type: a single "shadow" would let an R5000 restore accept an
+    // R4400 snapshot, because `cpu_model_mismatch` compares this string alone.
+    // The R10000 shadow keeps the historical "shadow" so existing IP28
+    // snapshots still load.
+    const NAME: &'static str = match PRID {
+        0x0000_0440 => "R4400",
+        0x0000_2321 => "R5000",
+        _ => "shadow",
+    };
     const R10K_CACHE_OPS: bool = R10K_OPS;
+    const CACHE_MODEL: &'static str = "shadow";
 }
 
 impl<
@@ -545,6 +555,25 @@ impl<
 pub type R10000ShadowCache =
     ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, true>;
 
+/// SGI Indy IP24 R4400 (IP22's CPU too).
+///
+/// Geometry identical to `R4400Cache` — 16 KB direct-mapped L1s with 16-byte
+/// lines, an inclusive 1 MB secondary with 128-byte lines — so CP0 Config and
+/// a PROM's cache sizing are unchanged. The functional model's L2 owns the
+/// decoded-instruction slots; the shadow holds none, so instruction fetch goes
+/// straight to memory.
+pub type R4400ShadowCache =
+    ShadowCache<16384, 16, 16384, 16, 1048576, 128, false, 0x0000_0440, 0x0000_0500, 48, false>;
+
+/// SGI Indy IP24 R5000.
+///
+/// Geometry identical to `R5000Cache` — 2-way 32 KB L1s with 32-byte lines and
+/// no secondary cache. The functional R5000 keeps its decoded instructions in
+/// L1I; the shadow bypasses the data path entirely, which also sidesteps the
+/// L1I model's coherence bugs.
+pub type R5000ShadowCache =
+    ShadowCache<32768, 32, 32768, 32, 0, 128, true, 0x0000_2321, 0x0000_2300, 48, false>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +758,42 @@ mod tests {
         assert_eq!(c.get_config(CACH_PI), (32768, 64));
         assert_eq!(c.get_config(CACH_PD), (32768, 32));
         assert_eq!(c.get_config(CACH_SD), (1048576, 128));
+    }
+
+    /// The R4400 and R5000 shadows are the same type with new geometry, and
+    /// the geometry the guest reads back — through `MipsCache`'s consts and
+    /// `get_config`, which is what CP0 Config and the cache cpu-tests size from
+    /// — must be exactly what the functional models reported.
+    #[test]
+    fn r4400_and_r5000_shadows_report_the_functional_geometry() {
+        use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+
+        fn same<S: MipsCache, F: MipsCache>() {
+            assert_eq!(S::IC_SIZE, F::IC_SIZE, "I-cache size");
+            assert_eq!(S::IC_LINE, F::IC_LINE, "I-cache line");
+            assert_eq!(S::DC_SIZE, F::DC_SIZE, "D-cache size");
+            assert_eq!(S::DC_LINE, F::DC_LINE, "D-cache line");
+            assert_eq!(S::L2_SIZE, F::L2_SIZE, "secondary size");
+            assert_eq!(S::L2_LINE, F::L2_LINE, "secondary line");
+        }
+        same::<R4400ShadowCache, R4400Cache>();
+        same::<R5000ShadowCache, R5000Cache>();
+
+        // Identity the guest and the restore guard read: PRId/FIR, ISA level,
+        // TLB size, and the cache-model marker the selector is asserted on.
+        fn same_model<S: CpuModel, F: CpuModel>() {
+            assert_eq!(S::PRID, F::PRID, "PRId");
+            assert_eq!(S::FIR, F::FIR, "FIR");
+            assert_eq!(S::MIPS4, F::MIPS4, "ISA level");
+            assert_eq!(S::TLB_ENTRIES, F::TLB_ENTRIES, "TLB entries");
+        }
+        same_model::<R4400ShadowCache, R4400Cache>();
+        same_model::<R5000ShadowCache, R5000Cache>();
+
+        assert_eq!(<R4400ShadowCache as CpuModel>::CACHE_MODEL, "shadow");
+        assert_eq!(<R5000ShadowCache as CpuModel>::CACHE_MODEL, "shadow");
+        assert!(!<R4400ShadowCache as CpuModel>::R10K_CACHE_OPS);
+        assert!(!<R5000ShadowCache as CpuModel>::R10K_CACHE_OPS);
     }
 
     /// Under tcache the JIT serves this model through the window alone, and

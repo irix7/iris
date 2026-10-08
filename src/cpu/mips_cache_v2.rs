@@ -436,6 +436,12 @@ pub trait CpuModel: MipsCache {
     const VA_BITS: u32 = 40;
     /// Name as the guest and the benchmark report see it.
     const NAME: &'static str;
+    /// Which cache implementation this model runs: `"shadow"` for the
+    /// observation-only cache that keeps CACHE state but stays out of the data
+    /// path, `"functional"` for the model whose arrays load, store and fetch
+    /// consult. The machine's CPU selector is asserted against this, and the
+    /// cache-suite baseline report names it.
+    const CACHE_MODEL: &'static str = "functional";
     /// Cache ops 5/6/7 carry their R10000 meanings rather than their R4000 ones.
     /// The executor needs this: `Index_Store_Data` takes its value from TagLo
     /// and `Index_Load_Data` returns into it, neither of which is true of the
