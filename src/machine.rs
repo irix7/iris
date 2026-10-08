@@ -585,6 +585,13 @@ impl Machine {
             Some(r)
         };
 
+        // Let a blocked VDMA worker wake when REX3's GFIFO drains: the worker
+        // parks on the MC's GioDma condvar instead of spinning on BUS_BUSY.
+        for r in [rex3.as_ref(), rex3_head1.as_ref()].into_iter().flatten() {
+            let giodma = mc.giodma().clone();
+            r.set_dma_space_callback(Arc::new(move || giodma.notify_space()));
+        }
+
         // GR2 (XZ / Extreme) in the GIO gfx slot. Created even when headless:
         // selecting the board is explicit, and the PROM needs it to probe.
         let gr2: Option<Arc<crate::dev::gr2::Gr2>> = match cfg.graphics.board {

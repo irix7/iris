@@ -43,19 +43,27 @@
 //!
 //! ## Dispatch
 //!
-//! [`MemoryController::dma_dispatch`] picks one of four bodies from the latched
-//! [`VdmaJob`]. The generic byte engine is the reference implementation and
-//! handles every case; the three specialised paths are byte-identical
-//! shortcuts for the shapes that dominate real workloads, and are gated by
-//! [`VdmaJob::flat_run`] — a pure *shape* test — so that anything unusual falls
-//! through to the generic engine rather than growing a corner case here.
+//! [`MemoryController::latch_run`] picks one of four bodies from the latched
+//! [`VdmaJob`] and stores it as a resumable [`VdmaRun`]. The generic byte engine
+//! is the reference implementation and handles every case; the three
+//! specialised paths are byte-identical shortcuts for the shapes that dominate
+//! real workloads, and are gated by [`VdmaJob::flat_run`] — a pure *shape* test
+//! — so that anything unusual falls through to the generic engine rather than
+//! growing a corner case here.
 //!
 //! | path | shape |
 //! |---|---|
 //! | [`dma_fill_phys`](MemoryController::dma_fill_phys) | untranslated word fill — the PROM clearing memory |
-//! | [`dma_mem_to_gio_64`](MemoryController::dma_mem_to_gio_64) | 64-bit memory → GIO/REX3 image upload, translated or not |
-//! | [`dma_gio_to_mem_64`](MemoryController::dma_gio_to_mem_64) | 64-bit GIO/REX3 → memory image readback, translated or not |
-//! | [`dma_generic_bytes`](MemoryController::dma_generic_bytes) | everything else: unaligned, descending, zoom/stride blocks |
+//! | [`dma_mem_to_gio_64_step`](MemoryController::dma_mem_to_gio_64_step) | 64-bit memory → GIO/REX3 image upload, translated or not |
+//! | [`dma_gio_to_mem_64_step`](MemoryController::dma_gio_to_mem_64_step) | 64-bit GIO/REX3 → memory image readback, translated or not |
+//! | [`dma_lines_bulk_step`](MemoryController::dma_lines_bulk_step) | per-line bulk: ragged, strided, zoomed blocks |
+//! | [`dma_generic_step`](MemoryController::dma_generic_step) | everything else: unaligned, descending, zoom/stride blocks |
+//! | [`dma_gio32_step`](MemoryController::dma_gio32_step) | 32-bit GIO slot (GR2) word transfers |
+//!
+//! Every body is resumable rather than blocking: a `BUS_BUSY` returns
+//! [`VdmaStep::Busy`] with the transfer parked, and [`MemoryController::dma_run`]
+//! waits on the [`GioDma`] condvar before re-dispatching. See the
+//! "Yield-and-re-dispatch" section below the job types.
 //!
 //! The 64-bit paths translate once per qword; the generic engine still
 //! translates once per *byte* (a µTLB walk, a state-lock acquisition and a PTE
@@ -64,11 +72,12 @@
 //! step and is deliberately not done here.
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use parking_lot::{Mutex, Condvar};
 use std::io::Write as IoWrite;
 
 use crate::devlog::LogModule;
-use crate::traits::BUS_BUSY;
+use crate::traits::{BUS_BUSY, BUS_ERR};
 use crate::dev::ioc::IocInterrupt;
 use crate::dev::mc::MemoryController;
 
@@ -154,6 +163,14 @@ pub struct GioDma {
 }
 
 impl GioDma {
+    /// Wake a VDMA worker parked on a full GIO queue (see
+    /// [`MemoryController::wait_gio_space`]). Called by the peer device when it
+    /// frees queue space; takes no lock, so it is safe from the peer's own
+    /// worker thread.
+    pub(crate) fn notify_space(&self) {
+        self.cond.notify_all();
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(GioDmaState {
@@ -204,7 +221,7 @@ pub struct VdmaJob {
     pub word_aligned: bool,
     /// Target GIO slot is 32 bits wide (its `GIO64_ARB` *_SIZE_64 bit is
     /// clear), e.g. GR2. Set by the worker after latching; routes the whole
-    /// transfer to [`dma_gio32`](MemoryController::dma_gio32).
+    /// transfer to [`dma_gio32_step`](MemoryController::dma_gio32_step).
     pub gio32: bool,
     /// Port address for 32-bit transfers (4-byte granular).
     pub gio_addr32: u32,
@@ -407,6 +424,159 @@ pub struct VdmaResult {
     pub exc: bool,
 }
 
+// ── Yield-and-re-dispatch ───────────────────────────────────────────────────
+//
+// A VDMA transfer body used to busy-wait (`std::hint::spin_loop`) whenever the
+// peer device reported `BUS_BUSY` (REX3's GFIFO full, GR2's queue full). That
+// burns a host core for as long as the peer takes to drain, and it runs on the
+// MC-DMA thread with no other work to do.
+//
+// The bodies are now resumable: an attempt makes progress until it is about to
+// issue a GIO transaction that could block, and reports [`VdmaStep::Busy`] with
+// its state recorded in one of the `*State` structs. `dma_run` then waits on
+// the existing [`GioDma`] condvar — which the peer pokes when it frees space —
+// and re-dispatches. The pure memory work that precedes a busy GIO op (reads,
+// translation, packing) is simply redone on resume, so this changes *how* the
+// waiter waits, never what is transferred.
+//
+// Every state struct below is a projection of the nest in the corresponding
+// body: on `Busy` the body must not have committed the operation it was about
+// to issue, so re-entering replays that same operation. The one place a
+// multi-transaction operation can partially commit is the 64-bit/bulk scalar
+// fallback, which is why the chunk states carry an element cursor.
+
+/// Outcome of one attempt at a transfer body.
+pub(crate) enum VdmaStep {
+    /// The transfer finished (completed or faulted).
+    Done(VdmaResult),
+    /// A GIO transaction reported `BUS_BUSY`; state is parked and the caller
+    /// should wait on the peer and re-dispatch.
+    Busy,
+}
+
+/// Nest state for the byte-at-a-time generic engine and the 32-bit GIO engine.
+///
+/// Both walk the same `line / zoom / byte` nest; only the GIO transaction
+/// width differs. The body decrements `line_count`/`zoom_count`/`byte_count`
+/// exactly where the original did, so a resume re-enters the nest at the same
+/// point.
+pub(crate) struct NestState {
+    line_count: u32,
+    zoom_count: u32,
+    byte_count: u32,
+    mem_vaddr: u32,
+    exc: bool,
+}
+
+impl NestState {
+    fn new(job: &VdmaJob) -> Self {
+        Self {
+            line_count: job.line_count,
+            zoom_count: job.zoom_count,
+            byte_count: job.byte_count,
+            mem_vaddr: job.mem_vaddr,
+            exc: false,
+        }
+    }
+}
+
+/// State for the chunked 64-bit flat paths (`dma_mem_to_gio_64`,
+/// `dma_gio_to_mem_64`).
+///
+/// `staged` means `stage[..chunk]` already holds the current chunk and must not
+/// be re-gathered on resume. `pos` is the scalar-fallback cursor: the number of
+/// elements of the current chunk already handed to the device. `loaded` is the
+/// read-side equivalent.
+pub(crate) struct ChunkedState {
+    mem_vaddr: u32,
+    remaining: u64,
+    chunk: usize,
+    staged: bool,
+    scalar: bool,
+    pos: usize,
+    loaded: bool,
+}
+
+impl ChunkedState {
+    fn new(job: &VdmaJob) -> Self {
+        Self {
+            mem_vaddr: job.mem_vaddr,
+            remaining: job.flat_len(),
+            chunk: 0,
+            staged: false,
+            scalar: false,
+            pos: 0,
+            loaded: false,
+        }
+    }
+}
+
+/// State for the per-line bulk engine (`dma_lines_bulk`).
+///
+/// The nest fields mirror the original locals; the `flush_*` fields park a
+/// chunk hand-off that returned `BUS_BUSY` so it can be retried without
+/// re-staging the lines.
+pub(crate) struct LinesState {
+    qpl: usize,
+    lines_per_chunk: usize,
+    line_idx: u32,
+    reps_left: u32,
+    pending: usize,
+    mem_vaddr: u32,
+    chunk_mem: u32,
+    chunk_reps: u32,
+    flushing: bool,
+    flush_n: usize,
+    flush_pos: usize,
+    flush_scalar: bool,
+    flush_loaded: bool,
+}
+
+impl LinesState {
+    fn new(job: &VdmaJob) -> Self {
+        let qpl = job.qwords_per_line();
+        Self {
+            qpl,
+            lines_per_chunk: (VDMA_CHUNK_QWORDS / qpl).max(1),
+            line_idx: 0,
+            reps_left: job.zoom_count,
+            pending: 0,
+            mem_vaddr: job.mem_vaddr,
+            chunk_mem: job.mem_vaddr,
+            chunk_reps: job.zoom_count,
+            flushing: false,
+            flush_n: 0,
+            flush_pos: 0,
+            flush_scalar: false,
+            flush_loaded: false,
+        }
+    }
+}
+
+/// The resumable body selected for a job.
+pub(crate) enum VdmaRun {
+    Generic(NestState),
+    Gio32(NestState),
+    MemToGio64(ChunkedState),
+    GioToMem64(ChunkedState),
+    Lines(LinesState),
+    /// Untranslated word fill: touches only memory, so it cannot yield.
+    Fill,
+}
+
+impl VdmaRun {
+    /// Resume address used to report a transfer abandoned by `stop()`.
+    fn mem_vaddr(&self, job: &VdmaJob) -> u32 {
+        match self {
+            VdmaRun::Generic(s) | VdmaRun::Gio32(s) => s.mem_vaddr,
+            VdmaRun::MemToGio64(s) | VdmaRun::GioToMem64(s) => s.mem_vaddr,
+            VdmaRun::Lines(s) => s.mem_vaddr,
+            VdmaRun::Fill => job.mem_vaddr,
+        }
+    }
+}
+
+
 // ── Engine ──────────────────────────────────────────────────────────────────
 
 impl MemoryController {
@@ -518,7 +688,19 @@ impl MemoryController {
         None
     }
 
+    /// Blocking dispatch: drive a job to completion, retrying a `BUS_BUSY`
+    /// transaction immediately. This is the test/reference entry point; the
+    /// worker uses [`dma_run`](Self::dma_run) with a real wait.
     fn dma_dispatch(&self, job: &VdmaJob) -> VdmaResult {
+        self.dma_run(job, &mut || true)
+    }
+
+    /// Drive a resumable body to completion, yielding to `wait` on `BUS_BUSY`.
+    ///
+    /// `wait` returns `false` when the machine is stopping, which abandons the
+    /// transfer with `exc` set rather than waiting forever for a peer that will
+    /// never drain.
+    fn dma_run(&self, job: &VdmaJob, wait: &mut dyn FnMut() -> bool) -> VdmaResult {
         let Some(phys) = self.phys() else {
             return VdmaResult { mem_vaddr: job.mem_vaddr, exc: true };
         };
@@ -554,32 +736,56 @@ impl MemoryController {
             }
         }
 
+        let mut run = self.latch_run(job);
+        loop {
+            let step = match &mut run {
+                VdmaRun::Gio32(s) => self.dma_gio32_step(phys, job, s),
+                VdmaRun::Fill => VdmaStep::Done(self.dma_fill_phys(phys, job)),
+                VdmaRun::MemToGio64(s) => self.dma_mem_to_gio_64_step(phys, job, s),
+                VdmaRun::GioToMem64(s) => self.dma_gio_to_mem_64_step(phys, job, s),
+                VdmaRun::Lines(s) => self.dma_lines_bulk_step(phys, job, s),
+                VdmaRun::Generic(s) => self.dma_generic_step(phys, job, s),
+            };
+            match step {
+                VdmaStep::Done(r) => return r,
+                VdmaStep::Busy => {
+                    if !wait() {
+                        return VdmaResult { mem_vaddr: run.mem_vaddr(job), exc: true };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Select the resumable body for a job. Same shape tests as the old
+    /// dispatch; only the variant wrapping differs.
+    fn latch_run(&self, job: &VdmaJob) -> VdmaRun {
         if job.gio32 {
             dlog_dev!(LogModule::Mc, "MC: DMA using GIO32 PATH (gio={:#010x} to_host={} xlate={})",
                 job.gio_addr32, job.to_host, job.xlate);
-            self.dma_gio32(phys, job)
+            VdmaRun::Gio32(NestState::new(job))
         } else if job.word_aligned && job.fill && job.to_host && !job.xlate {
             dlog_dev!(LogModule::Mc, "MC: DMA using FILL FAST PATH (stride={})", job.stride);
-            self.dma_fill_phys(phys, job)
+            VdmaRun::Fill
         } else if job.qword_flat() && !job.fill && !job.to_host {
             dlog_dev!(LogModule::Mc, "MC: DMA using MEM->GIO QWORD PATH (len={} xlate={})",
                 job.flat_len(), job.xlate);
-            self.dma_mem_to_gio_64(phys, job)
+            VdmaRun::MemToGio64(ChunkedState::new(job))
         } else if job.qword_flat() && !job.fill && job.to_host {
             dlog_dev!(LogModule::Mc, "MC: DMA using GIO->MEM QWORD PATH (len={} xlate={})",
                 job.flat_len(), job.xlate);
-            self.dma_gio_to_mem_64(phys, job)
+            VdmaRun::GioToMem64(ChunkedState::new(job))
         } else if job.line_bulk_ok() {
             dlog_dev!(LogModule::Mc,
                 "MC: DMA using PER-LINE BULK PATH (lw={} lc={} stride={} zoom={}/{} xlate={})",
                 job.line_width, job.line_count, job.stride,
                 job.zoom_count, job.line_zoom, job.xlate);
-            self.dma_lines_bulk(phys, job)
+            VdmaRun::Lines(LinesState::new(job))
         } else {
             let path = if job.word_aligned && !job.xlate { "WORD" } else { "BYTE" };
             dlog_dev!(LogModule::Mc, "MC: DMA using {} PATH (to_host={} fill={} xlate={} stride={})",
                 path, job.to_host, job.fill, job.xlate, job.stride);
-            self.dma_generic_bytes(phys, job)
+            VdmaRun::Generic(NestState::new(job))
         }
     }
 
@@ -666,71 +872,91 @@ impl MemoryController {
     /// fault is discovered while filling the staging buffer, before any of it
     /// has reached REX3, so the transfer aborts without having pushed a partial
     /// run into the pipeline.
-    fn dma_mem_to_gio_64(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
-        let mut mem_vaddr = job.mem_vaddr;
-        let mut remaining = job.flat_len();
+    /// Resumable form of the above. A `BUS_BUSY` from the hand-off parks the
+    /// chunk in `s` (the staging buffer is left populated) and returns
+    /// [`VdmaStep::Busy`]; the scalar fallback resumes from `s.pos` so no
+    /// element is written twice.
+    fn dma_mem_to_gio_64_step(
+        &self,
+        phys: &dyn crate::traits::BusDevice,
+        job: &VdmaJob,
+        s: &mut ChunkedState,
+    ) -> VdmaStep {
         let mut stage = self.vdma_stage().lock();
 
-        while remaining >= 8 {
-            let chunk = ((remaining / 8) as usize).min(VDMA_CHUNK_QWORDS);
-
-            // Gather: translate + read into the staging buffer. A fault here
-            // aborts before anything is handed to the device.
-            for slot in stage[..chunk].iter_mut() {
-                let Some(phys_addr) = self.dma_xlate_qword(job, mem_vaddr, false) else {
-                    return VdmaResult { mem_vaddr, exc: true };
-                };
-                *slot = { let r = phys.read64(phys_addr); if r.is_ok() { r.data } else { 0 } };
-                mem_vaddr = mem_vaddr.wrapping_add(8);
-            }
-
-            if self.vdma_debug_enabled() {
-                if let Some(f) = self.vdma_log().lock().as_mut() {
-                    let _ = writeln!(f,
-                        "  write chunk: {} qwords first={:016x} last={:016x}",
-                        chunk, stage[0], stage[chunk - 1]);
+        loop {
+            if !s.staged {
+                if s.remaining < 8 {
+                    return VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: false });
                 }
+                s.chunk = ((s.remaining / 8) as usize).min(VDMA_CHUNK_QWORDS);
+
+                // Gather: translate + read into the staging buffer. A fault here
+                // aborts before anything is handed to the device.
+                for slot in stage[..s.chunk].iter_mut() {
+                    let Some(phys_addr) = self.dma_xlate_qword(job, s.mem_vaddr, false) else {
+                        return VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: true });
+                    };
+                    *slot = { let r = phys.read64(phys_addr); if r.is_ok() { r.data } else { 0 } };
+                    s.mem_vaddr = s.mem_vaddr.wrapping_add(8);
+                }
+
+                if self.vdma_debug_enabled() {
+                    if let Some(f) = self.vdma_log().lock().as_mut() {
+                        let _ = writeln!(f,
+                            "  write chunk: {} qwords first={:016x} last={:016x}",
+                            s.chunk, stage[0], stage[s.chunk - 1]);
+                    }
+                }
+
+                s.staged = true;
+                s.scalar = false;
+                s.pos = 0;
             }
 
             // Hand off the whole chunk. BUS_ERR means the device declined to
             // batch this address, so fall back to the scalar loop for it rather
-            // than failing the transfer.
-            let st = phys.dma_write64_bulk(job.gio_addr, &stage[..chunk]);
-            if st == crate::traits::BUS_ERR {
-                for &data in stage[..chunk].iter() {
-                    // Spin on BUS_BUSY — the DMA worker has no EXEC_RETRY
-                    // mechanism, so dropping the status here would silently
-                    // lose pixel data whenever REX3's GFIFO is full.
-                    while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
-                        std::hint::spin_loop();
-                    }
+            // than failing the transfer. BUS_BUSY means the peer had no room and
+            // consumed nothing (the bulk contract is all-or-nothing), so the
+            // chunk is retried from the top on resume.
+            if !s.scalar {
+                let st = phys.dma_write64_bulk(job.gio_addr, &stage[..s.chunk]);
+                if st == BUS_ERR {
+                    s.scalar = true;
+                    s.pos = 0;
+                } else if st == BUS_BUSY {
+                    return VdmaStep::Busy;
                 }
-            } else {
-                let mut st = st;
-                while st == BUS_BUSY {
-                    std::hint::spin_loop();
-                    st = phys.dma_write64_bulk(job.gio_addr, &stage[..chunk]);
+            }
+            if s.scalar {
+                while s.pos < s.chunk {
+                    let st = phys.dma_write64(job.gio_addr, stage[s.pos]);
+                    if st == BUS_BUSY {
+                        return VdmaStep::Busy;
+                    }
+                    // Any other non-OK status is ignored, matching the old spin
+                    // loop, which only ever re-tried on BUS_BUSY.
+                    s.pos += 1;
                 }
             }
 
-            remaining -= (chunk as u64) * 8;
+            s.remaining -= (s.chunk as u64) * 8;
+            s.staged = false;
         }
-
-        VdmaResult { mem_vaddr, exc: false }
     }
 
     /// 64-bit GIO → memory: the image readback from REX3.
     ///
-    /// Mirror of [`dma_mem_to_gio_64`](Self::dma_mem_to_gio_64). Each
+    /// Mirror of [`dma_mem_to_gio_64_step`](Self::dma_mem_to_gio_64_step). Each
     /// `dma_read64` on the HOSTRW port both returns a qword and advances
     /// REX3's pipeline, so the reads must not be skipped or reordered.
     ///
     /// The translation happens *before* the GIO read, so a fault does not
     /// consume a qword from REX3's pipeline it cannot then store — the generic
     /// engine has the opposite order and can drop one on a mid-qword fault.
-    /// Staged like [`dma_mem_to_gio_64`](Self::dma_mem_to_gio_64), in the other
-    /// order: fill the staging buffer from the device in one bulk read, then
-    /// drain it to guest memory, translating per qword.
+    /// Staged like [`dma_mem_to_gio_64_step`](Self::dma_mem_to_gio_64_step), in
+    /// the other order: fill the staging buffer from the device in one bulk
+    /// read, then drain it to guest memory, translating per qword.
     ///
     /// The bulk read is where the real win is on this side. The scalar path
     /// pays a `wait_idle()` — a full REX3 pipeline drain — for every 8 bytes;
@@ -740,54 +966,81 @@ impl MemoryController {
     /// undelivered. That matches the scalar path's behaviour (it too stops at
     /// the faulting address) and the words already written stay written, which
     /// is what the fault handler expects to find.
-    fn dma_gio_to_mem_64(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
-        let mut mem_vaddr = job.mem_vaddr;
-        let mut remaining = job.flat_len();
+    /// Resumable form of the readback. A `BUS_BUSY` during the device read
+    /// parks `s.loaded = false` with `s.pos` at the last qword that *did*
+    /// arrive; the drain to memory (which cannot yield) only runs once the
+    /// whole chunk is in hand.
+    fn dma_gio_to_mem_64_step(
+        &self,
+        phys: &dyn crate::traits::BusDevice,
+        job: &VdmaJob,
+        s: &mut ChunkedState,
+    ) -> VdmaStep {
         let mut stage = self.vdma_stage().lock();
 
-        while remaining >= 8 {
-            let chunk = ((remaining / 8) as usize).min(VDMA_CHUNK_QWORDS);
-
-            let st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..chunk]);
-            if st == crate::traits::BUS_ERR {
-                // Device declined to batch — scalar fallback for this chunk.
-                for slot in stage[..chunk].iter_mut() {
-                    *slot = loop {
-                        let r = phys.dma_read64(job.gio_addr);
-                        if r.is_ok() { break r.data; }
-                        if r.status != BUS_BUSY { break 0u64; }
-                        std::hint::spin_loop();
-                    };
+        loop {
+            if !s.staged {
+                if s.remaining < 8 {
+                    return VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: false });
                 }
-            } else {
-                let mut st = st;
-                while st == BUS_BUSY {
-                    std::hint::spin_loop();
-                    st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..chunk]);
-                }
+                s.chunk = ((s.remaining / 8) as usize).min(VDMA_CHUNK_QWORDS);
+                s.staged = true;
+                s.scalar = false;
+                s.pos = 0;
+                s.loaded = false;
             }
 
-            if self.vdma_debug_enabled() {
-                if let Some(f) = self.vdma_log().lock().as_mut() {
-                    let _ = writeln!(f,
-                        "  read chunk: {} qwords st={:#x} first={:016x} last={:016x}",
-                        chunk, st, stage[0], stage[chunk - 1]);
+            if !s.loaded {
+                if !s.scalar {
+                    let st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..s.chunk]);
+                    if st == BUS_ERR {
+                        // Device declined to batch — scalar fallback for this chunk.
+                        s.scalar = true;
+                    } else if st == BUS_BUSY {
+                        return VdmaStep::Busy;
+                    } else {
+                        s.loaded = true;
+                    }
+                }
+                if !s.loaded && s.scalar {
+                    while s.pos < s.chunk {
+                        let r = phys.dma_read64(job.gio_addr);
+                        if r.is_ok() {
+                            stage[s.pos] = r.data;
+                            s.pos += 1;
+                        } else if r.status == BUS_BUSY {
+                            return VdmaStep::Busy;
+                        } else {
+                            // Matches the old loop, which stored 0 and moved on
+                            // for any non-BUSY error.
+                            stage[s.pos] = 0;
+                            s.pos += 1;
+                        }
+                    }
+                    s.loaded = true;
+                }
+
+                if self.vdma_debug_enabled() {
+                    if let Some(f) = self.vdma_log().lock().as_mut() {
+                        let _ = writeln!(f,
+                            "  read chunk: {} qwords first={:016x} last={:016x}",
+                            s.chunk, stage[0], stage[s.chunk - 1]);
+                    }
                 }
             }
 
             // Drain: translate + write out.
-            for &data in stage[..chunk].iter() {
-                let Some(phys_addr) = self.dma_xlate_qword(job, mem_vaddr, true) else {
-                    return VdmaResult { mem_vaddr, exc: true };
+            for &data in stage[..s.chunk].iter() {
+                let Some(phys_addr) = self.dma_xlate_qword(job, s.mem_vaddr, true) else {
+                    return VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: true });
                 };
                 phys.write64(phys_addr, data);
-                mem_vaddr = mem_vaddr.wrapping_add(8);
+                s.mem_vaddr = s.mem_vaddr.wrapping_add(8);
             }
 
-            remaining -= (chunk as u64) * 8;
+            s.remaining -= (s.chunk as u64) * 8;
+            s.staged = false;
         }
-
-        VdmaResult { mem_vaddr, exc: false }
     }
 
     /// Per-line bulk engine: handles unaligned starts and ends, non-zero
@@ -817,149 +1070,161 @@ impl MemoryController {
     ///
     /// A line longer than the whole staging buffer is rejected by
     /// [`line_bulk_ok`](VdmaJob::line_bulk_ok) and falls to the generic engine.
+    /// Blocking wrapper retained for the differential tests: drive the
+    /// per-line body to completion, re-trying `BUS_BUSY` immediately.
     fn dma_lines_bulk(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
-        let qpl = job.qwords_per_line();
+        let mut s = LinesState::new(job);
+        loop {
+            match self.dma_lines_bulk_step(phys, job, &mut s) {
+                VdmaStep::Done(r) => return r,
+                VdmaStep::Busy => {}
+            }
+        }
+    }
+
+    /// Resumable per-line engine. Staging is pure memory work, so a yield can
+    /// only happen during a chunk flush; the flush cursor and the nest fields
+    /// live in `s` and the staging buffer keeps the parked lines.
+    fn dma_lines_bulk_step(
+        &self,
+        phys: &dyn crate::traits::BusDevice,
+        job: &VdmaJob,
+        s: &mut LinesState,
+    ) -> VdmaStep {
+        let qpl = s.qpl;
         debug_assert!(qpl > 0 && qpl <= VDMA_CHUNK_QWORDS);
-        // At least one line per chunk — guaranteed by the gate above.
-        let lines_per_chunk = (VDMA_CHUNK_QWORDS / qpl).max(1);
-
         let mut stage = self.vdma_stage().lock();
-        let mut mem_vaddr = job.mem_vaddr;
 
-        // The generic engine's nest, flattened: the first source line repeats
-        // `zoom_count` times and every later one `line_zoom` times, because
-        // `zoom_count` reloads from `line_zoom` at the bottom of the outer loop.
-        let mut line_idx = 0u32;           // which source line we are on
-        let mut reps_left = job.zoom_count; // repeats remaining for this line
-        let mut pending: usize = 0;         // lines staged but not yet flushed
+        loop {
+            if !s.flushing {
+                // ── Stage lines until the chunk is full or the job is done ──
+                while s.line_idx < job.line_count && s.pending < s.lines_per_chunk {
+                    let base = s.pending * qpl;
+                    if job.to_host {
+                        // GIO -> memory: nothing to gather; the device produces
+                        // the words. Just reserve the slots.
+                        for slot in stage[base..base + qpl].iter_mut() { *slot = 0; }
+                    } else {
+                        // Memory -> GIO: pack this line's bytes MSB-first, exactly
+                        // as the generic engine does, including the zero-filled
+                        // tail of a ragged final qword.
+                        let mut remaining = job.line_width;
+                        let mut addr = s.mem_vaddr;
+                        for slot in stage[base..base + qpl].iter_mut() {
+                            let length = remaining.min(8);
+                            let mut data = 0u64;
+                            let mut shift = 56u32;
+                            for _ in 0..length {
+                                let Some(pa) = self.dma_xlate_qword(job, addr, false) else {
+                                    return VdmaStep::Done(VdmaResult { mem_vaddr: addr, exc: true });
+                                };
+                                let byte = { let r = phys.read8(pa); if r.is_ok() { r.data as u64 } else { 0 } };
+                                data |= byte << shift;
+                                addr = addr.wrapping_add(1);
+                                shift = shift.wrapping_sub(8);
+                            }
+                            *slot = data;
+                            remaining -= length;
+                        }
+                    }
+                    s.pending += 1;
 
-        // The memory address this chunk's first staged line started at, so the
-        // scatter direction can replay the same walk the gather did.
-        let mut chunk_mem = mem_vaddr;
-        // Repeat counter as of the chunk's first staged line. The scatter has
-        // to replay the same nest the gather walked, and a chunk boundary can
-        // land in the middle of a line's zoom repeats, so this cannot be
-        // re-derived from the line index alone.
-        let mut chunk_reps = reps_left;
+                    // ── Advance the nest ────────────────────────────────────
+                    // A zoom repeat re-sends the *same* source line, so memory
+                    // does not advance; only the last repeat steps to the next
+                    // line.
+                    s.reps_left -= 1;
+                    if s.reps_left == 0 {
+                        s.line_idx += 1;
+                        s.reps_left = job.line_zoom;
+                        s.mem_vaddr = (s.mem_vaddr.wrapping_add(job.line_width) as i32)
+                            .wrapping_add(job.stride) as u32;
+                    }
+                }
 
-        while line_idx < job.line_count {
-            // ── Stage one line ──────────────────────────────────────────
-            let base = pending * qpl;
+                let done = s.line_idx >= job.line_count;
+                if s.pending == 0 && done {
+                    return VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: false });
+                }
+                // The staging loop only exits on "chunk full" or "job done",
+                // and `pending == 0 && done` returned above, so there is a
+                // flush to park.
+                s.flush_n = s.pending * qpl;
+                s.flushing = true;
+                s.flush_pos = 0;
+                s.flush_scalar = false;
+                s.flush_loaded = false;
+            }
+
+            // ── Flush the parked chunk ──────────────────────────────────────
             if job.to_host {
-                // GIO -> memory: nothing to gather; the device produces the
-                // words. Just reserve the slots.
-                for slot in stage[base..base + qpl].iter_mut() { *slot = 0; }
+                if !s.flush_loaded {
+                    if !s.flush_scalar {
+                        let st = phys.dma_read64_bulk(job.gio_addr, &mut stage[..s.flush_n]);
+                        if st == BUS_ERR {
+                            s.flush_scalar = true;
+                        } else if st == BUS_BUSY {
+                            return VdmaStep::Busy;
+                        } else {
+                            s.flush_loaded = true;
+                        }
+                    }
+                    if !s.flush_loaded && s.flush_scalar {
+                        while s.flush_pos < s.flush_n {
+                            let r = phys.dma_read64(job.gio_addr);
+                            if r.is_ok() {
+                                stage[s.flush_pos] = r.data;
+                                s.flush_pos += 1;
+                            } else if r.status == BUS_BUSY {
+                                return VdmaStep::Busy;
+                            } else {
+                                stage[s.flush_pos] = 0;
+                                s.flush_pos += 1;
+                            }
+                        }
+                        s.flush_loaded = true;
+                    }
+                }
+                // Scatter: replay the same line walk the gather would have,
+                // writing only the valid bytes of each line.
+                if let Some(bad) = self.scatter_lines(
+                    phys, job, &stage[..s.flush_n], s.pending, qpl, s.chunk_mem, s.chunk_reps)
+                {
+                    return VdmaStep::Done(VdmaResult { mem_vaddr: bad, exc: true });
+                }
             } else {
-                // Memory -> GIO: pack this line's bytes MSB-first, exactly as
-                // the generic engine does, including the zero-filled tail of a
-                // ragged final qword.
-                let mut remaining = job.line_width;
-                let mut addr = mem_vaddr;
-                for slot in stage[base..base + qpl].iter_mut() {
-                    let length = remaining.min(8);
-                    let mut data = 0u64;
-                    let mut shift = 56u32;
-                    for _ in 0..length {
-                        let Some(pa) = self.dma_xlate_qword(job, addr, false) else {
-                            return VdmaResult { mem_vaddr: addr, exc: true };
-                        };
-                        let byte = { let r = phys.read8(pa); if r.is_ok() { r.data as u64 } else { 0 } };
-                        data |= byte << shift;
-                        addr = addr.wrapping_add(1);
-                        shift = shift.wrapping_sub(8);
-                    }
-                    *slot = data;
-                    remaining -= length;
-                }
-            }
-            pending += 1;
-
-            // ── Advance the nest ────────────────────────────────────────
-            // A zoom repeat re-sends the *same* source line, so memory does not
-            // advance; only the last repeat steps to the next line.
-            reps_left -= 1;
-            let line_done = reps_left == 0;
-            if line_done {
-                line_idx += 1;
-                reps_left = job.line_zoom;
-                // Step over this line and apply the stride, matching the
-                // generic engine: it walks `line_width` bytes forward during
-                // the line, then adds `stride` at the bottom of the outer loop.
-                mem_vaddr = (mem_vaddr.wrapping_add(job.line_width) as i32)
-                    .wrapping_add(job.stride) as u32;
-            }
-
-            // ── Flush when the chunk is full or the job is done ──────────
-            let done = line_idx >= job.line_count;
-            if pending == lines_per_chunk || done {
-                let n = pending * qpl;
-                if job.to_host {
-                    self.bulk_read_chunk(phys, job, &mut stage[..n]);
-                    // Scatter: replay the same line walk the gather would have,
-                    // writing only the valid bytes of each line.
-                    if let Some(bad) = self.scatter_lines(
-                        phys, job, &stage[..n], pending, qpl, chunk_mem, chunk_reps)
-                    {
-                        return VdmaResult { mem_vaddr: bad, exc: true };
-                    }
-                } else {
-                    self.bulk_write_chunk(phys, job, &stage[..n]);
-                }
-
-                if self.vdma_debug_enabled() {
-                    if let Some(f) = self.vdma_log().lock().as_mut() {
-                        let _ = writeln!(f,
-                            "  line chunk: {} lines x {} qwords = {} qwords ({})",
-                            pending, qpl, n,
-                            if job.to_host { "gio->mem" } else { "mem->gio" });
+                if !s.flush_scalar {
+                    let st = phys.dma_write64_bulk(job.gio_addr, &stage[..s.flush_n]);
+                    if st == BUS_ERR {
+                        s.flush_scalar = true;
+                    } else if st == BUS_BUSY {
+                        return VdmaStep::Busy;
                     }
                 }
-                pending = 0;
-                chunk_mem = mem_vaddr;
-                chunk_reps = reps_left;
-            }
-        }
-
-        VdmaResult { mem_vaddr, exc: false }
-    }
-
-    /// Hand a staged chunk to the device, falling back to scalar writes if it
-    /// declines to batch this port.
-    fn bulk_write_chunk(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob, buf: &[u64]) {
-        let st = phys.dma_write64_bulk(job.gio_addr, buf);
-        if st == crate::traits::BUS_ERR {
-            for &data in buf {
-                while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
-                    std::hint::spin_loop();
+                if s.flush_scalar {
+                    while s.flush_pos < s.flush_n {
+                        let st = phys.dma_write64(job.gio_addr, stage[s.flush_pos]);
+                        if st == BUS_BUSY {
+                            return VdmaStep::Busy;
+                        }
+                        s.flush_pos += 1;
+                    }
                 }
             }
-        } else {
-            let mut st = st;
-            while st == BUS_BUSY {
-                std::hint::spin_loop();
-                st = phys.dma_write64_bulk(job.gio_addr, buf);
-            }
-        }
-    }
 
-    /// Fill a staged chunk from the device, falling back to scalar reads.
-    fn bulk_read_chunk(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob, buf: &mut [u64]) {
-        let st = phys.dma_read64_bulk(job.gio_addr, buf);
-        if st == crate::traits::BUS_ERR {
-            for slot in buf.iter_mut() {
-                *slot = loop {
-                    let r = phys.dma_read64(job.gio_addr);
-                    if r.is_ok() { break r.data; }
-                    if r.status != BUS_BUSY { break 0u64; }
-                    std::hint::spin_loop();
-                };
+            if self.vdma_debug_enabled() {
+                if let Some(f) = self.vdma_log().lock().as_mut() {
+                    let _ = writeln!(f,
+                        "  line chunk: {} lines x {} qwords = {} qwords ({})",
+                        s.pending, qpl, s.flush_n,
+                        if job.to_host { "gio->mem" } else { "mem->gio" });
+                }
             }
-        } else {
-            let mut st = st;
-            while st == BUS_BUSY {
-                std::hint::spin_loop();
-                st = phys.dma_read64_bulk(job.gio_addr, buf);
-            }
+
+            s.pending = 0;
+            s.chunk_mem = s.mem_vaddr;
+            s.chunk_reps = s.reps_left;
+            s.flushing = false;
         }
     }
 
@@ -1017,102 +1282,120 @@ impl MemoryController {
     /// The reference engine: byte-at-a-time, full line/zoom/stride nest, µTLB
     /// translation, either direction. Every case the specialised paths decline
     /// lands here.
+    ///
+    /// This blocking form is the differential reference the other engines are
+    /// tested against. It forces this engine regardless of `job` shape, so it
+    /// stays independent of [`latch_run`](Self::latch_run).
     fn dma_generic_bytes(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
-        let mut line_count = job.line_count;
-        let mut zoom_count = job.zoom_count;
-        let mut byte_count = job.byte_count;
-        let mut mem_vaddr = job.mem_vaddr;
-        let mut exc = false;
+        let mut s = NestState::new(job);
+        loop {
+            match self.dma_generic_step(phys, job, &mut s) {
+                VdmaStep::Done(r) => return r,
+                VdmaStep::Busy => {}
+            }
+        }
+    }
 
+    /// Resumable reference engine. Every GIO transaction is a single qword
+    /// (`to_host`) or a single packed qword (`mem->gio`), so a `BUS_BUSY`
+    /// simply leaves `mem_vaddr`/`byte_count` uncommitted for that transaction
+    /// and the re-dispatch replays it. Memory-side work before the transaction
+    /// (translation, reads) is pure and recomputed.
+    fn dma_generic_step(
+        &self,
+        phys: &dyn crate::traits::BusDevice,
+        job: &VdmaJob,
+        s: &mut NestState,
+    ) -> VdmaStep {
         // GIO side uses 64-bit (qword) transactions; memory side uses bytes.
         // For fill+to_host the inner unit is 4 bytes (dword).
-        'dma_loop: while line_count > 0 {
-            line_count -= 1;
-            while zoom_count > 0 {
-                zoom_count -= 1;
-                while byte_count > 0 {
+        //
+        // `line_count` is decremented at the *end* of a line, never at the top:
+        // a `Busy` return leaves the current line in progress, so the resume
+        // must re-enter it rather than treating it as already done.
+        'dma_loop: while s.line_count > 0 {
+            while s.zoom_count > 0 {
+                while s.byte_count > 0 {
                     if job.to_host {
                         if job.fill {
                             // Fill: write gio_addr as dword to memory, step 4
                             let phys_addr = if job.xlate {
-                                match self.translate_addr(mem_vaddr, true) {
+                                match self.translate_addr(s.mem_vaddr, true) {
                                     Some(a) => a,
-                                    None => { exc = true; break 'dma_loop; }
+                                    None => { s.exc = true; break 'dma_loop; }
                                 }
-                            } else { mem_vaddr };
+                            } else { s.mem_vaddr };
                             phys.write32(phys_addr, job.gio_addr);
-                            if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(4); }
-                            else          { mem_vaddr = mem_vaddr.wrapping_sub(4); }
-                            byte_count = byte_count.saturating_sub(4);
+                            if job.dir_up { s.mem_vaddr = s.mem_vaddr.wrapping_add(4); }
+                            else          { s.mem_vaddr = s.mem_vaddr.wrapping_sub(4); }
+                            s.byte_count = s.byte_count.saturating_sub(4);
                         } else {
-                            // GIO -> Mem: read qword from GIO, unpack bytes to memory.
-                            // Spin on BUS_BUSY (GRXDLY / pipeline not idle) — DMA worker
-                            // thread has no EXEC_RETRY mechanism, so we busy-wait here.
-                            let length = byte_count.min(8);
-                            let data = loop {
-                                let r = phys.dma_read64(job.gio_addr);
-                                if r.is_ok() { break r.data; }
-                                if r.status != BUS_BUSY { break 0u64; }
-                                std::hint::spin_loop();
-                            };
+                            // GIO -> Mem: read qword from GIO, unpack bytes to
+                            // memory. A BUS_BUSY read consumes nothing, so it is
+                            // re-issued untouched after the wait.
+                            let length = s.byte_count.min(8);
+                            let r = phys.dma_read64(job.gio_addr);
+                            if r.status == BUS_BUSY { return VdmaStep::Busy; }
+                            let data = if r.is_ok() { r.data } else { 0 };
                             let mut shift = 56u32;
                             for _ in 0..length {
                                 let byte = (data >> shift) as u8;
                                 let phys_addr = if job.xlate {
-                                    match self.translate_addr(mem_vaddr, true) {
+                                    match self.translate_addr(s.mem_vaddr, true) {
                                         Some(a) => a,
-                                        None => { exc = true; break 'dma_loop; }
+                                        None => { s.exc = true; break 'dma_loop; }
                                     }
-                                } else { mem_vaddr };
+                                } else { s.mem_vaddr };
                                 phys.write8(phys_addr, byte);
-                                if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
-                                else          { mem_vaddr = mem_vaddr.wrapping_sub(1); }
+                                if job.dir_up { s.mem_vaddr = s.mem_vaddr.wrapping_add(1); }
+                                else          { s.mem_vaddr = s.mem_vaddr.wrapping_sub(1); }
                                 shift = shift.wrapping_sub(8);
                             }
-                            byte_count = byte_count.saturating_sub(length);
+                            s.byte_count = s.byte_count.saturating_sub(length);
                         }
                     } else {
-                        // Mem -> GIO: pack bytes from memory into qword, write to GIO
-                        let length = byte_count.min(8);
+                        // Mem -> GIO: pack bytes from memory into a qword, then
+                        // write it. Packing must not commit `mem_vaddr` until
+                        // the write lands, or a BUS_BUSY retry would advance
+                        // past bytes it never sent.
+                        let length = s.byte_count.min(8);
                         let mut data = 0u64;
                         let mut shift = 56u32;
-                        for _ in 0..length {
+                        for k in 0..length {
+                            let a = if job.dir_up { s.mem_vaddr.wrapping_add(k) }
+                                    else          { s.mem_vaddr.wrapping_sub(k) };
                             let phys_addr = if job.xlate {
-                                match self.translate_addr(mem_vaddr, false) {
-                                    Some(a) => a,
-                                    None => { exc = true; break 'dma_loop; }
+                                match self.translate_addr(a, false) {
+                                    Some(p) => p,
+                                    None => { s.mem_vaddr = a; s.exc = true; break 'dma_loop; }
                                 }
-                            } else { mem_vaddr };
-                            let byte = { let _r = phys.read8(phys_addr); if _r.is_ok() { let b = _r.data as _; b } else { 0 } };
-                            data |= (byte as u64) << shift;
-                            if job.dir_up { mem_vaddr = mem_vaddr.wrapping_add(1); }
-                            else          { mem_vaddr = mem_vaddr.wrapping_sub(1); }
+                            } else { a };
+                            let byte = { let _r = phys.read8(phys_addr); if _r.is_ok() { _r.data as u64 } else { 0 } };
+                            data |= byte << shift;
                             shift = shift.wrapping_sub(8);
                         }
-                        // Spin on BUS_BUSY, same as the GIO->Mem read
-                        // path above: the DMA worker has no EXEC_RETRY
-                        // mechanism, so dropping the status here would
-                        // silently lose pixel data whenever REX3's GFIFO
-                        // is full (write64 reports BUS_BUSY rather than
-                        // blocking, so the CPU can retry — but only a
-                        // caller that checks it actually retries).
-                        while phys.dma_write64(job.gio_addr, data) == BUS_BUSY {
-                            std::hint::spin_loop();
+                        let st = phys.dma_write64(job.gio_addr, data);
+                        if st == BUS_BUSY { return VdmaStep::Busy; }
+                        for _ in 0..length {
+                            if job.dir_up { s.mem_vaddr = s.mem_vaddr.wrapping_add(1); }
+                            else          { s.mem_vaddr = s.mem_vaddr.wrapping_sub(1); }
                         }
-                        byte_count = byte_count.saturating_sub(length);
+                        s.byte_count = s.byte_count.saturating_sub(length);
                     }
                 }
-                byte_count = job.line_width;
-                if zoom_count > 0 {
-                    if job.dir_up { mem_vaddr = mem_vaddr.wrapping_sub(job.line_width); }
-                    else          { mem_vaddr = mem_vaddr.wrapping_add(job.line_width); }
+                s.byte_count = job.line_width;
+                if s.zoom_count > 1 {
+                    if job.dir_up { s.mem_vaddr = s.mem_vaddr.wrapping_sub(job.line_width); }
+                    else          { s.mem_vaddr = s.mem_vaddr.wrapping_add(job.line_width); }
                 }
+                s.zoom_count -= 1;
             }
-            zoom_count = job.line_zoom;
-            mem_vaddr = (mem_vaddr as i32).wrapping_add(job.stride) as u32;
+            s.zoom_count = job.line_zoom;
+            s.mem_vaddr = (s.mem_vaddr as i32).wrapping_add(job.stride) as u32;
+            s.line_count -= 1;
         }
 
-        VdmaResult { mem_vaddr, exc }
+        VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: s.exc })
     }
 
     /// 32-bit GIO slot (GR2): the same line/zoom/stride nest as the generic
@@ -1120,54 +1403,61 @@ impl MemoryController {
     /// issued as a single register access at the port address. Bytes are
     /// packed MSB-first, as on the big-endian bus; a short tail (<4 bytes)
     /// goes out left-justified in the word.
-    fn dma_gio32(&self, phys: &dyn crate::traits::BusDevice, job: &VdmaJob) -> VdmaResult {
-        let mut mem_vaddr = job.mem_vaddr;
-        let mut exc = false;
+    fn dma_gio32_step(
+        &self,
+        phys: &dyn crate::traits::BusDevice,
+        job: &VdmaJob,
+        s: &mut NestState,
+    ) -> VdmaStep {
         let step = |v: u32| if job.dir_up { v.wrapping_add(1) } else { v.wrapping_sub(1) };
-        let mut zoom_count = job.zoom_count;
-        let mut byte_count = job.byte_count;
 
-        'dma: for _line in 0..job.line_count {
-            while zoom_count > 0 {
-                zoom_count -= 1;
-                while byte_count > 0 {
-                    let length = byte_count.min(4);
+        'dma: while s.line_count > 0 {
+            while s.zoom_count > 0 {
+                while s.byte_count > 0 {
+                    let length = s.byte_count.min(4);
                     if job.to_host {
-                        let data = loop {
-                            let r = phys.read32(job.gio_addr32);
-                            if r.is_ok() { break r.data; }
-                            if r.status != BUS_BUSY { break 0; }
-                            std::hint::spin_loop();
-                        };
+                        // A BUS_BUSY read consumes nothing; re-issued on resume.
+                        let r = phys.read32(job.gio_addr32);
+                        if r.status == BUS_BUSY { return VdmaStep::Busy; }
+                        let data = if r.is_ok() { r.data } else { 0 };
                         for k in 0..length {
-                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, true) else { exc = true; break 'dma; };
+                            let Some(pa) = self.dma_mem_addr(job, s.mem_vaddr, true) else {
+                                s.exc = true; break 'dma;
+                            };
                             phys.write8(pa, (data >> (24 - 8 * k)) as u8);
-                            mem_vaddr = step(mem_vaddr);
+                            s.mem_vaddr = step(s.mem_vaddr);
                         }
                     } else {
+                        // Pack without committing `mem_vaddr`; a BUS_BUSY write
+                        // leaves nothing sent, so the same word is rebuilt.
                         let mut data = 0u32;
                         for k in 0..length {
-                            let Some(pa) = self.dma_mem_addr(job, mem_vaddr, false) else { exc = true; break 'dma; };
+                            let a = if job.dir_up { s.mem_vaddr.wrapping_add(k) }
+                                    else          { s.mem_vaddr.wrapping_sub(k) };
+                            let Some(pa) = self.dma_mem_addr(job, a, false) else {
+                                s.mem_vaddr = a; s.exc = true; break 'dma;
+                            };
                             let b = phys.read8(pa);
                             data |= (if b.is_ok() { b.data as u32 } else { 0 }) << (24 - 8 * k);
-                            mem_vaddr = step(mem_vaddr);
                         }
-                        while phys.write32(job.gio_addr32, data) == BUS_BUSY {
-                            std::hint::spin_loop();
-                        }
+                        let st = phys.write32(job.gio_addr32, data);
+                        if st == BUS_BUSY { return VdmaStep::Busy; }
+                        for _ in 0..length { s.mem_vaddr = step(s.mem_vaddr); }
                     }
-                    byte_count -= length;
+                    s.byte_count -= length;
                 }
-                byte_count = job.line_width;
-                if zoom_count > 0 {
-                    mem_vaddr = if job.dir_up { mem_vaddr.wrapping_sub(job.line_width) }
-                                else { mem_vaddr.wrapping_add(job.line_width) };
+                s.byte_count = job.line_width;
+                if s.zoom_count > 1 {
+                    s.mem_vaddr = if job.dir_up { s.mem_vaddr.wrapping_sub(job.line_width) }
+                                  else { s.mem_vaddr.wrapping_add(job.line_width) };
                 }
+                s.zoom_count -= 1;
             }
-            zoom_count = job.line_zoom;
-            mem_vaddr = (mem_vaddr as i32).wrapping_add(job.stride) as u32;
+            s.zoom_count = job.line_zoom;
+            s.mem_vaddr = (s.mem_vaddr as i32).wrapping_add(job.stride) as u32;
+            s.line_count -= 1;
         }
-        VdmaResult { mem_vaddr, exc }
+        VdmaStep::Done(VdmaResult { mem_vaddr: s.mem_vaddr, exc: s.exc })
     }
 
     /// Memory-side address for one byte: translated or identity.
@@ -1190,6 +1480,25 @@ impl MemoryController {
             _ => return false,
         };
         self.gio64_arb() & bit == 0
+    }
+
+    /// Wait for the peer to free GIO queue space after a `BUS_BUSY`.
+    ///
+    /// Parks on the [`GioDma`] condvar, which the peer device pokes via
+    /// [`GioDma::notify_space`] when it drains. The wait is bounded: if no peer
+    /// ever signals (a genuinely stuck device, or a peer that does not know to
+    /// notify), the timeout re-checks and the transfer resumes rather than
+    /// hanging forever.
+    ///
+    /// Returns `false` when the machine is stopping, so the caller abandons the
+    /// transfer instead of waiting on a peer that is being torn down.
+    fn wait_gio_space(&self) -> bool {
+        let giodma = self.giodma();
+        {
+            let mut state = giodma.state.lock();
+            giodma.cond.wait_for(&mut state, Duration::from_millis(1));
+        }
+        self.dma_running()
     }
 
     /// The MC-DMA thread body: wait for a run signal, latch, dispatch, retire.
@@ -1236,7 +1545,7 @@ impl MemoryController {
                 self.log_vdma_start(&job, tlb_hi, tlb_lo);
             }
 
-            let result = self.dma_dispatch(&job);
+            let result = self.dma_run(&job, &mut || self.wait_gio_space());
 
             let end_time = crate::platform::get_host_ticks();
             let elapsed = end_time.wrapping_sub(start_time);
@@ -1397,7 +1706,7 @@ mod tests {
     ///
     /// This is the check that would have caught gating the fast path on
     /// `!xlate`: it only passes if translation actually happens inside
-    /// `dma_mem_to_gio_64`.
+    /// `dma_mem_to_gio_64_step`.
     #[test]
     fn translated_qword_path_reads_through_the_page_table() {
         use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -2419,5 +2728,291 @@ mod gio32_tests {
         assert!(!r.exc);
         let got: Vec<u8> = (0..6).map(|i| bus.mem.read8(0x2000 + i).data).collect();
         assert_eq!(got, vec![0xa0, 0xa1, 0xa2, 0xa3, 0xb0, 0xb1]);
+    }
+}
+
+/// The yield-and-re-dispatch path: a GIO transaction that reports `BUS_BUSY`
+/// must park the transfer at exactly that operation, wait, and resume without
+/// duplicating or skipping anything.
+#[cfg(test)]
+mod yield_redispatch_tests {
+    use super::*;
+    use crate::dev::eeprom_93c56::Eeprom93c56;
+    use crate::dev::mem::Memory;
+    use crate::traits::{BusDevice, BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK};
+    use parking_lot::Mutex as PlMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// RAM that refuses the first N DMA writes, standing in for a peer whose
+    /// queue is full. Records every accepted qword in order.
+    struct FlakySink {
+        mem: Memory,
+        seen: StdMutex<Vec<u64>>,
+        busy_left: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl BusDevice for FlakySink {
+        fn read8(&self, a: u32) -> BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read16(&self, a: u32) -> BusRead16 { self.mem.read16(a) }
+        fn read32(&self, a: u32) -> BusRead32 { self.mem.read32(a) }
+        fn write32(&self, a: u32, v: u32) -> u32 { self.mem.write32(a, v) }
+        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
+        fn dma_write64(&self, _a: u32, v: u64) -> u32 {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let refused = self
+                .busy_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 { Some(n - 1) } else { None }
+                })
+                .is_ok();
+            if refused { return BUS_BUSY; }
+            self.seen.lock().unwrap().push(v);
+            BUS_OK
+        }
+    }
+
+    fn job() -> VdmaJob {
+        // Descending so the shape misses both fast paths and lands in the
+        // generic byte engine, whose GIO side is one dma_write64 per qword.
+        VdmaJob {
+            line_count: 1, line_width: 16, line_zoom: 1, zoom_count: 1,
+            byte_count: 16, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x200f,
+            mode: 0, ctl: 0, to_host: false, fill: false, dir_up: false,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
+        }
+    }
+
+    #[test]
+    fn busy_gio_write_yields_and_resumes_without_duplicating() {
+        let sink = Arc::new(FlakySink {
+            mem: Memory::new(1),
+            seen: StdMutex::new(Vec::new()),
+            busy_left: AtomicUsize::new(3),
+            writes: AtomicUsize::new(0),
+        });
+        for i in 0..16u32 { sink.mem.write8(0x2000 + i, i as u8); }
+
+        let phys: Arc<dyn BusDevice> = sink.clone();
+        let mc = MemoryController::new(
+            Arc::new(PlMutex::new(Eeprom93c56::new())), true, [1, 0, 0, 0]);
+        mc.set_phys(phys.clone());
+
+        let j = job();
+        assert!(!j.qword_flat() && !j.line_bulk_ok(),
+            "shape must reach the generic engine to exercise its BUS_BUSY path");
+
+        let mut waits = 0usize;
+        let r = mc.dma_run(&j, &mut || { waits += 1; true });
+        assert!(!r.exc);
+
+        assert_eq!(waits, 3, "each BUS_BUSY must park once and be re-dispatched");
+        assert_eq!(sink.writes.load(Ordering::SeqCst), 5,
+            "3 refused attempts + 2 accepted writes");
+        assert_eq!(*sink.seen.lock().unwrap(),
+            vec![0x0f0e_0d0c_0b0a_0908, 0x0706_0504_0302_0100],
+            "resume must replay the refused qword exactly once, in order");
+    }
+
+    /// A sink that can be told to refuse a fixed number of GIO operations,
+    /// bulk or scalar, and serve a deterministic read stream. Refused
+    /// operations consume nothing from the feed.
+    struct ResumeSink {
+        mem: Memory,
+        seen: StdMutex<Vec<u64>>,
+        feed: StdMutex<Vec<u64>>,
+        feed_pos: StdMutex<usize>,
+        refuse_bulk: AtomicUsize,
+        refuse_scalar: AtomicUsize,
+        bulk_ok: bool,
+    }
+
+    impl ResumeSink {
+        fn new(bulk_ok: bool, refuse_bulk: usize, refuse_scalar: usize) -> Self {
+            ResumeSink {
+                mem: Memory::new(8),
+                seen: StdMutex::new(Vec::new()),
+                feed: StdMutex::new((0..80_000u64)
+                    .map(|k| k.wrapping_mul(0x0102_0304_0506_0709) ^ 0xA5A5_0000_0000_5A5A)
+                    .collect()),
+                feed_pos: StdMutex::new(0),
+                refuse_bulk: AtomicUsize::new(refuse_bulk),
+                refuse_scalar: AtomicUsize::new(refuse_scalar),
+                bulk_ok,
+            }
+        }
+        fn next_feed(&self) -> u64 {
+            let mut pos = self.feed_pos.lock().unwrap();
+            let v = self.feed.lock().unwrap().get(*pos).copied().unwrap_or(0);
+            *pos += 1;
+            v
+        }
+        fn take(counter: &AtomicUsize) -> bool {
+            counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    if n > 0 { Some(n - 1) } else { None }
+                })
+                .is_ok()
+        }
+    }
+
+    impl BusDevice for ResumeSink {
+        fn read8(&self, a: u32) -> BusRead8 { self.mem.read8(a) }
+        fn write8(&self, a: u32, v: u8) -> u32 { self.mem.write8(a, v) }
+        fn read16(&self, a: u32) -> BusRead16 { self.mem.read16(a) }
+        fn read32(&self, a: u32) -> BusRead32 { self.mem.read32(a) }
+        fn write32(&self, a: u32, v: u32) -> u32 { self.mem.write32(a, v) }
+        fn read64(&self, a: u32) -> BusRead64 { self.mem.read64(a) }
+        fn write64(&self, a: u32, v: u64) -> u32 { self.mem.write64(a, v) }
+        fn dma_read64(&self, _a: u32) -> BusRead64 {
+            if Self::take(&self.refuse_scalar) { return BusRead64::busy(); }
+            BusRead64::ok(self.next_feed())
+        }
+        fn dma_write64(&self, _a: u32, v: u64) -> u32 {
+            if Self::take(&self.refuse_scalar) { return BUS_BUSY; }
+            self.seen.lock().unwrap().push(v);
+            BUS_OK
+        }
+        fn dma_read64_bulk(&self, _a: u32, out: &mut [u64]) -> u32 {
+            if !self.bulk_ok { return BUS_ERR; }
+            if Self::take(&self.refuse_bulk) { return BUS_BUSY; }
+            for slot in out.iter_mut() { *slot = self.next_feed(); }
+            BUS_OK
+        }
+        fn dma_write64_bulk(&self, _a: u32, vals: &[u64]) -> u32 {
+            if !self.bulk_ok { return BUS_ERR; }
+            if Self::take(&self.refuse_bulk) { return BUS_BUSY; }
+            self.seen.lock().unwrap().extend_from_slice(vals);
+            BUS_OK
+        }
+    }
+
+    fn run(job: &VdmaJob, bulk_ok: bool, refuse_bulk: usize, refuse_scalar: usize)
+        -> (Arc<ResumeSink>, VdmaResult, usize)
+    {
+        let sink = Arc::new(ResumeSink::new(bulk_ok, refuse_bulk, refuse_scalar));
+        for i in 0..0x20_0000u32 {
+            sink.mem.write8(0x2000u32.wrapping_add(i), (i.wrapping_mul(31) ^ (i >> 5)) as u8);
+        }
+        let phys: Arc<dyn BusDevice> = sink.clone();
+        let mc = MemoryController::new(
+            Arc::new(PlMutex::new(Eeprom93c56::new())), true, [8, 0, 0, 0]);
+        mc.set_phys(phys.clone());
+        let mut waits = 0usize;
+        let r = mc.dma_run(job, &mut || { waits += 1; true });
+        (sink, r, waits)
+    }
+
+    fn reference(job: &VdmaJob) -> (Arc<ResumeSink>, VdmaResult) {
+        let sink = Arc::new(ResumeSink::new(false, 0, 0));
+        for i in 0..0x20_0000u32 {
+            sink.mem.write8(0x2000u32.wrapping_add(i), (i.wrapping_mul(31) ^ (i >> 5)) as u8);
+        }
+        let phys: Arc<dyn BusDevice> = sink.clone();
+        let mc = MemoryController::new(
+            Arc::new(PlMutex::new(Eeprom93c56::new())), true, [8, 0, 0, 0]);
+        mc.set_phys(phys.clone());
+        let r = mc.dma_generic_bytes(phys.as_ref(), job);
+        (sink, r)
+    }
+
+    /// A GIO op refused at any point — bulk or scalar, 64-bit, per-line or
+    /// generic — must resume to exactly the reference engine's wire stream.
+    #[test]
+    fn refused_gio_ops_resume_identically_on_every_path() {
+        // (name, job, bulk_ok, refuse_bulk, refuse_scalar, exercises)
+        let base = || VdmaJob {
+            line_count: 1, line_width: 0x40, line_zoom: 1, zoom_count: 1,
+            byte_count: 0x40, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x2000,
+            mode: 0, ctl: 0, to_host: false, fill: false, dir_up: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
+        };
+        let cases: Vec<(&str, VdmaJob, bool, usize, usize)> = vec![
+            ("qword-flat 64-bit bulk refused",
+                base(), true, 3, 0),
+            ("per-line ragged bulk refused",
+                VdmaJob { line_count: 239, line_width: 164, byte_count: 164, stride: 0, ..base() },
+                true, 3, 0),
+            ("per-line zoomed bulk refused",
+                VdmaJob { line_count: 3, line_width: 20, byte_count: 20, stride: 20,
+                          line_zoom: 2, zoom_count: 2, ..base() }, true, 5, 0),
+            ("64-bit scalar fallback refused",
+                base(), false, 0, 2),
+            ("per-line scalar fallback refused",
+                VdmaJob { line_count: 4, line_width: 12, byte_count: 12, stride: 12, ..base() },
+                false, 0, 3),
+            ("generic byte engine refused",
+                VdmaJob { line_count: 2, line_width: 12, byte_count: 12, stride: 12,
+                          zoom_count: 1, line_zoom: 1, dir_up: false, mem_vaddr: 0x2001, ..base() },
+                false, 0, 2),
+        ];
+
+        for (name, job, bulk_ok, rb, rs) in cases {
+            let (want_sink, want_r) = reference(&job);
+            let (got_sink, got_r, waits) = run(&job, bulk_ok, rb, rs);
+
+            assert_eq!(got_r.exc, want_r.exc, "{name}: fault flag differs");
+            assert_eq!(got_r.mem_vaddr, want_r.mem_vaddr, "{name}: final mem_vaddr differs");
+            assert!(waits > 0, "{name}: test setup refused nothing — vacuous");
+
+            let want = want_sink.seen.lock().unwrap().clone();
+            let got = got_sink.seen.lock().unwrap().clone();
+            assert_eq!(got.len(), want.len(), "{name}: wire length differs");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(g, w, "{name}: wire qword {i} differs: got {g:016x} want {w:016x}");
+            }
+        }
+    }
+
+    /// Mirror of the write test for the readback direction: guest memory must
+    /// end up byte-identical to the reference even when the GIO read is refused.
+    #[test]
+    fn refused_gio_reads_resume_identically_on_every_path() {
+        let base = || VdmaJob {
+            line_count: 1, line_width: 0x40, line_zoom: 1, zoom_count: 1,
+            byte_count: 0x40, stride: 0, gio_addr: 0x1f0f_0000, mem_vaddr: 0x2000,
+            mode: 0, ctl: 0, to_host: true, fill: false, dir_up: true,
+            ie: false, xlate: false, word_aligned: true, gio32: false, gio_addr32: 0,
+        };
+        let cases: Vec<(&str, VdmaJob, bool, usize, usize)> = vec![
+            ("qword-flat readback bulk refused", base(), true, 3, 0),
+            ("per-line ragged readback bulk refused",
+                VdmaJob { line_count: 239, line_width: 164, byte_count: 164, stride: 0, ..base() },
+                true, 3, 0),
+            ("per-line zoomed readback bulk refused",
+                VdmaJob { line_count: 3, line_width: 20, byte_count: 20, stride: 20,
+                          line_zoom: 2, zoom_count: 2, ..base() }, true, 5, 0),
+            ("64-bit scalar read fallback refused", base(), false, 0, 2),
+            ("per-line scalar read fallback refused",
+                VdmaJob { line_count: 4, line_width: 12, byte_count: 12, stride: 12, ..base() },
+                false, 0, 3),
+            ("generic read engine refused",
+                VdmaJob { line_count: 2, line_width: 12, byte_count: 12, stride: 12,
+                          dir_up: false, mem_vaddr: 0x2001, ..base() }, false, 0, 2),
+        ];
+
+        for (name, job, bulk_ok, rb, rs) in cases {
+            let (want_sink, want_r) = reference(&job);
+            let (got_sink, got_r, waits) = run(&job, bulk_ok, rb, rs);
+
+            assert_eq!(got_r.exc, want_r.exc, "{name}: fault flag differs");
+            assert_eq!(got_r.mem_vaddr, want_r.mem_vaddr, "{name}: final mem_vaddr differs");
+            assert!(waits > 0, "{name}: test setup refused nothing — vacuous");
+
+            let mut diffs = 0;
+            for i in 0..0x2_0000u32 {
+                let addr = 0x2000u32.wrapping_add(i);
+                let w = want_sink.mem.read8(addr).data;
+                let g = got_sink.mem.read8(addr).data;
+                if w != g {
+                    if diffs < 8 { eprintln!("{name}: mem[{addr:#x}] got={g:#04x} want={w:#04x}"); }
+                    diffs += 1;
+                }
+            }
+            assert_eq!(diffs, 0, "{name}: {diffs} bytes differ from the reference engine");
+        }
     }
 }

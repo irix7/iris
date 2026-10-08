@@ -1342,6 +1342,11 @@ pub struct Rex3 {
     /// interrupt — one physical pin for both directions, selected by
     /// `CONFIG_GFIFOABOVEINT`; see `update_gfifo_irqs`).
     pub fifo_full_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    /// Poked on the GFIFO consumer thread whenever the queue transitions from
+    /// non-empty to empty, i.e. when it frees space a blocked VDMA producer was
+    /// waiting for. Set by the machine wiring to the MC's [`GioDma`] condvar;
+    /// `OnceLock` keeps the consumer's read lock-free.
+    pub dma_space_cb: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
     /// Incremented each time an XMAP mode table entry is written (buf_sel flip signal).
     /// Payload of GFIFO_DISP_SYNC pushed to the GFIFO on each such write.
     pub xmap_fence: AtomicU32,
@@ -1515,6 +1520,7 @@ impl Rex3 {
             screen,
             vblank_cb: Mutex::new(None),
             fifo_full_cb: Mutex::new(None),
+            dma_space_cb: std::sync::OnceLock::new(),
             xmap_fence: AtomicU32::new(0),
             gfifo_fence: AtomicU32::new(0),
             debug: Arc::new(AtomicBool::new(false)),
@@ -1622,6 +1628,12 @@ impl Rex3 {
 
     pub fn set_fifo_full_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.fifo_full_cb.lock() = Some(cb);
+    }
+
+    /// Register the "GFIFO freed space" callback the VDMA worker waits on.
+    /// Set once at machine construction; see [`Self::dma_space_cb`].
+    pub fn set_dma_space_callback(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.dma_space_cb.set(cb);
     }
 
     /// Program VC2 with a host-side Newport timing preset (see `[graphics] resolution`).
@@ -2597,6 +2609,9 @@ impl Rex3 {
                 if is_busy {
                     self.gfxbusy.store(false, Ordering::Release);
                     is_busy = false;
+                    // The queue just drained: wake any VDMA producer parked on
+                    // BUS_BUSY so it can re-dispatch. Cheap when nobody waits.
+                    if let Some(cb) = self.dma_space_cb.get() { cb(); }
                     //self.update_gfifo_irqs();
                 }
                 self.gfifo.flush_head();
