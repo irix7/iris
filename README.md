@@ -305,7 +305,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-The JIT compiler (jitv2) delivers a massive performance boost over the interpreter, achieving 589.0 MIPS for the R4400 and 556.5 MIPS for the R5000, which represents a roughly 10x speedup compared to the interpreter’s 59.5 and 103.2 MIPS respectively. While the JIT significantly outpaces the interpreter in raw MIPS, the R4400 configuration yields higher DMIPS (522.9) than the R5000 (324.2), and all four configurations achieved a 100.0% success rate across the 12 recorded runs.
+On this host the JIT (jitv2) runs the R4400 guest at 570 MIPS versus 88 MIPS interpreted (6.5x).
 
 ![latest benchmark cells](data/bench_cells.svg)
 
@@ -313,15 +313,15 @@ Latest run's four cells:
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
 |---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 59.5 | 87.0 | 10.1 |
-| `r4400-jitv2` | R4400 | 100.0% | 589.0 | 522.9 | 31.8 |
-| `r5000-interp` | R5000 | 100.0% | 103.2 | 141.7 | 16.1 |
-| `r5000-jitv2` | R5000 | 100.0% | 556.5 | 324.2 | 30.8 |
+| `r4400-interp` | R4400 | 100.0% | 88.0 | 123.2 | 13.1 |
+| `r4400-jitv2` | R4400 | 100.0% | 570.4 | 354.3 | 18.7 |
+| `r5000-interp` | R5000 | 100.0% | 60.1 | 76.5 | 9.7 |
+| `r5000-jitv2` | R5000 | 100.0% | 514.1 | 338.8 | 30.1 |
 
-History — all 12 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
+History — all 13 recorded runs, grouped by CPU (interpreter vs jitv2; a line breaks where the host CPU changes):
 
 ![benchmark history](data/bench_history.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (12 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (13 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->

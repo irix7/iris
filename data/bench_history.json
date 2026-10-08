@@ -647,6 +647,60 @@
           "linpack": 30.77
         }
       ]
+    },
+    {
+      "source": "irix7/iris",
+      "commit": "b9b0dd2b613cb69d891a292d69061613e5a7fa1c",
+      "ref": "main",
+      "date": "2026-10-08T03:01:40Z",
+      "title": "Merge remote-tracking branch 'origin/main'\n\n# Conflicts:\n#\tREADME.md",
+      "host": {
+        "raw": "linux x86_64 / INTEL(R) XEON(R) PLATINUM 8573C / 4 cores",
+        "cpu": "INTEL(R) XEON(R) PLATINUM 8573C",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 88.0,
+          "dmips": 123.2,
+          "whet": 4469.0,
+          "linpack": 13.14
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 570.4,
+          "dmips": 354.3,
+          "whet": 3144.0,
+          "linpack": 18.71
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 60.1,
+          "dmips": 76.5,
+          "whet": 3059.0,
+          "linpack": 9.66
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 514.1,
+          "dmips": 338.8,
+          "whet": 3428.0,
+          "linpack": 30.11
+        }
+      ]
     }
   ]
 }
