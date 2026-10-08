@@ -110,6 +110,10 @@ jobs:
 
       - name: Fold the shard fragments into the history
         run: |
+          # Always merge onto the latest history, so the interpreter and jitv2
+          # backfills (separate runs) don't overwrite each other's entries.
+          git fetch origin main
+          git checkout origin/main -- data/bench_history.json || true
           mapfile -t FRAGS < <(find fragments -name history.json | sort)
           if [ "${#FRAGS[@]}" -eq 0 ]; then echo "no fragments to merge"; exit 0; fi
           printf 'merging %d fragments\n' "${#FRAGS[@]}"
@@ -123,4 +127,4 @@ jobs:
           git add data/ README.md
           if git diff --cached --quiet; then echo "no history to record"; exit 0; fi
           git commit -m "bench: backfill benchmark history [skip ci]"
-          git push
+          git push || { git pull --rebase origin main && git push; }
