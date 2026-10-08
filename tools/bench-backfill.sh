@@ -52,8 +52,7 @@ make -C bench hostbench
 # shellcheck disable=SC2086
 cargo build --release --bin iris-bench ${FEATURES:+--features $FEATURES}
 rm -rf "$OUT"; mkdir -p "$OUT"
-./target/release/iris-bench host --label host --out "$OUT"
-echo "backfill: apparatus ready; host baseline recorded"
+echo "backfill: apparatus ready"
 
 # ── commit list, oldest first ────────────────────────────────────────────────
 # Either a rev-list spec (`HEAD~30..HEAD`, `v1..v2`) or a path to a file of
@@ -111,7 +110,15 @@ for sha in "${COMMITS[@]}"; do
   fi
   EMU_BIN="$TARGET/release/iris"
 
-  # Run the CURRENT suite against the OLD emulator; the host baseline stays.
+  # Host baseline for THIS commit on THIS runner, now. A shard spans ~an hour
+  # and a shared runner's speed drifts across it, so one baseline per shard
+  # biases every commit measured after it — the source of the swings in the
+  # first backfill. Pool a few samples to quiet the native run's own jitter.
+  ./target/release/iris-bench host --label host --out "$OUT" \
+      --repeat "${BACKFILL_HOST_REPEAT:-3}" >/dev/null 2>&1 \
+    || echo "   (host baseline failed; efficiency will be missing)"
+
+  # Run the CURRENT suite against the OLD emulator.
   # shellcheck disable=SC2086
   if ! ./target/release/iris-bench run --iris "$EMU_BIN" \
         --elf "$SUITE_ELF" --config "$ROOT/bench/run/bare.toml" \

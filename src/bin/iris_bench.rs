@@ -936,6 +936,11 @@ enum Cmd {
         /// report can pair each emulated cell with the host run on its runner.
         #[arg(long, default_value = "host")]
         label: String,
+        /// Pool this many host samples (see `run --repeat`). A single native
+        /// run is quick but jittery, and it is the denominator of every
+        /// efficiency figure, so a few samples pay for themselves.
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
     },
 
     /// Build every CPU x engine cell and run all of them.
@@ -1096,10 +1101,15 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Host { exe, out, timeout, label } => {
+        Cmd::Host { exe, out, timeout, label, repeat } => {
             let exe = exe.unwrap_or_else(|| repo_relative("bench/build/irisbench-host"));
             let out = out.unwrap_or_else(default_out);
-            let run = run_host(&exe, timeout, &label)?;
+            let repeat = repeat.max(1);
+            let mut samples = Vec::with_capacity(repeat as usize);
+            for _ in 0..repeat {
+                samples.push(run_host(&exe, timeout, &label)?);
+            }
+            let run = average_runs(samples)?;
             let path = save(&run, &out)?;
             print!("{}", text_summary(std::slice::from_ref(&run)));
             println!("wrote {}", path.display());

@@ -171,8 +171,20 @@ def history_svg(entries, metric="mips"):
             hosts.append(h)
     host_color = {h: HOST_COLORS[i % len(HOST_COLORS)] for i, h in enumerate(hosts)}
 
-    groups = [("R4400", ["r4400-interp", "r4400-jitv2"]),
-              ("R5000", ["r5000-interp", "r5000-jitv2"])]
+    all_groups = [("R4400", ["r4400-interp", "r4400-jitv2"]),
+                  ("R5000", ["r5000-interp", "r5000-jitv2"])]
+
+    def group_has_data(cells):
+        return any(c["name"] in cells and c.get(metric) is not None
+                   for e in entries for c in e["cells"])
+
+    groups = [g for g in all_groups if group_has_data(g[1])]
+    if not groups:
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
+    # The raw-MIPS chart carries a host strip and breaks lines at host changes
+    # because raw MIPS is only comparable within a host. The normalised chart
+    # has the host divided out, so none of that belongs on it.
+    show_host = metric == "mips"
 
     W = 880
     pad_l, pad_r, pad_t = 84, 18, 104
@@ -239,22 +251,24 @@ def history_svg(entries, metric="mips"):
         parts.append(f'<text x="{lx + 14}" y="65" font-size="11" fill="#444">{label}</text>')
         lx += 14 + 7 * len(label) + 22
 
-    lx = pad_l
-    for h in hosts:
-        label = _short_host(h)
-        parts.append(f'<rect x="{lx:.1f}" y="78" width="10" height="10" fill="{host_color[h]}"/>')
-        parts.append(f'<text x="{lx + 14:.1f}" y="87" font-size="11" fill="#444">{label}</text>')
-        lx += 14 + 7 * len(label) + 16
+    if show_host:
+        lx = pad_l
+        for h in hosts:
+            label = _short_host(h)
+            parts.append(f'<rect x="{lx:.1f}" y="78" width="10" height="10" fill="{host_color[h]}"/>')
+            parts.append(f'<text x="{lx + 14:.1f}" y="87" font-size="11" fill="#444">{label}</text>')
+            lx += 14 + 7 * len(label) + 16
 
     band_y = panel_top(ngroup - 1) + panel_h + host_gap
 
     # Host-change separators span the panels, drawn first so points sit on top.
-    for i in range(1, n):
-        if entries[i]["host"].get("cpu", "?") != entries[i - 1]["host"].get("cpu", "?"):
-            x = pad_l + plot_w * i / n
-            parts.append(f'<line x1="{x:.1f}" y1="{pad_t - 4}" x2="{x:.1f}" '
-                         f'y2="{band_y + host_band:.1f}" stroke="#dddddd" stroke-width="1" '
-                         f'stroke-dasharray="3,3"/>')
+    if show_host:
+        for i in range(1, n):
+            if entries[i]["host"].get("cpu", "?") != entries[i - 1]["host"].get("cpu", "?"):
+                x = pad_l + plot_w * i / n
+                parts.append(f'<line x1="{x:.1f}" y1="{pad_t - 4}" x2="{x:.1f}" '
+                             f'y2="{band_y + host_band:.1f}" stroke="#dddddd" stroke-width="1" '
+                             f'stroke-dasharray="3,3"/>')
 
     for j, (title, cells) in enumerate(groups):
         top = panel_top(j)
@@ -287,11 +301,12 @@ def history_svg(entries, metric="mips"):
                 prev = (x, y, h)
 
     # Host strip: one coloured cell per run, under the panels.
-    seg = plot_w / n
-    for i, e in enumerate(entries):
-        h = e["host"].get("cpu", "?")
-        parts.append(f'<rect x="{pad_l + i * seg:.1f}" y="{band_y}" width="{seg:.1f}" '
-                     f'height="{host_band}" fill="{host_color[h]}"/>')
+    if show_host:
+        seg = plot_w / n
+        for i, e in enumerate(entries):
+            h = e["host"].get("cpu", "?")
+            parts.append(f'<rect x="{pad_l + i * seg:.1f}" y="{band_y}" width="{seg:.1f}" '
+                         f'height="{host_band}" fill="{host_color[h]}"/>')
 
     base = band_y + host_band
     for i, e in enumerate(entries):
@@ -404,16 +419,12 @@ def readme_block(entry, entries, analysis):
     parts.append("|---|---|---:|---:|---:|---:|")
     parts.append(cells)
     parts.append("")
-    parts.append(f"History — all {len(entries)} recorded runs, grouped by CPU "
-                 f"(interpreter vs jitv2; a line breaks where the host CPU changes):")
-    parts.append("")
-    parts.append("![benchmark history](data/bench_history.svg)")
-    parts.append("")
     if has_efficiency(entries):
-        parts.append("Host-normalised efficiency (the runner's own native rate = 1.0); "
-                     "because the host cancels, this is comparable across different CI runners:")
+        parts.append(f"Normalised benchmark across all {len(entries)} recorded runs — each run "
+                     f"divided by its own runner's native rate, so the same number means the same "
+                     f"thing on every CI runner (interpreter vs jitv2):")
         parts.append("")
-        parts.append("![host-normalised efficiency history](data/bench_history_eff.svg)")
+        parts.append("![normalised benchmark history](data/bench_history_eff.svg)")
         parts.append("")
     parts.append(f"Full history table: [data/bench_history.md](data/bench_history.md) "
                  f"({len(entries)} runs). Regenerated from `data/bench_history.json` "
