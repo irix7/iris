@@ -168,13 +168,42 @@ mod tests {
         fn set_word(&self, addr: u64, val: u32) {
             for (i, b) in val.to_be_bytes().iter().enumerate() { self.set_byte(addr + i as u64, *b); }
         }
+        /// Bump the JIT generation counter for the page containing the
+        /// (already-translated physical) `addr`, mirroring
+        /// `Memory::bump_gen`/`PpMemory::bump_gen`. Without this a compiled
+        /// page stays "current" after a guest/DMA write and the JIT keeps
+        /// running stale native code; this is issue #75's missing half.
+        ///
+        /// Deliberately *not* a call to the process-global `note_phys_write`:
+        /// the CPU-store force-exit already reaches the executing page through
+        /// the executor's own `pcp` (`write_data_impl` -> `smc_note_write`),
+        /// and keeping single-word mock writes off the global active-page
+        /// pointer preserves the property — relied on by the rest of this
+        /// suite running in parallel — that these mock devices can't
+        /// cross-contaminate another test's active-page latch. The DMA path
+        /// below is the one that does go through the global, as devices do.
+        #[cfg(feature = "jitv2")]
+        fn bump_gen(&self, addr: u32) {
+            self.bump_page(addr / PAGE_SIZE);
+        }
+        #[cfg(feature = "jitv2")]
+        fn bump_page(&self, page: u32) {
+            let mut gens = self.gens.lock().unwrap();
+            let counter = gens.entry(page).or_insert_with(|| Box::new(AtomicU64::new(0)));
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     impl BusDevice for MockMemory {
         fn read8(&self, addr: u32) -> BusRead8 {
             BusRead8::ok(self.get_byte(addr as u64))
         }
-        fn write8(&self, addr: u32, val: u8) -> u32 { self.set_byte(addr as u64, val); BUS_OK }
+        fn write8(&self, addr: u32, val: u8) -> u32 {
+            self.set_byte(addr as u64, val);
+            #[cfg(feature = "jitv2")]
+            self.bump_gen(addr);
+            BUS_OK
+        }
         fn read16(&self, addr: u32) -> BusRead16 {
             let a = (addr & !1) as u64;
             let mut b = [0u8; 2];
@@ -184,6 +213,8 @@ mod tests {
         fn write16(&self, addr: u32, val: u16) -> u32 {
             let a = (addr & !1) as u64;
             for (i, b) in val.to_be_bytes().iter().enumerate() { self.set_byte(a + i as u64, *b); }
+            #[cfg(feature = "jitv2")]
+            self.bump_gen(addr);
             BUS_OK
         }
         fn read32(&self, addr: u32) -> BusRead32 {
@@ -199,7 +230,12 @@ mod tests {
             }
             BusRead32::ok(self.get_word(a))
         }
-        fn write32(&self, addr: u32, val: u32) -> u32 { self.set_word((addr & !3) as u64, val); BUS_OK }
+        fn write32(&self, addr: u32, val: u32) -> u32 {
+            self.set_word((addr & !3) as u64, val);
+            #[cfg(feature = "jitv2")]
+            self.bump_gen(addr);
+            BUS_OK
+        }
         fn read64(&self, addr: u32) -> BusRead64 {
             let a = (addr & !7) as u64;
             let hi = self.get_word(a) as u64;
@@ -210,6 +246,40 @@ mod tests {
             let a = (addr & !7) as u64;
             self.set_word(a, (val >> 32) as u32);
             self.set_word(a + 4, val as u32);
+            #[cfg(feature = "jitv2")]
+            self.bump_gen(addr);
+            BUS_OK
+        }
+        /// DMA-style block write (issue #75's DMA half). Mirrors
+        /// `Memory::write_block`: write the qwords, bump every page the block
+        /// spans, then run the DMA-side active-region probe against the
+        /// process-global executing page — the one path that legitimately
+        /// consults it, exactly as a real device DMA would.
+        fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
+            let base = addr & !7;
+            let mut a = base;
+            for &val in buf.iter() {
+                self.set_word(a as u64, (val >> 32) as u32);
+                self.set_word(a as u64 + 4, val as u32);
+                a = a.wrapping_add(8);
+            }
+            #[cfg(feature = "jitv2")]
+            {
+                // Bump every 4 KB page the block spans, once each.
+                let start = base / PAGE_SIZE;
+                let last = base.wrapping_add(((buf.len().max(1) - 1) as u32) * 8);
+                let end = last / PAGE_SIZE;
+                if end >= start {
+                    for page in start..=end { self.bump_page(page); }
+                } else {
+                    for page in start..=u32::MAX / PAGE_SIZE { self.bump_page(page); }
+                    for page in 0..=end { self.bump_page(page); }
+                }
+                crate::cpu::jitv2::jitv2::note_phys_write_range(
+                    base,
+                    (buf.len().max(1) as u32) * 8,
+                );
+            }
             BUS_OK
         }
         #[cfg(feature = "jitv2")]
@@ -1009,6 +1079,189 @@ mod tests {
         exec.write_data::<4>(pc + 0x20, 0x1122_3344);
         assert!(unsafe { (*page).smc_hit() },
             "a write on a compiled line must latch smc_hit");
+    }
+
+    /// Seed guest code at both its virtual address and its kseg-masked
+    /// physical address — a guest fetch (JIT snapshot or interpreter
+    /// re-fetch) goes through the translated physical address, while
+    /// `MockMemory` keys its store by the raw address it was handed, so both
+    /// must be present or a fallback re-fetch reads zeros. Same convention as
+    /// `run_multipage`'s `store` closure.
+    fn seed_smc_code(mem: &MockMemory, code: &[(u64, u32)]) {
+        for &(vaddr, raw) in code {
+            mem.set_word(vaddr, raw);
+            mem.set_word(vaddr & 0x1FFF_FFFF, raw);
+        }
+    }
+
+    /// Drive `step_jit` until `exec.core.pc` reaches `exit_pc`, up to `cap`
+    /// dispatches. Under `jitv2_inline_compile` a single call may run a whole
+    /// compiled region (including a self-modifying loop's iterations that end
+    /// in an SMC bail), so this steps by *dispatch*, not by guest instruction.
+    fn drive_smc_until(
+        exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>,
+        exit_pc: u64,
+        cap: usize,
+    ) {
+        let mut n = 0;
+        while exec.core.pc != exit_pc {
+            assert!(n < cap,
+                "self-modifying program did not reach exit {:#x}: pc={:#x} r2={:#x} r5={:#x}",
+                exit_pc, exec.core.pc, exec.core.gpr[2], exec.core.gpr[5]);
+            exec.step_jit();
+            n += 1;
+        }
+    }
+
+    /// Build an executor for the SMC guest tests: `jit=true` gets the real
+    /// inline-compile gate over `MockMemory::new()` (generation bumps on
+    /// writes); `jit=false` gets the pure-interpreter reference
+    /// (`new_not_compilable`, page denylisted). Hooks installed for both so a
+    /// JIT callout store has somewhere to go.
+    fn smc_guest_executor(
+        jit: bool,
+        gpr: [u64; 32],
+        pc: u64,
+    ) -> (Box<MipsExecutor<PassthroughTlb, PassthroughCache>>, Arc<MockMemory>) {
+        let mem = if jit { MockMemory::new() } else { MockMemory::new_not_compilable() };
+        let (exec, mem) = seeded_executor_over(mem, gpr, pc);
+        let mut exec = Box::new(exec);
+        exec.install_jit_hooks();
+        if jit {
+            exec.jitv2_inline_compile = true;
+        }
+        (exec, mem)
+    }
+
+    /// Issue #75: a real self-modifying guest loop, patched by a **CPU store**
+    /// while the compiled line is executing, must produce the same result
+    /// under the JIT as under the interpreter.
+    ///
+    /// Program (entry word 0 is the patched word):
+    ///   w0: addiu r2,r2,1     (patched to +2 by the store on the first pass)
+    ///   w1: addiu r5,r5,1     (loop counter)
+    ///   w2: sw    r4,0(r3)    (writes the +2 addiu over w0; r3 = page base)
+    ///   w3: slt   r7,r5,r6
+    ///   w4: bne   r7,r0,-5    (back to w0 while r5 < r6)
+    ///   w5: nop               (delay slot)
+    ///   w6: jr    r31         (exit)
+    ///   w7: nop               (delay slot)
+    ///
+    /// Without a generation bump on the store, the region after the SMC bail
+    /// re-enters the still-"current" compiled function and keeps adding 1, so
+    /// the JIT ends on r2 = r6; the interpreter (and the fixed JIT) end on
+    /// r2 = 1 + 2*(r6-1).
+    #[test]
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    fn smc_guest_self_patch_cpu_store_matches_interpreter() {
+        let pc = 0xFFFF_FFFF_8002_4000u64;
+        let page_base = pc & !(PAGE_SIZE as u64 - 1);
+        let exit_pc = pc + 0x1000;
+        let bound = 5u64;
+
+        let addiu_w0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 1);
+        let addiu_counter = make_i(crate::cpu::mips_isa::OP_ADDIU, 5, 5, 1);
+        let sw = make_i(crate::cpu::mips_isa::OP_SW, 3, 4, 0);
+        let slt = make_r(crate::cpu::mips_isa::OP_SPECIAL, 5, 6, 7, 0, crate::cpu::mips_isa::FUNCT_SLT);
+        // target word 0: imm = target_word - branch_word - 1 = 0 - 4 - 1.
+        let bne = make_i(crate::cpu::mips_isa::OP_BNE, 7, 0, (-5i16) as u16);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+
+        let code = [
+            (pc + 0x00, addiu_w0),
+            (pc + 0x04, addiu_counter),
+            (pc + 0x08, sw),
+            (pc + 0x0c, slt),
+            (pc + 0x10, bne),
+            (pc + 0x14, 0),
+            (pc + 0x18, jr),
+            (pc + 0x1c, 0),
+            (pc + 0x20, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        let mut gpr = [0u64; 32];
+        gpr[2] = 0;
+        gpr[3] = page_base; // store base: the *virtual* address of word 0
+        gpr[4] = make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 2) as u64; // the +2 addiu
+        gpr[5] = 0;
+        gpr[6] = bound;
+        gpr[31] = exit_pc;
+
+        let run = |jit: bool| -> CoreSnapshot {
+            let (mut exec, mem) = smc_guest_executor(jit, gpr, pc);
+            seed_smc_code(&mem, &code);
+            drive_smc_until(&mut exec, exit_pc, 400);
+            CoreSnapshot::capture(&exec.core)
+        };
+
+        let interp = run(false);
+        let jitted = run(true);
+        // Interpreter: pass 1 adds 1, then every pass adds 2; bound = 5.
+        assert_eq!(interp.gpr[2], 1 + 2 * (bound - 1),
+            "interpreter must run the loop against the patched instruction");
+        assert_eq!(interp.gpr[5], bound);
+        assert_eq!(jitted.gpr[2], interp.gpr[2],
+            "JIT must match the interpreter after a CPU store patches the executing compiled line");
+        assert_eq!(jitted.gpr[5], interp.gpr[5]);
+        assert_eq!(jitted.pc, interp.pc);
+    }
+
+    /// Issue #75, DMA half: the same code page is patched by a **DMA-style
+    /// block write** (the device-side `write_block` path) after the line has
+    /// been compiled and executed, and the JIT must recompile to the new bytes
+    /// and match the interpreter.
+    ///
+    /// Unlike the CPU-store case the write is not issued by the guest, so
+    /// there is no in-region store to trigger the force-exit; what this covers
+    /// is that the *device write path* bumps the owning RAM page's generation
+    /// counter, so the next dispatch sees the page as stale. That is exactly
+    /// the DMA half of the `#39` acceptance ("writes via the CPU and via DMA
+    /// both trigger the force-exit").
+    #[test]
+    #[cfg(not(feature = "jitv2_lockstep"))]
+    fn smc_guest_dma_block_write_matches_interpreter() {
+        let pc = 0xFFFF_FFFF_8002_8000u64;
+        let phys_base = (pc as u32) & 0x1FFF_FFFF & !(PAGE_SIZE as u32 - 1);
+        let exit_pc = pc + 0x1000;
+
+        let addiu_w0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 1);
+        let jr = make_r(crate::cpu::mips_isa::OP_SPECIAL, 31, 0, 0, 0, crate::cpu::mips_isa::FUNCT_JR);
+        let code = [
+            (pc + 0x00, addiu_w0),
+            (pc + 0x04, jr),
+            (pc + 0x08, 0),
+            (pc + 0x0c, crate::cpu::mips_isa::JIT_REGION_BOUNDARY_SENTINEL),
+        ];
+
+        let mut gpr = [0u64; 32];
+        gpr[31] = exit_pc;
+
+        // Replace the first addiu (+1) with (+5) via a DMA block write, laid
+        // out exactly as `BusDevice::write_block` splits a qword: high word
+        // first, then low word.
+        let patched_w0 = make_i(crate::cpu::mips_isa::OP_ADDIU, 2, 2, 5);
+        let patch_qword = ((patched_w0 as u64) << 32) | (jr as u64);
+
+        let run = |jit: bool| -> CoreSnapshot {
+            let (mut exec, mem) = smc_guest_executor(jit, gpr, pc);
+            seed_smc_code(&mem, &code);
+            // First pass: the line is fetched, compiled and executed.
+            drive_smc_until(&mut exec, exit_pc, 200);
+            assert_eq!(exec.core.gpr[2], 1, "first pass must run the original addiu");
+            // DMA-style block write over the now-compiled, executing page.
+            mem.write_block(phys_base, &[patch_qword]);
+            // Re-enter the patched page from the top.
+            exec.core.pc = pc;
+            drive_smc_until(&mut exec, exit_pc, 200);
+            CoreSnapshot::capture(&exec.core)
+        };
+
+        let interp = run(false);
+        let jitted = run(true);
+        assert_eq!(interp.gpr[2], 6, "interpreter must run the DMA-patched addiu (+5)");
+        assert_eq!(jitted.gpr[2], interp.gpr[2],
+            "JIT must match the interpreter after a DMA block write patches a compiled line");
+        assert_eq!(jitted.pc, interp.pc);
     }
 
     /// Diagnostic (not a strict regression gate): loads the REAL page
