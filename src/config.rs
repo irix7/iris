@@ -170,6 +170,171 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+/// The identity of one fleet instance. `id` is 0-based; a fleet of N uses
+/// `0..N-1`. `state_dir` is the one root every persistent artefact is placed
+/// beneath; `port_base` seeds the monitor/serial/CI port block.
+#[derive(Debug, Clone)]
+pub struct InstanceIdentity {
+    pub id: u32,
+    pub state_dir: std::path::PathBuf,
+    pub port_base: u16,
+}
+
+/// Fill in the defaults for an [`InstanceIdentity`].
+///
+/// `state_dir` defaults to `iris-instance-{id}` relative to the working
+/// directory; `port_base` defaults to `9000 + id * 10` (clear of the legacy
+/// single-instance defaults 8880/8881/8888). Because `derive_instance`
+/// must be a pure function over its arguments, this is the single place those
+/// defaults live — callers that need to report the derived endpoints (e.g.
+/// `--print-instance`) recompute the same identity here rather than guessing.
+pub fn instance_identity(
+    id: u32,
+    state_dir: Option<std::path::PathBuf>,
+    port_base: Option<u16>,
+) -> InstanceIdentity {
+    let state_dir = state_dir
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("iris-instance-{id}")));
+    let port_base = port_base.unwrap_or_else(|| {
+        (9000u32.saturating_add(id.saturating_mul(10))).min(u16::MAX as u32) as u16
+    });
+    InstanceIdentity { id, state_dir, port_base }
+}
+
+/// Deterministic SGI-OUI (`08:00:69`) station address for an instance id.
+///
+/// This mirrors `iris_gui::settings::generate_mac_bytes`: a `DefaultHasher`
+/// seeded from a stable string, with the low three hash bytes under the OUI.
+/// Unlike the GUI's raw hash, the final octet is forced to the low byte of
+/// `id`, which makes a fleet of up to 256 instances collision-free (a 24-bit
+/// hash cannot promise that). The two implementations therefore agree on
+/// OUI and hashing approach, but not byte-for-byte for a shared seed.
+pub fn instance_mac(id: u32) -> [u8; 6] {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    format!("iris-instance-{id}").hash(&mut h);
+    let v = h.finish();
+    [0x08, 0x00, 0x69, (v >> 16) as u8, (v >> 8) as u8, id as u8]
+}
+
+/// Derive a fully-isolated instance configuration from a base config.
+///
+/// This is the *only* step allowed to invent per-instance paths and ports.
+/// It is pure: it clones `base` and fills in instance-specific values without
+/// touching the filesystem or global state.
+///
+/// Precedence, field by field:
+///
+/// - **state dir**: `state_dir` if given, else `iris-instance-{id}`.
+/// - **NVRAM / EEPROM**: `<state_dir>/nvram.bin` and
+///   `<state_dir>/nveeprom.bin`, but only when the base still holds the
+///   neutral default names (`nvram.bin` / `nveeprom.bin`); an explicit user
+///   path is preserved.
+/// - **Ports**: monitor/serial A/serial B default to `port_base + 0/1/2`. A
+///   port already set explicitly in the base (TOML or `--monitor-port` /
+///   `--serial-port-*`) wins over the derivation; `--port-base` sets only the
+///   ones still unset. The CI TCP port is `port_base + 3` (Windows only).
+/// - **CI socket**: when the base still holds the neutral platform default,
+///   unix gets `<state_dir>/iris.sock` and Windows gets
+///   `127.0.0.1:{port_base + 3}`. An explicit socket is preserved.
+/// - **MAC**: `[network] mac` is preserved; otherwise a unique
+///   [`instance_mac`] is written.
+/// - **NAT subnet**: `nat_subnet` is preserved; otherwise
+///   `192.168.{id % 256}.0/24`.
+///
+/// `headless` and `ci` are deliberately untouched.
+pub fn derive_instance(
+    base: &MachineConfig,
+    id: u32,
+    state_dir: Option<std::path::PathBuf>,
+    port_base: Option<u16>,
+) -> MachineConfig {
+    let ident = instance_identity(id, state_dir, port_base);
+    let mut cfg = base.clone();
+
+    cfg.state_dir = Some(ident.state_dir.to_string_lossy().into_owned());
+
+    if cfg.nvram == default_nvram() {
+        cfg.nvram = ident.state_dir.join("nvram.bin").to_string_lossy().into_owned();
+    }
+    if cfg.nveeprom == default_nveeprom() {
+        cfg.nveeprom = ident.state_dir.join("nveeprom.bin").to_string_lossy().into_owned();
+    }
+
+    if cfg.monitor_port.is_none() {
+        cfg.monitor_port = Some(ident.port_base);
+    }
+    if cfg.serial_port_a.is_none() {
+        cfg.serial_port_a = Some(ident.port_base.saturating_add(1));
+    }
+    if cfg.serial_port_b.is_none() {
+        cfg.serial_port_b = Some(ident.port_base.saturating_add(2));
+    }
+
+    if cfg.ci_socket == default_ci_socket() {
+        #[cfg(windows)]
+        {
+            cfg.ci_socket = format!("127.0.0.1:{}", ident.port_base.saturating_add(3));
+        }
+        #[cfg(not(windows))]
+        {
+            cfg.ci_socket = ident.state_dir.join("iris.sock").to_string_lossy().into_owned();
+        }
+    }
+
+    if cfg.network.mac.is_none() {
+        cfg.network.mac = Some(crate::net::mac_str(&instance_mac(id)));
+    }
+    if cfg.nat_subnet.is_none() {
+        cfg.nat_subnet = Some(format!("192.168.{}.0/24", id % 256));
+    }
+
+    cfg
+}
+
+/// Render the derived instance's endpoints and paths as stable `key: value`
+/// lines, for `--print-instance`. Kept separate from the printing side effect
+/// so it can be unit-tested.
+pub fn instance_report(cfg: &MachineConfig, ident: &InstanceIdentity) -> String {
+    let paths = crate::state::StatePaths::under(&ident.state_dir);
+    let [serial_a, serial_b] = cfg.serial_ports();
+    let mac = cfg
+        .network
+        .mac
+        .clone()
+        .unwrap_or_else(|| crate::net::mac_str(&instance_mac(ident.id)));
+    let nat_subnet = cfg
+        .nat_subnet
+        .clone()
+        .unwrap_or_else(|| format!("192.168.{}.0/24", ident.id % 256));
+    format!(
+        "instance: {}\n\
+         state_dir: {}\n\
+         nvram: {}\n\
+         nveeprom: {}\n\
+         snapshots: {}\n\
+         monitor: {}\n\
+         serial_a: {}\n\
+         serial_b: {}\n\
+         ci_port: {}\n\
+         ci_socket: {}\n\
+         mac: {}\n\
+         nat_subnet: {}\n",
+        ident.id,
+        ident.state_dir.display(),
+        cfg.nvram,
+        cfg.nveeprom,
+        paths.snapshots_dir().display(),
+        cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT),
+        serial_a,
+        serial_b,
+        ident.port_base.saturating_add(3),
+        cfg.ci_socket,
+        mac,
+        nat_subnet,
+    )
+}
+
 /// Protocol for port forwarding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -999,6 +1164,12 @@ pub struct MachineConfig {
     #[serde(default = "default_nveeprom")]
     pub nveeprom: String,
 
+    /// Instance state directory, set by `--instance` / `--state-dir` via
+    /// [`derive_instance`]. `None` (the default) is single-instance mode:
+    /// every persistent artefact keeps the path it uses today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
+
     /// RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
     #[serde(default = "default_banks")]
     pub banks: [u32; 4],
@@ -1238,6 +1409,7 @@ impl Default for MachineConfig {
             prom: default_prom(),
             nvram: default_nvram(),
             nveeprom: default_nveeprom(),
+            state_dir: None,
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
@@ -1670,6 +1842,28 @@ pub struct Cli {
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
     #[arg(long = "clock-fixed-mhz", value_name = "MHZ")]
     pub clock_fixed_mhz: Option<f64>,
+
+    /// Run as fleet instance `N` (0-based). Derives a private state directory,
+    /// NVRAM/EEPROM paths, monitor/serial/CI ports, CI socket, MAC and NAT
+    /// subnet from the id so instances do not collide. See also --state-dir
+    /// and --port-base.
+    #[arg(long, value_name = "N")]
+    pub instance: Option<u32>,
+
+    /// Override the instance state directory (default: iris-instance-<N>).
+    /// Implies instance mode.
+    #[arg(long = "state-dir", value_name = "PATH")]
+    pub state_dir: Option<String>,
+
+    /// Base port for the derived monitor/serial/CI ports
+    /// (default: 9000 + N*10). Implies instance mode.
+    #[arg(long = "port-base", value_name = "PORT")]
+    pub port_base: Option<u16>,
+
+    /// Print the derived instance's state dir, endpoints, socket, MAC and NAT
+    /// subnet as `key: value` lines, then exit. Implies instance mode.
+    #[arg(long = "print-instance", default_value_t = false)]
+    pub print_instance: bool,
 }
 
 impl Cli {
@@ -1789,6 +1983,37 @@ pub fn load_config() -> (MachineConfig, u32) {
 
     let toml_cfg = MachineConfig::load_toml(&cli.config);
     let cfg = cli.apply(toml_cfg);
+
+    // Instance identity is opt-in: only when one of the instance flags is
+    // present does anything derive a per-instance state dir or port block.
+    // Without one, the config is exactly what it was before this seam existed.
+    let instance_active = cli.instance.is_some()
+        || cli.state_dir.is_some()
+        || cli.port_base.is_some()
+        || cli.print_instance;
+    let cfg = if instance_active {
+        let id = cli.instance.unwrap_or(0);
+        derive_instance(
+            &cfg,
+            id,
+            cli.state_dir.as_ref().map(std::path::PathBuf::from),
+            cli.port_base,
+        )
+    } else {
+        cfg
+    };
+
+    if cli.print_instance {
+        let id = cli.instance.unwrap_or(0);
+        let ident = instance_identity(
+            id,
+            cli.state_dir.as_ref().map(std::path::PathBuf::from),
+            cli.port_base,
+        );
+        print!("{}", instance_report(&cfg, &ident));
+        std::process::exit(0);
+    }
+
     let scale = cfg.scale;
     if let Err(e) = cfg.validate() {
         eprintln!("Configuration error: {}", e);
@@ -2085,5 +2310,159 @@ mod apply_env_tests {
         std::env::remove_var(OURS);
         set_or_remove_env(OURS, "");
         assert!(std::env::var_os(OURS).is_none());
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn derived(id: u32) -> MachineConfig {
+        derive_instance(&MachineConfig::default(), id, None, None)
+    }
+
+    /// Two different ids must never share a single per-instance artefact.
+    #[test]
+    fn two_ids_derive_disjoint_artefacts() {
+        let a = derived(1);
+        let b = derived(2);
+        assert_ne!(a.state_dir, b.state_dir);
+        assert_ne!(a.nvram, b.nvram);
+        assert_ne!(a.nveeprom, b.nveeprom);
+        assert_ne!(a.ci_socket, b.ci_socket);
+        assert_ne!(a.monitor_port, b.monitor_port);
+        assert_ne!(a.serial_ports(), b.serial_ports());
+        assert_ne!(a.network.mac, b.network.mac);
+        assert_ne!(a.nat_subnet, b.nat_subnet);
+    }
+
+    #[test]
+    fn default_port_base_arithmetic() {
+        let c = derived(3);
+        assert_eq!(c.monitor_port, Some(9030));
+        assert_eq!(c.serial_port_a, Some(9031));
+        assert_eq!(c.serial_port_b, Some(9032));
+        // CI port is base + 3 even though only Windows stores it as a socket.
+        assert_eq!(instance_identity(3, None, None).port_base.saturating_add(3), 9033);
+    }
+
+    /// The default block must not land on the legacy single-instance defaults
+    /// (monitor 8888, serial A/B 8880/8881), or an instance could not run
+    /// alongside a plain iris.
+    #[test]
+    fn derived_ports_avoid_legacy_defaults() {
+        let legacy = [
+            crate::monitor::DEFAULT_PORT,
+            crate::dev::z85c30::DEFAULT_PORTS[0],
+            crate::dev::z85c30::DEFAULT_PORTS[1],
+        ];
+        for id in 0..64u32 {
+            let c = derived(id);
+            for p in [c.monitor_port.unwrap(), c.serial_port_a.unwrap(), c.serial_port_b.unwrap()] {
+                assert!(!legacy.contains(&p), "instance {id} derived legacy port {p}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_state_dir_and_port_base_overrides_win() {
+        let c = derive_instance(
+            &MachineConfig::default(),
+            1,
+            Some(PathBuf::from("/state/one")),
+            Some(9000),
+        );
+        assert_eq!(c.state_dir.as_deref(), Some("/state/one"));
+        assert_eq!(c.nvram, "/state/one/nvram.bin");
+        assert_eq!(c.nveeprom, "/state/one/nveeprom.bin");
+        assert_eq!(c.monitor_port, Some(9000));
+        assert_eq!(c.serial_port_a, Some(9001));
+        assert_eq!(c.serial_port_b, Some(9002));
+        #[cfg(unix)]
+        assert_eq!(c.ci_socket, "/state/one/iris.sock");
+    }
+
+    #[test]
+    fn explicit_user_paths_are_preserved() {
+        let mut base = MachineConfig::default();
+        base.nvram = "custom/nv.bin".into();
+        base.nveeprom = "custom/eep.bin".into();
+        base.network.mac = Some("08:00:69:aa:bb:cc".into());
+        base.nat_subnet = Some("10.0.0.0/24".into());
+        let c = derive_instance(&base, 7, None, None);
+        assert_eq!(c.state_dir.as_deref(), Some("iris-instance-7"));
+        assert_eq!(c.nvram, "custom/nv.bin");
+        assert_eq!(c.nveeprom, "custom/eep.bin");
+        assert_eq!(c.network.mac.as_deref(), Some("08:00:69:aa:bb:cc"));
+        assert_eq!(c.nat_subnet.as_deref(), Some("10.0.0.0/24"));
+    }
+
+    /// A per-port override in the base beats the derived port block, but the
+    /// ports still unset still come from `port_base`.
+    #[test]
+    fn per_port_overrides_beat_port_base() {
+        let mut base = MachineConfig::default();
+        base.monitor_port = Some(9100);
+        base.serial_port_a = Some(9101);
+        let c = derive_instance(&base, 1, None, Some(9000));
+        assert_eq!(c.monitor_port, Some(9100));
+        assert_eq!(c.serial_port_a, Some(9101));
+        assert_eq!(c.serial_port_b, Some(9002));
+    }
+
+    #[test]
+    fn derived_mac_has_sgi_oui_and_is_unique_across_a_fleet() {
+        let a = instance_mac(1);
+        let b = instance_mac(2);
+        assert_eq!(&a[..3], &[0x08, 0x00, 0x69]);
+        assert_eq!(&b[..3], &[0x08, 0x00, 0x69]);
+        assert_ne!(a, b);
+
+        let mut seen = std::collections::HashSet::new();
+        for id in 0..256u32 {
+            assert!(seen.insert(instance_mac(id)), "instance id {id} collides");
+        }
+    }
+
+    #[test]
+    fn nat_subnet_is_unique_per_instance_modulo_256() {
+        assert_eq!(derived(3).nat_subnet.as_deref(), Some("192.168.3.0/24"));
+        assert_eq!(derived(300).nat_subnet.as_deref(), Some("192.168.44.0/24"));
+    }
+
+    /// An explicit NAT subnet must survive derivation, including one that
+    /// happens to equal another id's default.
+    #[test]
+    fn explicit_nat_subnet_is_preserved_over_derivation() {
+        let mut base = MachineConfig::default();
+        base.nat_subnet = Some("192.168.99.0/24".into());
+        let c = derive_instance(&base, 1, None, None);
+        assert_eq!(c.nat_subnet.as_deref(), Some("192.168.99.0/24"));
+    }
+
+    #[test]
+    fn report_lists_the_derived_endpoints() {
+        let c = derived(3);
+        let ident = instance_identity(3, None, None);
+        let report = instance_report(&c, &ident);
+        assert!(report.contains("instance: 3\n"), "{report}");
+        assert!(report.contains("state_dir: iris-instance-3\n"), "{report}");
+        assert!(report.contains("nvram: iris-instance-3/nvram.bin\n"), "{report}");
+        assert!(report.contains("snapshots: iris-instance-3/saves\n"), "{report}");
+        assert!(report.contains("monitor: 9030\n"), "{report}");
+        assert!(report.contains("serial_a: 9031\n"), "{report}");
+        assert!(report.contains("serial_b: 9032\n"), "{report}");
+        assert!(report.contains("ci_port: 9033\n"), "{report}");
+        assert!(report.contains("mac: 08:00:69:"), "{report}");
+        assert!(report.contains("nat_subnet: 192.168.3.0/24\n"), "{report}");
+    }
+
+    /// With no instance flag nothing derives, so the default export must not
+    /// grow an instance-only key.
+    #[test]
+    fn default_export_omits_state_dir() {
+        let out = toml::to_string(&MachineConfig::default()).unwrap();
+        assert!(!out.contains("state_dir"), "{out}");
     }
 }
