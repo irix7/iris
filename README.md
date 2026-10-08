@@ -308,7 +308,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On this host the JIT (jitv2) runs the R4400 guest at 652 MIPS versus 60 MIPS interpreted (10.8x).
+On this host the JIT (jitv2) runs the R4400 guest at 550 MIPS versus 47 MIPS interpreted (11.7x).
 
 ![latest benchmark cells](data/bench_cells.svg)
 
@@ -316,15 +316,15 @@ Latest run's four cells:
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
 |---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 60.2 | 84.6 | 11.0 |
-| `r4400-jitv2` | R4400 | 100.0% | 652.0 | 550.3 | 57.0 |
-| `r5000-interp` | R5000 | 100.0% | 46.3 | 67.4 | 8.2 |
-| `r5000-jitv2` | R5000 | 100.0% | 610.6 | 555.7 | 56.8 |
+| `r4400-interp` | R4400 | 100.0% | 46.9 | 65.8 | 8.6 |
+| `r4400-jitv2` | R4400 | 100.0% | 550.3 | 602.3 | 52.1 |
+| `r5000-interp` | R5000 | 100.0% | 47.3 | 68.1 | 8.9 |
+| `r5000-jitv2` | R5000 | 100.0% | 627.3 | 551.6 | 51.0 |
 
-Normalised benchmark across all 408 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
+Normalised benchmark across all 409 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
 
 ![normalised benchmark history](data/bench_history_eff.svg)
 
-Full history table: [data/bench_history.md](data/bench_history.md) (408 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (409 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
