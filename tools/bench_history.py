@@ -141,15 +141,15 @@ def _f(s):
         return None
 
 
-def load() -> dict:
-    if HISTORY.exists():
-        return json.loads(HISTORY.read_text())
+def load(path=HISTORY) -> dict:
+    if path.exists():
+        return json.loads(path.read_text())
     return {"entries": []}
 
 
-def save(data: dict) -> None:
-    HISTORY.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY.write_text(json.dumps(data, indent=2) + "\n")
+def save(data: dict, path=HISTORY) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def entry_exists(data, source, commit):
@@ -203,6 +203,24 @@ def collect(repo, run_id, source, ref, date, title):
     return added
 
 
+def merge_into(into_path: Path, from_paths) -> None:
+    """Fold history fragments into one file, deduping by (source, commit).
+
+    A sharded one-time backfill collects each shard into its own fragment; this
+    is how the shards are stitched back into the single history."""
+    into = load(into_path)
+    before = len(into["entries"])
+    seen = {(e["source"], e["commit"]) for e in into["entries"]}
+    for f in from_paths:
+        for e in load(Path(f))["entries"]:
+            key = (e["source"], e["commit"])
+            if key not in seen:
+                into["entries"].append(e)
+                seen.add(key)
+    save(into, into_path)
+    print(f"merge: {len(into['entries']) - before} new entries, {len(into['entries'])} total")
+
+
 def backfill(repo, limit, dry_run=False):
     import tempfile
     runs = gh_run_list(repo, limit)
@@ -243,26 +261,37 @@ def main():
     c.add_argument("--ref", default="main")
     c.add_argument("--date", default="")
     c.add_argument("--title", default="")
+    c.add_argument("--history", default=str(HISTORY),
+                   help="history file to append to (default data/bench_history.json); "
+                        "a sharded backfill writes its own fragment here")
 
     b = sub.add_parser("backfill")
     b.add_argument("--repo", required=True)
     b.add_argument("--limit", type=int, default=30)
     b.add_argument("--dry-run", action="store_true")
 
+    m = sub.add_parser("merge")
+    m.add_argument("--into", default=str(HISTORY))
+    m.add_argument("--from", dest="from_", nargs="+", required=True,
+                   help="history fragment files to fold in (deduped by commit)")
+
     args = ap.parse_args()
     if args.cmd == "collect":
         if args.report:
             md = Path(args.report).read_text()
             date = args.date or datetime.datetime.utcnow().isoformat() + "Z"
-            data = load()
+            hist = Path(args.history)
+            data = load(hist)
             add_entry(data, args.source, args.commit or "local", args.ref, date, args.title, md)
-            save(data)
+            save(data, hist)
         else:
             if not args.repo or not args.run:
                 sys.exit("--repo and --run are required without --report")
             collect(args.repo, args.run, args.source, args.ref, args.date, args.title)
     elif args.cmd == "backfill":
         backfill(args.repo, args.limit, args.dry_run)
+    elif args.cmd == "merge":
+        merge_into(Path(args.into), args.from_)
 
 
 if __name__ == "__main__":

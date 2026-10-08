@@ -33,6 +33,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 TARGET="${BACKFILL_TARGET:-$ROOT/target/backfill}"
 OUT="${BACKFILL_OUT:-$ROOT/bench/build/results}"
+FRAG="$OUT/history.json"               # this shard's history fragment
 EMU="$(mktemp -d "${TMPDIR:-/tmp}/iris-backfill-emu.XXXXXX")"
 EMU="${EMU}/emu"                     # worktree dir inside the temp dir
 
@@ -53,13 +54,36 @@ rm -rf "$OUT"; mkdir -p "$OUT"
 echo "backfill: apparatus ready; host baseline recorded"
 
 # ── commit list, oldest first ────────────────────────────────────────────────
-mapfile -t COMMITS < <(git rev-list --reverse "$SPEC" | awk -v s="$STEP" 'NR % s == 1')
+# Either a rev-list spec (`HEAD~30..HEAD`, `v1..v2`) or a path to a file of
+# hashes, one per line (a hardcoded one-time set). The file form is preferred
+# for a curated backfill: it does not depend on refs resolving in a detached CI
+# checkout.
+if [ -f "$SPEC" ]; then
+  mapfile -t COMMITS < <(grep -vE '^[[:space:]]*(#|$)' "$SPEC")
+else
+  mapfile -t COMMITS < <(git rev-list --reverse "$SPEC" | awk -v s="$STEP" '(NR - 1) % s == 0')
+fi
 total="${#COMMITS[@]}"
 if [ "$total" -eq 0 ]; then
   echo "backfill: '$SPEC' matched no commits (does the ref exist in this checkout?)" >&2
   exit 2
 fi
-echo "backfill: $total commits, cpu=$CPU engine=$ENGINE repeat=$REPEAT"
+
+# Optional sharding: shard S of N takes commits S, S+N, S+2N, ... Each shard is
+# its own job on its own runner, so each records its own host baseline; the
+# host-normalised efficiency stitches the shards back together. See the merge
+# job in the workflow.
+SHARDS="${BACKFILL_SHARDS:-1}"
+SHARD="${BACKFILL_SHARD:-0}"
+if [ "$SHARDS" -gt 1 ]; then
+  sliced=(); idx=0
+  for c in "${COMMITS[@]}"; do
+    [ $((idx % SHARDS)) -eq "$SHARD" ] && sliced+=("$c")
+    idx=$((idx + 1))
+  done
+  COMMITS=("${sliced[@]}")
+fi
+echo "backfill: ${#COMMITS[@]}/$total commits (shard ${SHARD}/${SHARDS}), cpu=$CPU engine=$ENGINE repeat=$REPEAT"
 
 i=0
 for sha in "${COMMITS[@]}"; do
@@ -93,6 +117,7 @@ for sha in "${COMMITS[@]}"; do
 
   ./target/release/iris-bench report --format md --dir "$OUT" >/tmp/backfill-report.md
   python3 tools/bench_history.py collect --report /tmp/backfill-report.md \
+      --history "$FRAG" \
       --source "irix7/iris" --commit "$sha" --ref "$(git rev-parse --abbrev-ref HEAD)" \
       --date "$date" --title "$subj" >/dev/null \
     || echo "   (history already had $sha, or the report was empty)"
@@ -101,5 +126,10 @@ done
 git worktree remove --force "$EMU" >/dev/null 2>&1 || true
 rmdir "$(dirname "$EMU")" >/dev/null 2>&1 || true
 
-python3 tools/bench_graphs.py
-echo "backfill: done — data/bench_history.json updated"
+if [ "$SHARDS" -gt 1 ]; then
+  echo "backfill: shard $SHARD/$SHARDS wrote $FRAG (merge it in the final job)"
+else
+  python3 tools/bench_history.py merge --from "$FRAG"
+  python3 tools/bench_graphs.py
+  echo "backfill: done — data/bench_history.json updated"
+fi

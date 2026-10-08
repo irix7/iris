@@ -1,26 +1,28 @@
 # One-time benchmark backfill.
 #
 # Benchmarks historical EMULATOR builds with the CURRENT harness to build a
-# speed history of the code. It runs as a single job on a single runner, so
-# every point in the backfill shares one host and is directly comparable; the
-# apparatus (suite + iris-bench + host baseline) is fixed at the checked-out
-# commit and only the emulator varies. See tools/bench-backfill.sh.
+# speed history of the code. Commits come from a hardcoded list
+# (bench/backfill-commits.txt by default), oldest first; only the emulator
+# varies, the apparatus (checked-in suite + iris-bench + one host baseline per
+# runner) is fixed at the checked-out commit. See tools/bench-backfill.sh.
 #
-# Trigger from Actions → "Benchmark backfill" → Run workflow. Pick a range small
-# enough to finish inside the job timeout: each commit costs one release build
-# (registry deps are cached after the first) plus `repeat` suite runs. Start
-# with a range of ~10–30 commits and repeat 3.
+# The list is split into 8 shards, each running as its own job on its own
+# runner so the whole backfill finishes inside the job timeout. Each shard
+# records the host baseline for its own machine, so the host-normalised
+# efficiency stitches the shards into one comparable history; the merge job then
+# folds the shard fragments into data/bench_history.json and regenerates the
+# graphs.
 name: Benchmark backfill
 
 on:
   workflow_dispatch:
     inputs:
       spec:
-        description: "git rev-list spec, oldest..newest (e.g. HEAD~30..HEAD)"
+        description: "A file of commit hashes (one per line), or a git rev-list spec"
         required: true
-        default: "HEAD~30..HEAD"
+        default: "bench/backfill-commits.txt"
       step:
-        description: "Take every Nth commit"
+        description: "Take every Nth commit (rev-list specs only)"
         required: true
         default: "1"
       cpu:
@@ -41,16 +43,21 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep this in step with the matrix below.
+  SHARDS: "8"
 
 jobs:
   backfill:
-    name: Backfill benchmark history
+    name: shard ${{ matrix.shard }}
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v5
         with:
-          # The whole history: the backfill checks out old commits to build them.
           fetch-depth: 0
 
       - name: Install build dependencies
@@ -58,21 +65,54 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Backfill
+      - name: Backfill shard
         env:
+          BACKFILL_SHARD: ${{ matrix.shard }}
+          BACKFILL_SHARDS: ${{ env.SHARDS }}
           BACKFILL_REPEAT: ${{ inputs.repeat }}
         run: |
+          set -o pipefail
           tools/bench-backfill.sh \
             "${{ inputs.spec }}" "${{ inputs.step }}" \
             "${{ inputs.cpu }}" "${{ inputs.engine }}" \
-            2>&1 | tee bench-backfill.log
+            2>&1 | tee "bench-backfill-${{ matrix.shard }}.log"
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bench-backfill-log
-          path: bench-backfill.log
+          name: backfill-frag-${{ matrix.shard }}
+          path: bench/build/results/history.json
           if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: backfill-log-${{ matrix.shard }}
+          path: bench-backfill-${{ matrix.shard }}.log
+          if-no-files-found: ignore
+
+  merge:
+    name: Merge history
+    needs: backfill
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: backfill-frag-*
+          path: fragments
+
+      - name: Fold the shard fragments into the history
+        run: |
+          mapfile -t FRAGS < <(find fragments -name history.json | sort)
+          if [ "${#FRAGS[@]}" -eq 0 ]; then echo "no fragments to merge"; exit 0; fi
+          printf 'merging %d fragments\n' "${#FRAGS[@]}"
+          python3 tools/bench_history.py merge --from "${FRAGS[@]}"
+          python3 tools/bench_graphs.py
 
       - name: Record history
         run: |
