@@ -13,6 +13,7 @@
 ///   docs/vino/vino.{h,cpp}   — MAME reference implementation (Ryan Holtz)
 ///   irix/stand/arcs/ide/IP22/video/VINO/vinohw.h — IRIX diagnostic headers
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::{Mutex, Condvar};
@@ -279,7 +280,12 @@ struct ChannelState {
     fifo_video_ptr: u32, // video (capture-write) FIFO pointer
 
     // ── Internal / derived ──
-    // No FIFO buffer — assembled dwords are written directly to memory.
+    /// Per-channel pixel FIFO (plan §3.1). The pixel producer (`render_and_pump`)
+    /// pushes assembled qwords here; the descriptor engine (`do_dma_transfer`)
+    /// drains them into memory, bounded by this FIFO and the chain's STOP — never
+    /// by the pixel count. Bounded by `fifo_threshold` in the real chip; the
+    /// producer drains at the threshold so it never grows without bound.
+    fifo:            VecDeque<u64>,
     decimation:      u32, // effective decimation factor (1–8)
     next_dword:      u64, // dword being assembled from incoming pixels
     word_pixel_cnt:  u32, // pixels packed into next_dword so far
@@ -302,6 +308,7 @@ impl Default for ChannelState {
             fifo_threshold: 0,
             fifo_gio_ptr:   0,
             fifo_video_ptr: 0,
+            fifo:           VecDeque::new(),
             decimation:     1,
             next_dword:     0,
             word_pixel_cnt: 0,
@@ -484,6 +491,7 @@ impl Vino {
     fn start_channel(st: &mut VinoState, ch: usize) {
         let chan = &mut st.channels[ch];
         chan.field_counter  = 0;
+        chan.fifo.clear();
         chan.fifo_gio_ptr   = 0;
         chan.fifo_video_ptr = 0;
         dlog_dev!(LogModule::Vino, "VINO: channel {} DMA enabled", if ch == 0 { 'A' } else { 'B' });
@@ -600,100 +608,154 @@ impl Vino {
         }
     }
 
-    // ── DMA: emit one dword to memory at the current descriptor offset ────
+    // ── Pixel FIFO producer (plan §3.1) ───────────────────────────────────
 
-    /// Write one assembled dword to system memory at the current channel's
-    /// DMA position, then advance `page_index` (handling 4 K rollover and
-    /// interleave-mode line skips).  Returns false if DMA stopped — either
-    /// the channel was disabled mid-flight, or the head descriptor had the
-    /// STOP bit set (in which case the DESC interrupt is raised here).
-    fn dma_emit_dword(&self, ch: usize, dword: u64, mem: &Arc<dyn BusDevice>) -> bool {
-        let mut st = self.state.lock();
-
-        let dma_en = [ctrl::CHA_DMA_EN, ctrl::CHB_DMA_EN][ch];
-        if st.control & dma_en == 0 {
-            return false;
-        }
-
-        let interleave = st.control & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
-
-        if st.channels[ch].descriptors[0] & desc::VALID_BIT != 0
-            && st.channels[ch].descriptors[0] & desc::STOP_BIT  != 0
+    /// Push one assembled qword onto the channel's pixel FIFO and hand it to the
+    /// descriptor engine, which drains the FIFO to its STOP. The engine is
+    /// invoked after each push, matching the shipped pixel-driven timing exactly;
+    /// the FIFO is the seam that keeps pixel production and descriptor
+    /// consumption separate (and is what `do_dma_transfer` can be driven from
+    /// directly in tests). Returns `true` if DMA stopped (the engine consumed the
+    /// chain's STOP, or deferred it on the first interlaced field), so the pixel
+    /// producer can stop filling the FIFO. The producer itself never inspects
+    /// descriptors.
+    fn push_fifo(&self, ch: usize, word: u64, mem: &Arc<dyn BusDevice>) -> bool {
         {
-            // Interlaced capture (IRIX 6.5): the kernel lays out ONE dense
-            // descriptor chain spanning the whole frame buffer, and BOTH fields
-            // traverse it to the same terminating STOP. Real VINO keeps DMA
-            // running across both fields and raises end-of-descriptor (DESC) only
-            // when the chain completes after the SECOND field. We model a
-            // DMA-enable cycle as one interlaced frame: `field_counter` is 0 for
-            // the first field of the cycle (reset in start_channel) and >=1
-            // after. On the FIRST field, reaching STOP must NOT raise DESC or
-            // disable DMA — otherwise the kernel restarts capture every field,
-            // which re-sets its "first field of capture" flag (conn+0xb8) and
-            // forces its field-parity counter even, so vinoEOD's completion check
-            // never clears *(conn+0xc) and videod's vinoGetFrame is never woken.
-            // Deferring completion to the second field lets the kernel's parity go
-            // odd and the frame deliver. Both fields still render their own rows
-            // into the shared buffer; only the DESC interrupt is deferred.
-            // (Full derivation: rules/irix/vino-capture-on-6.5-progress.md cont.12.)
-            //
-            // 5.3 GATE: IRIX 5.3 capture is EOF-driven and page-steps NEXT_4_DESC
-            // per field, so it never reaches a STOP descriptor here — this branch
-            // never executes for 5.3 and its delivery path is untouched.
-            if interleave && st.channels[ch].field_counter == 0 {
+            let mut st = self.state.lock();
+            let chan = &mut st.channels[ch];
+            chan.fifo.push_back(word);
+            chan.fifo_video_ptr = (chan.fifo.len() as u32) * 8;
+        }
+        // do_dma_transfer returns true while the channel is still draining;
+        // invert so the producer sees "stopped".
+        !self.do_dma_transfer(ch, mem)
+    }
+
+    // ── Descriptor engine (plan §3.2) ─────────────────────────────────────
+
+    /// Drain the per-channel pixel FIFO into memory, bounded by the FIFO and
+    /// the descriptor chain's STOP — never by the pixel count. This is the
+    /// separate descriptor-fetch engine: it advances `page_index` (4 K rollover
+    /// plus the interleave row skip), rotates the 4-word descriptor cache on a
+    /// page wrap (`shift_descriptors`), and consumes the chain's STOP here,
+    /// raising `CHx_DESC` and clearing DMA enable — NOT in the pixel pump.
+    /// Returns `true` if the channel is still active (FIFO drained, DMA on) and
+    /// `false` once it has stopped.
+    fn do_dma_transfer(&self, ch: usize, mem: &Arc<dyn BusDevice>) -> bool {
+        loop {
+            let mut st = self.state.lock();
+
+            let dma_en = [ctrl::CHA_DMA_EN, ctrl::CHB_DMA_EN][ch];
+            if st.control & dma_en == 0 {
                 return false;
             }
-            let isr_desc = [isr::CHA_DESC, isr::CHB_DESC][ch];
-            let new_status = st.int_status | isr_desc;
-            let irq = self.irq.lock().clone();
-            Self::raise_interrupt(&mut st, &irq, new_status);
-            st.control &= !dma_en;
-            return false;
-        }
 
-        let chan = &mut st.channels[ch];
-        let desc_base  = (chan.descriptors[0] as u32) & desc::PTR_MASK as u32;
-        let write_addr = desc_base | (chan.page_index & 0x0FF8);
-        drop(st);
-
-        mem.write64(write_addr, dword);
-
-        let mut st = self.state.lock();
-        let interleave = st.control & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
-        let chan = &mut st.channels[ch];
-
-        let old_page = chan.page_index;
-        chan.page_index = (chan.page_index + 8) & 0x0FFF;
-
-        if interleave {
-            chan.line_counter += 8;
-            // CH_LINE_SIZE is encoded as "last dword's start offset within
-            // the line" — i.e. one dword (8 bytes) short of the actual
-            // stride. So an N-dword line has line_size = (N-1)*8, the
-            // last dword writes when line_counter == line_size, and the
-            // *next* dword (line_counter == line_size + 8) is the first
-            // dword of the next interleaved row. Trigger on strict ">"
-            // so we capture the last dword in this row before skipping —
-            // not on ">=", which dropped the last dword and cascaded a
-            // 2-pixel-per-row diagonal across the captured frame.
-            if chan.line_counter > chan.line_size {
-                chan.line_counter = 0;
-                // Skip is the full row stride: (line_size + 8).
-                let skip = chan.line_size.wrapping_add(8);
-                let new_page = chan.page_index.wrapping_add(skip);
-                chan.page_index = new_page & 0x0FFF;
-                if chan.page_index < old_page || new_page >= 0x1000 {
-                    Self::shift_descriptors(chan, mem);
-                }
+            if st.channels[ch].fifo.is_empty() {
+                // Nothing buffered: the engine is idle but the channel is live,
+                // so the producer may keep filling.
                 return true;
             }
-        }
 
-        if chan.page_index < old_page {
-            Self::shift_descriptors(chan, mem);
-        }
+            let interleave = st.control
+                & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
 
-        true
+            // STOP is consumed in the descriptor engine, not the pixel pump.
+            if st.channels[ch].descriptors[0] & desc::VALID_BIT != 0
+                && st.channels[ch].descriptors[0] & desc::STOP_BIT != 0
+            {
+                // Whatever is still queued will never be written; drop it so it
+                // cannot leak into the next field.
+                st.channels[ch].fifo.clear();
+                st.channels[ch].fifo_gio_ptr = 0;
+                st.channels[ch].fifo_video_ptr = 0;
+
+                // Interlaced capture (IRIX 6.5): the kernel lays out ONE dense
+                // descriptor chain spanning the whole frame buffer, and BOTH
+                // fields traverse it to the same terminating STOP. Real VINO
+                // keeps DMA running across both fields and raises
+                // end-of-descriptor (DESC) only when the chain completes after
+                // the SECOND field. We model a DMA-enable cycle as one
+                // interlaced frame: `field_counter` is 0 for the first field of
+                // the cycle (reset in start_channel) and >=1 after. On the FIRST
+                // field, reaching STOP must NOT raise DESC or disable DMA —
+                // otherwise the kernel restarts capture every field, which
+                // re-sets its "first field of capture" flag (conn+0xb8) and
+                // forces its field-parity counter even, so vinoEOD's completion
+                // check never clears *(conn+0xc) and videod's vinoGetFrame is
+                // never woken. Deferring completion to the second field lets the
+                // kernel's parity go odd and the frame deliver.
+                // (Full derivation: rules/irix/vino-capture-on-6.5-progress.md
+                // cont.12.)
+                //
+                // 5.3 GATE: IRIX 5.3 capture is EOF-driven and page-steps
+                // NEXT_4_DESC per field, so it never reaches a STOP descriptor
+                // here — this branch never executes for 5.3 and its delivery
+                // path is untouched.
+                if interleave && st.channels[ch].field_counter == 0 {
+                    return false;
+                }
+                let isr_desc = [isr::CHA_DESC, isr::CHB_DESC][ch];
+                let new_status = st.int_status | isr_desc;
+                let irq = self.irq.lock().clone();
+                Self::raise_interrupt(&mut st, &irq, new_status);
+                st.control &= !dma_en;
+                return false;
+            }
+
+            let dword = st.channels[ch].fifo.pop_front().unwrap();
+            let desc_base  = (st.channels[ch].descriptors[0] as u32) & desc::PTR_MASK as u32;
+            let write_addr = desc_base | (st.channels[ch].page_index & 0x0FF8);
+            st.channels[ch].fifo_video_ptr = (st.channels[ch].fifo.len() as u32) * 8;
+            drop(st);
+
+            mem.write64(write_addr, dword);
+
+            let mut st = self.state.lock();
+            let interleave = st.control
+                & [ctrl::CHA_INTERLEAVE_EN, ctrl::CHB_INTERLEAVE_EN][ch] != 0;
+            let chan = &mut st.channels[ch];
+
+            let old_page = chan.page_index;
+            chan.page_index = (chan.page_index + 8) & 0x0FFF;
+
+            if interleave {
+                chan.line_counter += 8;
+                // CH_LINE_SIZE is encoded as "last dword's start offset within
+                // the line" — i.e. one dword (8 bytes) short of the actual
+                // stride. So an N-dword line has line_size = (N-1)*8, the
+                // last dword writes when line_counter == line_size, and the
+                // *next* dword (line_counter == line_size + 8) is the first
+                // dword of the next interleaved row. Trigger on strict ">"
+                // so we capture the last dword in this row before skipping —
+                // not on ">=", which dropped the last dword and cascaded a
+                // 2-pixel-per-row diagonal across the captured frame.
+                if chan.line_counter > chan.line_size {
+                    chan.line_counter = 0;
+                    // Skip is the full row stride: (line_size + 8).
+                    let skip = chan.line_size.wrapping_add(8);
+                    let new_page = chan.page_index.wrapping_add(skip);
+                    chan.page_index = new_page & 0x0FFF;
+                    if chan.page_index < old_page || new_page >= 0x1000 {
+                        Self::shift_descriptors(chan, mem);
+                    }
+                    continue;
+                }
+            }
+
+            if chan.page_index < old_page {
+                Self::shift_descriptors(chan, mem);
+            }
+        }
+    }
+
+    /// Single-word compatibility entry point for callers/tests that hand the
+    /// engine one assembled dword: push it onto the FIFO and force a drain even
+    /// if the threshold would have deferred it. Returns `false` if DMA stopped.
+    fn dma_emit_dword(&self, ch: usize, dword: u64, mem: &Arc<dyn BusDevice>) -> bool {
+        if self.push_fifo(ch, dword, mem) {
+            return false;
+        }
+        self.do_dma_transfer(ch, mem)
     }
 
     // ── Field pump: pull a field, clip/decimate/convert, DMA to memory ────
@@ -773,6 +835,7 @@ impl Vino {
             Self::descriptor_fetch(chan, start_desc_ptr, mem);
             chan.next_desc_ptr = start_desc_ptr.wrapping_add(16);
             chan.line_counter  = 0;
+            chan.fifo.clear();
             chan.page_index    = match field.parity {
                 FieldParity::Even => 0,
                 FieldParity::Odd  => line_size.wrapping_add(8),
@@ -825,12 +888,14 @@ impl Vino {
         Self::raise_interrupt(&mut st, &irq, new_status);
     }
 
-    /// Walk the clipped rectangle in source coordinates with the configured
-    /// decimation, sample UYVY from the field, convert to `format`, pack
-    /// bytes MSB-first into 64-bit dwords, and stream them through DMA.
+    /// Pixel producer (plan §3.1): walk the clipped rectangle in source
+    /// coordinates with the configured decimation, sample UYVY from the field,
+    /// convert to `format`, pack bytes MSB-first into 64-bit dwords, and push
+    /// them onto the channel FIFO (`push_fifo`). It knows only the field's pixel
+    /// budget; descriptors and STOP belong to `do_dma_transfer`.
     /// In interleave mode each emitted output row is zero-padded out to
-    /// `line_size + 8` (the kernel-allocated row stride in bytes), so
-    /// `dma_emit_dword`'s row-skip trigger fires at the boundary the kernel
+    /// `line_size + 8` (the kernel-allocated row stride in bytes), so the
+    /// descriptor engine's row-skip trigger fires at the boundary the kernel
     /// expects — not at our shorter rendered line. Without this the source
     /// (e.g. 640 px NTSC) writing into a buffer the kernel sized for 768 px
     /// stride packs rows back-to-back and shears the captured image.
@@ -1337,7 +1402,7 @@ fn emit_byte(vino: &Vino, ch: usize, mem: &Arc<dyn BusDevice>,
     *bytes_in += 1;
     *line_bytes += 1;
     if *bytes_in == 8 {
-        if !vino.dma_emit_dword(ch, *accum, mem) {
+        if vino.push_fifo(ch, *accum, mem) {
             *stopped = true;
         }
         *accum = 0;
@@ -2053,6 +2118,79 @@ mod tests {
             assert_eq!(*a, expected,
                 "frame buffer has a gap/overlap at {:#010x}", a);
             expected = expected.wrapping_add(8);
+        }
+    }
+
+    /// The descriptor engine (`do_dma_transfer`) consumes the chain to its STOP
+    /// independently of the pixel-production rectangle (plan §3.2): it is
+    /// bounded by the FIFO and the STOP descriptor, never by the pixel count.
+    /// The clip rectangle here is set tiny (8x1) and never rendered; instead the
+    /// FIFO is seeded with the frame's qwords plus slack and the engine is
+    /// driven directly. It must walk all 300 chain data pages and stop at STOP,
+    /// discarding the slack rather than draining the whole FIFO.
+    #[test]
+    fn descriptor_engine_consumes_chain_to_stop_independent_of_pixel_rectangle() {
+        let vino = Vino::new();
+        let mem  = FrameMem::new();
+        vino.set_phys(mem.clone());
+        let data_pages = build_jump_bug_chain(&mem);
+
+        {
+            let mut st = vino.state.lock();
+            // Non-interleaved so the page walk is a plain 4 K sequence, and DESC
+            // interrupts enabled so the consumed STOP surfaces in int_status.
+            st.control = ctrl::CHA_DMA_EN | ctrl::CHA_DESC_INT_EN;
+            let chan = &mut st.channels[0];
+            // A rectangle that would produce almost nothing: the descriptor
+            // engine must not care about it.
+            chan.clip_start = 0;
+            chan.clip_end   = (8 & clip::X_MASK)
+                            | ((1 & clip::YEVEN_MASK) << clip::YEVEN_SHIFT)
+                            | ((1 & clip::YODD_MASK)  << clip::YODD_SHIFT);
+            chan.line_size     = 0;
+            chan.page_index    = 0;
+            chan.field_counter = 0;
+        }
+        vino.write_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR, CHAIN_TABLE_BASE);
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC,   CHAIN_TABLE_BASE);
+
+        // Seed the FIFO with a full frame's qwords (300 pages x 512 qwords) plus
+        // slack; the STOP must bound the transfer before the slack is drained.
+        let frame_qwords = data_pages * 512;
+        {
+            let mut st = vino.state.lock();
+            for _ in 0..(frame_qwords + 512) {
+                st.channels[0].fifo.push_back(0xDEAD_BEEF_DEAD_BEEF);
+            }
+        }
+
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+        let still_active = vino.do_dma_transfer(0, &mem_dyn);
+        assert!(!still_active, "engine stops once it consumes the chain's STOP");
+
+        {
+            let st = vino.state.lock();
+            assert_ne!(st.int_status & isr::CHA_DESC, 0,
+                "STOP is consumed in the descriptor engine and raises CHA_DESC");
+            assert_eq!(st.control & ctrl::CHA_DMA_EN, 0,
+                "consuming STOP disables channel A DMA");
+            assert!(st.channels[0].fifo.is_empty(),
+                "the un-written FIFO slack is dropped when the engine stops");
+        }
+
+        // The engine walked the whole chain, bounded by STOP — not by the FIFO.
+        let writes = mem.writes();
+        assert_eq!(writes.len(), frame_qwords,
+            "the descriptor engine wrote exactly the chain, not the whole FIFO");
+        let mut page_hits = std::collections::BTreeMap::<u32, usize>::new();
+        for (addr, _) in &writes {
+            *page_hits.entry(*addr & !0x0FFF).or_default() += 1;
+        }
+        for p in 0..data_pages {
+            let page = CHAIN_DATA_BASE + (p as u32) * 0x1000;
+            assert_eq!(page_hits.get(&page).copied().unwrap_or(0), 512,
+                "chain data page {:#010x} ({}/{}) must be fully written by the engine",
+                page, p + 1, data_pages);
         }
     }
 }
