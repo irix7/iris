@@ -1,19 +1,23 @@
 use std::sync::Arc;
 use spin::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use crate::cpu::guest_timer::{GuestTimerCallback, GuestTimers, PIT_CH0, PIT_CH1, PIT_CH2, TimerKey};
+use crate::cpu::mips_core::NS_PER_GUEST_CYCLE;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
-use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use std::io::Write;
 
 pub trait TimerCallback: Send + Sync {
     fn callback(&self);
 }
 
+/// Which queue key an 8254 channel registers its deadline under.
+const PIT_KEYS: [TimerKey; 3] = [PIT_CH0, PIT_CH1, PIT_CH2];
+
 struct Channel {
     // Registers
-    count: u16, // Current count value (simulated)
+    count: u16, // Last latched/loaded count (fallback when disarmed)
     reload: u16, // Reload value
     latched_count: Option<u16>,
 
@@ -25,12 +29,12 @@ struct Channel {
     // Internal State
     rw_state: u8, // 0: First byte, 1: Second byte (for rw_mode 3)
 
-    // Timer tracking (for count interpolation between callbacks)
-    period_start: Option<Instant>,
-    period_duration: Option<Duration>,
+    // Guest-time tracking: the absolute guest cycle the count next reaches
+    // zero, and the period in guest cycles. No host `Instant` — the count is
+    // `deadline - hot.cycles` converted to input-clock ticks.
+    deadline_cycle: Option<u64>,
+    period_cycles: Option<u64>,
     input_freq: u32,
-    // Active hptimer ID, if armed
-    timer_id: Option<TimerId>,
 }
 
 impl Channel {
@@ -43,10 +47,39 @@ impl Channel {
             rw_mode: 1, // Default LSB
             bcd: false,
             rw_state: 0,
-            period_start: None,
-            period_duration: None,
+            deadline_cycle: None,
+            period_cycles: None,
             input_freq: 0,
-            timer_id: None,
+        }
+    }
+}
+
+/// Fires one 8254 channel's IOC callback at its guest-time deadline and
+/// advances the channel's mirrored deadline. The shared queue re-arms the
+/// entry itself (`deadline + period`), so this and the queue stay in step.
+struct PitChannelCallback {
+    chan: Arc<Mutex<Channel>>,
+    index: usize,
+    callback: Option<Arc<dyn TimerCallback>>,
+    debug: Arc<AtomicBool>,
+}
+
+impl GuestTimerCallback for PitChannelCallback {
+    fn fire(&self) {
+        {
+            let mut chan = self.chan.lock();
+            chan.count = 0;
+            if let (Some(d), Some(p)) = (chan.deadline_cycle, chan.period_cycles) {
+                chan.deadline_cycle = Some(d.wrapping_add(p));
+            }
+        }
+        if let Some(cb) = &self.callback {
+            if self.debug.load(Ordering::Relaxed) && self.index != 2 {
+                println!("PIT: Channel {} expired, triggering callback", self.index);
+            }
+            cb.callback();
+        } else if self.debug.load(Ordering::Relaxed) && self.index != 2 {
+            println!("PIT: Channel {} expired (no callback)", self.index);
         }
     }
 }
@@ -55,7 +88,7 @@ impl Channel {
 pub struct Pit8254 {
     channels: [Arc<Mutex<Channel>>; 3],
     callbacks: [Option<Arc<dyn TimerCallback>>; 3],
-    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
+    guest_timers: Arc<OnceLock<Arc<GuestTimers>>>,
     debug: Arc<AtomicBool>,
     base_frequency: u32,
 }
@@ -69,7 +102,7 @@ impl Pit8254 {
                 Arc::new(Mutex::new(Channel::new())),
             ],
             callbacks: [cb0, cb1, cb2],
-            timer_manager: Arc::new(std::sync::OnceLock::new()),
+            guest_timers: Arc::new(OnceLock::new()),
             debug: Arc::new(AtomicBool::new(false)),
             base_frequency,
         };
@@ -78,62 +111,66 @@ impl Pit8254 {
         pit
     }
 
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timer_manager.set(tm);
+    /// Wire the shared guest-time timer queue, on which every channel's
+    /// deadline is registered as an absolute `hot.cycles` value.
+    pub fn set_guest_timers(&self, gt: Arc<GuestTimers>) {
+        let _ = self.guest_timers.set(gt);
+    }
+
+    fn guest_now(&self) -> u64 {
+        self.guest_timers.get().map(|t| t.now()).unwrap_or(0)
+    }
+
+    /// Remaining ticks of `chan` at guest time, or its latched `count` when it
+    /// is not armed.
+    fn remaining_ticks(&self, chan: &Channel) -> u16 {
+        if let Some(deadline) = chan.deadline_cycle {
+            if chan.input_freq > 0 {
+                let remaining = deadline.saturating_sub(self.guest_now());
+                let ns_per_tick = 1_000_000_000u64 / chan.input_freq as u64;
+                return (remaining.saturating_mul(NS_PER_GUEST_CYCLE) / ns_per_tick) as u16;
+            }
+        }
+        chan.count
     }
 
     fn arm_channel(&self, idx: usize) {
-        let Some(tm) = self.timer_manager.get() else { return; };
+        let Some(tm) = self.guest_timers.get() else { return; };
 
         // Disarm any existing timer first
         self.disarm_channel(idx);
 
-        let period;
+        let (deadline, period_cycles);
         {
             let mut chan = self.channels[idx].lock();
             if chan.reload == 0 || chan.input_freq == 0 {
                 return;
             }
-            let ns = 1_000_000_000u64 / chan.input_freq as u64;
-            period = Duration::from_nanos(chan.reload as u64 * ns);
-            chan.period_start = Some(Instant::now());
-            chan.period_duration = Some(period);
+            let ns_per_tick = 1_000_000_000u64 / chan.input_freq as u64;
+            let p = (chan.reload as u64 * ns_per_tick) / NS_PER_GUEST_CYCLE;
+            let now = tm.now();
+            deadline = now.saturating_add(p);
+            period_cycles = p;
+            chan.deadline_cycle = Some(deadline);
+            chan.period_cycles = Some(period_cycles);
         }
 
-        let chan_arc = self.channels[idx].clone();
-        let callback = self.callbacks[idx].clone();
-        let debug = self.debug.clone();
-
-        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
-            {
-                let mut chan = chan_arc.lock();
-                chan.count = 0;
-                chan.period_start = Some(Instant::now());
-            }
-            if let Some(cb) = &callback {
-                if debug.load(Ordering::Relaxed) && idx != 2 {
-                    println!("PIT: Channel {} expired, triggering callback", idx);
-                }
-                cb.callback();
-            } else if debug.load(Ordering::Relaxed) && idx != 2 {
-                println!("PIT: Channel {} expired (no callback)", idx);
-            }
-            TimerReturn::Continue
+        let cb: Arc<dyn GuestTimerCallback> = Arc::new(PitChannelCallback {
+            chan: self.channels[idx].clone(),
+            index: idx,
+            callback: self.callbacks[idx].clone(),
+            debug: self.debug.clone(),
         });
-
-        self.channels[idx].lock().timer_id = Some(id);
+        tm.schedule(PIT_KEYS[idx], deadline, period_cycles, Some(cb));
     }
 
     fn disarm_channel(&self, idx: usize) {
-        let id = self.channels[idx].lock().timer_id.take();
-        if let Some(id) = id {
-            if let Some(tm) = self.timer_manager.get() {
-                tm.remove(id);
-            }
+        if let Some(tm) = self.guest_timers.get() {
+            tm.cancel(PIT_KEYS[idx]);
         }
         let mut chan = self.channels[idx].lock();
-        chan.period_start = None;
-        chan.period_duration = None;
+        chan.deadline_cycle = None;
+        chan.period_cycles = None;
     }
 
     fn read_channel(&self, idx: usize) -> u8 {
@@ -143,24 +180,7 @@ impl Pit8254 {
         let val = if let Some(latched) = chan.latched_count {
             latched
         } else {
-            // Calculate current count based on elapsed time
-            if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
-                if chan.input_freq > 0 {
-                    let elapsed = start.elapsed();
-                    if elapsed < duration {
-                        let remaining = duration - elapsed;
-                        let ns_per_tick = 1_000_000_000 / chan.input_freq as u128;
-                        let ticks = (remaining.as_nanos() / ns_per_tick) as u16;
-                        ticks
-                    } else {
-                        0
-                    }
-                } else {
-                    chan.count
-                }
-            } else {
-                chan.count
-            }
+            self.remaining_ticks(&chan)
         };
 
         match chan.rw_mode {
@@ -240,22 +260,9 @@ impl Pit8254 {
             let mut chan = self.channels[idx].lock();
 
             if rw == 0 {
-                // Counter Latch Command
+                // Counter Latch Command: capture the current guest-time count.
                 if chan.latched_count.is_none() {
-                    // Calculate current count
-                    let current = if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
-                        let elapsed = start.elapsed();
-                        if elapsed < duration {
-                            let remaining = duration - elapsed;
-                            let ns_per_tick = 1_000_000_000 / self.base_frequency as u128;
-                            (remaining.as_nanos() / ns_per_tick) as u16
-                        } else {
-                            0
-                        }
-                    } else {
-                        chan.count
-                    };
-                    chan.latched_count = Some(current);
+                    chan.latched_count = Some(self.remaining_ticks(&chan));
                 }
             } else {
                 // Mode/RW setup
@@ -349,13 +356,12 @@ impl Device for Pit8254 {
     }
 
     fn start(&self) {
-
         for i in 0..3 {
             self.arm_channel(i);
         }
     }
 
-    fn is_running(&self) -> bool { self.timer_manager.get().is_some() }
+    fn is_running(&self) -> bool { self.guest_timers.get().is_some() }
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -383,7 +389,7 @@ impl Device for Pit8254 {
                     for (i, channel_arc) in self.channels.iter().enumerate() {
                         let chan = channel_arc.lock();
                         writeln!(writer, "  Channel {}: Mode={} RW={} BCD={} Count={:04x} Reload={:04x} Freq={}Hz Running={}",
-                            i, chan.mode, chan.rw_mode, chan.bcd, chan.count, chan.reload, chan.input_freq, chan.period_start.is_some()).unwrap();
+                            i, chan.mode, chan.rw_mode, chan.bcd, chan.count, chan.reload, chan.input_freq, chan.deadline_cycle.is_some()).unwrap();
                     }
                     Ok(())
                 }
@@ -415,9 +421,8 @@ impl Resettable for Pit8254 {
             chan.rw_mode = 1; // default LSB
             chan.bcd = false;
             chan.rw_state = 0;
-            chan.period_start = None;
-            chan.period_duration = None;
-            chan.timer_id = None;
+            chan.deadline_cycle = None;
+            chan.period_cycles = None;
             // Channel 2 is driven by base frequency; channels 0,1 start with 0 until chaining fires.
             chan.input_freq = if i == 2 { self.base_frequency } else { 0 };
         }
@@ -442,21 +447,21 @@ fn chan_from_toml(v: &toml::Value, chan: &mut Channel) {
     if let Some(x) = get_field(v, "rw_mode")    { if let Some(n) = toml_u8(x)  { chan.rw_mode = n; } }
     if let Some(x) = get_field(v, "bcd")        { if let Some(b) = toml_bool(x) { chan.bcd = b; } }
     if let Some(x) = get_field(v, "input_freq") { if let Some(n) = toml_u32(x) { chan.input_freq = n; } }
-    // Transient state cleared on load.
+    // Transient guest-time deadlines are re-derived by `start()`/`arm_channel`
+    // from the restored register state; they are not restored from the
+    // snapshot (the guest cycle base is not snapshot state).
     chan.latched_count = None;
     chan.rw_state = 0;
-    chan.period_start = None;
-    chan.period_duration = None;
-    chan.timer_id = None;
+    chan.deadline_cycle = None;
+    chan.period_cycles = None;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cpu::guest_timer::TestClock;
     use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
     use std::sync::Mutex;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     // Serialise all timing-sensitive tests so they don't interfere with each other
     // when the test suite runs with multiple threads.
@@ -468,15 +473,24 @@ mod tests {
     }
 
     fn make_pit(freq: u32) -> Pit8254 {
+        let clock = TestClock::new();
+        let gt = Arc::new(GuestTimers::new(clock.ptr()));
         let pit = Pit8254::new(freq, None, None, None);
-        pit.set_timer_manager(Arc::new(TimerManager::new()));
+        pit.set_guest_timers(gt);
+        // Keep the clock alive for the life of the test by leaking it: the
+        // pointer in `gt` must stay valid, and these tests are short-lived.
+        std::mem::forget(clock);
         pit
     }
 
-    fn make_pit_cb(freq: u32, cb: Arc<dyn TimerCallback>) -> Pit8254 {
-        let pit = Pit8254::new(freq, None, None, Some(cb));
-        pit.set_timer_manager(Arc::new(TimerManager::new()));
-        pit
+    /// A PIT with a guest clock the test can advance manually. No host sleep,
+    /// no `Instant`: guest time is exactly what the test sets it to.
+    fn make_pit_clocked(freq: u32) -> (Pit8254, TestClock, Arc<GuestTimers>) {
+        let clock = TestClock::new();
+        let gt = Arc::new(GuestTimers::new(clock.ptr()));
+        let pit = Pit8254::new(freq, None, None, None);
+        pit.set_guest_timers(gt.clone());
+        (pit, clock, gt)
     }
 
     // Program channel `ch` as mode 2 (rate generator), LSB+MSB, with given reload.
@@ -505,98 +519,88 @@ mod tests {
         (hi as u16) << 8 | lo as u16
     }
 
-    // Start PIT, program channel 2, then wait briefly for the timer to be armed.
-    fn start_and_program(freq: u32, reload: u16) -> Pit8254 {
-        let pit = make_pit(freq);
-        pit.start();
-        program_mode2(&pit, 2, reload);
-        // Give the timer manager a moment to process the new timer.
-        thread::sleep(Duration::from_millis(2));
-        pit
-    }
-
-    fn start_and_program_cb(freq: u32, reload: u16, cb: Arc<dyn TimerCallback>) -> Pit8254 {
-        let pit = make_pit_cb(freq, cb);
-        pit.start();
-        program_mode2(&pit, 2, reload);
-        thread::sleep(Duration::from_millis(2));
-        pit
-    }
-
-    /// Channel 2 at 1 MHz, reload=100: one period = 100 µs wall-clock.
-    /// After waiting well past one period the count must be < reload (timer running).
+    /// Channel 2 at 1 MHz, reload=100: one period = 100 µs = 10 000 guest
+    /// cycles. Advance 105 000 cycles (10.5 periods) and the count must be
+    /// mid-period, i.e. < reload.
     #[test]
-    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_100us_period() {
         let _lock = SERIAL.lock().unwrap();
-        let pit = start_and_program(1_000_000, 100);
-        // Sleep several extra periods so we're definitely mid-period.
-        thread::sleep(Duration::from_millis(1));
+        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
+        pit.start();
+        program_mode2(&pit, 2, 100);
+        clock.set(105_000);
+        gt.drain(clock.now());
         let count = latch_read16(&pit, 2);
         pit.stop();
-        // In mode 2 the channel reloads; count is always in [0, reload).
         assert!(count < 100, "count={} should be < reload=100", count);
     }
 
-    /// Mid-period read: after ~5 ms into a 10 ms period count should be ~5000.
+    /// Mid-period read: 7 ms into a 10 ms period, count is exactly 3000. Guest
+    /// time is set explicitly, so this is exact, not "≈".
     #[test]
-    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_midperiod_read() {
         let _lock = SERIAL.lock().unwrap();
-        let pit = start_and_program(1_000_000, 10_000); // 10 ms period
-        thread::sleep(Duration::from_millis(5));
+        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
+        pit.start();
+        program_mode2(&pit, 2, 10_000); // 10 ms = 1 000 000 cycles
+        clock.set(700_000);
+        gt.drain(clock.now());
         let count = latch_read16(&pit, 2);
         pit.stop();
-        // startup sleep (~2ms) + 5ms measured = ~7ms elapsed, remaining ~3000. Allow ±1000.
-        let expected: i32 = 3000;
-        let delta = (count as i32 - expected).abs();
-        assert!(delta < 1000, "count={} expected ~{} (delta={})", count, expected, delta);
+        assert_eq!(count, 3000, "7 ms into a 10 ms period leaves 3000 ticks");
     }
 
-    /// Callback fires ~100 times per 100 ms when reload=1000 at 1 MHz (1 ms period).
+    /// Callback fires exactly 100 times when 100 periods (100 ms) of guest
+    /// time elapse — deterministic, no host jitter window.
     #[test]
-    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_callback_rate() {
         let _lock = SERIAL.lock().unwrap();
         let counter = Arc::new(AtomicU32::new(0));
-        let cb = Arc::new(CountCallback(counter.clone())) as Arc<dyn TimerCallback>;
-        let pit = start_and_program_cb(1_000_000, 1000, cb);
-        thread::sleep(Duration::from_millis(100));
+        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
         pit.stop();
+        // Rebuild with the counting callback on channel 2.
+        let cb = Arc::new(CountCallback(counter.clone())) as Arc<dyn TimerCallback>;
+        let pit2 = Pit8254::new(1_000_000, None, None, Some(cb));
+        pit2.set_guest_timers(gt.clone());
+        pit2.start();
+        program_mode2(&pit2, 2, 1000); // 1 ms = 100 000 cycles
+        clock.set(10_000_000); // 100 periods
+        gt.drain(clock.now());
+        pit2.stop();
         let fires = counter.load(AOrdering::SeqCst);
-        // ~100 callbacks in 100 ms, allow ±25 for jitter.
-        assert!(fires >= 75 && fires <= 125,
-            "callback fired {} times in 100 ms, expected ~100", fires);
+        assert_eq!(fires, 100, "100 ms of guest time at a 1 ms period");
+        drop(pit);
     }
 
     /// The count decrements monotonically within a period.
     #[test]
-    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_count_decrements() {
         let _lock = SERIAL.lock().unwrap();
-        let pit = start_and_program(1_000_000, 0xFFFF); // ~65 ms period
+        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
+        pit.start();
+        program_mode2(&pit, 2, 0xFFFF); // ~65.5 ms = 6 553 500 cycles
         let c0 = latch_read16(&pit, 2);
-        thread::sleep(Duration::from_millis(5));
+        clock.set(500_000); // 5 ms
+        gt.drain(clock.now());
         let c1 = latch_read16(&pit, 2);
         pit.stop();
-        // c0 > c1 (count decrements toward 0)
+        assert_eq!(c0, 0xFFFF);
         assert!(c0 > c1, "count should decrement: c0={} c1={}", c0, c1);
     }
 
-    /// Reload=0xFFFF at 1 MHz: period = 65.535 ms. After 10 ms count ≈ 55535.
+    /// Reload=0xFFFF at 1 MHz: period = 6 553 500 cycles. After 1 200 000
+    /// cycles (12 ms) the remaining count is exactly 53 535.
     #[test]
-    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_large_reload() {
         let _lock = SERIAL.lock().unwrap();
-        let pit = start_and_program(1_000_000, 0xFFFF);
-        thread::sleep(Duration::from_millis(10));
+        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
+        pit.start();
+        program_mode2(&pit, 2, 0xFFFF);
+        clock.set(1_200_000);
+        gt.drain(clock.now());
         let count = latch_read16(&pit, 2);
         pit.stop();
-        // startup sleep (~2ms) + 10ms measured = ~12ms total elapsed, remaining ~53535
-        let expected: i32 = 0xFFFF - 12_000;
-        let delta = (count as i32 - expected).abs();
-        assert!(delta < 1000,
-            "count={} expected ~{} (delta={})", count, expected, delta);
+        assert_eq!(count, 53_535);
     }
 
     /// Phase 1.7 round-trip: program a few channels with non-default values,

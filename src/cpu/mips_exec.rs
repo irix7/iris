@@ -2506,12 +2506,10 @@ macro_rules! step_cycles {
         // from the same cycles, so this is the guest-visible Compare match.
         if $self.core.hot.cycles >= $self.core.count_fire_cycle {
             // Next architectural match is a full 32-bit Count wrap away;
-            // normally a Compare write re-arms much sooner.
-            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / $self.core.count_hz as u128;
-            $self.core.count_fire_cycle = $self.core.hot.cycles
-                .saturating_add(wrap_ns as u64 / crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
-            $self.core.hot.interrupts.fetch_or(crate::cpu::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
-            $self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
+            // normally a Compare write re-arms much sooner. This also
+            // republishes the deadline on the shared guest-time queue so
+            // idle parking targets it.
+            $self.core.rearm_compare_after_fire();
         }
     }};
 }
@@ -2969,6 +2967,21 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// process" contract as `interrupts_ptr` above.
     pub fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr {
         crate::cpu::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
+    }
+
+    /// Run every guest-time deadline that `hot.cycles` has reached, in queue
+    /// order. Called once per dispatch batch from the CPU run loop (and by the
+    /// 8254 PIT in its own tests), never per instruction: the batch is ~1000
+    /// instructions (~10 us of guest time), far finer than any guest timer.
+    ///
+    /// Runs while the executor lock is held, but the callbacks only touch
+    /// device state (the PIT's channels and the IOC's interrupt word) — the
+    /// same work the hptimer thread used to do — and never re-enter the
+    /// executor, so this cannot deadlock against the CPU thread.
+    pub fn drain_guest_timers(&self) {
+        if let Some(t) = &self.core.guest_timers {
+            t.drain(self.core.hot.cycles);
+        }
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -11416,6 +11429,10 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
 
     fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+        // Unpark a parked CPU thread so it notices `running == false` at once
+        // instead of waiting out its deadline-based park.
+        #[cfg(feature = "idle-pause")]
+        crate::cpu::idle_park::wake();
         if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
@@ -11639,6 +11656,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     #[cfg(not(feature = "jitv2"))]
                     run_batch!(step_int);
                 }
+                // Fire any guest-time deadlines the batch crossed (8254 PIT
+                // channels and, harmlessly, the no-callback Compare entry).
+                // The Compare IP7 itself is delivered per-instruction by the
+                // step preamble's threshold check; this drains the rest of the
+                // one ordered queue.
+                guard.drain_guest_timers();
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
                     drop(guard);
@@ -14680,12 +14703,29 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // Cache (L1-I, L1-D, L2 tags + data, LL/SC state)
         tbl.insert("cache".into(), exec.cache.save_cache_state());
 
+        // Guest-time timer queue (#43): named deadlines only. Transient
+        // callbacks are never serialised (they are re-registered by their
+        // owners on load), so no anonymous timer can block or corrupt a
+        // savestate. On load the queue re-sorts and the owners re-arm.
+        if let Some(t) = &c.guest_timers {
+            tbl.insert("timers".into(), t.save_state());
+        }
+
         toml::Value::Table(tbl)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
         let mut exec = self.executor.lock();
         let c = &mut exec.core;
+
+        // Restore the (re-sorted) guest-time queue before the CP0 block below
+        // re-arms the Compare deadline, so the fresh deadline wins. The PIT
+        // re-arms its channels in `start()` after this returns.
+        if let Some(t) = &c.guest_timers {
+            if let Some(tv) = get_field(v, "timers") {
+                t.load_state(tv);
+            }
+        }
 
         if let Some(arr) = get_field(v, "gpr") { load_u64_slice(arr, &mut c.gpr); }
         if let Some(x) = get_field(v, "pc")  { c.pc = toml_u64(x).unwrap_or(c.pc); }

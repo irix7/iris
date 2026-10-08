@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::cpu::guest_timer::{GuestTimers, COMPARE};
+
 // CP0 Status Register bit definitions
 pub const STATUS_IE: u32 = 1 << 0;      // Interrupt Enable
 pub const STATUS_EXL: u32 = 1 << 1;     // Exception Level
@@ -887,6 +889,11 @@ pub struct MipsCore {
     /// hptimer of its own. None until `set_timer_manager` is wired.
     pub(crate) timer_mgr: Option<Arc<crate::hptimer::TimerManager>>,
     pub(crate) timer_id: Option<crate::hptimer::TimerId>,
+    /// The one ordered guest-time timer queue (#43). Shared with the 8254 PIT
+    /// so both the Compare deadline and the PIT channels register absolute
+    /// `hot.cycles` deadlines on the same serialisable queue, letting the run
+    /// loop park to the next deadline. None until wired by `Machine`.
+    pub guest_timers: Option<Arc<GuestTimers>>,
     /// `hot.cycles` value the virtual count is anchored at (synthetic
     /// `NS_PER_GUEST_CYCLE` ns per retired cycle, instead of the wall clock,
     /// so runs stay deterministic).
@@ -1363,6 +1370,7 @@ impl MipsCore {
             count_paused: false,
             timer_mgr: None,
             timer_id: None,
+            guest_timers: None,
             count_anchor_cycle: 0,
             count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
@@ -1766,15 +1774,46 @@ impl MipsCore {
             d => d,
         };
         let ns = ((delta as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-        self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
+        self.set_count_fire_cycle(self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE));
+    }
+
+    /// Publish the Compare deadline both as the `hot.cycles` threshold the
+    /// step preamble checks and as a named entry on the shared guest-time
+    /// queue, so idle parking can include it in "the next deadline". One
+    /// source of truth, two readers.
+    fn set_count_fire_cycle(&mut self, cycle: u64) {
+        self.count_fire_cycle = cycle;
+        if let Some(t) = &self.guest_timers {
+            if cycle == u64::MAX {
+                t.cancel(COMPARE);
+            } else {
+                t.schedule(COMPARE, cycle, 0, None);
+            }
+        }
     }
 
     /// Cancel any armed Count==Compare interrupt source.
     fn disarm_compare_timer(&mut self) {
-        self.count_fire_cycle = u64::MAX;
+        self.set_count_fire_cycle(u64::MAX);
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
             tm.remove(id);
         }
+    }
+
+    /// The step preamble reached `count_fire_cycle`: raise IP7 for the match
+    /// and arm the next architectural match (a full 32-bit Count wrap away,
+    /// normally much sooner via a Compare write). Kept identical to the old
+    /// inline macro behaviour, plus republishing the deadline on the queue.
+    #[inline]
+    pub fn rearm_compare_after_fire(&mut self) {
+        let wrap_ns = ((1u128 << 32) * 1_000_000_000) / self.count_hz as u128;
+        let next = self.hot.cycles
+            .saturating_add(wrap_ns as u64 / NS_PER_GUEST_CYCLE);
+        self.set_count_fire_cycle(next);
+        self.hot.interrupts.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        self.fasttick_count.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "idle-pause")]
+        crate::cpu::idle_park::wake();
     }
 
     /// Wire the machine's hptimer manager in. The cycle-derived clock arms no
@@ -1805,6 +1844,9 @@ impl MipsCore {
         }
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
+        if let Some(t) = &self.guest_timers {
+            t.cancel(COMPARE);
+        }
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id) {
             tm.disable(id);
         }

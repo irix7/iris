@@ -201,6 +201,15 @@ hashes are given where a change is easiest to understand by reading the commit.
   retired no-op — the behaviour it gated is unconditional — and old snapshots
   listing `ci_clock` still restore (it joins `chd`/`camera` in
   `RETIRED_FEATURES`).
+- **2026-10-09 — One ordered guest-time timer queue (#43).** The 8254 PIT
+  channels and the CP0 Compare deadline now register absolute `hot.cycles`
+  deadlines on a single ordered queue (`src/cpu/guest_timer.rs`) with a stable
+  same-deadline tie-break. The run loop drains it once per dispatch batch and
+  idle parking targets the queue's next deadline instead of a fixed 1 ms
+  slice. The PIT reads its count-down from guest time, not a host `Instant`,
+  so the latch/readback timing tests are deterministic and re-enabled. Named
+  deadlines are serialisable and re-sorted on load; transient callbacks are
+  never saved, so an anonymous timer cannot corrupt a snapshot.
 
 ## September 2026
 

@@ -9,7 +9,7 @@ use crate::dev::z85c30::{Z85c30, IrqCallback};
 use crate::dev::pit8254::{Pit8254, TimerCallback};
 use crate::cpu::mips_core::{CAUSE_IP2, CAUSE_IP3, CAUSE_IP4, CAUSE_IP5, CAUSE_IP6};
 use crate::dev::ps2::{Ps2Controller, Ps2Callback};
-use crate::hptimer::TimerManager;
+use crate::cpu::guest_timer::GuestTimers;
 use std::io::Write;
 
 pub const IOC_BASE: u32 = 0x1FBD9800;
@@ -434,8 +434,8 @@ pub struct Ioc {
     heartbeat: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
     /// Counter bumped on every 8254 timer 0/1 interrupt (see `set_clock_ticks`).
     clock_ticks: Arc<std::sync::OnceLock<Arc<AtomicU64>>>,
-    /// Shared timer manager for PIT channels.
-    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
+    /// Shared guest-time timer queue for PIT channels (#43).
+    guest_timers: Arc<std::sync::OnceLock<Arc<GuestTimers>>>,
 }
 
 impl Ioc {
@@ -537,13 +537,16 @@ impl Ioc {
             event_tx: Arc::new(std::sync::OnceLock::new()),
             heartbeat: Arc::new(std::sync::OnceLock::new()),
             clock_ticks,
-            timer_manager: Arc::new(std::sync::OnceLock::new()),
+            guest_timers: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
-    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
-        let _ = self.timer_manager.set(tm.clone());
-        self.pit.set_timer_manager(tm);
+    /// Wire the machine's one guest-time timer queue into the 8254 PIT. The
+    /// PIT registers each channel's absolute `hot.cycles` deadline on it and
+    /// reads its count-down from the queue's clock instead of a host `Instant`.
+    pub fn set_guest_timers(&self, gt: Arc<GuestTimers>) {
+        let _ = self.guest_timers.set(gt.clone());
+        self.pit.set_guest_timers(gt);
     }
 
     pub fn set_event_sender(&self, tx: mpsc::SyncSender<MachineEvent>) {

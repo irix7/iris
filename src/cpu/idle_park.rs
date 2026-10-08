@@ -11,6 +11,36 @@ use crate::cpu::mips_core::MipsCore;
 
 const IDLE_RING: usize = 32;
 const SLICE_NS: u64 = 1_000_000;
+/// Upper bound on a single park when a guest-time deadline is armed, so a
+/// stop request or a lost wake is still noticed promptly. Not a fixed slice:
+/// with a timer due sooner, the park ends at the timer.
+const MAX_PARK_NS: u64 = 100_000_000;
+
+/// The soonest thing that can end a park: the Compare deadline or the next
+/// guest-time timer (8254 PIT) on the shared queue. `u64::MAX` when neither
+/// is armed.
+fn next_deadline_cycle(core: &MipsCore) -> u64 {
+    let queue = core
+        .guest_timers
+        .as_ref()
+        .map(|t| t.next_deadline())
+        .unwrap_or(u64::MAX);
+    core.count_fire_cycle.min(queue)
+}
+
+/// How long to sleep before re-checking: the time to the next guest-time
+/// deadline, or a short fallback slice when only external interrupts can wake
+/// us. This is what replaces the fixed 1 ms slice.
+fn park_timeout_nanos(core: &MipsCore) -> u64 {
+    let deadline = next_deadline_cycle(core);
+    if deadline == u64::MAX {
+        return SLICE_NS;
+    }
+    let remaining = deadline.saturating_sub(core.hot.cycles);
+    remaining
+        .saturating_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE)
+        .min(MAX_PARK_NS)
+}
 
 /// The CPU thread while it is parked in [`IdleParkState::park`], so an
 /// interrupt source can wake it at once instead of leaving it to notice on its
@@ -121,16 +151,16 @@ impl IdleParkState {
             if (ip & im) != 0 {
                 break;
             }
-            // The compare deadline is a cycles threshold checked in step()'s
-            // preamble, so stop parking once we cross it.
-            if core.hot.cycles >= core.count_fire_cycle {
+            // Stop once the soonest guest deadline — Compare or a queued PIT
+            // timer — is reached, so the run loop can deliver it.
+            if core.hot.cycles >= next_deadline_cycle(core) {
                 break;
             }
 
             let t0 = Instant::now();
-            // Still a bounded slice — `running` and the compare threshold are
-            // only polled — but an interrupt now ends it at once.
-            std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
+            // Park exactly to the next deadline (capped), rather than a fixed
+            // slice; an interrupt still ends it at once via `wake`.
+            std::thread::park_timeout(Duration::from_nanos(park_timeout_nanos(core)));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
         }
@@ -170,14 +200,13 @@ pub fn park_wait(core: &mut MipsCore) {
         if (ip & im) != 0 {
             break;
         }
-        // The compare deadline is a cycles threshold checked in step()'s
-        // preamble, so stop parking once we cross it so the next step
-        // delivers IP7 (same rule as `IdleParkState::park`).
-        if core.hot.cycles >= core.count_fire_cycle {
+        // Stop once the soonest guest deadline is reached so the next step
+        // delivers it (same rule as `IdleParkState::park`).
+        if core.hot.cycles >= next_deadline_cycle(core) {
             break;
         }
         let t0 = Instant::now();
-        std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
+        std::thread::park_timeout(Duration::from_nanos(park_timeout_nanos(core)));
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
     }
@@ -221,6 +250,52 @@ mod tests {
         // be delivered, so the wait `park` performs can never end.
         let (mut st, core) = repeated_idle_state(STATUS_IE);
         assert!(!st.update(&core), "IM == 0 makes park's wake condition unsatisfiable");
+    }
+
+    /// With no armed guest deadline the park falls back to the short slice
+    /// (only an external interrupt can end it).
+    #[test]
+    fn park_timeout_is_a_slice_when_nothing_is_armed() {
+        let core = MipsCore::default();
+        assert_eq!(park_timeout_nanos(&core), SLICE_NS);
+    }
+
+    /// The park timeout is derived from the next guest-time deadline, not a
+    /// fixed slice: a timer 300 us of guest time away parks for 300 us.
+    #[test]
+    fn park_waits_to_the_next_guest_deadline() {
+        use crate::cpu::guest_timer::{GuestTimers, PIT_CH0};
+        use crate::cpu::mips_core::CyclesPtr;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.cp0_compare = 1; // park returns immediately while this is zero
+        // Wire the queue's clock at the core's own cycle counter, exactly as
+        // production does, so `park` advancing `hot.cycles` also advances it.
+        let timers = Arc::new(GuestTimers::new(CyclesPtr::new(
+            &core.hot.cycles as *const u64,
+        )));
+        // A PIT channel due in 30 000 guest cycles == 300 us at 10 ns/cycle.
+        timers.schedule(PIT_CH0, 30_000, 0, None);
+        core.guest_timers = Some(timers);
+        core.count_fire_cycle = 1_000_000; // Compare far in the future
+
+        assert_eq!(
+            park_timeout_nanos(&core),
+            300_000,
+            "park must target the 300 us queue deadline, not the fixed slice"
+        );
+
+        let running = AtomicBool::new(true);
+        let st = IdleParkState::default();
+        st.park(&mut core, &running);
+        assert!(
+            core.hot.cycles >= 30_000,
+            "park returned before the guest deadline: cycles={}",
+            core.hot.cycles
+        );
     }
 }
 
