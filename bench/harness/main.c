@@ -286,7 +286,11 @@ static unsigned planned_benches(void)
 
 /* The FPU by name where the implementation number is one we know. An R4400
  * carries an R4010-generation FPU reporting imp 0x05; on an R5000 the FPU is
- * on-chip and reports the CPU's own 0x23. */
+ * on-chip and reports the CPU's own 0x23.
+ *
+ * Guest-only: the host build has no MIPS inventory to print (see
+ * print_inventory), so these would otherwise be defined-but-unused there. */
+#if !defined(BENCH_HOST)
 static const char *fpu_name(void)
 {
     switch (hw.fpu_imp) {
@@ -304,6 +308,7 @@ static void print_bytes(u32 n)
     if (n >= 1024u)             { con_udec(n >> 10); con_puts(" KB"); return; }
     con_udec(n); con_puts(" B");
 }
+#endif
 
 /*
  * What this machine is, read out of the machine — see `struct hwinv`.
@@ -315,14 +320,14 @@ static void print_bytes(u32 n)
  */
 static void print_inventory(void)
 {
-    unsigned i;
-
 #if defined(BENCH_HOST)
     /* The host build has no CP0 and no memory controller, and there is no
      * portable substitute worth pretending with — see hostplat.c. */
     con_puts("   CPU        the host, natively (no MIPS inventory)\n");
     return;
 #else
+    unsigned i;
+
     con_printf("   CPU        %s rev %u.%u   (PRId %x)\n",
                cpu_name(), hw.cpu_rev_major, hw.cpu_rev_minor, hw.prid);
     con_printf("   FPU        %s rev %u.%u   (FIR %x)\n",
