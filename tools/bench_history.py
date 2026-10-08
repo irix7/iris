@@ -222,3 +222,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# NOTE: do not put the literal "[skip ci]" anywhere in a commit message — GitHub
+# treats it (and "[ci skip]", "[no ci]", "skip-checks: true") as a directive to
+# skip that commit's workflows, even when it appears in the body as prose.
