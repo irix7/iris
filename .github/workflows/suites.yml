@@ -57,6 +57,11 @@ on:
 # The report job records results back to data/ and regenerates the README
 # graphs, so it needs to push. `[skip ci]` on that commit prevents a loop:
 # data/ and README.md are outside this workflow's push paths, but not rust.yml's.
+#
+# GOTCHA: GitHub also honours the "skip-ci" directive when it appears in a
+# *commit message* (subject or body, even inside backticks/quotes as prose).
+# Do not write the literal "[skip ci]" / "[ci skip]" / "[no ci]" / "skip-checks"
+# in a commit message unless you mean to skip that commit's workflows.
 permissions:
   contents: write
 
