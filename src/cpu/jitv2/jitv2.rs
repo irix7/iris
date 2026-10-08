@@ -654,6 +654,11 @@ static NEVER_COMPILABLE_GEN: AtomicU64 = AtomicU64::new(0);
 /// reallocates a slot — [`Jitv2`] pre-allocates its capacity and reuses slots
 /// via `reset_to_unclaimed`), so a raw pointer is safe to hold here.
 ///
+/// Every field the probe reads through this pointer is atomic — `pfn`
+/// ([`PhysicalCodePage::pfn`]), the `compiled_lines` words, and `smc_hit` — so
+/// the CPU thread resetting/reusing the slot underneath a device-thread probe
+/// is not a data race (HACKING's per-device concurrency invariant, #74).
+///
 /// One `Machine` per process (CLAUDE.md), so a single global is coherent; CPU
 /// stores in tests use their own mock RAM devices and never reach
 /// [`note_phys_write`], so parallel test executors cannot cross-contaminate
@@ -683,6 +688,10 @@ pub static SMC_IDLE_HIT: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomic
 /// page from [`ACTIVE_SMC_PAGE`] and latches that page's `smc_hit` when the
 /// write lands on a compiled line. The running region's next preamble then
 /// force-exits and recompiles. A no-op when no page is active.
+///
+/// Race-free by construction: the pointer is loaded atomically and every field
+/// it is used to read is itself atomic (`pfn`, `compiled_lines`, `smc_hit`),
+/// so nothing here is an unsynchronised cross-thread field access (#74).
 #[inline]
 pub fn note_phys_write(phys: u32) {
     let page = ACTIVE_SMC_PAGE.load(Ordering::Acquire);
@@ -709,7 +718,13 @@ pub fn note_phys_write_range(phys: u32, len: u32) {
 /// has ever been a JIT compilation target; the executor holds a pointer to
 /// the page it is currently executing out of.
 pub struct PhysicalCodePage {
-    pub pfn: Pfn,
+    /// This page's physical frame number. **Atomic**: the DMA/device-side SMC
+    /// probe ([`note_phys_write`]) reaches this page through the process-wide
+    /// [`ACTIVE_SMC_PAGE`] pointer from another thread, and the CPU thread may
+    /// reset and reuse the slot underneath it — so a plain read here would be a
+    /// data race (HACKING's per-device concurrency invariant). Read through
+    /// [`Self::pfn`]. #74.
+    pfn: AtomicU32,
     /// Free list pointer: singly-linked free list threaded through
     /// `Jitv2::free_head`. `NO_SLOT` when claimed or at tail of free list.
     next: u32,
@@ -1276,7 +1291,7 @@ impl PhysicalCodePage {
     /// downstream ever needs to check.
     pub fn new(pfn: Pfn, gen: *const AtomicU64) -> Self {
         Self {
-            pfn,
+            pfn: AtomicU32::new(pfn),
             next: NO_SLOT,
             gen: if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen },
             requested: new_bitmap(),
@@ -1373,16 +1388,24 @@ impl PhysicalCodePage {
     /// invalidation and on an FR-guard bail (see [`Self::fr1`]'s doc comment).
     #[inline]
     pub fn is_claimed(&self) -> bool {
-        self.pfn != UNCLAIMED_PFN
+        self.pfn() != UNCLAIMED_PFN
+    }
+
+    /// This page's physical frame number (§2.4). An atomic load: the DMA-side
+    /// SMC probe reads it cross-thread through [`ACTIVE_SMC_PAGE`] (see the
+    /// `pfn` field's own doc, #74).
+    #[inline]
+    pub fn pfn(&self) -> Pfn {
+        self.pfn.load(Ordering::Relaxed)
     }
 
     pub fn claim(&mut self, pfn: Pfn, gen: *const AtomicU64, fr1: bool) {
-        debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn == UNCLAIMED_PFN,
+        debug_assert!(std::ptr::eq(self.gen, &NEVER_COMPILABLE_GEN) && self.pfn() == UNCLAIMED_PFN,
             "claim() called on a slot that wasn't clean (pfn={:#x}) — every path that reuses a slot must reset it first (see reset_to_unclaimed)",
-            self.pfn);
+            self.pfn());
         debug_assert!(self.func.load(Ordering::Relaxed).is_null(),
             "claim() called on a slot with a still-published function — mega_flush must reset_to_unclaimed before this slot can be reused");
-        self.pfn = pfn;
+        self.pfn.store(pfn, Ordering::Relaxed);
         self.gen = if gen.is_null() { &NEVER_COMPILABLE_GEN } else { gen };
         self.fr1.store(fr1, Ordering::Relaxed);
         // A freshly-claimed slot has no bail outstanding: `fr1` was just set
@@ -1460,7 +1483,7 @@ impl PhysicalCodePage {
     /// obviously-bogus pfn instead of silently aliasing page 0's real data.
     pub fn reset_to_unclaimed(&mut self) {
         self.reset_entries_and_bitmaps();
-        self.pfn = UNCLAIMED_PFN;
+        self.pfn.store(UNCLAIMED_PFN, Ordering::Relaxed);
         self.gen = &NEVER_COMPILABLE_GEN;
     }
 
@@ -1917,7 +1940,7 @@ impl PhysicalCodePage {
     /// asks for.
     #[inline]
     pub fn note_write(&self, phys: u32) -> bool {
-        if (phys >> 12) != self.pfn {
+        if (phys >> 12) != self.pfn() {
             return false;
         }
         let line = ((phys >> LINE_SHIFT) as usize) & (LINES_PER_PAGE - 1);
@@ -1934,7 +1957,7 @@ impl PhysicalCodePage {
     /// of the page does not force an exit.
     #[inline]
     pub fn note_write_range(&self, phys: u32, len: u32) -> bool {
-        let base = self.pfn << 12;
+        let base = self.pfn() << 12;
         let end = phys.saturating_add(len.max(1));
         if end <= base || phys >= base.saturating_add(PAGE_SIZE) {
             return false;
@@ -2703,7 +2726,7 @@ impl Jitv2 {
 
     /// Release `slot` back to the free list.
     fn free_page(&mut self, slot: PageSlot) {
-        let pfn = self.pages[slot as usize].pfn;
+        let pfn = self.pages[slot as usize].pfn();
         self.pfn_to_slot.remove(pfn);
         self.pages[slot as usize].reset_to_unclaimed();
         self.pages[slot as usize].next = self.free_head;
@@ -2717,9 +2740,9 @@ impl Jitv2 {
     /// running `mega_flush` and retrying.
     pub fn page_for(&mut self, pfn: Pfn, phys_addr: u32, bus: &dyn BusDevice, fr1: bool) -> Option<PageSlot> {
         if let Some(slot) = self.pfn_to_slot.get(pfn) {
-            debug_assert_eq!(self.pages[slot as usize].pfn, pfn,
+            debug_assert_eq!(self.pages[slot as usize].pfn(), pfn,
                 "pfn_to_slot[{:#x}] -> slot {} whose own pfn is {:#x} — the map and the slot it points at have                  desynced (a slot was reused/evicted without this map entry being updated to match)",
-                pfn, slot, self.pages[slot as usize].pfn);
+                pfn, slot, self.pages[slot as usize].pfn());
             return Some(slot);
         }
         if self.free_head == NO_SLOT {
@@ -4088,6 +4111,61 @@ mod tests {
         page.reset_compiled_state();
         assert!(!page.note_write(base + 0x50), "reset clears compiled_lines");
         assert!(!page.smc_hit(), "reset clears smc_hit");
+    }
+
+    /// #74 regression: the DMA-side SMC probe reads the active page's state
+    /// through the process-wide [`ACTIVE_SMC_PAGE`] pointer from a device
+    /// thread while the CPU thread may reset/reuse the slot. Every field it
+    /// touches is now atomic (`pfn`, the compiled-line words, `smc_hit`), and a
+    /// page reset clears the whole published state — pfn back to the sentinel,
+    /// lines and latch zeroed. Exercises the same set/probe/clear seam a DMA
+    /// writer uses, then confirms the atomic pfn/line view stays consistent.
+    ///
+    /// Serialized on `FALLBACK_TEST_LOCK`: `ACTIVE_SMC_PAGE` is a process
+    /// global, so a parallel test running compiled code must not win the
+    /// pointer between this test's set and its probe.
+    #[test]
+    fn active_smc_published_state_is_consistent_across_set_and_clear() {
+        let _serialize = crate::cpu::jitv2::analyzer::FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let mut page = claimed_page(false); // pfn 0x1234
+        let mut lines = [0u64; LINE_BITMAP_WORDS];
+        lines[0] = 1 << 4; // line 4: bytes 0x40..=0x4F
+        page.set_compiled_lines(&lines);
+        let base = 0x1234u32 << 12;
+        let me = &mut *page as *mut PhysicalCodePage;
+
+        // SET: publishing the active page makes a device write to a compiled
+        // line latch the shared hit, and the atomic pfn view matches the page.
+        set_active_smc_page(me);
+        assert_eq!(ACTIVE_SMC_PAGE.load(Ordering::Acquire), me, "set publishes the page");
+        assert_eq!(page.pfn(), 0x1234, "claimed pfn is published atomically");
+        note_phys_write(base + 4 * 16);
+        assert!(page.smc_hit(), "a device write on a compiled line must latch");
+
+        // A write to an uncompiled line of the same page, and to another page,
+        // must not latch.
+        page.smc_hit.store(0, Ordering::Relaxed);
+        note_phys_write(base + 5 * 16);
+        assert!(!page.smc_hit(), "an uncompiled line must not latch");
+        note_phys_write((0x1235u32) << 12);
+        assert!(!page.smc_hit(), "another page must not latch");
+
+        // CLEAR: dropping the active page stops the probe from matching.
+        page.smc_hit.store(0, Ordering::Relaxed);
+        set_active_smc_page(std::ptr::null_mut());
+        assert!(ACTIVE_SMC_PAGE.load(Ordering::Acquire).is_null(), "clear unpublishes");
+        note_phys_write(base + 4 * 16);
+        assert!(!page.smc_hit(), "a cleared publication must not latch");
+
+        // Page reset clears the state a subsequent probe would read.
+        page.reset_to_unclaimed();
+        assert_eq!(page.pfn(), UNCLAIMED_PFN, "reset clears the published pfn");
+        assert!(!page.note_write(base + 4 * 16), "reset clears the compiled-line map");
+        assert!(!page.note_write_range(base, PAGE_SIZE), "reset clears the range probe");
+        assert!(!page.smc_hit(), "reset clears the latch");
     }
 
     /// A page recycled between processes of different ABIs (o32 FR=0 ->
@@ -5477,7 +5555,7 @@ mod tests {
             let mapped_slot = *pfn_map_ptr.add(7);
             assert_eq!(mapped_slot, slot);
             let page = &*pages_base.add(mapped_slot as usize);
-            assert_eq!(page.pfn, 7);
+            assert_eq!(page.pfn(), 7);
         }
     }
 

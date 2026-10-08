@@ -134,7 +134,7 @@ impl PcpDump {
     /// possibility for a debugging dump, not a correctness-critical path).
     /// Returns `Err` with the failing physical address if any word read fails.
     pub fn capture(page: &PhysicalCodePage, bus: &dyn BusDevice) -> Result<Self, u32> {
-        let phys_base = page.pfn * PAGE_SIZE;
+        let phys_base = page.pfn() * PAGE_SIZE;
         let mut words = [0u32; ENTRIES_PER_PAGE];
         for (i, w) in words.iter_mut().enumerate() {
             let addr = phys_base + (i as u32) * 4;
@@ -145,7 +145,7 @@ impl PcpDump {
             *w = r.data;
         }
         Ok(Self {
-            pfn: page.pfn,
+            pfn: page.pfn(),
             current_gen: page.current_gen(),
             entry_gen: page.dump_entry_gen(),
             fr1: page.dump_fr1(),

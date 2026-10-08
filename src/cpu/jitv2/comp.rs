@@ -127,7 +127,7 @@ fn prepare_multi_entry_compile(
     #[cfg(feature = "developer")] stats: &crate::cpu::jitv2::JitStats,
 ) -> PrepareOutcome {
     let page = unsafe { &*req.page };
-    let phys_base = page.pfn * PAGE_SIZE;
+    let phys_base = page.pfn() * PAGE_SIZE;
 
     // Dirty-cache gate. The seqlock snapshot below reads RAM off the bus; the
     // guest CPU sees RAM overlaid with its own dirty L1-D/L2 lines, and a
@@ -405,7 +405,7 @@ fn prepare_multi_entry_compile(
         for &o in analyzer.covered() {
             entries[o as usize >> 6] |= 1u64 << (o % 64);
         }
-        crate::cpu::jitv2::hashstats::record(page.pfn, &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
+        crate::cpu::jitv2::hashstats::record(page.pfn(), &words, &used, &entries, req.compiled_for_fr1, instr_count, had_snapshot,
             page.last_skip_reject.load(std::sync::atomic::Ordering::Relaxed));
     }
 

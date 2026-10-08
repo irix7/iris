@@ -1720,7 +1720,7 @@ fn sync_smc_active(core: &mut MipsCore, page: *mut crate::cpu::jitv2::PhysicalCo
     } else {
         // SAFETY: `page` is a claimed pool slot; pfn/pointers are stable.
         unsafe {
-            core.jit_active_pfn = (*page).pfn;
+            core.jit_active_pfn = (*page).pfn();
             core.jit_smc_lines = (*page).compiled_lines_ptr();
             core.jit_smc_hit = (*page).smc_hit_ptr();
         }
@@ -2003,7 +2003,7 @@ unsafe extern "C" fn jit_fetch_verify<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::
         // address while `expected` is right, which looks like a coherent
         // "shift" but is really two unrelated regions. `tracked_pfn` vs
         // `phys_page` is what tells those apart.
-        let pcp_pfn: i64 = if exec.pcp.is_null() { -1 } else { unsafe { (*exec.pcp).pfn as i64 } };
+        let pcp_pfn: i64 = if exec.pcp.is_null() { -1 } else { unsafe { (*exec.pcp).pfn() as i64 } };
         eprintln!(
             "\n=== STALE COMPILED CODE at {:#018x}{} phys={:#010x} ===\n  compiled-in: {:08x}  {}\n  now in memory: {:08x}  {}\n  live pc={:#018x}  va_page={:#x}  phys_page={:#x}  tracked_pfn={}\n",
             va, sym, tr.phys,
@@ -3428,7 +3428,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.core.cur_code_pfn = if page.is_null() {
             u32::MAX
         } else {
-            unsafe { (*page).pfn }
+            unsafe { (*page).pfn() }
         };
         sync_smc_active(&mut self.core, page);
     }
@@ -3496,7 +3496,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     #[inline(always)]
     fn jitv2_track_pcp(&mut self, phys_addr: u32) {
         let pfn = phys_addr / crate::cpu::jitv2::PAGE_SIZE;
-        let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn == pfn };
+        let same_page = !self.pcp.is_null() && unsafe { (*self.pcp).pfn() == pfn };
         if same_page {
             return;
         }
@@ -3542,9 +3542,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             self.pcp = page;
             self.core.cur_code_pfn = pfn;
             sync_smc_active(&mut self.core, page);
-            debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
+            debug_assert_eq!(unsafe { (*self.pcp).pfn() }, pfn,
                 "jitv2_track_pcp fast path: pfn_map[{:#x}] pointed at a slot whose own pfn is {:#x}",
-                pfn, unsafe { (*self.pcp).pfn });
+                pfn, unsafe { (*self.pcp).pfn() });
             return;
         }
 
@@ -3573,9 +3573,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 // `page_for` just handed back, or self.pcp is now tracking
                 // the wrong physical page for this fetch (the exact failure
                 // shape `j2 pcp` can otherwise only reveal after the fact).
-                debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
+                debug_assert_eq!(unsafe { (*self.pcp).pfn() }, pfn,
                     "jitv2_track_pcp: page_for({:#x}) returned a slot whose own pfn is {:#x}",
-                    pfn, unsafe { (*self.pcp).pfn });
+                    pfn, unsafe { (*self.pcp).pfn() });
             }
             None => {
                 // Pool exhausted: `flush_from_cpu_thread` resets to initial
@@ -3603,9 +3603,9 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 self.pcp = jit.page_ptr(slot);
                 self.core.cur_code_pfn = pfn;
                 sync_smc_active(&mut self.core, self.pcp);
-                debug_assert_eq!(unsafe { (*self.pcp).pfn }, pfn,
+                debug_assert_eq!(unsafe { (*self.pcp).pfn() }, pfn,
                     "jitv2_track_pcp (post-flush retry): page_for({:#x}) returned a slot whose own pfn is {:#x}",
-                    pfn, unsafe { (*self.pcp).pfn });
+                    pfn, unsafe { (*self.pcp).pfn() });
             }
         }
     }
@@ -9285,7 +9285,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         let over_threshold = self.jitv2.lock().codegen.lock().as_ref()
             .is_some_and(|c| c.packing_stats().1 > crate::cpu::jitv2::CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         if over_threshold {
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn() * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
@@ -9329,7 +9329,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
         if ran_out_of_memory {
             let page = unsafe { &mut *self.pcp };
-            let phys_page_base = page.pfn * crate::cpu::jitv2::PAGE_SIZE;
+            let phys_page_base = page.pfn() * crate::cpu::jitv2::PAGE_SIZE;
             unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
             self.clear_pcp();
             self.jitv2_track_pcp(phys_page_base);
@@ -13865,7 +13865,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                         // structurally impossible under this design, so that
                         // diagnostic no longer applies).
                         writeln!(writer, "pfn={:#010x}  gen={}  entry_gen={}  scheduled(in-flight)={}  compiles_since_flush={}  rejected_compiles={}",
-                            page.pfn, page.current_gen(), page.entry_gen(), page.is_scheduled(), page.compiles_since_flush(), page.rejected_compiles()).unwrap();
+                            page.pfn(), page.current_gen(), page.entry_gen(), page.is_scheduled(), page.compiles_since_flush(), page.rejected_compiles()).unwrap();
                         // §13: one function per page, so FR mode is a single
                         // whole-page value — pinned at page-claim time from the
                         // live STATUS_FR (PhysicalCodePage::fr1) and every
@@ -14115,7 +14115,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                                         // signal, not a crash risk.
                                         let page = unsafe { &*page_ptr };
                                         writeln!(writer, "    page: pfn={:#010x} phys_base={:#010x}",
-                                            page.pfn, page.pfn * crate::cpu::jitv2::PAGE_SIZE).unwrap();
+                                            page.pfn(), page.pfn() * crate::cpu::jitv2::PAGE_SIZE).unwrap();
                                     }
                                 };
                                 match jit.compile_queue.seal_queue_entries() {
