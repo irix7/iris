@@ -22,6 +22,9 @@ instance operation for development. Sync upstream with
 - `CHANGELOG.md` — what changed, by area.
 - `docs/` — per-device notes and design docs (hal2, rex3, wd33c93a, ppmem,
   tcache, nutlb, …) plus the hardware datasheets (PDFs).
+- `docs/parallel-instances.md` — the per-instance isolation model, the
+  `StatePaths` / `derive_instance` seam, and the ticket map (GitHub epic #1,
+  tickets #2–#21). Read before touching config, persistent paths or ports.
 - `rules/` — accumulated, hard-won findings about emulator behaviour
   (`jitv2/`, `rex3/`, `snapshot/`, `irix/`, `testing/`, `gui/`, `perf/`,
   `scsi/`, `macos/`, `build/`). The IRIX install guide is
@@ -81,6 +84,11 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
   memory and out-of-bounds reads, and every one of those has already happened.
 - Both share `cpu-tests/harness` (toolchain probe, SCC console, startup and
   exception dispatch). Changing those files affects both suites.
+- `test/fleet/run.sh` — the parallel-agent end-to-end test: boots two isolated
+  instances (`--instance`) and drives each over its own CI serial socket (the
+  Indy PROM command monitor), asserting disjoint derivation and concurrent
+  operation. No IRIX media needed; runs in `.github/workflows/rust.yml`.
+  `$FLEET_N` sets the instance count, `$KEEP=1` keeps the temp dir.
 
 ## Hard invariants (from HACKING.md)
 
@@ -105,6 +113,28 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
   Persistent compiled-page reuse is opt-in via `[jitv2] cache` / `cache_dir`.
 - CHD, camera, DaynaPort, Ultra64, IP28, and ppmem are unconditional in core;
   do not use their retired Cargo features in build commands.
+
+## Parallel instances (fleet)
+
+The fork is growing an opt-in instance mode so N VMs run side by side from one
+host. Model and ticket map: `docs/parallel-instances.md` (epic #1, tickets
+#2–#21). The rules that matter when editing:
+
+- **One `Machine` per process.** Never run two `Machine`s in one process; a
+  fleet is N processes, each `iris --instance N`. Process-global state (idle
+  parking, CPU affinity, the dev log, the CI socket path) is why.
+- **Two seams own isolation, and nothing else may invent paths or ports.**
+  `src/state.rs` (`StatePaths`) is the registry of persistent artefacts;
+  `config::derive_instance()` is the one pure step that turns a base config plus
+  `(id, state-dir, port-base)` into a derived one. New artefacts get a
+  `StatePaths` accessor; new per-instance values get derived in
+  `derive_instance`.
+- **Opt-in and backwards compatible.** With no `--instance`/`--state-dir`/
+  `--port-base`, behaviour is unchanged. `--print-instance` prints the derived
+  endpoints as `key: value`.
+- **Status.** #2 (`StatePaths`) and #3 (`InstanceIdentity` + CLI) have landed;
+  #4 onward are open. The serial/CI session track (#15–#21) is independent of
+  the instance track and can run in parallel.
 
 ## Agent skills
 

@@ -12,6 +12,31 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Instances / parallel runs
+
+- **Instance mode: `--instance`, `--state-dir`, `--port-base` and
+  `--print-instance`.** Running several IRIS VMs from one host used to mean hand
+  writing N configs that did not collide on NVRAM, snapshots, ports, the CI
+  socket, the guest MAC or the NAT subnet. One `--instance N` now derives all of
+  those: a private state directory (`iris-instance-N`), NVRAM/EEPROM paths, a
+  monitor/serial/CI port block from `9000 + N*10`, a CI socket under the state
+  dir, a stable per-instance SGI-OUI MAC and a distinct NAT `/24`.
+  `--print-instance` prints the derived endpoints. Opt-in: with no instance flag,
+  behaviour is unchanged, and there is deliberately one VM per process.
+  (`947a60c`, `1bd24a1`)
+- **The `StatePaths` seam** (`src/state.rs`) is the one registry of persistent
+  artefacts, so a state directory can relocate NVRAM/EEPROM, the snapshot and
+  chunk store, COW overlays, CHD diffs, the jitv2 cache, logs and the test dump
+  together. `StatePaths::neutral()` reproduces today's paths exactly; wiring the
+  remaining artefacts into `Machine` follows in the epic's later tickets. The
+  instance model and ticket map are in
+  [docs/parallel-instances.md](docs/parallel-instances.md). (`df5df54`)
+- **A fleet CI test** (`test/fleet/run.sh`, run by the Rust workflow) boots two
+  isolated instances and drives each over its own CI serial socket — instance
+  derivation, the CI socket/serial path, concurrent instances and per-instance
+  MACs. It needs no IRIX media: the Indy PROM command monitor is the serial
+  endpoint.
+
 ### UI / input
 
 - **The `iris` window lets go of held keys and buttons when it loses
@@ -24,6 +49,11 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **The Nix flake (`flake.nix`) is the documented build environment.** Run
+  cargo from inside `nix develop` (or `nix develop --command cargo ...`); the
+  dev shell supplies the native ALSA/X11/GL/v4l/libclang libraries and pins the
+  host's shared rig Rust toolchain. `CLAUDE.md` records the invocation and the
+  GC'd-toolchain remedy.
 - **Retired the `chd`, `camera`, `ultra64`, `daynaport`, `ip28`, `ppmem`,
   `mips4` and `r5k` cargo features.** CHD images, the host camera, the
   Ultra64 dev board, DaynaPort and the IP28 / R10000 machine are always built

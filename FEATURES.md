@@ -155,6 +155,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `serial_log` | `unset` | Append guest channel-B output; used by CI and GUI serial capture. |
+| `state_dir` | `unset` | Instance state directory recorded by `--instance`/`--state-dir` (see [docs/parallel-instances.md](docs/parallel-instances.md)); derived automatically, not usually set by hand. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]
@@ -353,6 +354,10 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--ci-socket` | Override the default control-socket path (/tmp/iris.sock). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
 | `--serial-log` | With --ci, append every byte the guest emits on ttyd1 (IRIX serial console) to this file. Useful for live tailing during an install. |
+| `--instance` | Run as fleet instance N (0-based): derive a private state dir, monitor/serial/CI ports, CI socket, guest MAC and NAT subnet so VMs can run side by side. |
+| `--state-dir` | Override the derived instance state directory (default: `iris-instance-<N>`). Implies instance mode. |
+| `--port-base` | Base port for the derived monitor/serial/CI block (default `9000 + N*10`). Implies instance mode. |
+| `--print-instance` | Print the derived instance endpoints/paths as `key: value` lines and exit. Implies instance mode. |
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 

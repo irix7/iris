@@ -38,6 +38,12 @@ upstream-facing change of the latter kind is the CI copy-on-write overlay
 relocation (`IRIS_COW_OVERLAY_DIR`). Changes are kept in the shape of upstream
 commits so they can be offered back rather than diverging.
 
+Instance mode is landing in stages under the epic
+[**Parallel instance fleet**](https://github.com/irix7/iris/issues/1) (tickets
+#2–#21). The `--instance` flags and the two isolation seams are in; see
+[docs/parallel-instances.md](docs/parallel-instances.md) for the model, the
+derivation table, and what is still open.
+
 To pull upstream changes:
 
 ```sh
@@ -154,6 +160,7 @@ configuration inventory for both `iris` and `iris-gui`.
 | [FEATURES.md](FEATURES.md) | All build features, profiles, configuration keys, CLI switches, GUI settings, diagnostic environment controls, CPU specifications, and JIT behavior. |
 | [NETWORKING.md](NETWORKING.md) | PCAP bridging and DaynaPort setup; [DaynaPort protocol](docs/daynaport.md) and [XDMCP](docs/xdmcp.md) provide implementation and remote-display detail. |
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
+| [docs/parallel-instances.md](docs/parallel-instances.md) | Running several VMs side by side: the `--instance` flags, the `StatePaths` / `derive_instance` seam, and the epic #1 ticket map. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
 | [TODO.md](TODO.md) / [TODO_archive.md](TODO_archive.md) | Current feature-completion backlog and the original scratch list. |
@@ -222,6 +229,28 @@ is incomplete; that guide states the limits.
 Use [STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci) for Unix/TCP setup,
 commands, serial capture, and scripts. `--ci` keeps offscreen graphics alive
 unless `--headless` is explicitly selected.
+
+### Parallel instances (`--instance`)
+
+Run several VMs from one host with `--instance N` (ids are 0-based). Each id
+derives a private state directory (`iris-instance-{N}`, overridable with
+`--state-dir`), a port block from `--port-base` (default `9000 + N*10`, clear
+of the legacy 8880/8881/8888 defaults), a CI socket, a stable guest MAC and a
+distinct NAT `/24`:
+
+```sh
+iris --instance 0 --ci &             # first VM, CI socket under ./iris-instance-0
+iris --instance 1 --ci &             # second VM, no port or socket clash
+iris --instance 2 --print-instance   # print the derived endpoints and exit
+```
+
+Today the derivation applies NVRAM/EEPROM paths, the monitor/serial/CI ports,
+the CI socket, the MAC and the NAT subnet. Wiring the remaining artefacts
+(snapshot store, COW/CHD overlays, JIT cache, logs and the test dump) under the
+state directory, plus a fleet launcher and serial session isolation, are the
+open tickets in [docs/parallel-instances.md](docs/parallel-instances.md). With
+no instance flag nothing changes, and there is deliberately **one VM per
+process**.
 
 ### Scratch volume — file injection without networking
 

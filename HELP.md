@@ -614,6 +614,13 @@ Automation and debugging
   --test-device-dump <FILE>   Where its machine-state dump goes
   --cheritest-dump-hook       CP0 register 26 writes trigger a dump (tests only)
 
+Instances (parallel agentic runs)
+  --instance <N>              Run as fleet instance N (0-based): derive a private
+                              state dir, ports, CI socket, MAC and NAT subnet
+  --state-dir <PATH>          Override the derived instance state directory
+  --port-base <PORT>          Base for the derived port block (default 9000 + N*10)
+  --print-instance            Print the derived endpoints as `key: value` and exit
+
   -h, --help                  Print help
 ```
 
@@ -643,6 +650,12 @@ iris --headless --noaudio
 
 # Network-boot from the PROM: then `boot -f bootp()unix` at the PROM monitor
 iris --tftp-dir ./tftpboot
+
+# Run two isolated VMs side by side, each with its own ports, CI socket, MAC
+# and NAT subnet (see docs/parallel-instances.md). One VM per process.
+iris --instance 0 --ci &
+iris --instance 1 --ci &
+iris --instance 2 --print-instance   # print the derived endpoints, don't boot
 ```
 
 ---
