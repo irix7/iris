@@ -44,7 +44,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Keep this in step with the matrix below.
-  SHARDS: "8"
+  SHARDS: "16"
 
 jobs:
   backfill:
@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@v5
         with:
