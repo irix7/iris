@@ -22,7 +22,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::Module;
 
 use crate::cpu::jitv2::analyzer::{instrs_linear, CompiledInstr, WordOffset};
-use crate::cpu::jitv2::callout::{Callout, CalloutClobbers};
+use crate::cpu::jitv2::callout::{Callout, CalloutClobbers, GPR_COUNT};
 use crate::cpu::jitv2::{ARENA_RESERVE_SIZE, ENTRIES_PER_PAGE, PAGE_SIZE};
 use crate::cpu::mips_core::MipsCore;
 use crate::cpu::mips_exec::{EXEC_COMPLETE, EXEC_FALLBACK, EXEC_IS_EXCEPTION, ExecStatus};
@@ -299,6 +299,123 @@ struct EmitCtx<'a, 'b> {
     /// each per-instruction `EmitCtx`, so it survives across the fresh
     /// `EmitCtx` built for every head instruction.
     callout_clobbers: &'a mut CalloutClobbers,
+    /// The GPR forwarding cache those clobber masks drive (#37). Threaded
+    /// exactly like `callout_clobbers`: one per region, borrowed `&mut` into
+    /// each head instruction's `EmitCtx` so entries survive across heads that
+    /// dominate one another. See [`GprForward`].
+    forward: &'a mut GprForward,
+}
+
+/// Per-region guest-GPR store-to-load forwarding cache (#37).
+///
+/// The JIT keeps every guest GPR in `core.gpr`, so the only forwarding it
+/// gets is Cranelift's own — and Cranelift treats a `call_indirect` as an
+/// opaque memory clobber, so a callout normally forces every GPR to be
+/// reloaded afterwards even when the callee touches none of them. This cache
+/// is the consumer of the per-callout [`CalloutClobbers`] masks: it remembers
+/// the SSA `Value` most recently stored to (or loaded from) each GPR, and
+/// [`CalloutClobbers::spill_plan`] tells it exactly which entries a given
+/// callout's write set invalidates. A memory callout declares no GPR access,
+/// so a value loaded before it survives it and is reused instead of reloaded.
+///
+/// # Soundness
+///
+/// A cached `Value` is an SSA value defined in some Cranelift block; reusing
+/// it is only legal where that block dominates the use. Rather than run a
+/// dominator analysis online, the cache tracks the one block it currently
+/// believes its entries are valid in ([`Self::block`]) and **clears the whole
+/// cache whenever the builder moves to a different block** ([`Self::sync`]),
+/// so entries can never be silently reused out of their defining block. The
+/// two places where a block change is known to preserve validity re-seat the
+/// cache instead of clearing it:
+///
+/// - [`Self::reset_for_block`] carries a head instruction's entries into the
+///   next head only when the caller can prove the fallthrough edge is the
+///   sole path between them (`compile_region_uncommitted` checks the
+///   analyzer's `continues_to_fallthrough`/`is_branch_target` flags).
+/// - [`Self::bless`] re-seats after the interrupt preamble's conditional bail
+///   split, whose continuation is dominated by the block the preamble ran in.
+///
+/// No guest register is written anywhere except `emit_write_gpr` and a
+/// callout, both of which update this cache, so an entry can only be stale if
+/// a callout wrote its register without a matching mask — exactly the set
+/// `spill_plan` invalidates.
+#[derive(Clone, Copy)]
+struct GprForward {
+    values: [Option<Value>; GPR_COUNT as usize],
+    /// The block [`Self::values`] is currently valid in. `None` before any
+    /// block is established (an empty cache).
+    block: Option<Block>,
+}
+
+impl Default for GprForward {
+    fn default() -> Self {
+        Self { values: [None; GPR_COUNT as usize], block: None }
+    }
+}
+
+impl GprForward {
+    fn clear(&mut self) {
+        self.values = [None; GPR_COUNT as usize];
+    }
+
+    /// Begin a head instruction's emission in `block`. `carry` keeps the
+    /// previous head's entries (the caller has proven `block` is dominated by
+    /// the block they were defined in); otherwise the cache is reset.
+    fn reset_for_block(&mut self, block: Block, carry: bool) {
+        if !carry {
+            self.clear();
+        }
+        self.block = Some(block);
+    }
+
+    /// Re-seat the cache in a continuation block that is dominated by the one
+    /// it was valid in (used after the interrupt preamble's bail/continue
+    /// split). Entries survive; nothing is cleared.
+    fn bless(&mut self, block: Block) {
+        self.block = Some(block);
+    }
+
+    /// Drop everything if the builder has moved to a block other than the one
+    /// the entries were established in. A block change that survives no
+    /// explicit [`Self::bless`]/[`Self::reset_for_block`] is treated as a
+    /// join the entries may not dominate.
+    fn sync(&mut self, cur: Option<Block>) {
+        if self.block != cur {
+            self.clear();
+            self.block = cur;
+        }
+    }
+
+    fn get(&mut self, reg: u32, cur: Option<Block>) -> Option<Value> {
+        if reg == 0 || reg >= GPR_COUNT {
+            return None;
+        }
+        self.sync(cur);
+        self.values[reg as usize]
+    }
+
+    fn put(&mut self, reg: u32, value: Value, cur: Option<Block>) {
+        if reg == 0 || reg >= GPR_COUNT {
+            return;
+        }
+        self.sync(cur);
+        self.values[reg as usize] = Some(value);
+    }
+
+    /// Forget every GPR named by `mask` — the guest registers a callout's
+    /// spill plan says it may change.
+    fn invalidate(&mut self, mask: u32, cur: Option<Block>) {
+        self.sync(cur);
+        let mut m = mask;
+        while m != 0 {
+            let reg = m.trailing_zeros() as usize;
+            if reg < GPR_COUNT as usize {
+                self.values[reg] = None;
+            }
+            m &= m - 1;
+        }
+    }
 }
 
 /// Result of the block-allocation first pass: every visited instruction's
@@ -1323,6 +1440,7 @@ impl Codegen {
             let dead = builder.create_block();
             let mut unused_cycles = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
+            let mut unused_forward = GprForward::default();
             let mut hctx = EmitCtx {
                 builder: &mut builder,
                 module: &mut self.module,
@@ -1344,6 +1462,7 @@ impl Codegen {
                 abs_exit_block: dead,
                 cycles_pending: &mut unused_cycles,
                 callout_clobbers: &mut unused_clobbers,
+                forward: &mut unused_forward,
             };
 
             let status = match helper {
@@ -1672,7 +1791,8 @@ impl Codegen {
             // so a throwaway local is correct here (never read back).
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
+            let mut unused_forward = GprForward::default();
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1704,7 +1824,8 @@ impl Codegen {
         if crate::cpu::jitv2::entry_preamble_forced() {
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
+            let mut unused_forward = GprForward::default();
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1785,7 +1906,8 @@ impl Codegen {
             let raw = instrs[w as usize].raw;
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
+            let mut unused_forward = GprForward::default();
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1915,8 +2037,35 @@ impl Codegen {
         // survive across iterations (only a `cycles_flush` word resets it)
         // even though a fresh `ctx` is constructed every iteration.
         let mut cycles_pending: u32 = 0;
+        // #37: the region's GPR forwarding cache, and the head word whose
+        // entries it currently holds. A head's entries may be carried into the
+        // next only when the analyzer says this word's *only* predecessor is
+        // the previous head's fallthrough edge — i.e. the previous head is a
+        // plain sequential instruction and this word is reachable no other way
+        // (not a branch/jump target, not the region entry, not a fallback
+        // successor). Anything else clears the cache, which `GprForward::sync`
+        // already does for any un-blessed block change.
+        let mut forward = GprForward::default();
+        let mut prev_head: Option<WordOffset> = None;
         for &(word, block) in &instr_blocks {
             builder.switch_to_block(block);
+
+            let carry = match prev_head {
+                Some(p) => {
+                    let pi = &instrs[p as usize];
+                    pi.continues_to_fallthrough == Some(word)
+                        && pi.continues_to_taken.is_none()
+                        && pi.taken_exit.is_none()
+                        && !pi.is_fallback
+                        && !pi.has_inline_slot
+                        && !instrs[word as usize].is_branch_target
+                        && !instrs[word as usize].is_entry_point
+                        && !instrs[word as usize].is_branch_fallback_successor
+                }
+                None => false,
+            };
+            forward.reset_for_block(block, carry);
+            prev_head = Some(word);
 
             let raw = instrs[word as usize].raw;
             // A branch-fallback successor (BC1 slot) arrives with correct live
@@ -1927,7 +2076,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending, callout_clobbers: &mut callout_clobbers };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending, callout_clobbers: &mut callout_clobbers, forward: &mut forward };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -2712,6 +2861,12 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
 
     ctx.builder.switch_to_block(continue_block);
     ctx.builder.seal_block(continue_block);
+    // #37: the bail arm returns, so this continuation is dominated by the
+    // block the preamble ran in — a carried forwarded value is still valid
+    // here, so re-seat the cache instead of making `sync` clear it at the
+    // next GPR read (which would defeat forwarding across every checked
+    // instruction).
+    ctx.forward.bless(continue_block);
 }
 
 /// Region-wide FR-mode guard: emitted once, in `entry_block`, only when the
@@ -4509,16 +4664,18 @@ fn emit_hook_callee_raw(
 ///
 /// **Every** `call_indirect` into a `MipsCore` hook goes through this helper
 /// (or its raw-builder sibling for the shared blocks). It is the single
-/// place codegen consumes [`Callout::clobbers`]: it folds the declared
-/// read/write masks into the region's running [`CalloutClobbers`] — the
-/// input to the spill/forward decision ([`CalloutClobbers::spill_plan`]) —
-/// and documents the mask at each call so #37's per-hook fill is a
-/// one-function change.
+/// place codegen consumes [`Callout::clobbers`]:
 ///
-/// #36 ships every hook conservative, so the accumulated set is
-/// `CalloutClobbers::CONSERVATIVE` (every GPR and FPR) and nothing about the
-/// emitted call differs from the pre-mask code: the masks are the seam, not
-/// yet a speedup.
+/// 1. it folds the declared read/write masks into the region's running
+///    [`CalloutClobbers`] (reported by `last_region_clobbers`), and
+/// 2. it invalidates exactly the GPRs the callout's
+///    [`CalloutClobbers::spill_plan`] says it may change in the region's
+///    [`GprForward`] cache (#37) — a memory callout declares none, so a value
+///    stored before it survives and is reused instead of reloaded.
+///
+/// A callout that declares no GPR access still keeps Cranelift's own opaque
+/// call barrier; the forwarding this recovers is codegen's, for the GPR reads
+/// `emit_read_gpr` emits after the call.
 fn emit_callout(
     ctx: &mut EmitCtx,
     callout: Callout,
@@ -4526,12 +4683,13 @@ fn emit_callout(
     callee: Value,
     args: &[Value],
 ) -> ir::Inst {
-    // Consume the declared masks: fold this call's guest-register footprint
-    // into the region total that `last_region_clobbers` reports and the
-    // spill/forward decision reads. Under the conservative default that
-    // decision is "spill everything" — exactly Cranelift's own opaque-call
-    // assumption — so no register is ever wrongly kept live across the call.
-    ctx.callout_clobbers.union_assign(callout.clobbers());
+    let clobbers = callout.clobbers();
+    ctx.callout_clobbers.union_assign(clobbers);
+    // The cache's validity rule is about the *block*, so there is nothing to
+    // invalidate when the callout is in a cold arm whose results rejoin later;
+    // `sync` inside `invalidate` clears if the builder has moved.
+    ctx.forward
+        .invalidate(clobbers.spill_plan().gpr, ctx.builder.current_block());
     ctx.builder.ins().call_indirect(sig_ref, callee, args)
 }
 
@@ -6053,9 +6211,21 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
     if reg == 0 {
         return ctx.builder.ins().iconst(ir::types::I64, 0);
     }
+    // #37: a value this region already stored to (or loaded from) `reg` and
+    // that no callout's spill plan has invalidated is still correct here — the
+    // JIT keeps guest GPRs in memory but this region's own writes are the only
+    // thing that can change them while it runs, so reuse the SSA value instead
+    // of reloading across the opaque callout barrier Cranelift cannot see
+    // through.
+    let cur = ctx.builder.current_block();
+    if let Some(value) = ctx.forward.get(reg, cur) {
+        return value;
+    }
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
-    ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off)
+    let value = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+    ctx.forward.put(reg, value, ctx.builder.current_block());
+    value
 }
 
 /// Store `value` to `core.gpr[reg]`, matching `MipsCore::write_gpr`'s
@@ -6072,6 +6242,9 @@ fn emit_write_gpr(ctx: &mut EmitCtx, reg: u32, value: Value) {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     ctx.builder.ins().store(mem, value, ctx.core_ptr, off);
+    // #37: this store is now the value of `reg`, so later reads of it in this
+    // region can reuse the SSA value rather than reloading it.
+    ctx.forward.put(reg, value, ctx.builder.current_block());
 }
 
 /// Compile-time FPU register-file addressing mode, resolved once per
@@ -10466,15 +10639,23 @@ mod tests {
             "inline memory should be on by default in a non-lockstep build");
     }
 
-    /// #36 plumbing: every callout's declared mask must reach codegen's
-    /// per-region clobber accumulator. Compile a region containing the two
-    /// commonest callouts (a load and a store) with the shipping defaults and
-    /// require the recorded clobber set to be fully conservative — i.e.
-    /// codegen consumed "all clobbered" and its spill decision is to spill
-    /// every guest register, exactly as the pre-mask behaviour implied.
+    /// #37: a region whose only callouts are memory accesses must report a
+    /// *narrow* clobber footprint. The default load path hands `read*_fn` a
+    /// pointer to `core.jit_read_scratch` and writes the GPR itself; the store
+    /// callout takes its value as a scalar argument. Neither touches the guest
+    /// register file, so the region's [`CalloutClobbers`] is empty and its
+    /// spill plan forces no GPR reload — exactly the narrowing #36 exposed the
+    /// seam for. Compiles the lw/sw region with default (unsupported) geometry
+    /// so both accesses emit their real Rust callouts rather than inlining.
+    ///
+    /// Not run under `jitv2_lockstep`: that build brackets every instruction
+    /// with the conservative `LockstepStep`/`LockstepCompare` hooks, so the
+    /// region's footprint is deliberately total there. Not run under
+    /// `developer` either, for the same reason (`emit_dev_trace_bp` brackets
+    /// every instruction with the conservative `DevTrace` hook).
     #[test]
-    fn callout_masks_are_plumbed_to_codegen_as_conservative() {
-        use crate::cpu::jitv2::callout::GPR_COUNT;
+    #[cfg(all(not(feature = "jitv2_lockstep"), not(feature = "developer")))]
+    fn memory_callouts_report_a_narrow_region_clobber_set() {
         use crate::cpu::mips_isa::{OP_LW, OP_SW};
         fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
             (op << 26) | (rs << 21) | (rt << 16) | imm as u32
@@ -10491,22 +10672,19 @@ mod tests {
         let mut instrs_owned = *instrs;
 
         let mut codegen = Codegen::new();
-        // Default (unsupported) geometry: the inline memory fast path
-        // declines, so the load and store emit their real Rust callouts and
-        // the accumulator has something to record.
         let _ = codegen.compile_region(&mut instrs_owned, 0, true, false)
             .expect("lw/sw region must compile");
 
         let clobbers = codegen.last_region_clobbers();
         std::mem::forget(codegen);
 
-        assert!(clobbers.is_conservative(),
-            "#36 must plumb the conservative all-clobbered default through to codegen: {clobbers:?}");
-        assert!(clobbers.spill_plan().spills_all_gprs());
-        for reg in 0..GPR_COUNT {
-            assert!(clobbers.reads_gpr(reg) && clobbers.writes_gpr(reg),
-                "conservative plumbing must claim gpr{reg}");
-        }
+        assert!(!clobbers.is_conservative(),
+            "#37 must narrow the memory-callout clobber set: {clobbers:?}");
+        assert!(!clobbers.spill_plan().spills_all_gprs(),
+            "a memory callout must not force every GPR to spill: {clobbers:?}");
+        assert_eq!(clobbers.spill_plan().gpr, 0,
+            "the register file is written by codegen, not the memory callouts");
+        assert_eq!(clobbers.spill_plan().fpr, 0);
     }
 
     #[test]
@@ -10638,13 +10816,14 @@ mod tests {
                 // function's doc comment) — never touches cycles bookkeeping.
                 let mut unused_cycles_pending = 0u32;
                 let mut unused_clobbers = CalloutClobbers::NONE;
+                let mut unused_forward = GprForward::default();
                 let dc_geometry = crate::cpu::mips_cache_v2::JitDcGeometry::unsupported();
                 // This harness compiles against no real core, so hook targets
                 // must keep coming from `core_ptr` loads rather than being
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves

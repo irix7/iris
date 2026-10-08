@@ -251,14 +251,90 @@ impl Callout {
         }
     }
 
-    /// The read/write masks this callout declares.
+    /// The read/write masks this callout declares — the hook's true guest
+    /// GPR/FPR access set (#37).
     ///
-    /// #36 ships [`CalloutClobbers::CONSERVATIVE`] for every hook:
-    /// behaviour and emitted code are unchanged. #37 replaces the matching
-    /// arm here with the hook's true access set; every emission site reads
-    /// this one function, so nothing else moves.
+    /// Every emission site reads this one function through
+    /// [`crate::cpu::jitv2::codegen::emit_callout`], which unions it into the
+    /// region's running [`CalloutClobbers`] *and* uses its
+    /// [`CalloutClobbers::spill_plan`] to invalidate exactly the guest GPRs
+    /// the callee may change in codegen's forwarding cache. A memory callout
+    /// touches **no** guest register directly — the default load path hands
+    /// `read*_fn` a pointer to `core.jit_read_scratch`, `write*_fn` takes the
+    /// value as a scalar argument, and `emit_load`/`emit_store` write the GPR
+    /// themselves — so `MemoryRead`/`MemoryWrite`/`MemoryWriteMasked` declare
+    /// nothing and forwarding is free to survive them. The hooks that run
+    /// whole instructions or inspect the register file stay conservative.
+    ///
+    /// # A read is not a write
+    ///
+    /// This JIT has no dirty register cache: `emit_write_gpr` stores every
+    /// GPR straight to `core.gpr` before the next instruction, so a hook that
+    /// only *reads* the register file (the lockstep/dev-trace tracers, a
+    /// read's `dst` in the opt-in helper path) cannot change what a forwarded
+    /// value must equal. Those hooks are nevertheless marked as readers of the
+    /// full file — [`CalloutClobbers::spill_plan`] folds read and write
+    /// together deliberately, and being conservative on a `developer`-only
+    /// hook costs nothing in production.
     pub const fn clobbers(self) -> CalloutClobbers {
-        CalloutClobbers::CONSERVATIVE
+        match self {
+            // The value goes to `core.jit_read_scratch` (or an opt-in helper's
+            // `dst` offset, tracked as `MemoryHelper` below), never a guest
+            // register named here: codegen emits the GPR write itself.
+            Callout::MemoryRead => CalloutClobbers::NONE,
+            // The stored value arrives as a scalar argument, not through the
+            // register file.
+            Callout::MemoryWrite => CalloutClobbers::NONE,
+            Callout::MemoryWriteMasked => CalloutClobbers::NONE,
+            // A helper either writes an arbitrary GPR `dst` (load) or reads a
+            // scalar value argument (store). Its `dst` is a runtime byte
+            // offset, so no static narrow set exists — conservative on GPRs.
+            Callout::MemoryHelper => CalloutClobbers {
+                gpr_read: u32::MAX,
+                gpr_write: u32::MAX,
+                fpr_read: 0,
+                fpr_write: 0,
+            },
+            // Un-publishes one entry table slot; no guest register involved.
+            Callout::KillEntry => CalloutClobbers::NONE,
+            // Runs one real interpreter instruction: anything may change.
+            Callout::InterpFallback => CalloutClobbers::CONSERVATIVE,
+            // Re-reads memory and, on mismatch, live `core.pc` — no GPR/FPR.
+            Callout::FetchVerify => CalloutClobbers::NONE,
+            // Captures the full register file for `dt`/trace records.
+            Callout::DevTrace => CalloutClobbers::CONSERVATIVE,
+            // Runs the instruction through the interpreter and compares the
+            // entire architectural state — both directions, full file.
+            Callout::LockstepStep => CalloutClobbers::CONSERVATIVE,
+            Callout::LockstepCompare => CalloutClobbers::CONSERVATIVE,
+            // Computes EPC/Cause/BadVAddr and a vector; never touches GPR/FPR.
+            Callout::HandleException => CalloutClobbers::NONE,
+            // Writes the host rounding-mode control word only.
+            Callout::FpuSetMode => CalloutClobbers::NONE,
+            // The CVT family reads `$f{fs}` and writes `$f{fd}` directly in
+            // Rust (`cvt_*_and_commit`). `fs`/`fd` are known at each emit
+            // site, but this mask is static per hook and this JIT does not
+            // forward FPRs, so be conservative on the FPR file rather than
+            // inventing a second per-site seam.
+            Callout::FpuCvtToInt => CalloutClobbers {
+                gpr_read: 0,
+                gpr_write: 0,
+                fpr_read: u32::MAX,
+                fpr_write: u32::MAX,
+            },
+            Callout::FpuCvtIntToFloat => CalloutClobbers {
+                gpr_read: 0,
+                gpr_write: 0,
+                fpr_read: u32::MAX,
+                fpr_write: u32::MAX,
+            },
+            Callout::FpuCvtDToS => CalloutClobbers {
+                gpr_read: 0,
+                gpr_write: 0,
+                fpr_read: u32::MAX,
+                fpr_write: u32::MAX,
+            },
+        }
     }
 }
 
@@ -288,15 +364,71 @@ mod tests {
     }
 
     #[test]
-    fn every_callout_ships_the_conservative_default() {
-        for callout in Callout::ALL {
+    fn every_callout_declares_a_real_access_set() {
+        // #37: the conservative default is gone. The hooks that touch no
+        // guest register must say so; the ones that run whole instructions or
+        // inspect the register file must stay total.
+        let narrow = [
+            Callout::MemoryRead,
+            Callout::MemoryWrite,
+            Callout::MemoryWriteMasked,
+            Callout::KillEntry,
+            Callout::FetchVerify,
+            Callout::HandleException,
+            Callout::FpuSetMode,
+        ];
+        for callout in narrow {
             assert_eq!(
                 callout.clobbers(),
-                CalloutClobbers::CONSERVATIVE,
-                "{} must default to all-clobbered until #37 fills its mask",
+                CalloutClobbers::NONE,
+                "{} must declare no guest-register access",
+                callout.name()
+            );
+            assert!(!callout.clobbers().is_conservative(), "{}", callout.name());
+        }
+        for callout in [
+            Callout::InterpFallback,
+            Callout::DevTrace,
+            Callout::LockstepStep,
+            Callout::LockstepCompare,
+        ] {
+            assert!(
+                callout.clobbers().is_conservative(),
+                "{} touches arbitrary architectural state and must stay conservative",
                 callout.name()
             );
         }
+        // MemoryHelper can write an arbitrary `dst` GPR, so its GPR set is
+        // total even though it names no FPR.
+        let helper = Callout::MemoryHelper.clobbers();
+        assert_eq!(helper.gpr_read | helper.gpr_write, u32::MAX);
+        assert_eq!(helper.fpr_read | helper.fpr_write, 0);
+        // The CVT family touches the FPR file but no GPR.
+        for callout in [Callout::FpuCvtToInt, Callout::FpuCvtIntToFloat, Callout::FpuCvtDToS] {
+            let c = callout.clobbers();
+            assert_eq!(c.gpr_read | c.gpr_write, 0, "{}", callout.name());
+            assert_eq!(c.fpr_read | c.fpr_write, u32::MAX, "{}", callout.name());
+        }
+    }
+
+    #[test]
+    fn a_narrow_callout_yields_a_smaller_spill_plan_than_conservative() {
+        // The point of #37: a callout that touches no guest register spills
+        // nothing, where the old conservative default spilled everything.
+        let narrow = Callout::MemoryRead.clobbers().spill_plan();
+        let conservative = CalloutClobbers::CONSERVATIVE.spill_plan();
+        assert_eq!(narrow, SpillPlan::NONE);
+        assert_eq!(conservative, SpillPlan::ALL);
+        // "Smaller" stated as the property that matters: strictly fewer GPRs
+        // and strictly fewer FPRs are forced to spill.
+        assert!(
+            narrow.gpr.count_ones() < conservative.gpr.count_ones(),
+            "narrow={:#x} conservative={:#x}",
+            narrow.gpr,
+            conservative.gpr
+        );
+        assert!(narrow.fpr.count_ones() < conservative.fpr.count_ones());
+        assert!(!narrow.spills_all_gprs());
     }
 
     #[test]
