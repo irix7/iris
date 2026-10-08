@@ -138,6 +138,17 @@ mod zz_corpus {
         // comparable between runs.
         let mut weighted: u128 = 0;
         let mut have_weights = false;
+        // #66: summed across every compiled region, the GPR loads the
+        // forwarding cache avoided (`avoided`) versus had to emit (`emitted`).
+        // With `IRIS_FORWARD_AB=1` the same corpus is also compiled with the
+        // callout masks forced conservative (pre-#37), and the `_cons` totals
+        // are reported alongside — the delta is exactly the clobber-mask gain
+        // on real guest code. Off by default because it doubles compile time.
+        let forward_ab = std::env::var("IRIS_FORWARD_AB").is_ok();
+        let mut loads_avoided = 0u64;
+        let mut loads_emitted = 0u64;
+        let mut loads_avoided_cons = 0u64;
+        let mut loads_emitted_cons = 0u64;
 
         // One `Analyzer` and one `Codegen`, reused across the whole corpus
         // rather than built per entry point. The `Analyzer` is just scratch
@@ -228,6 +239,32 @@ mod zz_corpus {
                     total += sz;
                     n_ok += 1;
                     weighted += (sz as u128) * (dump.call_count as u128);
+                    // #66: the masked build's forwarding tally.
+                    let fs = cg.last_forward_stats();
+                    loads_avoided += fs.gpr_loads_avoided;
+                    loads_emitted += fs.gpr_loads_emitted;
+                    if forward_ab {
+                        // Recompile the same entry with every callout forced
+                        // conservative (the pre-#37 baseline) and tally that
+                        // too, so the two builds' emitted-load totals are
+                        // directly diffable. A re-walk is required because
+                        // `compile_region` mutates the per-word `block_id`s.
+                        cg.set_callout_masks_enabled(false);
+                        let (walked2, ok2) = an.walk_bounded(&pw, off, 0x8000_0000u32, usize::MAX);
+                        if ok2 {
+                            let mut ins2 = *walked2;
+                            let f2: Option<JitFn> = cg.compile_region(&mut ins2, off, true, false);
+                            let sz2 = cg.last_code_size() as u64;
+                            if f2.is_some() {
+                                let fs2 = cg.last_forward_stats();
+                                loads_avoided_cons += fs2.gpr_loads_avoided;
+                                loads_emitted_cons += fs2.gpr_loads_emitted;
+                            }
+                            let _ = f2;
+                            since_reset += sz2;
+                        }
+                        cg.set_callout_masks_enabled(true);
+                    }
                 } else { n_decl += 1; }
                 // Explicit: `f` must not outlive the reset below.
                 let _ = f;
@@ -264,6 +301,22 @@ mod zz_corpus {
             println!("CORPUS weighted_bytes={} (sum of region bytes x page dispatch count)", weighted);
         } else {
             println!("CORPUS weighted_bytes=n/a (corpus has no dispatch counts: captured from a non-developer build)");
+        }
+        // #66: the clobber-mask forwarding gain, in loads. `emitted` is actual
+        // `load` instructions codegen had to emit off `core.gpr`; `avoided` is
+        // reads served from the forwarding cache. With `IRIS_FORWARD_AB=1` the
+        // `_cons` line is the same corpus under conservative (pre-#37) masks,
+        // and `emitted_cons - emitted` / `avoided - avoided_cons` is the gain.
+        println!("CORPUS forward_masks=on reads={} avoided={} emitted={}",
+            loads_avoided + loads_emitted, loads_avoided, loads_emitted);
+        if forward_ab {
+            println!("CORPUS forward_masks=off reads={} avoided={} emitted={}",
+                loads_avoided_cons + loads_emitted_cons, loads_avoided_cons, loads_emitted_cons);
+            println!("CORPUS forward_masks_delta loads_avoided={} loads_emitted={}",
+                loads_avoided as i64 - loads_avoided_cons as i64,
+                loads_emitted_cons as i64 - loads_emitted as i64);
+        } else {
+            println!("CORPUS forward_masks_delta n/a (set IRIS_FORWARD_AB=1 to compile each entry a second time with the masks off)");
         }
         if cfg!(feature = "developer") {
             println!("WARNING: `developer` is on — opt_level=none plus a per-instruction trace callout. \
