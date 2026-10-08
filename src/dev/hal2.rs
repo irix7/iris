@@ -141,16 +141,6 @@ const PACE_MAX_BACKLOG: Duration = Duration::from_millis(100);
 /// How much faster than real time a channel may catch up after a late wake
 /// (5/4): see `Pacer::due`.
 const PACE_CATCHUP_NUM: u64 = 5;
-/// How far (in milliseconds of audio) codec A may read past the DMA position
-/// the guest last polled. IRIX refills its 202-frame playback ring from a
-/// 1 kHz callback, writing only a little ahead of the position it reads.
-/// Emulated, that callback runs late when the host is busy (GLQuake), and a
-/// channel paced by the wall clock alone then ran into slots not yet
-/// refilled and replayed the previous lap (18 ms chunks at 11025 Hz: the
-/// "robot" sound). Coupled to the guest's polls, the channel waits for a
-/// late callback instead; the host output buffer covers the wait. A guest
-/// that does not poll the position (no poll for 50 ms) is not held back.
-const READ_AHEAD_MS: u64 = 1;
 const PACE_CATCHUP_DEN: u64 = 4;
 
 /// Wall-clock frame pacing for one channel: how many frames are due now.
@@ -1019,7 +1009,6 @@ impl Hal2 {
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
         let prebuf_ms = self.audio_config.prebuf_ms;
-        let read_ahead_clamp = self.audio_config.read_ahead_clamp;
         let resampler_kind = self.audio_config.resampler;
         let cap = pace_wake_cap(pitch_rate as u64);
         // Keep the host ring about one prebuffer ahead of the callback. A sink
@@ -1042,24 +1031,10 @@ impl Hal2 {
                 o.consumed_frames()
                     .map(|played| (played as u128 * pitch_rate as u128 / stream_rate as u128) as u64)
             });
-            let (mut due, closed_loop) = match consumed {
+            let (due, closed_loop) = match consumed {
                 Some(consumed) => (rate_ctl.budget(Instant::now(), consumed, lead, cap), true),
                 None => (pacer.due(), false),
             };
-            // Legacy open-loop clamp: keep within READ_AHEAD_MS of the position
-            // the guest last polled. Off by default — bounded-buffer
-            // backpressure in `drain_codec_a` replaces it. Retained behind
-            // `[audio] read_ahead_clamp` until recorded-audio validation.
-            if read_ahead_clamp {
-                if let Some(ahead_words) = dma_client.read_ahead_of_poll() {
-                    let words_per_frame: u64 = match mode { MODE_MONO => 1, MODE_QUAD => 4, _ => 2 };
-                    let limit = (pitch_rate as u64 * READ_AHEAD_MS).div_ceil(1000);
-                    let allowed = limit.saturating_sub(ahead_words / words_per_frame);
-                    if due > allowed {
-                        due = allowed;
-                    }
-                }
-            }
             if due == 0 {
                 return TimerReturn::Continue;
             }
@@ -2003,6 +1978,193 @@ mod tests {
         }
         let moved2 = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, ResamplerKind::CatmullRom, 100);
         assert_eq!(moved2, cap as u64, "the read resumes once the ring drains");
+    }
+
+    /// A DMA client that replays an interleaved stereo PCM capture, one i16
+    /// sample per 32-bit read, for the recorded-audio validation below.
+    struct CorpusDma {
+        samples: Vec<i16>,
+        served: AtomicU64,
+    }
+
+    impl DmaClient for CorpusDma {
+        fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+            let i = self.served.fetch_add(1, Ordering::Relaxed) as usize;
+            match self.samples.get(i) {
+                Some(&s) => Some((s as u16 as u32, DmaStatus::ok(), None)),
+                None => {
+                    self.served.fetch_sub(1, Ordering::Relaxed);
+                    None
+                }
+            }
+        }
+        fn write(&self, _val: u32, _eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
+            (DmaStatus::ok(), None)
+        }
+    }
+
+    /// Outcome of replaying a PCM capture through the Codec A drain under a
+    /// simulated host consumer.
+    struct RecordedAudio {
+        /// Interleaved stereo samples the host actually pulled, in order.
+        played: Vec<i16>,
+        /// The capture, for a prefix comparison that catches loss or reorder.
+        source: Vec<i16>,
+        /// Host callbacks that found the ring empty while audio was playing.
+        underruns: u64,
+        /// Frames the codec moved from the DMA channel.
+        frames_moved: u64,
+    }
+
+    /// Replays `source` through the real Codec A drain and closed-loop rate
+    /// control, with a host consumer draining the ring at `host_rate` frames/s.
+    /// `stall`, if set, pauses the consumer for `(from, to)` wakes to model a
+    /// busy host.
+    ///
+    /// This is the recorded-audio validation that retired the legacy
+    /// `read_ahead_of_poll` clamp: it follows the same production path as
+    /// `Hal2::arm_codeca`, driving a synthetic PCM capture at a bounded ring.
+    fn replay_recorded(
+        source: Vec<i16>,
+        host_rate: u64,
+        ring_frames: usize,
+        prebuf_ms: u64,
+        wakes: u64,
+        stall: Option<(u64, u64)>,
+    ) -> RecordedAudio {
+        let guest = 48_000u32;
+        let dma = Arc::new(CorpusDma { samples: source.clone(), served: AtomicU64::new(0) });
+        let client: Arc<dyn DmaClient> = dma.clone();
+        let (out, mut cons) = test_output(ring_frames);
+        let mut st = CodecAState::new();
+        st.out = Some(out);
+        st.resampler = Some(make_resampler(ResamplerKind::CatmullRom, guest, guest));
+
+        let cap = pace_wake_cap(guest as u64);
+        // The same ring lead `arm_codeca` keeps ahead of the host callback.
+        let lead = ((prebuf_samples(guest, prebuf_ms) / 2) as u64).max(cap);
+        let mut ctl = RateCtl::new(guest);
+        let mut now = ctl.start;
+
+        let mut played = Vec::new();
+        let mut underruns = 0u64;
+        let mut frames_moved = 0u64;
+        let mut host_acc: u128 = 0;
+
+        for w in 0..wakes {
+            now += PACE_PERIOD;
+            let stalled = stall.map_or(false, |(from, to)| w >= from && w < to);
+            if !stalled {
+                host_acc += host_rate as u128 * PACE_PERIOD.as_nanos() as u128;
+            }
+            let host_due = (host_acc / 1_000_000_000) as usize;
+            host_acc %= 1_000_000_000;
+
+            let consumed = st.out.as_ref().unwrap().consumed_frames().unwrap();
+            let budget = ctl.budget(now, consumed, lead, cap);
+            let moved = drain_codec_a(
+                &mut st, &client, MODE_STEREO, guest, guest,
+                prebuf_ms, ResamplerKind::CatmullRom, budget,
+            );
+            ctl.accounted(moved);
+            frames_moved += moved;
+
+            if st.prebuffering {
+                // Still filling the initial pre-buffer; the ring is empty and
+                // silence (not a corpus sample) is what the host would hear.
+                continue;
+            }
+            for _ in 0..host_due {
+                match cons.pop() {
+                    Ok(v) => played.push(v),
+                    Err(_) => {
+                        // Policy: an underrun is rendered as silence.
+                        underruns += 1;
+                        played.push(0);
+                    }
+                }
+            }
+        }
+
+        RecordedAudio { played, source, underruns, frames_moved }
+    }
+
+    /// A deterministic, nonzero stereo capture: a dropped, duplicated or
+    /// reordered sample cannot hide in a run of silence.
+    fn sawtooth_capture(frames: usize) -> Vec<i16> {
+        let mut v = Vec::with_capacity(frames * 2);
+        for k in 0..frames as i64 {
+            let l = ((k * 7) % 30_000) as i16 + 1;
+            let r = -(((k * 11) % 30_000) as i16 + 1);
+            v.push(l);
+            v.push(r);
+        }
+        v
+    }
+
+    /// Recorded-audio validation for the clamp removal. A captured PCM stream
+    /// is replayed through the Codec A drain under host consumers running slow,
+    /// on-rate and fast (clock drift either way). With the legacy poll clamp
+    /// retired, the bounded ring and closed-loop rate control must deliver the
+    /// capture intact: no dropped, duplicated or reordered samples, no underruns
+    /// once playback has started, and production never running away from the
+    /// host.
+    #[test]
+    fn recorded_audio_delivers_intact_under_slow_and_fast_hosts() {
+        let capture_frames = 120_000;
+        let cap = pace_wake_cap(48_000);
+        let lead = ((prebuf_samples(48_000, PREBUF_MS) / 2) as u64).max(cap);
+        for &host_rate in &[46_000u64, 48_000, 50_000] {
+            let run = replay_recorded(
+                sawtooth_capture(capture_frames),
+                host_rate,
+                4096,
+                PREBUF_MS,
+                8_000,
+                None,
+            );
+            assert_eq!(
+                run.underruns, 0,
+                "host {} Hz: {} underruns without the poll clamp",
+                host_rate, run.underruns
+            );
+            assert!(!run.played.is_empty(), "host {} Hz: nothing played", host_rate);
+            assert_eq!(
+                &run.played[..], &run.source[..run.played.len()],
+                "host {} Hz: capture not delivered intact (loss/dup/reorder)",
+                host_rate
+            );
+            // Production follows the host callback, bounded by the ring lead:
+            // it neither starves the host nor runs away from it.
+            let played_frames = (run.played.len() / 2) as i64;
+            let gap = run.frames_moved as i64 - played_frames;
+            assert!(
+                (0..=(lead + 2 * cap) as i64).contains(&gap),
+                "host {} Hz: produced-consumed gap {} outside 0..{}",
+                host_rate, gap, lead + 2 * cap
+            );
+        }
+    }
+
+    /// A captured stream must ride out a busy host without clicks: the bounded
+    /// ring absorbs the pause, production stalls rather than reading ahead, and
+    /// on resume the capture continues in order with no underrun or lost sample.
+    #[test]
+    fn recorded_audio_absorbs_a_host_stall_without_underrun_or_loss() {
+        // A 60 ms host pause after steady state is established.
+        let run = replay_recorded(
+            sawtooth_capture(120_000),
+            48_000,
+            4096,
+            PREBUF_MS,
+            8_000,
+            Some((2_000, 2_240)),
+        );
+        assert_eq!(run.underruns, 0, "host stall caused {} underruns", run.underruns);
+        assert_eq!(
+            &run.played[..], &run.source[..run.played.len()],
+            "capture not delivered intact across the host stall"
+        );
     }
 
     /// The wav sink writes a RIFF/WAVE file with a valid header and the pushed

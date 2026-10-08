@@ -1164,12 +1164,6 @@ pub struct AudioConfig {
     /// Fixed cpal buffer size in frames (stereo pairs). Unset = host default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpal_buffer_frames: Option<u32>,
-    /// Retain the legacy `read_ahead_of_poll` clamp on Codec A. Bounded-buffer
-    /// backpressure (the codec stalls when the host ring is full) replaces it
-    /// by default; this exists only until recorded-audio validation proves the
-    /// clamp is no longer needed.
-    #[serde(default)]
-    pub read_ahead_clamp: bool,
     /// Codec A resampler quality. Default Catmull-Rom.
     #[serde(default)]
     pub resampler: ResamplerKind,
@@ -1185,7 +1179,6 @@ impl Default for AudioConfig {
         Self {
             prebuf_ms: default_audio_prebuf_ms(),
             cpal_buffer_frames: None,
-            read_ahead_clamp: false,
             resampler: ResamplerKind::default(),
             backend: AudioBackendKind::default(),
         }

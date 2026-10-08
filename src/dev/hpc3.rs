@@ -322,9 +322,6 @@ struct PdmaChannel {
     /// device had read by then), for `pdma polls N`.
     cbp_log: std::collections::VecDeque<(u64, u32, u64)>,
     cbp_log_t0: Option<std::time::Instant>,
-    /// Device reads when the guest last read CBP, and when.
-    reads_at_poll: u64,
-    last_poll: Option<std::time::Instant>,
     cbp: u32,
     nbdp: u32,
     bc: u32,
@@ -393,8 +390,6 @@ impl PdmaChannel {
             cbp_polls: 0,
             cbp_log: std::collections::VecDeque::new(),
             cbp_log_t0: None,
-            reads_at_poll: 0,
-            last_poll: None,
             width_16: false,
             crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, rown: false, last_rx_ctrl: 0xFFFFFFFF,
             irq_pending: false,
@@ -865,15 +860,6 @@ impl DmaClient for PdmaClientImpl {
         if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
         r
     }
-    fn read_ahead_of_poll(&self) -> Option<u64> {
-        let c = self.channel.lock();
-        // A guest that has not read CBP for a while is not steering by it.
-        match c.last_poll {
-            Some(t) if t.elapsed() < std::time::Duration::from_millis(50) =>
-                Some(c.dev_reads.saturating_sub(c.reads_at_poll)),
-            _ => None,
-        }
-    }
     fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
         let r = self.channel.lock().dma_write(val, eop);
         if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
@@ -910,8 +896,6 @@ impl PdmaChannelOps for PbusDmaOps {
         match reg {
             HPC3_PDMA_CBP => {
                 chan.cbp_polls += 1;
-                chan.reads_at_poll = chan.dev_reads;
-                chan.last_poll = Some(std::time::Instant::now());
                 let t0 = *chan.cbp_log_t0.get_or_insert_with(std::time::Instant::now);
                 if chan.cbp_log.len() == 64 { chan.cbp_log.pop_front(); }
                 let entry = (t0.elapsed().as_micros() as u64, chan.cbp, chan.dev_reads * 4);
