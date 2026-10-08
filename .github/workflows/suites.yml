@@ -121,7 +121,14 @@ jobs:
       # the guest is compiled with -g, so DWARF records the build directory, and
       # a runner's path is never a developer's. Two correct builds of identical
       # source differ. See bench/prebuilt-stamp.py.
+      #
+      # On a pull request this is a gate: run `make -C bench prebuilt` and commit
+      # bench/prebuilt/ with the change that caused it. On main the report job
+      # rebuilds and commits it automatically, so a missed refresh cannot leave
+      # main red or ship a stale image (a stale one is worse than none — accuracy
+      # is scored against golden checksums compiled into the image).
       - name: bench — checked-in guest binary matches its sources
+        if: github.event_name == 'pull_request'
         run: make -C bench check-prebuilt
 
       # One binary of each for every cell below — that is what makes the matrix
@@ -422,6 +429,23 @@ jobs:
           path: bench/build/report.md
           if-no-files-found: ignore
 
+      # Heal a stale prebuilt guest image on main: if the checked-in image no
+      # longer matches the sources it was built from, rebuild and stamp it here
+      # and let the commit below carry it. The PR gate in the guests job still
+      # catches a stale image at review; this keeps main — and the released
+      # binaries that link the image in — current without a human remembering.
+      - name: Refresh the prebuilt guest image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if make -C bench check-prebuilt; then
+            echo "prebuilt guest image is current"
+            exit 0
+          fi
+          echo "::warning::bench/prebuilt is stale on main — rebuilding and committing"
+          sudo apt-get update
+          sudo apt-get install -y gcc-mips-linux-gnu binutils-mips-linux-gnu
+          make -C bench prebuilt
+
       # Record this run into data/bench_history.json and regenerate the README
       # benchmark section + SVG. Only on main pushes — PR runs must not write
       # history. The commit is `[skip ci]` so the resulting data/README commit
@@ -443,7 +467,7 @@ jobs:
           python3 tools/bench_graphs.py
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/bench_history.json data/bench_cells.svg data/bench_history.svg data/bench_history_eff.svg data/bench_history.md README.md
+          git add data/bench_history.json data/bench_cells.svg data/bench_history.svg data/bench_history_eff.svg data/bench_history.md README.md bench/prebuilt/
           if git diff --cached --quiet; then echo "no changes to record"; exit 0; fi
           git commit -m "bench: record CI results and regenerate graphs [skip ci]"
           git push
