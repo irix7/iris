@@ -5,7 +5,9 @@ use crate::config::AudioConfig;
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
-use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient};
+use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, DmaClient, Saveable};
+use crate::snapshot::{get_field, hex_u16, u16_slice_to_toml, load_u16_slice,
+                      u32_slice_to_toml, load_u32_slice, toml_u16};
 use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{RingBuffer, Producer};
@@ -1363,6 +1365,90 @@ impl Device for Hal2 {
     }
 }
 
+impl Saveable for Hal2 {
+    fn save_state(&self) -> toml::Value {
+        let mut tbl = toml::map::Map::new();
+        {
+            let s = self.state.lock();
+            tbl.insert("isr".into(),  hex_u16(s.isr));
+            tbl.insert("iar".into(),  hex_u16(s.iar));
+            tbl.insert("idr".into(),  u16_slice_to_toml(&s.idr));
+            tbl.insert("codeca_ctrl".into(),  u16_slice_to_toml(&s.codeca_ctrl));
+            tbl.insert("codecb_ctrl".into(),  u16_slice_to_toml(&s.codecb_ctrl));
+            tbl.insert("aestx_ctrl".into(),   u16_slice_to_toml(&s.aestx_ctrl));
+            tbl.insert("aesrx_ctrl".into(),   u16_slice_to_toml(&s.aesrx_ctrl));
+            tbl.insert("bres_clock_sel".into(),     u16_slice_to_toml(&s.bres_clock_sel));
+            tbl.insert("bres_clock_inc".into(),     u16_slice_to_toml(&s.bres_clock_inc));
+            tbl.insert("bres_clock_modctrl".into(), u16_slice_to_toml(&s.bres_clock_modctrl));
+            tbl.insert("bres_clock_rate".into(),    u32_slice_to_toml(&s.bres_clock_rate));
+            tbl.insert("dma_enable".into(), hex_u16(s.dma_enable));
+            tbl.insert("dma_drive".into(),  hex_u16(s.dma_drive));
+            tbl.insert("dma_endian".into(), hex_u16(s.dma_endian));
+            tbl.insert("dma_relay".into(),  hex_u16(s.dma_relay));
+        }
+
+        // The armed HPC3 channel Codec A drains, or -1 when disarmed. Only the
+        // channel is persisted — the TimerId that drives it is rebuilt on load.
+        let armed_ch = self.ca_state.lock().armed_ch.map(|c| c as i64).unwrap_or(-1);
+        tbl.insert("armed_ch".into(), toml::Value::Integer(armed_ch));
+
+        // AES TX→RX loopback, in order — the audio path's only cross-channel
+        // queue that is not derivable from a register (this is not host audio I/O).
+        let loopback: Vec<u32> = self.ar_state.lock().loopback.iter().copied().collect();
+        tbl.insert("aes_rx_loopback".into(), u32_slice_to_toml(&loopback));
+
+        toml::Value::Table(tbl)
+    }
+
+    fn load_state(&self, v: &toml::Value) -> Result<(), String> {
+        {
+            let mut s = self.state.lock();
+            if let Some(x) = get_field(v, "isr") { if let Some(n) = toml_u16(x) { s.isr = n; } }
+            if let Some(x) = get_field(v, "iar") { if let Some(n) = toml_u16(x) { s.iar = n; } }
+            if let Some(x) = get_field(v, "idr") { load_u16_slice(x, &mut s.idr); }
+            if let Some(x) = get_field(v, "codeca_ctrl") { load_u16_slice(x, &mut s.codeca_ctrl); }
+            if let Some(x) = get_field(v, "codecb_ctrl") { load_u16_slice(x, &mut s.codecb_ctrl); }
+            if let Some(x) = get_field(v, "aestx_ctrl")  { load_u16_slice(x, &mut s.aestx_ctrl); }
+            if let Some(x) = get_field(v, "aesrx_ctrl")  { load_u16_slice(x, &mut s.aesrx_ctrl); }
+            if let Some(x) = get_field(v, "bres_clock_sel")     { load_u16_slice(x, &mut s.bres_clock_sel); }
+            if let Some(x) = get_field(v, "bres_clock_inc")     { load_u16_slice(x, &mut s.bres_clock_inc); }
+            if let Some(x) = get_field(v, "bres_clock_modctrl") { load_u16_slice(x, &mut s.bres_clock_modctrl); }
+            if let Some(x) = get_field(v, "bres_clock_rate")    { load_u32_slice(x, &mut s.bres_clock_rate); }
+            if let Some(x) = get_field(v, "dma_enable") { if let Some(n) = toml_u16(x) { s.dma_enable = n; } }
+            if let Some(x) = get_field(v, "dma_drive")  { if let Some(n) = toml_u16(x) { s.dma_drive  = n; } }
+            if let Some(x) = get_field(v, "dma_endian") { if let Some(n) = toml_u16(x) { s.dma_endian = n; } }
+            if let Some(x) = get_field(v, "dma_relay")  { if let Some(n) = toml_u16(x) { s.dma_relay  = n; } }
+        }
+
+        {
+            let mut ar = self.ar_state.lock();
+            ar.loopback.clear();
+            if let Some(toml::Value::Array(items)) = get_field(v, "aes_rx_loopback") {
+                for item in items {
+                    // toml_u32 handles both the hex-string encoding and ints.
+                    if let Some(n) = crate::snapshot::toml_u32(item) { ar.loopback.push_back(n); }
+                }
+            }
+        }
+
+        // Re-arm every channel the enable mask says is live. TimerId, the cpal
+        // stream and resampler history are deliberately not restored; the codec
+        // rebuilds them from the register state.
+        let dma_enable = self.state.lock().dma_enable;
+        self.apply_dma_enable(0, dma_enable);
+
+        // `apply_dma_enable` derives armed_ch from the codec config when a timer
+        // manager is present; restore the captured value so a host without one
+        // (tests, headless) round-trips identically.
+        if let Some(x) = get_field(v, "armed_ch") {
+            let armed = x.as_integer().filter(|n| *n >= 0).map(|n| n as usize);
+            self.ca_state.lock().armed_ch = armed;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,6 +1474,43 @@ mod tests {
         assert_eq!(sizing.ring_size, prebuf_samples(48000, 40) * RING_BUF_MULTIPLIER);
         // 40 ms of stereo at 48 kHz is twice the 20 ms default.
         assert_eq!(sizing.ring_size, 2 * prebuf_samples(48000, PREBUF_MS) * RING_BUF_MULTIPLIER);
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let src = Hal2::new(Vec::new(), AudioConfig::default());
+        {
+            let mut s = src.state.lock();
+            s.isr = 0x18;
+            s.iar = 0x9104;
+            s.idr = [0x1111, 0x2222, 0x3333, 0x4444];
+            s.codeca_ctrl = [0x0208, 0x0a0b, 0x0c0d];
+            s.codecb_ctrl = [0x0102, 0x0304, 0x0506];
+            s.aestx_ctrl  = [0x0213, 0x0000, 0x0000];
+            s.aesrx_ctrl  = [0x0102, 0x0000, 0x0000];
+            s.bres_clock_sel     = [0, 1, 2];
+            s.bres_clock_inc     = [4, 1, 4];
+            s.bres_clock_modctrl = [0xFFF9, 0xFFFF, 0xFFF3];
+            s.bres_clock_rate    = [48000, 44100, 16000];
+            s.dma_enable = DMA_EN_CODECA | DMA_EN_AES_TX;
+            s.dma_drive  = 0x0007;
+            s.dma_endian = 1;
+            s.dma_relay  = 1;
+        }
+        src.ca_state.lock().armed_ch = Some(3);
+        {
+            let mut ar = src.ar_state.lock();
+            ar.loopback.push_back(0xdead_beef);
+            ar.loopback.push_back(0x0000_1234);
+        }
+
+        let v1 = src.save_state();
+
+        let dst = Hal2::new(Vec::new(), AudioConfig::default());
+        dst.load_state(&v1).expect("load_state");
+        let v2 = dst.save_state();
+
+        assert_eq!(v1, v2, "Hal2 save_state mismatch after load_state round-trip");
     }
 
     #[test]

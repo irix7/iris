@@ -150,6 +150,9 @@ struct RollbackCheckpoint {
     scsi1: Option<toml::Value>,
     seeq: toml::Value,
     hpc3: toml::Value,
+    /// HAL2 audio registers/state. `None` when the machine runs headless
+    /// (`--noaudio`), matching `Hpc3::hal2()`.
+    hal2: Option<toml::Value>,
     rex3: Option<toml::Value>,
     rex3_head1: Option<toml::Value>,
 }
@@ -220,6 +223,8 @@ pub(crate) struct LiveCheckpoint {
     eeprom: toml::Value,
     seeq: toml::Value,
     hpc3: toml::Value,
+    /// HAL2 audio registers/state; `None` on a headless (`--noaudio`) machine.
+    hal2: Option<toml::Value>,
     rex3: Option<toml::Value>,
     rex3_head1: Option<toml::Value>,
 }
@@ -1552,6 +1557,7 @@ impl Machine {
         let scsi1 = self.hpc3.scsi1().map(|dev| dev.save_state());
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
+        let hal2 = self.hpc3.hal2().map(|h| h.save_state());
         let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
         let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
 
@@ -1583,7 +1589,7 @@ impl Machine {
             overlay_sets1,
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, rex3, rex3_head1,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, scsi, scsi1, seeq, hpc3, hal2, rex3, rex3_head1,
         })
     }
 
@@ -1607,6 +1613,9 @@ impl Machine {
         }
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
+        if let (Some(hal2), Some(hal2_toml)) = (self.hpc3.hal2(), &cp.hal2) {
+            hal2.load_state(hal2_toml)?;
+        }
         if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
@@ -1661,6 +1670,7 @@ impl Machine {
         let eeprom = self.hpc3.eeprom().lock().save_state_owned();
         let seeq = self.hpc3.seeq().save_state();
         let hpc3 = self.hpc3.save_state();
+        let hal2 = self.hpc3.hal2().map(|h| h.save_state());
         let rex3 = self._phys.rex3.as_ref().map(|r| r.save_state());
         let rex3_head1 = self._phys.rex3_head1.as_ref().map(|r| r.save_state());
 
@@ -1680,7 +1690,7 @@ impl Machine {
         LiveCheckpoint {
             bank_words,
             framebuffers,
-            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, rex3, rex3_head1,
+            cpu, mc, ioc, scc, pit, ps2, rtc, eeprom, seeq, hpc3, hal2, rex3, rex3_head1,
         }
     }
 
@@ -1710,6 +1720,9 @@ impl Machine {
         self.hpc3.eeprom().lock().load_state_mut(&cp.eeprom)?;
         self.hpc3.seeq().load_state(&cp.seeq)?;
         self.hpc3.load_state(&cp.hpc3)?;
+        if let (Some(hal2), Some(hal2_toml)) = (self.hpc3.hal2(), &cp.hal2) {
+            hal2.load_state(hal2_toml)?;
+        }
         if let (Some(rex3), Some(rex3_toml)) = (&self._phys.rex3, &cp.rex3) {
             rex3.load_state(rex3_toml)?;
         }
@@ -1821,6 +1834,9 @@ impl Machine {
         }
         snap.write_state("seeq",   &self.hpc3.seeq().save_state(),                 sv).map_err(|e| e.to_string())?;
         snap.write_state("hpc3",   &self.hpc3.save_state(),                        sv).map_err(|e| e.to_string())?;
+        if let Some(hal2) = self.hpc3.hal2() {
+            snap.write_state("hal2", &hal2.save_state(), sv).map_err(|e| e.to_string())?;
+        }
 
         // REX3 (optional — absent in headless config). Framebuffers are
         // included in the chunks manifest below for v3+; v2 wrote them as
@@ -2086,6 +2102,14 @@ impl Machine {
 
         let hpc3 = snap.read_state("hpc3", schema_version).map_err(|e| e.to_string())?;
         self.hpc3.load_state(&hpc3)?;
+
+        // hal2.* is absent from snapshots saved before HAL2 was saveable —
+        // leave the audio registers at their power-on values in that case.
+        if let Some(hal2) = self.hpc3.hal2() {
+            if let Ok(hal2_v) = snap.read_state("hal2", schema_version) {
+                hal2.load_state(&hal2_v)?;
+            }
+        }
 
         if let Some(rex3) = &self._phys.rex3 {
             let rex3_v = snap.read_state("rex3", schema_version).map_err(|e| e.to_string())?;
