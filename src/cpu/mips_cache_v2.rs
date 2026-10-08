@@ -229,6 +229,40 @@ impl JitDcGeometry {
     }
 }
 
+/// The `JitDcGeometry` a model publishes at steady state, computed from its
+/// cache constants with no cache instance.
+///
+/// The live geometry is read off a constructed cache (`MipsCache::jit_dc_geometry`)
+/// once the ppmem/tcache windows are wired up. An offline tool (the AOT cache
+/// filler, `src/bin/jitv2_aot.rs`) has no machine and no windows, but it does
+/// know which CPU model it is filling for, and geometry is a pure function of
+/// the model's consts — so it can reproduce the exact value the live worker
+/// will carry, and therefore the exact cache fingerprint.
+///
+/// `tagless` mirrors `ShadowCache`'s R10000 geometry: under `tcache` the
+/// inline path is the ppmem window alone, with no L1 tag probe. Every other
+/// model is the functional `CpuCache` shape. Keep this in step with the
+/// `jit_dc_geometry` implementations it mirrors.
+#[cfg(feature = "jitv2")]
+pub fn jit_dc_geometry_for_model<M: CpuModel>(tagless: bool) -> JitDcGeometry {
+    if tagless {
+        return JitDcGeometry { supported: true, tagless: true, ..JitDcGeometry::unsupported() };
+    }
+    let sets = M::DC_SIZE / M::DC_LINE / M::DC_WAYS;
+    JitDcGeometry {
+        supported: true,
+        line_shift: M::DC_LINE.trailing_zeros(),
+        num_lines_mask: (sets - 1) as u64,
+        data_mask: (M::DC_SIZE - 1) as u64,
+        has_l2: M::L2_SIZE > 0,
+        l2_line_shift: if M::L2_SIZE > 0 { M::L2_LINE.trailing_zeros() } else { 0 },
+        l2_num_lines_mask: if M::L2_SIZE > 0 { (M::L2_SIZE / M::L2_LINE - 1) as u64 } else { 0 },
+        ways: M::DC_WAYS as u32,
+        num_lines_shift: sets.trailing_zeros(),
+        tagless: false,
+    }
+}
+
 /// `#[repr(C)]`: jitv2's inline load/store fast path addresses `ptag` and
 /// `dirty` directly from compiled code at fixed byte offsets within the tag
 /// array (docs/jit-inline-memory.md §3.1), the same requirement `MipsCore`

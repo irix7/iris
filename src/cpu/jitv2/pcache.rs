@@ -93,8 +93,7 @@ fn root() -> Option<&'static PathBuf> {
             Some(d) => PathBuf::from(d),
             None => default_base()?,
         };
-        let exe = std::fs::read(std::env::current_exe().ok()?).ok()?;
-        let id = hex(&blake3::hash(&exe).as_bytes()[..16]);
+        let id = build_id_of_exe(&std::env::current_exe().ok()?)?;
         let dir = base.join(id);
         std::fs::create_dir_all(&dir).ok()?;
         // Mark this build as the most recently used one, for pruning.
@@ -124,6 +123,15 @@ fn prune_builds(base: &Path) {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The cache's build id for an executable: BLAKE3 of its bytes, first 16
+/// bytes hex. `root()` uses it for the running executable; the offline/AOT
+/// filler uses it for the emulator binary it is filling for, so the blobs it
+/// writes land in the namespace that binary reads (see [`fill_blob`]).
+pub fn build_id_of_exe(path: &Path) -> Option<String> {
+    let exe = std::fs::read(path).ok()?;
+    Some(hex(&blake3::hash(&exe).as_bytes()[..16]))
 }
 
 pub fn page_hash(words: &[u32; ENTRIES_PER_PAGE]) -> PageHash {
@@ -427,32 +435,75 @@ pub fn store(fp: Fingerprint, ph: PageHash, fr1: bool, blob: Blob) {
 
 fn write_job(job: Job) {
     let Some(dir) = page_dir(&job.fp, &job.ph, job.fr1) else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let bytes = encode(&job.fp, &job.ph, job.fr1, &job.blob);
-    let name = format!("{}.jc", hex(&entries_hash(&job.blob.entries)));
+    let _ = write_blob_to(&dir, &job.fp, &job.ph, job.fr1, &job.blob);
+}
+
+/// Write one blob into an already-computed page directory (temp file, then
+/// rename), then delete any stored variant the new one subsumes. Shared by
+/// the runtime writer thread and the offline [`fill_blob`] path, so both
+/// produce byte-identical files.
+fn write_blob_to(
+    dir: &Path,
+    fp: &Fingerprint,
+    ph: &PageHash,
+    fr1: bool,
+    blob: &Blob,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let bytes = encode(fp, ph, fr1, blob);
+    let name = format!("{}.jc", hex(&entries_hash(&blob.entries)));
+    let path = dir.join(&name);
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, dir.join(&name)).is_err() {
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
         let _ = std::fs::remove_file(&tmp);
-        return;
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     STORES.fetch_add(1, Relaxed);
     // A variant the new one covers can never be chosen over it again.
-    for path in variant_files(&dir) {
-        if path.file_name().is_some_and(|n| n == name.as_str()) {
+    for p in variant_files(dir) {
+        if p.file_name().is_some_and(|n| n == name.as_str()) {
             continue;
         }
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
+        let Ok(mut f) = std::fs::File::open(&p) else { continue };
         let mut buf = vec![0u8; HEADER_LEN];
         if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
             if let Some(h) = decode_header(&buf) {
-                if covers(&job.blob.entries, &h.entries) {
-                    let _ = std::fs::remove_file(&path);
+                if covers(&blob.entries, &h.entries) {
+                    let _ = std::fs::remove_file(&p);
                 }
             }
         }
     }
+    Ok(path)
+}
+
+/// Offline/AOT fill: write a blob this process compiled into an explicit
+/// cache namespace, `base/<build_id>/<fingerprint>/<page-hash>-<fr>/`.
+///
+/// This is [`store`]'s synchronous, current-executable-independent twin. The
+/// runtime writer keys on the *running* executable's build id via
+/// [`root`]; an offline tool is a different binary, so it must name the
+/// emulator it is filling for explicitly (`build_id_of_exe`). Everything
+/// else — the on-disk format, the subsumption sweep, the page-words compare a
+/// later lookup performs — is identical, so a blob written here is loaded by
+/// the emulator exactly like one its own compile worker wrote.
+///
+/// Returns the path written. `Err` if the directory or file could not be
+/// created; the caller keeps going on individual failures.
+pub fn fill_blob(
+    base: &Path,
+    build_id: &str,
+    fp: &Fingerprint,
+    ph: &PageHash,
+    fr1: bool,
+    blob: &Blob,
+) -> std::io::Result<PathBuf> {
+    let dir = base.join(build_id).join(hex(fp)).join(format!("{}-{}", hex(ph), fr1 as u8));
+    write_blob_to(&dir, fp, ph, fr1, blob)
 }
 
 #[cfg(test)]
@@ -489,6 +540,39 @@ mod tests {
             assert!(decode(&bad, &fp, &ph, true).is_none(), "flip at {i}");
         }
         assert!(decode(&bytes[..bytes.len() - 1], &fp, &ph, true).is_none());
+    }
+
+    /// The offline filler writes the exact format the runtime writer does:
+    /// a file at the explicit build-id/fingerprint/page path that `decode`
+    /// accepts under its key. `decode` is the same check a real lookup runs,
+    /// so this is a round trip through the on-disk boundary, not the
+    /// in-memory one.
+    #[test]
+    fn fill_blob_round_trips_through_the_disk_path() {
+        let base = std::env::temp_dir().join(format!(
+            "iris-aot-pcache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let fp = [7u8; 16];
+        let mut e = [0u64; BITMAP_WORDS];
+        e[0] = 0b101;
+        let b = blob(e, 9);
+        let ph = page_hash(&b.words);
+
+        let path = fill_blob(&base, "deadbeef", &fp, &ph, false, &b).expect("writes");
+        let bytes = std::fs::read(&path).expect("reads back");
+        let back = decode(&bytes, &fp, &ph, false).expect("decodes under its key");
+        assert_eq!(back.entries, b.entries);
+        assert_eq!(back.code, b.code);
+        assert_eq!(*back.words, *b.words);
+        // Wrong FR is a different directory namespace and must not decode.
+        assert!(decode(&bytes, &fp, &ph, true).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
