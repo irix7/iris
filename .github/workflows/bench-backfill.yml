@@ -43,8 +43,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Keep this in step with the matrix below.
-  SHARDS: "16"
+  # GitHub now allows 10 concurrent jobs per account here; 10 shards all start
+  # at once. Keep this in step with the matrix below.
+  SHARDS: "10"
 
 jobs:
   backfill:
@@ -53,8 +54,9 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
+      max-parallel: 10
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v5
         with:
