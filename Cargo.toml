@@ -239,6 +239,15 @@ hostcall = ["dep:iris-hostcall"]
 # Off by default, and iris-hostgl is outside the workspace members, so
 # nothing builds it unless this feature is asked for.
 hostgl = ["hostcall", "dep:iris-hostgl"]
+# Fault-based MMIO viability spike (issue #52, see
+# docs/ppmem-fault-mmio-spike.md). Compiles an isolated prototype that traps a
+# device page PROT_NONE, validates the fault against a registered site, and
+# demonstrates the store-restartability invariant, plus a latency measurement
+# against a branchy bus dispatch. It is deliberately NOT wired into `Physical`,
+# `jitv2` or the default execution path: the spike's decision was NO-GO, so
+# this exists only to keep the evidence and the tests reproducible. Off by
+# default; enabling it changes nothing about how the emulator runs.
+faultmmio = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
