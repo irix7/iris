@@ -97,6 +97,19 @@ pub struct Codegen {
     /// code is unchanged); the per-hook fill (#37) shrinks it and the
     /// forwarding/spill decisions that read it.
     last_region_clobbers: CalloutClobbers,
+    /// The GPR load/reuse counts the most recent successful compile produced
+    /// via its forwarding cache (`GprForward`) — the direct measurement of the
+    /// per-hook clobber-mask gain (#66). `Default` before any compile. A/B it
+    /// against [`Self::set_callout_masks_enabled`]`(false)`, which reproduces
+    /// the pre-#37 conservative masks. See [`ForwardStats`].
+    last_forward_stats: ForwardStats,
+    /// Whether codegen consults each callout's declared [`CalloutClobbers`]
+    /// (#37) or forces [`CalloutClobbers::CONSERVATIVE`] for every call — the
+    /// pre-#37 behaviour. Default `true`; `IRIS_CALLOUT_MASKS=0` disables the
+    /// masks process-wide at construction. A per-`Codegen` field (not a global
+    /// read at each `emit_callout`), so a unit test can A/B its own instance
+    /// without racing another test's concurrent compile.
+    callout_masks: bool,
     /// Set right before `compile_region` returns `None` iff that failure
     /// was `ModuleError::Allocation` — the `ArenaMemoryProvider` running out
     /// of its `ARENA_RESERVE_SIZE` reservation (real message observed live:
@@ -304,6 +317,10 @@ struct EmitCtx<'a, 'b> {
     /// each head instruction's `EmitCtx` so entries survive across heads that
     /// dominate one another. See [`GprForward`].
     forward: &'a mut GprForward,
+    /// A copy of [`Codegen::callout_masks`] for this compile — whether
+    /// [`emit_callout`] consults each hook's declared clobbers or substitutes
+    /// `CalloutClobbers::CONSERVATIVE` (the #66 A/B baseline).
+    callout_masks: bool,
 }
 
 /// Per-region guest-GPR store-to-load forwarding cache (#37).
@@ -346,11 +363,43 @@ struct GprForward {
     /// The block [`Self::values`] is currently valid in. `None` before any
     /// block is established (an empty cache).
     block: Option<Block>,
+    /// Running count of GPR reads this cache serviced, split by whether the
+    /// read reused a cached SSA value (the #37 gain: no `load` emitted) or had
+    /// to emit a real `load` off `core.gpr`. See [`ForwardStats`]; `clear()`
+    /// deliberately leaves this alone so it survives the block-boundary
+    /// resets it exists to report across.
+    stats: ForwardStats,
+}
+
+/// The per-region reload count the callout clobber masks (#37) act on.
+///
+/// A GPR read has exactly two outcomes in [`emit_read_gpr`]: the forwarding
+/// cache had the value and the load was avoided, or it did not and a real
+/// `load` was emitted. The mask's effect is therefore measured directly as the
+/// difference in these two counters between a mask-on compile and a
+/// conservative (pre-#37) one over the same region: a callout that declares
+/// no GPR access turns an `emit_loads_emitted` into an `emit_loads_avoided`.
+/// See `rules/jitv2/measure-the-callout-mask-gain.md`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ForwardStats {
+    /// GPR reads whose value came from the cache, i.e. no `load` emitted.
+    pub gpr_loads_avoided: u64,
+    /// GPR reads that emitted a real `load` off `core.gpr`.
+    pub gpr_loads_emitted: u64,
+}
+
+impl ForwardStats {
+    /// Total GPR reads (`avoided + emitted`) — the denominator for the
+    /// avoided-load fraction, and the sanity check that a mask-on and a
+    /// mask-off compile saw the same read stream.
+    pub fn total_reads(self) -> u64 {
+        self.gpr_loads_avoided + self.gpr_loads_emitted
+    }
 }
 
 impl Default for GprForward {
     fn default() -> Self {
-        Self { values: [None; GPR_COUNT as usize], block: None }
+        Self { values: [None; GPR_COUNT as usize], block: None, stats: ForwardStats::default() }
     }
 }
 
@@ -392,7 +441,11 @@ impl GprForward {
             return None;
         }
         self.sync(cur);
-        self.values[reg as usize]
+        let value = self.values[reg as usize];
+        if value.is_some() {
+            self.stats.gpr_loads_avoided += 1;
+        }
+        value
     }
 
     fn put(&mut self, reg: u32, value: Value, cur: Option<Block>) {
@@ -401,6 +454,19 @@ impl GprForward {
         }
         self.sync(cur);
         self.values[reg as usize] = Some(value);
+    }
+
+    /// Record that [`emit_read_gpr`] emitted a real `load` because this cache
+    /// had no live value for `reg`. Kept separate from [`Self::get`] so the
+    /// miss is attributed by the one function that actually emits the load.
+    fn note_load_emitted(&mut self) {
+        self.stats.gpr_loads_emitted += 1;
+    }
+
+    /// The region's accumulated read/reload counts, read once by `Codegen`
+    /// after the compile.
+    fn stats(&self) -> ForwardStats {
+        self.stats
     }
 
     /// Forget every GPR named by `mask` — the guest registers a callout's
@@ -568,6 +634,24 @@ static CODEGEN_INTERRUPT_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::
 /// of the corpus; the mean run is 4.33), and it keeps worst-case interrupt
 /// latency obviously bounded.
 pub const MAX_INTERRUPT_RUN: u32 = 32;
+
+/// Process-wide default for [`Codegen::callout_masks_enabled`], read once from
+/// `IRIS_CALLOUT_MASKS` (`0`/`off`/`false`/`no` disables the per-hook masks so
+/// a boot measures the conservative pre-#37 baseline). A `Once` seeds a static
+/// so every `Codegen` construction agrees, while the value still lives on each
+/// `Codegen` instance — see that field's own doc for why (a unit test must be
+/// able to A/B one instance without racing another test's compile).
+fn callout_masks_from_env() -> bool {
+    static SEED: std::sync::Once = std::sync::Once::new();
+    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    SEED.call_once(|| {
+        if let Ok(v) = std::env::var("IRIS_CALLOUT_MASKS") {
+            let on = !matches!(v.as_str(), "0" | "off" | "false" | "no");
+            ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl Codegen {
     /// Set the `opt_level` used by future `Codegen::new()`/`reset()` calls.
@@ -752,6 +836,8 @@ impl Codegen {
             last_code_size: 0,
             last_blob: None,
             last_region_clobbers: CalloutClobbers::NONE,
+            last_forward_stats: ForwardStats::default(),
+            callout_masks: callout_masks_from_env(),
             last_compile_ran_out_of_memory: false,
             #[cfg(feature = "developer")]
             last_decline_was_verifier_error: false,
@@ -917,6 +1003,7 @@ impl Codegen {
         self.last_code_size = 0;
         self.last_blob = None;
         self.last_region_clobbers = CalloutClobbers::NONE;
+        self.last_forward_stats = ForwardStats::default();
         self.last_compile_ran_out_of_memory = false;
         // `mem_helpers` is deliberately NOT cleared here. Shared helpers now
         // live in a permanent region owned by `Jitv2` (see
@@ -956,6 +1043,30 @@ impl Codegen {
     /// `last_region_clobbers`'s own field doc comment.
     pub fn last_region_clobbers(&self) -> CalloutClobbers {
         self.last_region_clobbers
+    }
+
+    /// The most recent successful compile's GPR load/reuse counts — the
+    /// measurement #66 exists to produce. `ForwardStats::default()` before any
+    /// compile. Compile the same region with [`Self::set_callout_masks_enabled`]
+    /// `(true)` and `(false)` and diff the two to attribute loads directly to
+    /// the per-hook clobber masks (see [`ForwardStats`]).
+    pub fn last_forward_stats(&self) -> ForwardStats {
+        self.last_forward_stats
+    }
+
+    /// Enable/disable the per-hook callout clobber masks (#37) for this
+    /// `Codegen`. `false` forces every call's [`CalloutClobbers`] to
+    /// `CONSERVATIVE`, reproducing pre-#37 codegen exactly, and is the A/B
+    /// baseline for [`Self::last_forward_stats`]. Affects only calls made
+    /// after this setter (already-emitted regions are unaffected, as with
+    /// every codegen setting). See `callout_masks`'s own field doc.
+    pub fn set_callout_masks_enabled(&mut self, on: bool) {
+        self.callout_masks = on;
+    }
+
+    /// Whether codegen currently consults the per-hook clobber masks.
+    pub fn callout_masks_enabled(&self) -> bool {
+        self.callout_masks
     }
 
     /// The most recent compile's machine code and alignment, if the
@@ -1146,7 +1257,7 @@ impl Codegen {
         // semantics to report one from). The full `compile_region_uncommitted`
         // path threads its real accumulator through the same helpers.
         let mut skeleton_clobbers = CalloutClobbers::NONE;
-        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut skeleton_clobbers);
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut skeleton_clobbers, self.callout_masks);
         // Not sealed: predecessors are every bail site across the whole
         // function, established incrementally as later passes emit them.
 
@@ -1163,7 +1274,7 @@ impl Codegen {
         let call_fault_pc_param = builder.append_block_param(exception_call_block, ir::types::I64);
         let call_bd_param = builder.append_block_param(exception_call_block, ir::types::I8);
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut skeleton_clobbers);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut skeleton_clobbers, self.callout_masks);
         // None of the three sealed here: predecessors (every emit_exception_exit
         // call site, plus the two outer stages' own jumps into
         // exception_call_block) are established incrementally as later
@@ -1463,6 +1574,7 @@ impl Codegen {
                 cycles_pending: &mut unused_cycles,
                 callout_clobbers: &mut unused_clobbers,
                 forward: &mut unused_forward,
+                callout_masks: self.callout_masks,
             };
 
             let status = match helper {
@@ -1792,7 +1904,7 @@ impl Codegen {
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
             let mut unused_forward = GprForward::default();
-            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
+            let mut guard_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward, callout_masks: self.callout_masks };
             emit_fr_mode_guard(&mut guard_ctx, live_entry_offset, compiled_for_fr1);
         }
 
@@ -1825,7 +1937,7 @@ impl Codegen {
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
             let mut unused_forward = GprForward::default();
-            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
+            let mut pre_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: 0, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward, callout_masks: self.callout_masks };
             emit_entry_interrupt_bail(&mut pre_ctx);
         }
 
@@ -1907,7 +2019,7 @@ impl Codegen {
             let mut unused_cycles_pending = 0u32;
             let mut unused_clobbers = CalloutClobbers::NONE;
             let mut unused_forward = GprForward::default();
-            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
+            let mut trace_ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word: w, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward, callout_masks: self.callout_masks };
             emit_dev_trace_bp(&mut trace_ctx, origin);
             builder.ins().jump(real_target, &[]);
             builder.seal_block(stub);
@@ -1927,11 +2039,11 @@ impl Codegen {
         let mut callout_clobbers = CalloutClobbers::NONE;
 
         builder.switch_to_block(exit_block);
-        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut callout_clobbers);
+        emit_exit_block_body(&mut builder, &mut self.module, &jit_consts, exit_core_ptr, word_offset_param, exit_status_param, &mut callout_clobbers, self.callout_masks);
         // Left unsealed until every bail site below has been emitted.
 
         builder.switch_to_block(exception_call_block);
-        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut callout_clobbers);
+        emit_exception_call_block_body(&mut self.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut callout_clobbers, self.callout_masks);
         // Left unsealed until every emit_exception_exit call site below has
         // been emitted — same reasoning as exit_block above.
 
@@ -2076,7 +2188,7 @@ impl Codegen {
             // the right exception outer stage.
             let is_entry_point = instrs[word as usize].is_entry_point;
             let trust_live_pc_bd_on_exc = is_entry_point || instrs[word as usize].is_branch_fallback_successor;
-            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending, callout_clobbers: &mut callout_clobbers, forward: &mut forward };
+            let mut ctx = EmitCtx { builder: &mut builder, module: &mut self.module, jit_consts, mem_helpers, core_ptr, raw, word, dc_geometry, bd: false, trust_live_pc_bd_on_exc, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut cycles_pending, callout_clobbers: &mut callout_clobbers, forward: &mut forward, callout_masks: self.callout_masks };
 
             if is_entry_point && entry_body_blocks.contains_key(&word) {
                 // This entry word's ordinary block is reached only by
@@ -2471,6 +2583,10 @@ impl Codegen {
         // `last_region_clobbers` reports. Under the #36 conservative default
         // this is every GPR and FPR, i.e. emitted code is unchanged.
         self.last_region_clobbers = callout_clobbers;
+        // And the forwarding cache's own read/reload tally (#66), captured
+        // before `forward` goes out of scope. This is the measurement that
+        // turns "a smaller SpillPlan" into a count of loads actually avoided.
+        self.last_forward_stats = forward.stats();
 
         // Pass 3: every block's predecessor set is now fully known.
         for &(_, block) in &instr_blocks {
@@ -3757,7 +3873,7 @@ fn emit_lockstep_compare_seq(ctx: &mut EmitCtx) {
 /// whatever this function already wrote for real. A preamble bail (nothing
 /// staged this dispatch) is a harmless no-op, same as every other lockstep
 /// compare call.
-fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, consts: &JitConsts, core_ptr: Value, word_offset: Value, status: Value, callout_clobbers: &mut CalloutClobbers) {
+fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelift_module::Module, consts: &JitConsts, core_ptr: Value, word_offset: Value, status: Value, callout_clobbers: &mut CalloutClobbers, callout_masks: bool) {
     let mem = MemFlagsData::trusted();
     let i64t = ir::types::I64;
     let pc_off = ir::immediates::Offset32::new(core_offset_of_pc());
@@ -3787,7 +3903,7 @@ fn emit_exit_block_body(builder: &mut FunctionBuilder, module: &mut dyn cranelif
         sig.returns.push(AbiParam::new(ir::types::I32)); // ExecStatus
         let sig_ref = builder.import_signature(sig);
         let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
-        let call = emit_callout_raw(builder, callout_clobbers, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
+        let call = emit_callout_raw(builder, callout_clobbers, callout_masks, Callout::LockstepCompare, sig_ref, callee, &[core_arg]);
         let cmp_status = builder.inst_results(call)[0];
 
         // Divergence: lockstep_compare (mips_exec.rs) already restored
@@ -4796,7 +4912,11 @@ fn emit_callout(
     callee: Value,
     args: &[Value],
 ) -> ir::Inst {
-    let clobbers = callout.clobbers();
+    let clobbers = if ctx.callout_masks {
+        callout.clobbers()
+    } else {
+        CalloutClobbers::CONSERVATIVE
+    };
     ctx.callout_clobbers.union_assign(clobbers);
     // The cache's validity rule is about the *block*, so there is nothing to
     // invalidate when the callout is in a cold arm whose results rejoin later;
@@ -4810,16 +4930,18 @@ fn emit_callout(
 /// a bare `FunctionBuilder` rather than an `EmitCtx`. `clobbers` is the same
 /// region accumulator `EmitCtx::callout_clobbers` carries on the ordinary
 /// path, threaded in explicitly so the exception/exit blocks' callouts are
-/// part of the region's total footprint too.
+/// part of the region's total footprint too. `callout_masks` mirrors
+/// [`Codegen::callout_masks`] so the #66 A/B is faithful here as well.
 fn emit_callout_raw(
     builder: &mut FunctionBuilder,
     clobbers: &mut CalloutClobbers,
+    callout_masks: bool,
     callout: Callout,
     sig_ref: ir::SigRef,
     callee: Value,
     args: &[Value],
 ) -> ir::Inst {
-    clobbers.union_assign(callout.clobbers());
+    clobbers.union_assign(if callout_masks { callout.clobbers() } else { CalloutClobbers::CONSERVATIVE });
     builder.ins().call_indirect(sig_ref, callee, args)
 }
 
@@ -6069,6 +6191,7 @@ fn emit_exception_call_block_body(
     fault_pc: Value,
     bd: Value,
     callout_clobbers: &mut CalloutClobbers,
+    callout_masks: bool,
 ) {
     let ptr_ty = module.target_config().pointer_type();
 
@@ -6090,7 +6213,7 @@ fn emit_exception_call_block_body(
     let sig_ref = builder.import_signature(sig);
 
     let core_arg = builder.ins().iadd_imm_s(core_ptr, CALLOUT_CORE_BIAS);
-    emit_callout_raw(builder, callout_clobbers, Callout::HandleException, sig_ref, callee, &[core_arg, status, fault_pc, bd]);
+    emit_callout_raw(builder, callout_clobbers, callout_masks, Callout::HandleException, sig_ref, callee, &[core_arg, status, fault_pc, bd]);
     let ret_status = builder.ins().iconst(ir::types::I32, EXEC_COMPLETE as i64);
     builder.ins().return_(&[ret_status]);
 }
@@ -6345,6 +6468,7 @@ fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
     let mem = MemFlagsData::trusted();
     let off = ir::immediates::Offset32::new(core_offset_of_gpr(reg));
     let value = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, off);
+    ctx.forward.note_load_emitted();
     ctx.forward.put(reg, value, ctx.builder.current_block());
     value
 }
@@ -10808,6 +10932,89 @@ mod tests {
         assert_eq!(clobbers.spill_plan().fpr, 0);
     }
 
+    /// #66: the clobber-mask gain, measured as an actual reload count rather
+    /// than "a smaller `SpillPlan`". The region writes `r4`, then runs a
+    /// memory callout (`sw`, whose [`Callout::MemoryWrite`] mask declares no
+    /// GPR access), then reads `r4`. With #37's masks on, the read reuses the
+    /// forwarded SSA value; with `set_callout_masks_enabled(false)` — every
+    /// call conservatively clobbering the whole file, i.e. pre-#37 codegen —
+    /// the callout invalidates `r4` and the read must emit a reload. The two
+    /// compiles of the same region differ by exactly that one load.
+    ///
+    /// A *store* is the shape where the win is real. A *load* callout
+    /// (`MemoryRead`) declares the same empty mask, but its destination-GPR
+    /// write happens after `emit_check_mem_status` has split to a fresh,
+    /// un-blessed continuation block, and that write's `sync` clears the
+    /// cache regardless of the mask — so a load cannot show the gain. This
+    /// asymmetry is exactly what only a reload count, not a `SpillPlan`,
+    /// could reveal; see `rules/jitv2/measure-the-callout-mask-gain.md`.
+    ///
+    /// Not run under `jitv2_lockstep`/`developer`: those builds bracket every
+    /// instruction with conservative tracer hooks, so no callout ever declares
+    /// a narrow memory mask (same reason as the sibling test above).
+    #[test]
+    #[cfg(all(not(feature = "jitv2_lockstep"), not(feature = "developer")))]
+    fn masked_callouts_avoid_a_gpr_reload_the_conservative_masks_force() {
+        use crate::cpu::mips_isa::{FUNCT_ADDU, OP_SPECIAL, OP_SW};
+
+        fn i_type(op: u32, rs: u32, rt: u32, imm: u16) -> u32 {
+            (op << 26) | (rs << 21) | (rt << 16) | imm as u32
+        }
+
+        // addu r4,r2,r3 ; sw r4,0(r1) ; addu r6,r4,r5 ; jr ra ; nop
+        fn page() -> [u32; ENTRIES_PER_PAGE] {
+            let mut page = [0u32; ENTRIES_PER_PAGE];
+            page[0] = r_type(OP_SPECIAL, 2, 3, 4, 0, FUNCT_ADDU); // write r4
+            page[1] = i_type(OP_SW, 1, 4, 0);                     // memory callout
+            page[2] = r_type(OP_SPECIAL, 4, 5, 6, 0, FUNCT_ADDU); // read r4
+            page[3] = r_type(OP_SPECIAL, 31, 0, 0, 0, FUNCT_JR);
+            page[4] = 0;
+            page
+        }
+
+        fn compile_with_masks(masks: bool) -> (ForwardStats, CalloutClobbers) {
+            let page = page();
+            let mut analyzer = Analyzer::new();
+            let (instrs, non_empty) = analyzer.walk(&page, 0, 0);
+            assert!(non_empty);
+            let mut instrs_owned = *instrs;
+            let mut codegen = Codegen::new();
+            codegen.set_callout_masks_enabled(masks);
+            let _ = codegen.compile_region(&mut instrs_owned, 0, true, false)
+                .expect("addu/sw/addu region must compile");
+            let stats = codegen.last_forward_stats();
+            let clobbers = codegen.last_region_clobbers();
+            std::mem::forget(codegen);
+            (stats, clobbers)
+        }
+
+        let (masked, masked_clobbers) = compile_with_masks(true);
+        let (conservative, conservative_clobbers) = compile_with_masks(false);
+        println!(
+            "CALLOUT_MASK_GAIN masked avoided={} emitted={} | conservative avoided={} emitted={}",
+            masked.gpr_loads_avoided, masked.gpr_loads_emitted,
+            conservative.gpr_loads_avoided, conservative.gpr_loads_emitted);
+
+        // The mechanism first: masks on is narrower than masks off.
+        assert!(!masked_clobbers.is_conservative(),
+            "masked build must report a narrow clobber set: {masked_clobbers:?}");
+        assert!(conservative_clobbers.is_conservative(),
+            "masks off must reproduce the pre-#37 all-clobbered set: {conservative_clobbers:?}");
+
+        // The measured gain: one fewer emitted load / one more avoided load.
+        // Both builds read the same set of GPRs, so the delta is the masks and
+        // nothing else.
+        assert_eq!(masked.total_reads(), conservative.total_reads(),
+            "masked and conservative compiles must read the same GPRs: \
+             masked={masked:?} conservative={conservative:?}");
+        assert_eq!(conservative.gpr_loads_emitted, masked.gpr_loads_emitted + 1,
+            "the memory callout must cost exactly one reload under conservative \
+             masks: masked={masked:?} conservative={conservative:?}");
+        assert_eq!(masked.gpr_loads_avoided, conservative.gpr_loads_avoided + 1,
+            "the masked build must avoid exactly that reload: \
+             masked={masked:?} conservative={conservative:?}");
+    }
+
     #[test]
     fn skeleton_allocates_one_block_per_visited_instruction() {
         let mut page = [0u32; ENTRIES_PER_PAGE];
@@ -10944,7 +11151,7 @@ mod tests {
                 // baked — `JitConsts::default()` is exactly that fallback.
                 let jit_consts = JitConsts::default();
             let mem_helpers = [None; MEM_HELPER_COUNT];
-                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward };
+                let mut ctx = EmitCtx { builder: &mut builder, module: &mut codegen.module, jit_consts, mem_helpers, core_ptr, raw: 0, word: word_offset, dc_geometry, bd: false, trust_live_pc_bd_on_exc: true, exit_block, exception_call_block, abs_exit_block, cycles_pending: &mut unused_cycles_pending, callout_clobbers: &mut unused_clobbers, forward: &mut unused_forward, callout_masks: codegen.callout_masks };
                 emit(&mut ctx, exit_block, word_offset);
             }
             // Not-fired/not-pending path continues here (the preamble leaves
@@ -10959,11 +11166,11 @@ mod tests {
             let mem_helpers: [Option<core::num::NonZeroUsize>; MEM_HELPER_COUNT] = [None; MEM_HELPER_COUNT];
             let mut harness_clobbers = CalloutClobbers::NONE;
             builder.switch_to_block(exit_block);
-            emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param, &mut harness_clobbers);
+            emit_exit_block_body(&mut builder, &mut codegen.module, &jit_consts, exit_core_ptr, exit_word_offset, exit_status_param, &mut harness_clobbers, codegen.callout_masks);
             builder.seal_block(exit_block); // only predecessor in this harness is the preamble's bail site
 
             builder.switch_to_block(exception_call_block);
-            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut harness_clobbers);
+            emit_exception_call_block_body(&mut codegen.module, &mut builder, &jit_consts, call_core_ptr, call_status_param, call_fault_pc_param, call_bd_param, &mut harness_clobbers, codegen.callout_masks);
             builder.switch_to_block(abs_exit_block);
             emit_absolute_pc_exit_block_body(&mut builder, abs_exit_core_ptr, abs_exit_target);
 
