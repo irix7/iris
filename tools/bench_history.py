@@ -152,7 +152,21 @@ def save(data: dict, path=HISTORY) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-def entry_exists(data, source, commit):
+def entry_key(entry):
+    """Identity of a history entry: source, commit, and the set of cells it
+    measured. The cell set matters — the interpreter and jitv2 backfills measure
+    the same commits, and both must survive a merge."""
+    return (entry.get("source"), entry.get("commit"),
+            tuple(sorted(c.get("name") for c in entry.get("cells", []))))
+
+
+def entry_exists(data, entry):
+    k = entry_key(entry)
+    return any(entry_key(e) == k for e in data["entries"])
+
+
+def commit_seen(data, source, commit):
+    """Coarse check used only to skip re-downloading an already-recorded CI run."""
     return any(e["source"] == source and e["commit"] == commit for e in data["entries"])
 
 
@@ -167,7 +181,7 @@ def add_entry(data, source, commit, ref, date, title, report_md):
         "host": parsed["host"],
         "cells": parsed["cells"],
     }
-    if entry_exists(data, source, commit):
+    if entry_exists(data, entry):
         return False
     data["entries"].append(entry)
     return True
@@ -204,16 +218,19 @@ def collect(repo, run_id, source, ref, date, title):
 
 
 def merge_into(into_path: Path, from_paths) -> None:
-    """Fold history fragments into one file, deduping by (source, commit).
+    """Fold history fragments into one file, deduping by entry key (source,
+    commit, measured cells).
 
     A sharded one-time backfill collects each shard into its own fragment; this
-    is how the shards are stitched back into the single history."""
+    is how the shards are stitched back into the single history. The cell set is
+    part of the key so the interpreter and jitv2 backfills of the same commit
+    both survive."""
     into = load(into_path)
     before = len(into["entries"])
-    seen = {(e["source"], e["commit"]) for e in into["entries"]}
+    seen = {entry_key(e) for e in into["entries"]}
     for f in from_paths:
         for e in load(Path(f))["entries"]:
-            key = (e["source"], e["commit"])
+            key = entry_key(e)
             if key not in seen:
                 into["entries"].append(e)
                 seen.add(key)
@@ -231,7 +248,7 @@ def backfill(repo, limit, dry_run=False):
             continue
         if r["event"] != "push" or r["headBranch"] != "main":
             continue
-        if entry_exists(data, repo, r["headSha"]):
+        if commit_seen(data, repo, r["headSha"]):
             continue
         try:
             with tempfile.TemporaryDirectory() as d:
