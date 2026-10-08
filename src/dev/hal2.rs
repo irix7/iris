@@ -154,6 +154,10 @@ const READ_AHEAD_MS: u64 = 1;
 const PACE_CATCHUP_DEN: u64 = 4;
 
 /// Wall-clock frame pacing for one channel: how many frames are due now.
+///
+/// Codec B and the AES engines have no host consumer, so a straight wall-clock
+/// generator is correct for them. Codec A uses `RateCtl` below, which closes
+/// the loop on what the host callback actually consumed.
 struct Pacer {
     start: Instant,
     rate: u64,
@@ -197,6 +201,87 @@ impl Pacer {
     }
 }
 
+/// Per-wake catch-up cap reused by `RateCtl`: never move more than
+/// `PACE_CATCHUP` periods' frames in one wake, as the open-loop pacer did.
+fn pace_wake_cap(rate: u64) -> u64 {
+    let per_period = (rate * PACE_PERIOD.as_micros() as u64).div_ceil(1_000_000);
+    (per_period * PACE_CATCHUP_NUM).div_ceil(PACE_CATCHUP_DEN).max(per_period + 1)
+}
+
+/// Drift-control window for Codec A, in frames: how far the host callback may
+/// run ahead of or behind the guest clock before the loop re-anchors the
+/// measurement. Reuses `PACE_MAX_BACKLOG` — the same host stall the open-loop
+/// pacer skips — so a device change or a long stall re-locks.
+fn rate_reset_window(rate: u64) -> i64 {
+    (rate * PACE_MAX_BACKLOG.as_millis() as u64 / 1000) as i64
+}
+
+/// Closed-loop frame budget for Codec A (QEMU `RateCtl` shape).
+///
+/// The guest's BRES clock says how many frames are *due* on the wall clock; the
+/// host output reports how many the callback has actually *consumed*. The
+/// difference is the drift. The per-wake budget is the wall-clock due biased by
+/// the measured drift — equivalently, what the host has consumed plus the ring
+/// lead we want to keep ahead of it, minus what we have already produced — so
+/// production follows the rate the host is really playing at instead of a host
+/// crystal slowly accumulating against the guest's fixed `Instant` pace. When
+/// the drift since the window opened leaves ±`rate_reset_window`, the window is
+/// re-anchored exactly as QEMU's `audio_rate_add_bytes` resets, so a device
+/// change or a long stall re-locks. Unlike QEMU the produced/consumed target is
+/// cumulative, so re-anchoring neither replays nor drops a backlog and does not
+/// re-prime the ring.
+struct RateCtl {
+    rate: u64,
+    start: Instant,
+    /// Host frames consumed at the window origin.
+    consumed_base: u64,
+    produced: u64,
+    peeked: i64,
+}
+
+impl RateCtl {
+    fn new(rate: u32) -> Self {
+        Self { rate: rate as u64, start: Instant::now(), consumed_base: 0, produced: 0, peeked: 0 }
+    }
+
+    /// Frames the guest clock says should have played since the window opened.
+    fn due(&self, now: Instant) -> u64 {
+        (now.duration_since(self.start).as_nanos() as u64).saturating_mul(self.rate) / 1_000_000_000
+    }
+
+    fn window(&self) -> i64 { rate_reset_window(self.rate) }
+
+    /// Frames to move this wake. `consumed` is the host callback's cumulative
+    /// played count, already converted to guest frames; `lead` is the ring
+    /// occupancy to keep ahead of it; `cap` bounds one wake (`pace_wake_cap`).
+    fn budget(&mut self, now: Instant, consumed: u64, lead: u64, cap: u64) -> u64 {
+        let due = self.due(now);
+        // Host frames played since the window opened, against the guest clock:
+        // positive means the host has run ahead, negative that it is behind.
+        let played = consumed.saturating_sub(self.consumed_base);
+        let error = played as i64 - due as i64;
+        self.peeked = error;
+        if error < -self.window() || error > self.window() {
+            // The host clock has diverged: re-anchor the drift measurement.
+            self.start = now;
+            self.consumed_base = consumed;
+            self.peeked = 0;
+        }
+        // due + error == played, so this is the wall-clock budget biased by the
+        // drift, expressed as an occupancy target: keep `lead` frames ahead of
+        // what the host callback has consumed. Production is cumulative, so a
+        // re-anchor above changes nothing physical.
+        let want = (consumed as i64 + lead as i64 - self.produced as i64).max(0) as u64;
+        want.min(cap)
+    }
+
+    /// Account frames actually moved into the host this wake. Frames the ring
+    /// refused stay unproduced, so they are due again on the next wake.
+    fn accounted(&mut self, moved: u64) {
+        self.produced += moved;
+    }
+}
+
 // Sample rates to try when opening the persistent output stream, in order.
 const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 
@@ -214,6 +299,11 @@ trait AudioOutput: Send {
     fn underruns(&self) -> u64;
     /// Gate underrun counting: false while prebuffering or idle.
     fn set_playing(&self, playing: bool);
+    /// Frames the host callback has consumed since the stream opened, measured
+    /// against a bounded ring. `None` for sinks that accept everything at once
+    /// (a file or null sink): they have no playback clock for the rate loop to
+    /// follow, so Codec A stays on the open-loop pacer.
+    fn consumed_frames(&self) -> Option<u64>;
 }
 
 /// Opens a host audio output. Selected from `[audio] backend` and the
@@ -228,6 +318,10 @@ trait AudioBackend {
 struct CpalOutput {
     stream_rate: u32,
     producer: Producer<i16>,
+    /// Total i16 samples accepted into the ring since the stream opened.
+    pushed_samples: u64,
+    /// Ring capacity in i16 samples (both channels).
+    capacity_samples: usize,
     underruns: Arc<AtomicU64>,
     // Set once prebuffering finishes and real samples are flowing; cleared when
     // the codec is disarmed/reset. Gates underrun counting so idle silence
@@ -250,11 +344,17 @@ impl AudioOutput for CpalOutput {
             if self.producer.push(s).is_err() { break; }
             n += 1;
         }
+        self.pushed_samples += n as u64;
         // n is i16 samples; a frame is two (stereo).
         n / 2
     }
     fn underruns(&self) -> u64 { self.underruns.load(Ordering::Relaxed) }
     fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
+    fn consumed_frames(&self) -> Option<u64> {
+        let free = self.producer.slots() as u64;
+        let occupied = (self.capacity_samples as u64).saturating_sub(free);
+        Some(self.pushed_samples.saturating_sub(occupied) / 2)
+    }
 }
 
 /// A sink that accepts and discards everything, at a nominal rate.
@@ -266,6 +366,7 @@ impl AudioOutput for NullOutput {
     fn push_frames(&mut self, samples: &[i16]) -> usize { samples.len() / 2 }
     fn underruns(&self) -> u64 { 0 }
     fn set_playing(&self, _playing: bool) {}
+    fn consumed_frames(&self) -> Option<u64> { None }
 }
 
 /// Writes interleaved stereo 16-bit little-endian PCM to a RIFF/WAVE file.
@@ -319,6 +420,7 @@ impl AudioOutput for WavOutput {
     }
     fn underruns(&self) -> u64 { 0 }
     fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
+    fn consumed_frames(&self) -> Option<u64> { None }
 }
 
 impl Drop for WavOutput {
@@ -813,6 +915,8 @@ fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &A
         return Some(CpalOutput {
             stream_rate: rate,
             producer,
+            pushed_samples: 0,
+            capacity_samples: ring_size,
             underruns,
             playing,
             _stream: stream,
@@ -917,11 +1021,31 @@ impl Hal2 {
         let prebuf_ms = self.audio_config.prebuf_ms;
         let read_ahead_clamp = self.audio_config.read_ahead_clamp;
         let resampler_kind = self.audio_config.resampler;
+        let cap = pace_wake_cap(pitch_rate as u64);
+        // Keep the host ring about one prebuffer ahead of the callback. A sink
+        // with no playback clock (file/null) reports no consumption, so the
+        // loop falls back to the open-loop pacer below.
+        let lead = ((prebuf_samples(rate, prebuf_ms) / 2) as u64).max(cap);
         let mut pacer = Pacer::new(pitch_rate);
+        let mut rate_ctl = RateCtl::new(pitch_rate);
 
         self.ca_state.lock().armed_ch = Some(dma_ch);
         let id = tm.add_recurring(Instant::now() + PACE_PERIOD, PACE_PERIOD, (), move |_| {
-            let mut due = pacer.due();
+            let mut st = ca_state.lock();
+            // Close the rate loop on what the host callback has actually
+            // consumed, converted from stream frames back to guest frames. A
+            // sink with no playback clock (file/null) reports none, and the
+            // loop stays open (wall-clock pacer).
+            let consumed = st.out.as_ref().and_then(|o| {
+                let stream_rate = o.stream_rate();
+                if stream_rate == 0 { return None; }
+                o.consumed_frames()
+                    .map(|played| (played as u128 * pitch_rate as u128 / stream_rate as u128) as u64)
+            });
+            let (mut due, closed_loop) = match consumed {
+                Some(consumed) => (rate_ctl.budget(Instant::now(), consumed, lead, cap), true),
+                None => (pacer.due(), false),
+            };
             // Legacy open-loop clamp: keep within READ_AHEAD_MS of the position
             // the guest last polled. Off by default — bounded-buffer
             // backpressure in `drain_codec_a` replaces it. Retained behind
@@ -932,7 +1056,6 @@ impl Hal2 {
                     let limit = (pitch_rate as u64 * READ_AHEAD_MS).div_ceil(1000);
                     let allowed = limit.saturating_sub(ahead_words / words_per_frame);
                     if due > allowed {
-                        pacer.give_back(due - allowed);
                         due = allowed;
                     }
                 }
@@ -940,12 +1063,15 @@ impl Hal2 {
             if due == 0 {
                 return TimerReturn::Continue;
             }
-            let mut st = ca_state.lock();
             let moved = drain_codec_a(&mut st, &dma_client, mode, pitch_rate, rate, prebuf_ms, resampler_kind, due);
             drop(st);
-            // Frames the ring would not accept stay due: the read stalled, so
-            // CBP did not advance, and the pacer retries once the ring drains.
-            if moved < due {
+            if closed_loop {
+                // Frames the ring would not accept stay unproduced, so they are
+                // due again next wake; a stalled read never advances CBP.
+                rate_ctl.accounted(moved);
+            } else {
+                // The pacer counted the whole open budget up front; return what
+                // the clamp or a stalled ring left unmoved.
                 pacer.give_back(due - moved);
             }
             TimerReturn::Continue
@@ -1809,6 +1935,8 @@ mod tests {
     struct TestOutput {
         rate: u32,
         producer: Producer<i16>,
+        capacity_samples: usize,
+        pushed_samples: u64,
         playing: AtomicBool,
     }
 
@@ -1821,15 +1949,27 @@ mod tests {
                 if self.producer.push(s).is_err() { break; }
                 n += 1;
             }
+            self.pushed_samples += n as u64;
             n / 2
         }
         fn underruns(&self) -> u64 { 0 }
         fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
+        fn consumed_frames(&self) -> Option<u64> {
+            let free = self.producer.slots() as u64;
+            let occupied = (self.capacity_samples as u64).saturating_sub(free);
+            Some(self.pushed_samples.saturating_sub(occupied) / 2)
+        }
     }
 
     fn test_output(frames: usize) -> (Box<dyn AudioOutput>, rtrb::Consumer<i16>) {
         let (producer, consumer) = RingBuffer::<i16>::new(frames * 2);
-        let out = TestOutput { rate: 48000, producer, playing: AtomicBool::new(false) };
+        let out = TestOutput {
+            rate: 48000,
+            producer,
+            capacity_samples: frames * 2,
+            pushed_samples: 0,
+            playing: AtomicBool::new(false),
+        };
         (Box::new(out), consumer)
     }
 
@@ -2032,6 +2172,58 @@ mod tests {
         let mut total = first;
         for _ in 0..200 { total += p.due(); }
         assert!(total >= 110, "backlog not delivered: {}", total);
+    }
+
+    /// The rate loop must follow the host callback, not the guest's fixed
+    /// `Instant`: a consumer running faster or slower than the guest codec must
+    /// not accumulate a produced-vs-consumed gap. Driven directly, with no
+    /// audio hardware; wakes match `PACE_PERIOD`.
+    #[test]
+    fn rate_loop_corrects_a_fast_or_slow_consumer() {
+        let guest = 44_100u32;
+        let lead = 512u64;
+        let cap = pace_wake_cap(guest as u64);
+        let step = PACE_PERIOD;
+        let steps = 20_000u64; // 5 s of 250 µs wakes
+        // Consumer rates are multiples of 4000/s, so a 250 µs wake is a whole
+        // number of frames and truncation cannot masquerade as drift.
+        for &consumer in &[40_000u64, 44_000, 48_000, 52_000] {
+            let mut ctl = RateCtl::new(guest);
+            let mut now = ctl.start;
+            let (mut consumed, mut produced) = (0u64, 0u64);
+            for _ in 0..steps {
+                now += step;
+                consumed += consumer * step.as_nanos() as u64 / 1_000_000_000;
+                let budget = ctl.budget(now, consumed, lead, cap);
+                produced += budget;
+                ctl.accounted(budget);
+            }
+            let gap = produced as i64 - consumed as i64;
+            assert!(gap >= 0, "consumer {} Hz: producer fell behind the callback ({})", consumer, gap);
+            assert!(
+                gap <= (lead + 2 * cap) as i64,
+                "consumer {} Hz: produced-consumed gap {} ran away from the {} frame lead",
+                consumer, gap, lead
+            );
+        }
+    }
+
+    /// A host that stalls for longer than the reset window must not be sent a
+    /// huge catch-up burst: the loop drops its origin and re-locks, exactly as
+    /// QEMU's `RateCtl` reset does.
+    #[test]
+    fn rate_loop_resets_the_window_after_a_long_stall() {
+        let guest = 44_100u32;
+        let lead = 512u64;
+        let cap = pace_wake_cap(guest as u64);
+        let mut ctl = RateCtl::new(guest);
+        let mut now = ctl.start;
+        now += PACE_MAX_BACKLOG + Duration::from_millis(1000);
+        // The host consumed nothing across the stall; the budget must stay
+        // capped instead of replaying a second of audio at once.
+        let budget = ctl.budget(now, 0, lead, cap);
+        assert!(budget <= cap, "stall replayed as a {} frame burst", budget);
+        assert_eq!(ctl.peeked, 0, "the drift window was not reset");
     }
 
     /// A 1 kHz tone at 11025 Hz, resampled to 48 kHz, against the ideal
