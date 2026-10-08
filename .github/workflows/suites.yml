@@ -281,11 +281,15 @@ jobs:
       - name: Check the benchmark run
         run: |
           python3 - <<'PY'
-          import json, sys, glob
-          paths = glob.glob("bench/build/results/*.json")
-          if not paths:
-              sys.exit("::error::no result file was written")
-          run = json.load(open(paths[0]))
+          import json, sys, os
+          cell = "${{ matrix.cpu }}-${{ matrix.engine }}"
+          # The host-baseline step writes "<cell>-host.json" into this same
+          # directory, so an unsorted glob can hand back the host run and fail
+          # with "guest reports host". Pick the guest result for this cell.
+          path = f"bench/build/results/{cell}.json"
+          if not os.path.exists(path):
+              sys.exit(f"::error::no guest result file at {path}")
+          run = json.load(open(path))
           want = "${{ matrix.cpu }}".upper()
           if run["machine"]["cpu"] != want:
               sys.exit(f"::error::guest reports {run['machine']['cpu']}, expected {want}")
