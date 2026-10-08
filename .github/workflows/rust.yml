@@ -27,3 +27,10 @@ jobs:
       run: cargo build --workspace --verbose
     - name: Run tests
       run: cargo test --workspace --verbose
+    # The parallel-agent workflow: boot two isolated instances (`--instance N`)
+    # and drive each over its own CI serial socket. No IRIX media needed — the
+    # Indy PROM's command monitor is the serial endpoint. Catches regressions
+    # in instance derivation, the CI socket/serial path, and per-instance
+    # isolation that the unit tests alone would miss.
+    - name: Fleet parallel-agent test
+      run: test/fleet/run.sh target/debug/iris target/debug/iris-ci
