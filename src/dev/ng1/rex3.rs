@@ -4612,118 +4612,134 @@ fn load_rex3_context(ctx: &mut Rex3Context, v: &toml::Value) {
 }
 
 impl Saveable for Rex3 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("rex3", 1)
+                .field(
+                    "context",
+                    FieldKind::Table,
+                    1,
+                    |t| {
+                        let ctx = unsafe { &*self.context.get() };
+                        t.insert("context".into(), save_rex3_context(ctx));
+                    },
+                    |v| {
+                        let ctx = unsafe { &mut *self.context.get() };
+                        load_rex3_context(ctx, v);
+                        Ok(())
+                    },
+                )
+                .field(
+                    "config_regs",
+                    FieldKind::Table,
+                    1,
+                    |t| {
+                        let dcb = self.dcb.lock();
+                        let mut ctbl = toml::map::Map::new();
+                        ctbl.insert("config".into(),  hex_u32(self.config.config.load(Ordering::Relaxed)));
+                        ctbl.insert("status".into(),  hex_u32(self.config.status.load(Ordering::Relaxed)));
+                        ctbl.insert("dcbmode".into(),  hex_u32(dcb.dcbmode));
+                        ctbl.insert("dcbdata0".into(), hex_u32(dcb.dcbdata0));
+                        ctbl.insert("dcbdata1".into(), hex_u32(dcb.dcbdata1));
+                        t.insert("config_regs".into(), toml::Value::Table(ctbl));
+                    },
+                    |v| {
+                        let mut dcb = self.dcb.lock();
+                        if let Some(x) = get_field(v, "config") { self.config.config.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
+                        if let Some(x) = get_field(v, "status") { self.config.status.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
+                        if let Some(x) = get_field(v, "dcbmode")  { dcb.dcbmode  = toml_u32(x).unwrap_or(0); }
+                        if let Some(x) = get_field(v, "dcbdata0") { dcb.dcbdata0 = toml_u32(x).unwrap_or(0); }
+                        if let Some(x) = get_field(v, "dcbdata1") { dcb.dcbdata1 = toml_u32(x).unwrap_or(0); }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "vc2",
+                    FieldKind::Table,
+                    1,
+                    |t| {
+                        let vc2 = self.vc2.lock();
+                        let mut vtbl = toml::map::Map::new();
+                        vtbl.insert("index".into(), hex_u32(vc2.index as u32));
+                        let regs16: Vec<u32> = vc2.regs.iter().map(|&x| x as u32).collect();
+                        vtbl.insert("regs".into(), u32_slice_to_toml(&regs16));
+                        vtbl.insert("ram".into(), u16_slice_to_toml(&vc2.ram));
+                        t.insert("vc2".into(), toml::Value::Table(vtbl));
+                    },
+                    |v| {
+                        let mut vc2 = self.vc2.lock();
+                        if let Some(x) = get_field(v, "index") { vc2.index = toml_u32(x).unwrap_or(0) as u8; }
+                        if let Some(r) = get_field(v, "regs") {
+                            let mut tmp = [0u32; 32];
+                            load_u32_slice(r, &mut tmp);
+                            for (i, &val) in tmp.iter().enumerate() { vc2.regs[i] = val as u16; }
+                        }
+                        if let Some(r) = get_field(v, "ram") { load_u16_slice(r, &mut vc2.ram); }
+                        vc2.dirty = true;
+                        Ok(())
+                    },
+                )
+                .field(
+                    "xmap0",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("xmap0".into(), save_xmap9(&self.xmap0.lock())); },
+                    |v| { load_xmap9(&mut self.xmap0.lock(), v); Ok(()) },
+                )
+                .field(
+                    "xmap1",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("xmap1".into(), save_xmap9(&self.xmap1.lock())); },
+                    |v| { load_xmap9(&mut self.xmap1.lock(), v); Ok(()) },
+                )
+                .field(
+                    "cmap0",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("cmap0".into(), save_cmap(&self.cmap0.lock())); },
+                    |v| { load_cmap(&mut self.cmap0.lock(), v); Ok(()) },
+                )
+                .field(
+                    "cmap1",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("cmap1".into(), save_cmap(&self.cmap1.lock())); },
+                    |v| { load_cmap(&mut self.cmap1.lock(), v); Ok(()) },
+                )
+                // Bt445 RAMDAC (palette + registers) — missing this makes every
+                // pixel decode to black after restore.
+                .field(
+                    "bt445",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("bt445".into(), save_bt445(&self.bt445.lock())); },
+                    |v| { load_bt445(&mut self.bt445.lock(), v); Ok(()) },
+                )
+                // GFIFO is deliberately not part of the serialized snapshot at
+                // all (a live, in-flight draw-command queue has no meaningful
+                // "restore" — it's ephemeral producer/consumer state, not
+                // architectural). But `load_state` is always called with the
+                // processor thread stopped (every caller's contract —
+                // `restore_live_checkpoint`/`load_snapshot_paused`), so reset it
+                // explicitly rather than relying on it having already drained.
+                // See `GFifo::reset`'s own doc comment for why this is only safe
+                // with the consumer stopped.
+                .after_load(|| {
+                    self.gfifo.reset();
+                    self.gfxbusy.store(false, Ordering::Relaxed);
+                    Ok(())
+                }),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
-
-        // Drawing context
-        let ctx = unsafe { &*self.context.get() };
-        tbl.insert("context".into(), save_rex3_context(ctx));
-
-        // Config registers
-        {
-            let dcb = self.dcb.lock();
-            let mut ctbl = toml::map::Map::new();
-            ctbl.insert("config".into(),  hex_u32(self.config.config.load(Ordering::Relaxed)));
-            ctbl.insert("status".into(),  hex_u32(self.config.status.load(Ordering::Relaxed)));
-            ctbl.insert("dcbmode".into(),  hex_u32(dcb.dcbmode));
-            ctbl.insert("dcbdata0".into(), hex_u32(dcb.dcbdata0));
-            ctbl.insert("dcbdata1".into(), hex_u32(dcb.dcbdata1));
-            tbl.insert("config_regs".into(), toml::Value::Table(ctbl));
-        }
-
-        // Vc2
-        {
-            let vc2 = self.vc2.lock();
-            let mut vtbl = toml::map::Map::new();
-            vtbl.insert("index".into(), hex_u32(vc2.index as u32));
-            let regs16: Vec<u32> = vc2.regs.iter().map(|&x| x as u32).collect();
-            vtbl.insert("regs".into(), u32_slice_to_toml(&regs16));
-            vtbl.insert("ram".into(), u16_slice_to_toml(&vc2.ram));
-            tbl.insert("vc2".into(), toml::Value::Table(vtbl));
-        }
-
-        // Xmap0
-        {
-            let xmap = self.xmap0.lock();
-            tbl.insert("xmap0".into(), save_xmap9(&xmap));
-        }
-
-        // Xmap1
-        {
-            let xmap = self.xmap1.lock();
-            tbl.insert("xmap1".into(), save_xmap9(&xmap));
-        }
-
-        // Cmap0
-        {
-            let cmap = self.cmap0.lock();
-            tbl.insert("cmap0".into(), save_cmap(&cmap));
-        }
-
-        // Cmap1
-        {
-            let cmap = self.cmap1.lock();
-            tbl.insert("cmap1".into(), save_cmap(&cmap));
-        }
-
-        // Bt445 RAMDAC (palette + registers) — missing this makes every
-        // pixel decode to black after restore.
-        {
-            let dac = self.bt445.lock();
-            tbl.insert("bt445".into(), save_bt445(&dac));
-        }
-
-        toml::Value::Table(tbl)
+        self.state_desc().expect("rex3 has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        if let Some(ctx_v) = get_field(v, "context") {
-            let ctx = unsafe { &mut *self.context.get() };
-            load_rex3_context(ctx, ctx_v);
-        }
-
-        if let Some(cfg_v) = get_field(v, "config_regs") {
-            let mut dcb = self.dcb.lock();
-            if let Some(x) = get_field(cfg_v, "config") { self.config.config.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
-            if let Some(x) = get_field(cfg_v, "status") { self.config.status.store(toml_u32(x).unwrap_or(0), Ordering::Relaxed); }
-            if let Some(x) = get_field(cfg_v, "dcbmode")  { dcb.dcbmode  = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "dcbdata0") { dcb.dcbdata0 = toml_u32(x).unwrap_or(0); }
-            if let Some(x) = get_field(cfg_v, "dcbdata1") { dcb.dcbdata1 = toml_u32(x).unwrap_or(0); }
-        }
-
-        if let Some(vv) = get_field(v, "vc2") {
-            let mut vc2 = self.vc2.lock();
-            if let Some(x) = get_field(vv, "index") { vc2.index = toml_u32(x).unwrap_or(0) as u8; }
-            if let Some(r) = get_field(vv, "regs") {
-                let mut tmp = [0u32; 32];
-                load_u32_slice(r, &mut tmp);
-                for (i, &v) in tmp.iter().enumerate() { vc2.regs[i] = v as u16; }
-            }
-            if let Some(r) = get_field(vv, "ram") { load_u16_slice(r, &mut vc2.ram); }
-            vc2.dirty = true;
-        }
-
-        if let Some(xv) = get_field(v, "xmap0") { load_xmap9(&mut self.xmap0.lock(), xv); }
-        if let Some(xv) = get_field(v, "xmap1") { load_xmap9(&mut self.xmap1.lock(), xv); }
-        if let Some(cv) = get_field(v, "cmap0") { load_cmap(&mut self.cmap0.lock(), cv); }
-        if let Some(cv) = get_field(v, "cmap1") { load_cmap(&mut self.cmap1.lock(), cv); }
-        if let Some(dv) = get_field(v, "bt445") { load_bt445(&mut self.bt445.lock(), dv); }
-
-        // GFIFO is deliberately not part of the serialized snapshot at all
-        // (a live, in-flight draw-command queue has no meaningful
-        // "restore" — it's ephemeral producer/consumer state, not
-        // architectural). But `load_state` is always called with the
-        // processor thread stopped (every caller's contract —
-        // `restore_live_checkpoint`/`load_snapshot_paused`), and the FIFO's
-        // own head/tail are otherwise left exactly as whatever the pre-load
-        // live state happened to be — reset it explicitly here rather than
-        // relying on it having already drained to empty by coincidence.
-        // See `GFifo::reset`'s own doc comment for why this is only safe
-        // with the consumer stopped.
-        self.gfifo.reset();
-        self.gfxbusy.store(false, Ordering::Relaxed);
-
-        Ok(())
+        self.state_desc().expect("rex3 has a state description").load(v)
     }
 }
 

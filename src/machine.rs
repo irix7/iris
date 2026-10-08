@@ -2121,20 +2121,15 @@ impl Machine {
             cap!("mgras", &**mgras);
         }
 
-        // EEPROM: its load path needs `&mut` (the state lives in an owned
-        // array, not behind interior mutability), so it stays on the legacy
-        // codec for now — recorded as an unregistered schema entry.
+        // EEPROM: it has a registered description (so a renamed field is
+        // caught), but its load path needs `&mut` (the state lives in an owned
+        // array, not behind interior mutability), so only the save side runs
+        // through the generic codec here.
         {
-            let eeprom = self.hpc3.eeprom().lock().save_state_owned();
-            schemas.push(DeviceSchema {
-                name: "eeprom".into(),
-                version: 0,
-                minimum_version: 0,
-                registered: false,
-                signature: value_signature("eeprom", &eeprom),
-                fields: value_field_list(&eeprom),
-            });
-            payloads.push(("eeprom", eeprom));
+            let guard = self.hpc3.eeprom().lock();
+            let (v, s) = capture_device("eeprom", &*guard)?;
+            payloads.push(("eeprom", v));
+            schemas.push(s);
         }
 
         // Write the manifest first so `read_manifest` succeeds even if a later
@@ -2386,10 +2381,17 @@ impl Machine {
         load_device(&snap, schema_version, "rtc", &**self.hpc3.rtc(), schema_map.get("rtc"))?;
 
         // EEPROM keeps its &mut load path (owned array, no interior
-        // mutability) — its manifest entry is unregistered, so only the
-        // value-shape integrity check runs.
+        // mutability): migrate/check the schema through the generic seam on
+        // `&*guard`, Verify the field set, then apply via `load_state_mut`.
         let eeprom = snap.read_state("eeprom", schema_version).map_err(|e| e.to_string())?;
-        check_device_schema("eeprom", &eeprom, None, schema_map.get("eeprom"))?;
+        let eeprom = {
+            let guard = self.hpc3.eeprom().lock();
+            let prepared = prepare_device_value("eeprom", eeprom, &*guard, schema_map.get("eeprom"))?;
+            if let Some(desc) = guard.state_desc() {
+                desc.verify(&prepared)?;
+            }
+            prepared
+        };
         self.hpc3.eeprom().lock().load_state_mut(&eeprom)?;
 
         load_device(&snap, schema_version, "scsi", &**self.hpc3.scsi(), schema_map.get("scsi"))?;

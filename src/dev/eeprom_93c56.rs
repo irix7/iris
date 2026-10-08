@@ -441,11 +441,35 @@ impl Resettable for Eeprom93c56 {
 }
 
 impl Saveable for Eeprom93c56 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        // The owned array (`data`) is not behind interior mutability, so the
+        // load closures are not used: `load_state` is implemented on `&mut`
+        // (`load_state_mut`), which the Machine drives while holding the
+        // EEPROM's own Mutex. Registering the fields here gives the snapshot
+        // its readable field list and schema signature, so a renamed/removed
+        // field is caught by Verify.
+        Some(
+            StateDesc::new("eeprom", 1)
+                .field(
+                    "data",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("data".into(), u16_slice_to_toml(&self.data)); },
+                    |_| Err("eeprom: use load_state_mut".to_string()),
+                )
+                .field(
+                    "write_enable",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("write_enable".into(), toml::Value::Boolean(self.write_enable)); },
+                    |_| Err("eeprom: use load_state_mut".to_string()),
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("data".into(), u16_slice_to_toml(&self.data));
-        tbl.insert("write_enable".into(), toml::Value::Boolean(self.write_enable));
-        toml::Value::Table(tbl)
+        self.state_desc().expect("eeprom has a state description").save()
     }
 
     fn load_state(&self, _v: &toml::Value) -> Result<(), String> {
@@ -477,10 +501,7 @@ impl Eeprom93c56 {
     }
 
     pub fn save_state_owned(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("data".into(), u16_slice_to_toml(&self.data));
-        tbl.insert("write_enable".into(), toml::Value::Boolean(self.write_enable));
-        toml::Value::Table(tbl)
+        self.save_state()
     }
 }
 
@@ -620,6 +641,24 @@ mod tests {
         let v2 = dst.save_state_owned();
 
         assert_eq!(v1, v2, "EEPROM save_state mismatch after load_state round-trip");
+    }
+
+    /// The registered description records the exact field set, so a
+    /// renamed/removed field fails Verify instead of loading silently.
+    #[test]
+    fn state_desc_verify_rejects_a_renamed_field() {
+        let e = Eeprom93c56::new();
+        let desc = e.state_desc().expect("eeprom has a state description");
+        let saved = desc.save();
+        desc.verify(&saved).expect("freshly saved eeprom value verifies");
+        assert_eq!(desc.measure(), desc.signature());
+
+        let mut t = saved.as_table().cloned().unwrap();
+        let data = t.remove("data").unwrap();
+        t.insert("words".into(), data);
+        let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+        assert!(err.contains("data"), "names the field: {err}");
+        assert!(err.contains("missing") || err.contains("unknown"), "{err}");
     }
 
     /// MAC words must land at 0x7D-0x7F (the last 3 words of the 128-word

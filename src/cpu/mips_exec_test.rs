@@ -6036,4 +6036,25 @@ mod tests {
             assert_eq!(exec.core.cp0_badvaddr, 0x2000 + off);
         }
     }
+
+    /// The registered cpu description catches a renamed/removed field: the
+    /// generated payload verifies, but moving a key fails Verify. This is the
+    /// same signature check the snapshot loader runs on load.
+    #[test]
+    fn cpu_state_desc_verify_rejects_a_renamed_field() {
+        let (exec, _mem) = create_executor();
+        let cpu = crate::cpu::mips_exec::MipsCpu::new(exec);
+        let desc = crate::traits::Saveable::state_desc(&cpu)
+            .expect("cpu has a state description");
+        let saved = desc.save();
+        desc.verify(&saved).expect("freshly saved cpu state verifies");
+        assert_eq!(desc.measure(), desc.signature());
+
+        let mut t = saved.as_table().cloned().unwrap();
+        let gpr = t.remove("gpr").unwrap();
+        t.insert("registers".into(), gpr);
+        let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+        assert!(err.contains("gpr"), "names the field: {err}");
+        assert!(err.contains("missing") || err.contains("unknown"), "{err}");
+    }
 }

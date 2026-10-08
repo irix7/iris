@@ -26,8 +26,10 @@ save, load)` closures and an optional `.after_load(closure)`:
   inline (IOC `update_interrupts`, DS1x86 `base_centiseconds`, WD33C93A
   transient clear, SCC `notify_all`).
 - Closures capture `&self`; devices store state behind `Mutex`/atomics. A
-  device needing `&mut self` to load (EEPROM's owned array) stays on the
-  legacy codec.
+  device needing `&mut self` to load (EEPROM's owned array) registers its
+  fields for save/signature, but keeps a `&mut` load path
+  (`load_state_mut`); the orchestrator runs `verify` on the description
+  before applying it.
 
 ## Signature and verification
 
@@ -74,6 +76,9 @@ signature check:
 or the migration registry. #45 builders recorded the signature without them;
 adding them would make every pre-#46 snapshot fail the equal-version check.
 
-## Not yet migrated
+## Migrated
 
-cpu, hal2, rex3, gr2, mgras, eeprom (the `&mut` case).
+All `Saveable` devices now return a `StateDesc`: cpu, hal2, rex3 (both
+heads), gr2, mgras, eeprom, and the ten from #45. EEPROM's load stays on
+`load_state_mut` (owned array) but its field set and signature are
+registered, so a rename there is caught too.

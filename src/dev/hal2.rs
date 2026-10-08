@@ -1778,86 +1778,175 @@ impl Device for Hal2 {
 }
 
 impl Saveable for Hal2 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        use toml::Value;
+        Some(
+            StateDesc::new("hal2", 1)
+                .field(
+                    "isr",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("isr".into(), hex_u16(self.state.lock().isr)); },
+                    |v| { if let Some(n) = toml_u16(v) { self.state.lock().isr = n; } Ok(()) },
+                )
+                .field(
+                    "iar",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("iar".into(), hex_u16(self.state.lock().iar)); },
+                    |v| { if let Some(n) = toml_u16(v) { self.state.lock().iar = n; } Ok(()) },
+                )
+                .field(
+                    "idr",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("idr".into(), u16_slice_to_toml(&self.state.lock().idr)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().idr); Ok(()) },
+                )
+                .field(
+                    "codeca_ctrl",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("codeca_ctrl".into(), u16_slice_to_toml(&self.state.lock().codeca_ctrl)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().codeca_ctrl); Ok(()) },
+                )
+                .field(
+                    "codecb_ctrl",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("codecb_ctrl".into(), u16_slice_to_toml(&self.state.lock().codecb_ctrl)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().codecb_ctrl); Ok(()) },
+                )
+                .field(
+                    "aestx_ctrl",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("aestx_ctrl".into(), u16_slice_to_toml(&self.state.lock().aestx_ctrl)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().aestx_ctrl); Ok(()) },
+                )
+                .field(
+                    "aesrx_ctrl",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("aesrx_ctrl".into(), u16_slice_to_toml(&self.state.lock().aesrx_ctrl)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().aesrx_ctrl); Ok(()) },
+                )
+                .field(
+                    "bres_clock_sel",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("bres_clock_sel".into(), u16_slice_to_toml(&self.state.lock().bres_clock_sel)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().bres_clock_sel); Ok(()) },
+                )
+                .field(
+                    "bres_clock_inc",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("bres_clock_inc".into(), u16_slice_to_toml(&self.state.lock().bres_clock_inc)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().bres_clock_inc); Ok(()) },
+                )
+                .field(
+                    "bres_clock_modctrl",
+                    FieldKind::U16Array,
+                    1,
+                    |t| { t.insert("bres_clock_modctrl".into(), u16_slice_to_toml(&self.state.lock().bres_clock_modctrl)); },
+                    |v| { load_u16_slice(v, &mut self.state.lock().bres_clock_modctrl); Ok(()) },
+                )
+                .field(
+                    "bres_clock_rate",
+                    FieldKind::U32Array,
+                    1,
+                    |t| { t.insert("bres_clock_rate".into(), u32_slice_to_toml(&self.state.lock().bres_clock_rate)); },
+                    |v| { load_u32_slice(v, &mut self.state.lock().bres_clock_rate); Ok(()) },
+                )
+                .field(
+                    "dma_drive",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("dma_drive".into(), hex_u16(self.state.lock().dma_drive)); },
+                    |v| { if let Some(n) = toml_u16(v) { self.state.lock().dma_drive = n; } Ok(()) },
+                )
+                .field(
+                    "dma_endian",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("dma_endian".into(), hex_u16(self.state.lock().dma_endian)); },
+                    |v| { if let Some(n) = toml_u16(v) { self.state.lock().dma_endian = n; } Ok(()) },
+                )
+                .field(
+                    "dma_relay",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("dma_relay".into(), hex_u16(self.state.lock().dma_relay)); },
+                    |v| { if let Some(n) = toml_u16(v) { self.state.lock().dma_relay = n; } Ok(()) },
+                )
+                // Loading the enable mask re-arms every live channel. This must
+                // happen before `armed_ch` is restored below, so the captured
+                // value wins over the derived one.
+                .field(
+                    "dma_enable",
+                    FieldKind::U16,
+                    1,
+                    |t| { t.insert("dma_enable".into(), hex_u16(self.state.lock().dma_enable)); },
+                    |v| {
+                        let n = toml_u16(v).unwrap_or(0);
+                        self.state.lock().dma_enable = n;
+                        // Re-arm every channel the enable mask says is live.
+                        self.apply_dma_enable(0, n);
+                        Ok(())
+                    },
+                )
+                // AES TX→RX loopback, in order — the audio path's only
+                // cross-channel queue not derivable from a register.
+                .field(
+                    "aes_rx_loopback",
+                    FieldKind::U32Array,
+                    1,
+                    |t| {
+                        let loopback: Vec<u32> = self.ar_state.lock().loopback.iter().copied().collect();
+                        t.insert("aes_rx_loopback".into(), u32_slice_to_toml(&loopback));
+                    },
+                    |v| {
+                        let mut ar = self.ar_state.lock();
+                        ar.loopback.clear();
+                        if let Some(items) = v.as_array() {
+                            for item in items {
+                                // toml_u32 handles both the hex-string encoding and ints.
+                                if let Some(n) = crate::snapshot::toml_u32(item) { ar.loopback.push_back(n); }
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                // The armed HPC3 channel Codec A drains, or -1 when disarmed.
+                // Only the channel is persisted — the TimerId that drives it is
+                // rebuilt on load. Restored after `dma_enable`'s re-arm so a
+                // host without a timer manager (tests, headless) round-trips
+                // identically.
+                .field(
+                    "armed_ch",
+                    FieldKind::I64,
+                    1,
+                    |t| {
+                        let armed = self.ca_state.lock().armed_ch.map(|c| c as i64).unwrap_or(-1);
+                        t.insert("armed_ch".into(), Value::Integer(armed));
+                    },
+                    |v| {
+                        let armed = v.as_integer().filter(|n| *n >= 0).map(|n| n as usize);
+                        self.ca_state.lock().armed_ch = armed;
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
-        {
-            let s = self.state.lock();
-            tbl.insert("isr".into(),  hex_u16(s.isr));
-            tbl.insert("iar".into(),  hex_u16(s.iar));
-            tbl.insert("idr".into(),  u16_slice_to_toml(&s.idr));
-            tbl.insert("codeca_ctrl".into(),  u16_slice_to_toml(&s.codeca_ctrl));
-            tbl.insert("codecb_ctrl".into(),  u16_slice_to_toml(&s.codecb_ctrl));
-            tbl.insert("aestx_ctrl".into(),   u16_slice_to_toml(&s.aestx_ctrl));
-            tbl.insert("aesrx_ctrl".into(),   u16_slice_to_toml(&s.aesrx_ctrl));
-            tbl.insert("bres_clock_sel".into(),     u16_slice_to_toml(&s.bres_clock_sel));
-            tbl.insert("bres_clock_inc".into(),     u16_slice_to_toml(&s.bres_clock_inc));
-            tbl.insert("bres_clock_modctrl".into(), u16_slice_to_toml(&s.bres_clock_modctrl));
-            tbl.insert("bres_clock_rate".into(),    u32_slice_to_toml(&s.bres_clock_rate));
-            tbl.insert("dma_enable".into(), hex_u16(s.dma_enable));
-            tbl.insert("dma_drive".into(),  hex_u16(s.dma_drive));
-            tbl.insert("dma_endian".into(), hex_u16(s.dma_endian));
-            tbl.insert("dma_relay".into(),  hex_u16(s.dma_relay));
-        }
-
-        // The armed HPC3 channel Codec A drains, or -1 when disarmed. Only the
-        // channel is persisted — the TimerId that drives it is rebuilt on load.
-        let armed_ch = self.ca_state.lock().armed_ch.map(|c| c as i64).unwrap_or(-1);
-        tbl.insert("armed_ch".into(), toml::Value::Integer(armed_ch));
-
-        // AES TX→RX loopback, in order — the audio path's only cross-channel
-        // queue that is not derivable from a register (this is not host audio I/O).
-        let loopback: Vec<u32> = self.ar_state.lock().loopback.iter().copied().collect();
-        tbl.insert("aes_rx_loopback".into(), u32_slice_to_toml(&loopback));
-
-        toml::Value::Table(tbl)
+        self.state_desc().expect("hal2 has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        {
-            let mut s = self.state.lock();
-            if let Some(x) = get_field(v, "isr") { if let Some(n) = toml_u16(x) { s.isr = n; } }
-            if let Some(x) = get_field(v, "iar") { if let Some(n) = toml_u16(x) { s.iar = n; } }
-            if let Some(x) = get_field(v, "idr") { load_u16_slice(x, &mut s.idr); }
-            if let Some(x) = get_field(v, "codeca_ctrl") { load_u16_slice(x, &mut s.codeca_ctrl); }
-            if let Some(x) = get_field(v, "codecb_ctrl") { load_u16_slice(x, &mut s.codecb_ctrl); }
-            if let Some(x) = get_field(v, "aestx_ctrl")  { load_u16_slice(x, &mut s.aestx_ctrl); }
-            if let Some(x) = get_field(v, "aesrx_ctrl")  { load_u16_slice(x, &mut s.aesrx_ctrl); }
-            if let Some(x) = get_field(v, "bres_clock_sel")     { load_u16_slice(x, &mut s.bres_clock_sel); }
-            if let Some(x) = get_field(v, "bres_clock_inc")     { load_u16_slice(x, &mut s.bres_clock_inc); }
-            if let Some(x) = get_field(v, "bres_clock_modctrl") { load_u16_slice(x, &mut s.bres_clock_modctrl); }
-            if let Some(x) = get_field(v, "bres_clock_rate")    { load_u32_slice(x, &mut s.bres_clock_rate); }
-            if let Some(x) = get_field(v, "dma_enable") { if let Some(n) = toml_u16(x) { s.dma_enable = n; } }
-            if let Some(x) = get_field(v, "dma_drive")  { if let Some(n) = toml_u16(x) { s.dma_drive  = n; } }
-            if let Some(x) = get_field(v, "dma_endian") { if let Some(n) = toml_u16(x) { s.dma_endian = n; } }
-            if let Some(x) = get_field(v, "dma_relay")  { if let Some(n) = toml_u16(x) { s.dma_relay  = n; } }
-        }
-
-        {
-            let mut ar = self.ar_state.lock();
-            ar.loopback.clear();
-            if let Some(toml::Value::Array(items)) = get_field(v, "aes_rx_loopback") {
-                for item in items {
-                    // toml_u32 handles both the hex-string encoding and ints.
-                    if let Some(n) = crate::snapshot::toml_u32(item) { ar.loopback.push_back(n); }
-                }
-            }
-        }
-
-        // Re-arm every channel the enable mask says is live. TimerId, the cpal
-        // stream and resampler history are deliberately not restored; the codec
-        // rebuilds them from the register state.
-        let dma_enable = self.state.lock().dma_enable;
-        self.apply_dma_enable(0, dma_enable);
-
-        // `apply_dma_enable` derives armed_ch from the codec config when a timer
-        // manager is present; restore the captured value so a host without one
-        // (tests, headless) round-trips identically.
-        if let Some(x) = get_field(v, "armed_ch") {
-            let armed = x.as_integer().filter(|n| *n >= 0).map(|n| n as usize);
-            self.ca_state.lock().armed_ch = armed;
-        }
-
-        Ok(())
+        self.state_desc().expect("hal2 has a state description").load(v)
     }
 }
 
@@ -2255,6 +2344,25 @@ mod tests {
         let v2 = dst.save_state();
 
         assert_eq!(v1, v2, "Hal2 save_state mismatch after load_state round-trip");
+    }
+
+    /// The registered description catches a renamed/removed field: the
+    /// generated payload verifies, but moving a key fails Verify (and the
+    /// schema signature is what `measure` records).
+    #[test]
+    fn state_desc_verify_rejects_a_renamed_field() {
+        let src = Hal2::new(Vec::new(), AudioConfig::default());
+        let desc = src.state_desc().expect("hal2 has a state description");
+        let saved = desc.save();
+        desc.verify(&saved).expect("freshly saved hal2 value verifies");
+        assert_eq!(desc.measure(), desc.signature());
+
+        let mut t = saved.as_table().cloned().unwrap();
+        let isr = t.remove("isr").unwrap();
+        t.insert("isr_renamed".into(), isr);
+        let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+        assert!(err.contains("isr"), "names the field: {err}");
+        assert!(err.contains("missing") || err.contains("unknown"), "{err}");
     }
 
     #[test]

@@ -228,3 +228,21 @@ fn cpu_register_window_draws_and_reads_back() {
     let got: Vec<u32> = (0..3).map(|_| r32(g, re3_reg(REG_RWDATA))).collect();
     assert_eq!(got, vec![0, 5, 5]);
 }
+
+/// The registered gr2 description catches a renamed/removed field: the
+/// generated payload verifies, but moving a key fails Verify.
+#[test]
+fn state_desc_verify_rejects_a_renamed_field() {
+    let g = live_gr2(Gr2Variant::Xz);
+    let desc = g.state_desc().expect("gr2 has a state description");
+    let saved = desc.save();
+    desc.verify(&saved).expect("freshly saved gr2 value verifies");
+    assert_eq!(desc.measure(), desc.signature());
+
+    let mut t = saved.as_table().cloned().unwrap();
+    let shram = t.remove("shram").unwrap();
+    t.insert("shram_renamed".into(), shram);
+    let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+    assert!(err.contains("shram"), "names the field: {err}");
+    assert!(err.contains("missing") || err.contains("unknown"), "{err}");
+}
