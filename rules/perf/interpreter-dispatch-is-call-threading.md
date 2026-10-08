@@ -64,3 +64,35 @@ available if the `match` version still shows dispatch-bound behaviour.
   heads.
 - Report any measured delta against `bench/` (`iris-bench run`), since a live
   IRIX boot is I/O-bound and may under-state the interpreter's dispatch cost.
+
+## Measured (2026-10-08)
+
+`iris-bench run --cpu r4400` on this host, both sides built in isolated
+worktrees (0aacb75 = call-threading, 9d1988a = switch dispatch), same
+checked-in guest image and pinned toolchain:
+
+| build | accuracy | guest MIPS | DMIPS |
+|---|---:|---:|---:|
+| call-threading (0aacb75) | 100% (40/40) | 38.0 | 66.8 |
+| switch dispatch (9d1988a) | 100% (40/40) | 41.5 | 66.0 |
+
+**The hypothesis is not confirmed.** On the dispatch-bound `int/` kernels the
+switch dispatch is flat within noise (`int/alu` ~+1.5% in both runs;
+`int/muldiv` and `int/dhrystone` slightly negative). The headline +9% MIPS is
+concentrated in the `img/` byte-store kernels, consistent with the ppmem/SIMD
+word-swap memory fast paths that landed in the same commit — not the dispatch.
+
+Two caveats make the delta soft:
+
+1. The host was not idle (load ~8.7 on 6 cores; other agents building).
+   Same-binary run-to-run spread was ±5–21% (call-threading 38.0/40.1 MIPS,
+   dispatch 41.5/32.8 MIPS), so the <1% floor from `bench-first-numbers.md`
+   did not hold here.
+2. 9d1988a bundles the dispatch with the memory/device changes, so a
+   whole-commit before/after conflates them; a dispatch-only diff was not
+   isolated (see the ticket's "do not modify source" constraint).
+
+Conclusion: flat at best — the match dispatch did not reproduce Ertl's
+predicted win on dispatch-bound code. A clean verdict needs an idle host and a
+dispatch-only diff, and `opcodefusion` is still masking per-dispatch cost as
+flagged above.

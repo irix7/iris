@@ -339,6 +339,15 @@ strip = false
 inherits = "release"
 debug = 0
 
+# Native: opt-in `-C target-cpu=native` build (see
+# rules/build/allocator-pgo-native-defaults.md §2). Cargo profiles cannot set
+# rustc codegen flags, so this profile alone is not enough — pair it with the
+# RUSTFLAGS env var: `RUSTFLAGS="-C target-cpu=native" cargo build --profile
+# release-native`. Inherits release; the default release build stays generic
+# x86-64.
+[profile.release-native]
+inherits = "release"
+
 [[bin]]
 name = "iris"
 path = "src/main.rs"

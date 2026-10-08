@@ -270,6 +270,62 @@ pub trait DmaClient: Send + Sync {
     /// words beyond the position the guest last saw (see HAL2's codec A).
     /// `None` when it is not being polled.
     fn read_ahead_of_poll(&self) -> Option<u64> { None }
+
+    /// Bulk read: fill `dst` with consecutive DMA units, stopping early on
+    /// end-of-chain or a refused (inactive) channel.
+    ///
+    /// Returns `(status, writebacks, bytes_read)`. `status` ORs the per-unit
+    /// flags; `writebacks` collects every deferred `(addr, val16)` memory
+    /// write the per-unit path would have returned; `bytes_read` is the number
+    /// of `dst` bytes actually filled before the stop.
+    ///
+    /// The default loops the per-unit [`read`](Self::read), so implementors
+    /// that only provide the scalar path are unaffected.
+    fn read_block(&self, dst: &mut [u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let mut status = DmaStatus::ok();
+        let mut wb = Vec::new();
+        let mut n = 0;
+        for slot in dst.iter_mut() {
+            match self.read() {
+                Some((val, st, w)) => {
+                    *slot = val as u8;
+                    status |= st;
+                    if let Some(w) = w { wb.push(w); }
+                    n += 1;
+                    if st.eox() || st.refused() { break; }
+                }
+                None => {
+                    status |= DmaStatus(DmaStatus::NOT_ACTIVE);
+                    break;
+                }
+            }
+        }
+        (status, wb, n)
+    }
+
+    /// Bulk write: push `src` to the DMA channel, stopping early on
+    /// end-of-chain or a refused (inactive/ROWN) channel.
+    ///
+    /// Returns `(status, writebacks, bytes_written)`, where `bytes_written` is
+    /// the number of `src` bytes actually consumed (a refused byte is not
+    /// consumed). Mirrors [`read_block`](Self::read_block)'s writeback and
+    /// aggregation semantics, defaulting to a loop over
+    /// [`write`](Self::write).
+    fn write_block(&self, src: &[u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let mut status = DmaStatus::ok();
+        let mut wb = Vec::new();
+        let last = src.len().saturating_sub(1);
+        let mut n = 0;
+        for (i, &b) in src.iter().enumerate() {
+            let (st, w) = self.write(b as u32, i == last);
+            status |= st;
+            if let Some(w) = w { wb.push(w); }
+            if st.refused() { break; }
+            n += 1;
+            if st.eox() { break; }
+        }
+        (status, wb, n)
+    }
 }
 
 /// Asynchronous system-level events sent from devices to the machine event loop.

@@ -363,6 +363,10 @@ struct PdmaChannel {
     rown:          bool,
     // RX: last value returned from ENET_RX_CTRL read — suppress repeated debug prints
     last_rx_ctrl:  u32,
+    // A descriptor-completion IRQ is owed to the callback. Set by advance()/
+    // fetch_descriptor() instead of calling the callback inline; flushed by the
+    // DmaClient bulk/per-unit wrappers AFTER the channel lock is released.
+    irq_pending:   bool,
 }
 
 impl PdmaChannel {
@@ -393,6 +397,7 @@ impl PdmaChannel {
             last_poll: None,
             width_16: false,
             crbdp: 0, cpfxbdp: 0, ppfxbdp: 0, tx_new_packet: true, rown: false, last_rx_ctrl: 0xFFFFFFFF,
+            irq_pending: false,
         }
     }
 
@@ -468,8 +473,8 @@ fn start_transaction(&mut self) {
                         if self.xie {
                             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Transfer Complete (EOX), Interrupting", self.id); }
                             self.ctrl |= PDMA_CTRL_INT; // Set interrupt pending
-                            if let Some(cb) = &self.callback {
-                                cb.set_dma_interrupt(true);
+                            if self.callback.is_some() {
+                                self.irq_pending = true;
                             }
                         }
                         break; // Done
@@ -528,8 +533,17 @@ fn start_transaction(&mut self) {
         }
     }
 
-    fn dma_read(&mut self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
-        if !self.is_active() { return None; }
+    /// Descriptor byte-count consumed by one DMA unit. PBUS (channels 0-7)
+    /// moves 32-bit words; SCSI/enet move 16-bit words in DMA16 mode, else bytes.
+    fn unit_step(&self) -> usize {
+        if self.id < 8 { 4 } else if self.width_16 { 2 } else { 1 }
+    }
+
+    /// Read one DMA unit from the channel's current buffer position WITHOUT
+    /// advancing the descriptor state. Returns the same value `dma_read`
+    /// returns (a 32-bit container holding the byte/16-bit sample), or `None`
+    /// when the backing memory read fails.
+    fn read_unit(&mut self) -> Option<u32> {
         self.dev_reads += 1;
 
         // PBUS DMA (channels 0-7) reads 32-bit words; 16-bit samples occupy
@@ -537,11 +551,10 @@ fn start_transaction(&mut self) {
         if self.id < 8 {
             let addr = self.cbp;
             let mem_val = if let Some(mem) = &self.sys_mem {
-                { let _r = mem.read32(addr); if _r.is_ok() { _r.data } else { return None } }
+                let _r = mem.read32(addr); if _r.is_ok() { _r.data } else { return None }
             } else {
                 return None;
             };
-
             let val = if self.width_16 {
                 // SGI audio DMA convention: the producer (ADPCM decoder, sine generator, etc.)
                 // stores a signed 16-bit sample as `sample << 8` into a 32-bit int, placing
@@ -552,17 +565,13 @@ fn start_transaction(&mut self) {
             } else {
                 (mem_val >> 24) as u8 as u32
             };
-
             self.handle_dump(addr, &mem_val.to_be_bytes(), true);
-            let (st, wb) = self.advance(4, false);
-            return Some((val, st, wb));
+            return Some(val);
         }
 
         let addr = self.cbp;
-        let step = if self.width_16 { 2 } else { 1 };
         let swap = self.endian;
-
-        let val = if let Some(mem) = &self.sys_mem {
+        if let Some(mem) = &self.sys_mem {
             if self.width_16 {
                 let _r = mem.read16(addr);
                 if _r.is_ok() {
@@ -579,14 +588,50 @@ fn start_transaction(&mut self) {
             }
         } else {
             None
-        };
-
-        if let Some(v) = val {
-            let (st, wb) = self.advance(step, false);
-            Some((v, st, wb))
-        } else {
-            None
         }
+    }
+
+    /// Write one DMA unit to the channel's current buffer position WITHOUT
+    /// advancing the descriptor state. Mirrors `dma_write`'s memory access.
+    fn write_unit(&mut self, val: u32) {
+        // PBUS DMA (Channels 0-7) always operates on 32-bit words
+        if self.id < 8 {
+            let addr = self.cbp;
+            let mem_val = if self.width_16 {
+                let v = val as u16;
+                let v = if self.endian { v.swap_bytes() } else { v };
+                (v as u32) << 16
+            } else {
+                let v = val as u8;
+                (v as u32) << 24
+            };
+            if let Some(mem) = &self.sys_mem {
+                mem.write32(addr, mem_val);
+                self.handle_dump(addr, &mem_val.to_be_bytes(), false);
+            }
+            return;
+        }
+
+        let addr = self.cbp;
+        let swap = self.endian;
+        if let Some(mem) = &self.sys_mem {
+            if self.width_16 {
+                let v = if swap { (val as u16).swap_bytes() } else { val as u16 };
+                mem.write16(addr, v);
+                self.handle_dump(addr, &v.to_be_bytes(), false);
+            } else {
+                mem.write8(addr, val as u8);
+                self.handle_dump(addr, &[val as u8], false);
+            }
+        }
+    }
+
+    fn dma_read(&mut self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
+        if !self.is_active() { return None; }
+        let step = self.unit_step();
+        let val = self.read_unit()?;
+        let (st, wb) = self.advance(step as u32, false);
+        Some((val, st, wb))
     }
 
     fn dma_write(&mut self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
@@ -616,41 +661,104 @@ fn start_transaction(&mut self) {
             return (DmaStatus(DmaStatus::ROWN), None);
         }
 
-        // PBUS DMA (Channels 0-7) always operates on 32-bit words
-        if self.id < 8 {
-            let addr = self.cbp;
-            let mem_val = if self.width_16 {
-                let v = val as u16;
-                let v = if self.endian { v.swap_bytes() } else { v };
-                (v as u32) << 16
-            } else {
-                let v = val as u8;
-                (v as u32) << 24
-            };
+        let step = self.unit_step();
+        self.write_unit(val);
+        self.advance(step as u32, eop)
+    }
 
-            if let Some(mem) = &self.sys_mem {
-                mem.write32(addr, mem_val);
-                self.handle_dump(addr, &mem_val.to_be_bytes(), false);
+    /// Bulk read: fill `dst` with the low byte of each DMA unit, walking the
+    /// descriptor chain and signalling EOP/EOX/XIE/IRQ only at descriptor
+    /// boundaries. Returns (status, writebacks, bytes filled).
+    fn dma_read_block(&mut self, dst: &mut [u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let mut status = DmaStatus::ok();
+        let mut wb = Vec::new();
+        let mut read = 0usize;
+        let step = self.unit_step();
+
+        while read < dst.len() {
+            if !self.is_active() {
+                status |= DmaStatus(DmaStatus::NOT_ACTIVE);
+                break;
             }
-            return self.advance(4, eop);
+            let remaining = (self.bc & 0x3FFF) as usize;
+            if remaining == 0 {
+                // Zero-byte descriptor (link/EOX marker) — advance() already
+                // called fetch_descriptor at the previous boundary, so a zero
+                // count here means a malformed chain; guard rather than spin.
+                self.fetch_descriptor();
+                continue;
+            }
+            let dst_left = dst.len() - read;
+            let units = (remaining / step).min(dst_left);
+            if units == 0 { break; }
+            let mut ok = true;
+            for i in 0..units {
+                match self.read_unit() {
+                    Some(v) => dst[read + i] = v as u8,
+                    None => { ok = false; break; }
+                }
+            }
+            if !ok {
+                status |= DmaStatus(DmaStatus::NOT_ACTIVE);
+                break;
+            }
+            let (st, w) = self.advance((units * step) as u32, false);
+            status |= st;
+            if let Some(w) = w { wb.push(w); }
+            read += units;
+            if st.eox() || st.refused() { break; }
         }
 
-        let addr = self.cbp;
-        let step = if self.width_16 { 2 } else { 1 };
-        let swap = self.endian;
+        (status, wb, read)
+    }
 
-        if let Some(mem) = &self.sys_mem {
-            if self.width_16 {
-                let v = if swap { (val as u16).swap_bytes() } else { val as u16 };
-                mem.write16(addr, v);
-                self.handle_dump(addr, &v.to_be_bytes(), false);
-            } else {
-                mem.write8(addr, val as u8);
-                self.handle_dump(addr, &[val as u8], false);
+    /// Bulk write: push `src` to the channel, walking the descriptor chain and
+    /// signalling EOP/EOX/XIE/IRQ only at descriptor boundaries. Returns
+    /// (status, writebacks, bytes written).
+    fn dma_write_block(&mut self, src: &[u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let mut status = DmaStatus::ok();
+        let mut wb = Vec::new();
+        let mut written = 0usize;
+        let step = self.unit_step();
+
+        while written < src.len() {
+            if !self.is_active() {
+                status |= DmaStatus(DmaStatus::NOT_ACTIVE);
+                break;
             }
+            // RX channel (id=10): respect ROWN — only write if HPC3 owns the descriptor
+            if self.id == 10 && !self.rown {
+                if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: dma_write refused — ROWN=0 (host owns descriptor, cbp={:08x})", self.id, self.cbp); }
+                if self.eox {
+                    if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: receive chain exhausted at EOX — stopping channel", self.id); }
+                    self.ctrl &= !self.active_mask;
+                }
+                status |= DmaStatus(DmaStatus::ROWN);
+                break;
+            }
+            let remaining = (self.bc & 0x3FFF) as usize;
+            if remaining == 0 {
+                self.fetch_descriptor();
+                continue;
+            }
+            let src_left = src.len() - written;
+            let units = (remaining / step).min(src_left);
+            if units == 0 { break; }
+            // caller EOP is signalled on the final chunk (its last byte is the
+            // last byte of `src`), matching the per-unit `eop` on the last byte.
+            let caller_eop = src_left <= units;
+            self.dev_writes += units as u64;
+            for i in 0..units {
+                self.write_unit(src[written + i] as u32);
+            }
+            let (st, w) = self.advance((units * step) as u32, caller_eop);
+            status |= st;
+            if let Some(w) = w { wb.push(w); }
+            written += units;
+            if caller_eop || st.eox() || st.refused() { break; }
         }
 
-        self.advance(step, eop)
+        (status, wb, written)
     }
 
     /// Returns (status, writeback).
@@ -718,11 +826,13 @@ fn start_transaction(&mut self) {
 
         if irq {
             status |= DmaStatus(DmaStatus::IRQ);
-            // For SCSI/PBUS channels (callback installed): set ctrl INT flag and notify.
-            // For enet channels (no callback): IRQ bit in status is the signal; don't touch ctrl.
-            if let Some(cb) = &self.callback {
+            // For SCSI/PBUS channels (callback installed): set ctrl INT flag and
+            // defer the callback. For enet channels (no callback): the IRQ bit in
+            // status is the signal; don't touch ctrl. The callback is fired by the
+            // DmaClient wrappers AFTER the channel lock is released (flush_irq).
+            if self.callback.is_some() {
                 self.ctrl |= PDMA_CTRL_INT;
-                cb.set_dma_interrupt(true);
+                self.irq_pending = true;
             }
             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Interrupting (xie caller_eop={} bc_done={})", self.id, caller_eop, bc_done); }
         }
@@ -734,9 +844,26 @@ struct PdmaClientImpl {
     channel: Arc<Mutex<PdmaChannel>>,
 }
 
+impl PdmaClientImpl {
+    /// Take any pending DMA-completion IRQ, returning the callback to invoke
+    /// (or `None`). The channel lock is released before the callback is called,
+    /// so the assert never runs while the DMA mutex is held.
+    fn take_irq(&self) -> Option<Arc<dyn PdmaCallback>> {
+        let mut c = self.channel.lock();
+        if c.irq_pending {
+            c.irq_pending = false;
+            c.callback.clone()
+        } else {
+            None
+        }
+    }
+}
+
 impl DmaClient for PdmaClientImpl {
     fn read(&self) -> Option<(u32, DmaStatus, Option<(u32, u16)>)> {
-        self.channel.lock().dma_read()
+        let r = self.channel.lock().dma_read();
+        if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
+        r
     }
     fn read_ahead_of_poll(&self) -> Option<u64> {
         let c = self.channel.lock();
@@ -748,7 +875,19 @@ impl DmaClient for PdmaClientImpl {
         }
     }
     fn write(&self, val: u32, eop: bool) -> (DmaStatus, Option<(u32, u16)>) {
-        self.channel.lock().dma_write(val, eop)
+        let r = self.channel.lock().dma_write(val, eop);
+        if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
+        r
+    }
+    fn read_block(&self, dst: &mut [u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let r = self.channel.lock().dma_read_block(dst);
+        if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
+        r
+    }
+    fn write_block(&self, src: &[u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
+        let r = self.channel.lock().dma_write_block(src);
+        if let Some(cb) = self.take_irq() { cb.set_dma_interrupt(true); }
+        r
     }
 }
 
@@ -1601,6 +1740,24 @@ impl Device for Hpc3 {
     }
 }
 
+impl Hpc3 {
+    /// Deliver a channel's deferred DMA-completion IRQ, if one is pending.
+    /// The channel lock is released before the callback fires (assert up into
+    /// HPC3/IOC) — see HACKING.md's callback-up-to-a-parent deadlock class.
+    fn flush_channel_irq(&self, idx: usize) {
+        let cb = {
+            let mut c = self.pdma_channels[idx].lock();
+            if c.irq_pending {
+                c.irq_pending = false;
+                c.callback.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(cb) = cb { cb.set_dma_interrupt(true); }
+    }
+}
+
 impl BusDevice for Hpc3 {
     fn read8(&self, addr: u32) -> BusRead8 {
         let offset = addr - HPC3_BASE;
@@ -1733,6 +1890,8 @@ impl BusDevice for Hpc3 {
                 // Upper CTRL lanes configure the FIFO, which is not modeled.
                 _ => {}
             }
+            drop(chan);
+            self.flush_channel_irq(idx);
             return BUS_OK;
         }
 
@@ -2003,6 +2162,7 @@ impl BusDevice for Hpc3 {
             let idx = (offset / 0x2000) as usize;
             let reg = offset % 0x2000;
             self.pdma_ops[idx].write(&mut self.pdma_channels[idx].lock(), reg, val);
+            self.flush_channel_irq(idx);
             return BUS_OK;
         }
 

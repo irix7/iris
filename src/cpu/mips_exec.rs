@@ -7441,14 +7441,17 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     ///
     /// So: advance PC first (`handle_exec_complete`), then stall here.
     ///
-    /// ## Why a spin and not a host sleep
+    /// ## Pacing `hot.cycles` while stalled
     ///
     /// `step_cycles!` only runs in `step_preamble!`, i.e. once per dispatch —
     /// so a stall implemented *inside* this handler has to advance
     /// `hot.cycles` itself, which it does. Device timing workarounds depend on
-    /// that progress (the SCSI one NetBSD needs in particular) and would stall
-    /// outright if the CPU thread parked on an idle guest. `std::hint::spin_loop`
-    /// keeps it polite to SMT siblings without stopping the clock.
+    /// that progress (the SCSI one NetBSD needs in particular). With the
+    /// `idle-pause` feature the stall parks the CPU thread via
+    /// `idle_park::park_wait` (woken at once by an interrupt/soft-reset write),
+    /// which advances `hot.cycles` at the same 10 ns/guest-cycle rate; without
+    /// it the fallback below spins on `std::hint::spin_loop` while doing the
+    /// same. Either way the clock never stops.
     ///
     /// ## Exits
     ///
@@ -7483,54 +7486,70 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // WAIT graduates: PC moves to the next instruction before the stall.
         let status = self.handle_exec_complete();
 
-        let stall_start = std::time::Instant::now();
-        let mut issued: u64 = 0;
-        loop {
-            let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
-            if pending & SOFT_RESET_BIT != 0 {
-                break;
-            }
-            let ip = (self.core.cp0_cause | (pending as u32)) & crate::cpu::mips_core::CAUSE_IP_MASK;
-            let im = self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
-            if (ip & im) != 0 {
-                break;
-            }
-            // `hot.cycles` MUST keep advancing while stalled, but at a paced
-            // rate, not once per host iteration.
-            //
-            // Must advance: it is the clock other threads wait on. The
-            // WD33C93A's deferred-interrupt path (`wd33c93a.rs`, "Required for
-            // OpenBSD/NetBSD") spins until `cpu_cycles` has moved 10000 —
-            // holding still here deadlocks it against a CPU waiting for the
-            // very interrupt that spin is about to deliver.
-            //
-            // Must be paced: it is also the *virtual time base*
-            // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and under `ci_clock` CP0
-            // Count derives straight from it (`count_now`). Bumping once per
-            // host iteration would run guest time at hundreds of millions of
-            // cycles per real second inside one instruction — Count would leap
-            // and timers would fire early.
-            //
-            // So: one guest cycle per 10ns of real time, which is exactly the
-            // 1:1 rate `NS_PER_GUEST_CYCLE` defines, sampled off the host
-            // clock rather than off loop iterations. An idle guest's clock
-            // then tracks wall time the same way a running one does.
-            let now = std::time::Instant::now();
-            let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
-            // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
-            // defines, restated here because that constant is `ci_clock`-only
-            // while this pacing must hold in every build.
-            const STALL_NS_PER_CYCLE: u64 = 10;
-            let want = elapsed_ns / STALL_NS_PER_CYCLE;
-            if want > issued {
-                let delta = want - issued;
-                issued = want;
-                unsafe {
-                    let p = &mut self.core.hot.cycles as *mut u64;
-                    std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(delta));
+        // The stall itself. With `idle-pause` the CPU thread parks via the
+        // idle-park primitive (same Dekker wake as the run-loop idle park),
+        // advancing `hot.cycles` at the 10 ns/guest-cycle wall-clock rate so
+        // the WD33C93A deferred-interrupt spin and (under `ci_clock`) CP0
+        // Count keep seeing progress — identical pacing to the spin loop
+        // below, minus the host CPU burn. A guest that actually executes WAIT
+        // (OpenBSD/NetBSD, or an R10000 guest) then idles at ~0 host CPU.
+        #[cfg(feature = "idle-pause")]
+        {
+            crate::cpu::idle_park::park_wait(&mut self.core);
+        }
+
+        // Non-idle-pause fallback: the original spin stall. `hot.cycles` MUST
+        // keep advancing while stalled, but at a paced rate, not once per host
+        // iteration.
+        //
+        // Must advance: it is the clock other threads wait on. The
+        // WD33C93A's deferred-interrupt path (`wd33c93a.rs`, "Required for
+        // OpenBSD/NetBSD") spins until `cpu_cycles` has moved 10000 —
+        // holding still here deadlocks it against a CPU waiting for the
+        // very interrupt that spin is about to deliver.
+        //
+        // Must be paced: it is also the *virtual time base*
+        // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and under `ci_clock` CP0
+        // Count derives straight from it (`count_now`). Bumping once per
+        // host iteration would run guest time at hundreds of millions of
+        // cycles per real second inside one instruction — Count would leap
+        // and timers would fire early.
+        //
+        // So: one guest cycle per 10ns of real time, which is exactly the
+        // 1:1 rate `NS_PER_GUEST_CYCLE` defines, sampled off the host
+        // clock rather than off loop iterations. An idle guest's clock
+        // then tracks wall time the same way a running one does.
+        #[cfg(not(feature = "idle-pause"))]
+        {
+            let stall_start = std::time::Instant::now();
+            let mut issued: u64 = 0;
+            loop {
+                let pending = self.core.hot.interrupts.load(Ordering::Relaxed);
+                if pending & SOFT_RESET_BIT != 0 {
+                    break;
                 }
+                let ip = (self.core.cp0_cause | (pending as u32)) & crate::cpu::mips_core::CAUSE_IP_MASK;
+                let im = self.core.cp0_status & crate::cpu::mips_core::STATUS_IM_MASK;
+                if (ip & im) != 0 {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
+                // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
+                // defines, restated here because that constant is `ci_clock`-only
+                // while this pacing must hold in every build.
+                const STALL_NS_PER_CYCLE: u64 = 10;
+                let want = elapsed_ns / STALL_NS_PER_CYCLE;
+                if want > issued {
+                    let delta = want - issued;
+                    issued = want;
+                    unsafe {
+                        let p = &mut self.core.hot.cycles as *mut u64;
+                        std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(delta));
+                    }
+                }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
         }
 
         status

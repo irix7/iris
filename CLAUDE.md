@@ -40,9 +40,26 @@ cargo run --release -- --cpu r5000                        # CPU is a runtime cho
 cargo run -p iris-gui --release                           # GUI front-end
 ```
 
-The toolchain is pinned to nightly (`rust-toolchain.toml`). `lightning` and
-`developer` are mutually exclusive; `r5ksc`/`r5ksc_triton` deliberately fail to
-build.
+The build environment is the Nix flake (`flake.nix`). Run cargo from inside the
+dev shell rather than bare, or the native headers/libs (ALSA, X11/Wayland, GL,
+v4l, libclang for bindgen) and the pinned toolchain are missing:
+
+```
+nix develop --command cargo check -p iris
+nix develop --command cargo test -p iris
+```
+
+The dev shell pins rustup at the host's shared rig toolchain
+(`RUSTUP_HOME`/`CARGO_HOME` under `/mnt/europa/sgi-toolchain-scratch`), which
+`rust-toolchain.toml` names (`nightly-2026-10-02`). On another host, drop the
+flake's `shellHook` and let rustup honour `rust-toolchain.toml` itself. If the
+rig toolchain stops launching with "required file not found", a nix GC has
+collected the glibc its ELF interpreter points at: repoint `cargo`/`rustc` with
+`patchelf --set-interpreter <a surviving glibc>/lib/ld-linux-x86-64.so.2`, and
+set `TMPDIR` off any full root filesystem.
+
+`lightning` and `developer` are mutually exclusive; `r5ksc`/`r5ksc_triton`
+deliberately fail to build.
 
 Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
 `iris-bench` (benchmark driver), `coffdump`, `mkvh` (SGI volume headers),

@@ -28,8 +28,23 @@ The Rust Performance Book: "can improve runtime speed, especially if the compile
 finds vectorization opportunities." For a branchy interpreter/dispatch loop the win
 is typically low single-digit (newer encodings, scheduling), and AVX-512 can even
 *regress* on some CPUs via downclocking. It does not affect JIT-emitted guest code
-(generated independently). Add as an opt-in (`.cargo/config.toml` or env) for
-local/CI benchmark builds; keep generic x86-64 for distributed binaries.
+(generated independently). Add as an opt-in for local/CI benchmark builds; keep
+generic x86-64 for distributed binaries.
+
+Cargo profiles cannot set `-C target-cpu=native` (rustflags are global — via
+`.cargo/config.toml` or `RUSTFLAGS`), so the opt-in is an env var, optionally
+paired with the `release-native` profile in `Cargo.toml` for an unambiguous
+target dir:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --profile release-native
+```
+
+`release-native` merely `inherits = "release"`; the native codegen comes from
+`RUSTFLAGS` alone. Do **not** add a `.cargo/config.toml` that sets
+`target-cpu=native` unconditionally — that would silently apply it to every
+build, including the default generic binary. For a one-off check the plain
+profile also works: `RUSTFLAGS="-C target-cpu=native" cargo build --release`.
 
 ## 3. PGO — the highest-confidence codegen win
 

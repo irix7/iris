@@ -32,6 +32,8 @@ use crate::config::{ForwardBind, ForwardProto, NatSubnet, NetMode, NfsConfig, Po
 use crate::devlog::LogModule;
 use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 // ── Ethernet constants ────────────────────────────────────────────────────────
 const ETHERTYPE_ARP: u16        = 0x0806;
@@ -1356,6 +1358,13 @@ pub struct NatEngine {
     // MAC to reply to per TFTP client, so a retransmit can be addressed without
     // relying on the last-learned guest MAC.
     tftp_macs: HashMap<crate::net::tftp::ClientId, [u8; 6]>,
+    // Wake pipe folded into the host-socket poll(2) wait. The bridge thread
+    // (seeq-nat-wake) writes a byte to the write end whenever a producer signals
+    // `tx_wake`, so a guest TX frame wakes the poll like a host socket.
+    #[cfg(unix)]
+    wake_read: OwnedFd,
+    #[cfg(unix)]
+    wake_write: OwnedFd,
 }
 
 /// Reassembly state for one fragmented inbound IP datagram.
@@ -1446,6 +1455,20 @@ impl NatEngine {
             eprintln!("iris: TFTP server (read-only) serving {}", dir.display());
             crate::net::tftp::TftpServer::new(dir.clone())
         });
+        // Wake pipe: the read end joins the host-socket poll(2) set in run(); a
+        // bridge thread forwards `tx_wake` notifications to the write end.
+        #[cfg(unix)]
+        let (wake_read, wake_write) = {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "iris: pipe() failed");
+            for &fd in &fds {
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                assert!(flags >= 0, "iris: fcntl(F_GETFL) failed");
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                           0, "iris: fcntl(F_SETFL) failed");
+            }
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+        };
         Self { config, host_dns: None, tx_cons, rx_prod, rx_wake, tx_wake, running, ctl,
                udp_nat: HashMap::new(), tcp_nat: HashMap::new(), tcp_tw: HashMap::new(),
                icmp_nat: HashMap::new(), icmp_unavailable: false, deferred_rx: Vec::new(),
@@ -1454,6 +1477,10 @@ impl NatEngine {
                fwd_reserved_next: 512,
                guest_mac: None, ip_id: 1, nfs, frag_reasm: HashMap::new(),
                xdmcp_sessions: HashMap::new(),
+               #[cfg(unix)]
+               wake_read,
+               #[cfg(unix)]
+               wake_write,
                tftp, tftp_macs: HashMap::new() }
     }
 
@@ -1472,22 +1499,14 @@ impl NatEngine {
     }
 
     pub fn run(&mut self) {
+        #[cfg(unix)]
+        self.spawn_tx_wake_bridge();
+
         while self.running.load(Ordering::Relaxed) {
-            // Wait for new TX frames from the enet thread, bounded by a short
-            // timeout that doubles as the host-socket poll cadence. Guest TX
-            // signals tx_wake, but host->guest data (ICMP replies, incoming
-            // port-forwards, one-shot UDP, idle TCP push) is only seen by
-            // polling the host sockets, which this thread does on every wake —
-            // there is no epoll/select over those fds yet. A seconds-scale
-            // timeout would add that many seconds of host->guest latency; 50 ms
-            // bounds it while costing ~20 empty-table wakeups/s at idle. The
-            // proper fix folds the host fds into a poll(2)/mio wait (see
-            // rules/perf/nat-and-enet-threads-poll-at-1ms.md).
-            {
-                let (lock, cvar) = &*self.tx_wake;
-                let mut guard = lock.lock();
-                let _ = cvar.wait_for(&mut guard, Duration::from_millis(50));
-            }
+            // Block until a host socket is readable, the guest queues a TX frame
+            // (signalled through the wake pipe), or the retransmit/TFTP timer
+            // granularity elapses — see wait_for_work.
+            self.wait_for_work();
 
             // Machine reset: flush all NAT tables, close all host sockets.
             if self.ctl.reset_nat.swap(false, Ordering::AcqRel) {
@@ -1568,6 +1587,89 @@ impl NatEngine {
             if self.ctl.snapshot_dirty.swap(false, Ordering::AcqRel) {
                 self.update_snapshot();
             }
+        }
+    }
+
+    /// Spawn the bridge thread that folds guest-TX signalling into the wake pipe:
+    /// the producers (seeq pump_tx / DaynaPort) signal `tx_wake`, and this thread
+    /// forwards each notification to the write end of the wake pipe so the
+    /// poll(2) wait in `wait_for_work` wakes like a host socket. The 200 ms
+    /// `wait_for` timeout is only a watchdog so the thread can observe
+    /// `running == false` (seeq8003::stop does not notify `tx_wake`); it does not
+    /// add wakeups — a byte is written only on a real notification.
+    #[cfg(unix)]
+    fn spawn_tx_wake_bridge(&self) {
+        use AsRawFd as _;
+        let write_fd = self.wake_write.try_clone().expect("iris: dup wake pipe write end");
+        let tx_wake = self.tx_wake.clone();
+        let running = self.running.clone();
+        std::thread::Builder::new().name("seeq-nat-wake".into()).spawn(move || {
+            let one: u8 = 1;
+            let p = &one as *const u8 as *const libc::c_void;
+            let fd = write_fd.as_raw_fd();
+            let (lock, cvar) = &*tx_wake;
+            while running.load(Ordering::Relaxed) {
+                let mut guard = lock.lock();
+                let notified = !cvar.wait_for(&mut guard, Duration::from_millis(200)).timed_out();
+                if notified {
+                    unsafe { libc::write(fd, p, 1); }
+                }
+            }
+        }).expect("iris: failed to spawn seeq-nat-wake thread");
+    }
+
+    /// Block until there is work to do: a host socket becomes readable, the guest
+    /// queues a TX frame (signalled through the wake pipe), or the retransmit/TFTP
+    /// timer granularity elapses. On Unix this is a single poll(2) over every host
+    /// socket plus the wake pipe; on Windows it falls back to the condvar+timeout
+    /// wait.
+    fn wait_for_work(&self) {
+        #[cfg(unix)]
+        {
+            use AsRawFd as _;
+            let mut fds: Vec<libc::pollfd> = Vec::new();
+
+            for entry in self.tcp_nat.values() {
+                // Poll for writes only when the host socket has buffered data to
+                // flush; otherwise POLLOUT is always ready and poll would spin.
+                let mut events = libc::POLLIN;
+                if !entry.to_host.is_empty() { events |= libc::POLLOUT; }
+                fds.push(libc::pollfd { fd: entry.stream.as_raw_fd(), events, revents: 0 });
+            }
+            for entry in self.udp_nat.values() {
+                fds.push(libc::pollfd { fd: entry.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            }
+            for entry in self.icmp_nat.values() {
+                if let Some(sock) = &entry.sock {
+                    fds.push(libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+                }
+            }
+            for fwd in &self.tcp_fwd_listeners {
+                fds.push(libc::pollfd { fd: fwd.listener.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            }
+            for fwd in &self.udp_fwd_listeners {
+                fds.push(libc::pollfd { fd: fwd.sock.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+            }
+            fds.push(libc::pollfd { fd: self.wake_read.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+
+            // 200 ms granularity covers the TCP retransmit (RTO) and TFTP timers;
+            // it is a timer tick, not a latency floor — socket readiness and the
+            // wake pipe return immediately.
+            let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 200) };
+
+            // Drain the wake pipe so its level-triggered readability doesn't turn
+            // the next poll into a busy loop.
+            let mut buf = [0u8; 64];
+            loop {
+                let n = unsafe { libc::read(self.wake_read.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n <= 0 { break; }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let (lock, cvar) = &*self.tx_wake;
+            let mut guard = lock.lock();
+            let _ = cvar.wait_for(&mut guard, Duration::from_millis(50));
         }
     }
 

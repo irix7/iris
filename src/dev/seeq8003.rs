@@ -389,13 +389,15 @@ impl Seeq8003 {
         }
         // DMA is committed (pad[0] written); pop the frame now and finish writing it.
         let frame = rx_cons.pop().expect("peek succeeded so pop must succeed");
-        let _ = rx_dma.write(0, false); // pad[1]
-        for b in &frame {
-            let _ = rx_dma.write(*b as u32, false);
-        }
-        // Status byte — eop=true so DmaStatus::EOP is set; also catches EOX/IRQ if chain ended.
-        // This write triggers the RX writeback (crbdp+6) inside advance(), returned as writeback.
-        let (dma_st, writeback) = rx_dma.write(RX_STATUS_GOOD as u32, true);
+        // Bulk path: pad[1] + frame bytes + status byte in one descriptor-span write.
+        // The final byte (status) carries eop=true so DmaStatus::EOP is set and the
+        // RX writeback (crbdp+6) is produced inside advance().
+        let mut block = Vec::with_capacity(1 + frame.len() + 1);
+        block.push(0); // pad[1]
+        block.extend_from_slice(&frame);
+        block.push(RX_STATUS_GOOD);
+        let (dma_st, writebacks, _n) = rx_dma.write_block(&block);
+        let writeback = writebacks.into_iter().next();
 
         dlog_dev!(LogModule::Seeq, "SEEQ pump_rx: frame delivered ({} bytes to DMA) dma_st={:#x} irq={} wb={:?}",
                   2 + frame.len() + 1, dma_st.0, dma_st.irq(), writeback);

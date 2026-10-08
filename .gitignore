@@ -34,3 +34,7 @@ pcp_dump_pfn_*.bin
 # local registry (flake:nixpkgs). Pin flake.nix's input to a revision if you
 # want a portable lock.
 flake.lock
+
+# Agent/parallel-build artifacts (cargo target dirs and test temp).
+.tmp/
+target-fleet/

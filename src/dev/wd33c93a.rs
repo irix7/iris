@@ -2186,42 +2186,38 @@ impl Wd33c93aState {
         wdt!("DMA_OUT start: 0x{:x} bytes (offset=0x{:x})", data.len() - offset, offset);
         if let Some(dma_dev) = dma {
             let total = data.len();
-            let last_idx = total.saturating_sub(1);
             let mut i = offset;
             while i < total {
-                let is_last = i == last_idx;
-                let (mut st, _) = dma_dev.write(data[i] as u32, is_last);
+                let (mut st, _wb, mut n) = dma_dev.write_block(&data[i..]);
                 // On first byte, if channel not yet active (driver calls wdsc_dmago after
-                // issuing TRANSFER_INFO), spin up to 1ms for it to become ready.
-                if i == 0 && st.not_active() {
-                    // Driver calls wdsc_dmago *after* writing TRANSFER_INFO, so the channel
-                    // may not be active yet. Spin up to 100ms to let the CPU thread arm it.
+                // issuing TRANSFER_INFO), spin up to 100ms for it to become ready.
+                if i == 0 && n == 0 && st.not_active() {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-                    while st.not_active() && std::time::Instant::now() < deadline {
+                    while n == 0 && std::time::Instant::now() < deadline {
                         // Bounded sleep instead of yield_now(): yield busy-waits under
                         // the `state` lock and can starve the CPU thread that arms the
                         // channel. A short sleep lets the CPU thread run.
                         std::thread::sleep(std::time::Duration::from_micros(50));
-                        (st, _) = dma_dev.write(data[i] as u32, is_last);
+                        let r = dma_dev.write_block(&data[i..]);
+                        st = r.0;
+                        n = r.2;
                     }
-                    if st.not_active() {
-                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 1ms — pausing", self.id);
-                        //eprintln!("WD33C93A: DMA channel still not active after 1ms — pausing");
+                    if n == 0 {
+                        dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — pausing", self.id);
                     }
                 }
-                // On refused: byte was not accepted, do not advance or decrement.
-                // On eox/irq: byte was accepted, advance and decrement.
-                if !st.refused() {
-                    i += 1;
-                    self.decrement_transfer_count();
+                // Accepted bytes advance the cursor and decrement the transfer count.
+                if n > 0 {
+                    i += n;
+                    let count = self.get_transfer_count().saturating_sub(n as u32);
+                    self.set_transfer_count(count);
                 }
-                // EOX mid-transfer: chain exhausted early (device sent less than allocated).
-                // Pause so IRIX can re-arm via SELECT_ATN_XFER for the next chunk.
-                // XIE (irq without eox): descriptor boundary, chain continues — keep writing.
-                let pause = (st.eox() || st.refused()) && !is_last;
-                if pause {
-                    //eprintln!("WD33C93A: send_data_chunked pause: EOX={} XIE={} refused={} offset=0x{:x} remaining=0x{:x}",
-                    //    st.eox(), st.irq(), st.refused(), i, total - i);
+                if i >= total {
+                    break;
+                }
+                // EOX mid-transfer (chain exhausted early) or refused: pause so IRIX
+                // can re-arm via SELECT_ATN_XFER for the next chunk.
+                if st.eox() || st.refused() {
                     dlog!(self.log_module(), "WD33C93A({}): EOX={} XIE={} refused={} at offset=0x{:x}, remaining=0x{:x} — pausing", self.id,
                         st.eox(), st.irq(), st.refused(), i, total - i);
                     self.xfer_data = data;
@@ -2250,76 +2246,54 @@ impl Wd33c93aState {
         wdt!("DMA_IN start: 0x{:x} bytes (have=0x{:x})", total - data.len(), data.len());
         if let Some(dma_dev) = dma {
             while data.len() < total {
-                match dma_dev.read() {
-                    Some((val, st, _)) => {
-                        // Byte accepted — decrement transfer count register to mirror real HW.
-                        data.push(val as u8);
-                        self.decrement_transfer_count();
-                        // XIE without EOX: descriptor boundary, chain continues — keep reading.
-                        // EOX mid-transfer: chain exhausted before all bytes received — pause for IRIX resume.
-                        let pause = st.eox() && data.len() < total;
-                        if pause {
-                            dlog!(self.log_module(), "WD33C93A({}): EOX at offset=0x{:x}, remaining=0x{:x} — pausing", self.id, data.len(), total - data.len());
-                            wdt!("DMA_IN pause(EOX): at offset=0x{:x} remaining=0x{:x}", data.len(), total - data.len());
-                            self.xfer_data = data;
-                            self.xfer_offset = total; // store total as sentinel; xfer_data.len() is progress
-                            self.xfer_direction_in = false;
-                            self.queue_interrupt(Some(command_phase::TRANSFER_COUNT), scsi_status::UNEXPECTED_RECV_DATA);
-                            return None;
+                let mut buf = vec![0u8; total - data.len()];
+                let (_st, _wb, n) = dma_dev.read_block(&mut buf);
+                data.extend_from_slice(&buf[..n]);
+                // Bytes accepted — decrement transfer count register to mirror real HW.
+                if n > 0 {
+                    let count = self.get_transfer_count().saturating_sub(n as u32);
+                    self.set_transfer_count(count);
+                }
+                if data.len() >= total {
+                    break;
+                }
+                if data.is_empty() {
+                    // Channel not yet active — driver issues TRANSFER_INFO before dmago
+                    // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
+                    // Spin up to 100ms for the CPU thread to call dmago.
+                    wdt!("DMA_IN spin-wait: channel not yet active");
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    loop {
+                        if std::time::Instant::now() >= deadline {
+                            dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
+                            wdt!("DMA_IN spin-wait TIMEOUT: channel never became active");
+                            break;
                         }
-                    }
-                    None => {
-                        let remaining = total - data.len();
-                        if remaining > 0 {
-                            if data.is_empty() {
-                                // Channel not yet active — driver issues TRANSFER_INFO before dmago
-                                // (NetBSD: SET_SBIC_cmd then sc_dmago on same CPU thread).
-                                // Spin up to 100ms for the CPU thread to call dmago.
-                                wdt!("DMA_IN spin-wait: channel not yet active");
-                                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-                                let mut got = false;
-                                while std::time::Instant::now() < deadline {
-                                    // Bounded sleep instead of yield_now(): see
-                                    // send_data_chunked's arm-spin comment.
-                                    std::thread::sleep(std::time::Duration::from_micros(50));
-                                    if let Some((val, st, _)) = dma_dev.read() {
-                                        data.push(val as u8);
-                                        self.decrement_transfer_count();
-                                        let pause = st.eox() && data.len() < total;
-                                        if pause {
-                                            wdt!("DMA_IN pause(EOX after spin): offset=0x{:x}", data.len());
-                                            self.xfer_data = data;
-                                            self.xfer_offset = total;
-                                            self.xfer_direction_in = false;
-                                            self.queue_interrupt(Some(command_phase::TRANSFER_COUNT), scsi_status::UNEXPECTED_RECV_DATA);
-                                            return None;
-                                        }
-                                        got = true;
-                                        break;
-                                    }
-                                }
-                                if !got {
-                                    dlog!(self.log_module(), "WD33C93A({}): DMA channel still not active after 100ms — giving up", self.id);
-                                    //eprintln!("WD33C93A: receive_data_chunked: DMA not active after 100ms");
-                                    wdt!("DMA_IN spin-wait TIMEOUT: channel never became active");
-                                    break;
-                                }
-                                // Successfully got first byte — continue outer loop
-                            } else {
-                                // Mid-transfer: chain exhausted early — pause for IRIX resume
-                                dlog!(self.log_module(), "WD33C93A({}): EOX at offset=0x{:x}, remaining=0x{:x} — pausing", self.id, data.len(), remaining);
-                                wdt!("DMA_IN pause(inactive mid-xfer): offset=0x{:x} remaining=0x{:x}", data.len(), remaining);
-                                self.xfer_data = data;
-                                self.xfer_offset = total;
-                                self.xfer_direction_in = false;
-                                self.queue_interrupt(Some(command_phase::TRANSFER_COUNT), scsi_status::UNEXPECTED_RECV_DATA);
-                                return None;
-                            }
-                        } else {
+                        // Bounded sleep instead of yield_now(): see send_data_chunked's arm-spin comment.
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                        let (_s2, _w2, n2) = dma_dev.read_block(&mut buf);
+                        data.extend_from_slice(&buf[..n2]);
+                        if n2 > 0 {
+                            let count = self.get_transfer_count().saturating_sub(n2 as u32);
+                            self.set_transfer_count(count);
+                        }
+                        if data.len() >= total || !data.is_empty() {
                             break;
                         }
                     }
+                    if data.is_empty() {
+                        break; // gave up — return what we have (empty)
+                    }
+                    continue; // got first bytes, resume outer loop
                 }
+                // Mid-transfer: chain exhausted before all bytes received — pause for IRIX resume
+                dlog!(self.log_module(), "WD33C93A({}): EOX at offset=0x{:x}, remaining=0x{:x} — pausing", self.id, data.len(), total - data.len());
+                wdt!("DMA_IN pause(EOX): at offset=0x{:x} remaining=0x{:x}", data.len(), total - data.len());
+                self.xfer_data = data;
+                self.xfer_offset = total; // store total as sentinel; xfer_data.len() is progress
+                self.xfer_direction_in = false;
+                self.queue_interrupt(Some(command_phase::TRANSFER_COUNT), scsi_status::UNEXPECTED_RECV_DATA);
+                return None;
             }
         } else {
             while data.len() < total {

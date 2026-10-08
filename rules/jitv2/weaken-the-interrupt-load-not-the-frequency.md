@@ -49,3 +49,34 @@ Caveats before believing it:
   reordered with itself but does not fence other accesses).
 - Verify under `jitv2_lockstep` (which keeps per-instruction emission) that
   correctness is unchanged, and re-run `iris-bench run` for the throughput delta.
+
+## Result (measured 2026-10-08, offline)
+
+Ran the in-tree probe at `opt_level=speed`
+(`IRIS_RUN_CL_PROBE=1 cargo test --features jitv2 zz_cl_forwarding -- --nocapture`)
+against the committed plain-load code (9d1988a). The probe's `barrier`/`sidexit`
+shapes still emit the *old* `atomic_load`; `exitbr`/`exitbr2` (a plain
+`MemFlagsData::trusted()` load + `brif` to a cold block) are the faithful proxy
+for the new plain load — same flags, differing only in field width/offset, which
+alias analysis does not distinguish.
+
+Decisive signal, store then load of the same GPR with the check in between:
+
+| shape | check between store→load | reload of gpr[a]? |
+|---|---|---|
+| plain | none | no — forwarded (`leaq 8(%rsi), %rsi`) |
+| barrier | seqcst `atomic_load` | **yes** (`addq 0x88(%rdi), %rsi`) |
+| sidexit | `atomic_load` + brif | **yes** (`addq 0x88(%rdi), %r8`) |
+| split_barrier | `atomic_load` across a jump | **yes** |
+| exitbr | plain load + brif | **no** (`leaq 8(%rsi), %r8`) |
+| exitbr2 | plain load + brif, cold arm reads gpr | **no** — rematerialized in the cold arm |
+
+The plain load unblocks forwarding: the seqcst `atomic_load` shapes reload gpr[a]
+after its store; the plain-load shape does not. The committed change therefore
+achieves the goal with zero coarsening.
+
+Not yet measured: a real before/after on emitted bytes/loads over a corpus — that
+needs a live-boot `j2 corpus` capture (no `.pcp` corpus is checked in), and a true
+A/B needs the pre-change tree (1528d70), which the current working tree's
+uncommitted work from other agents makes unsafe to check out. `iris-bench` and
+`jitv2_lockstep` verification likewise still pending.
