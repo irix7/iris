@@ -305,7 +305,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On an Intel Xeon Platinum 8573C host, the JIT-enabled configurations significantly outperform their interpreter counterparts, with the r4400-jitv2 achieving 570.4 MIPS (354.3 DMIPS) compared to just 88.0 MIPS (123.2 DMIPS) for the r4400-interp. Similarly, the r5000-jitv2 delivers 514.1 MIPS (338.8 DMIPS), a substantial increase over the r5000-interp's 60.1 MIPS (76.5 DMIPS). All four tested configurations recorded a 100.0% completion rate, contributing to a total of 13 runs recorded in the benchmark history.
+The latest benchmark run on an AMD EPYC 9V74 80-Core Processor achieved a score of 763.6 MIPS with the r4400-jitv2 build, representing a 100.0% speedup over the interpreter baseline. This performance corresponds to 753.1 DMIPS, marking the 404th recorded run in the dataset.
 
 ![latest benchmark cells](data/bench_cells.svg)
 
@@ -313,11 +313,12 @@ Latest run's four cells:
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
 |---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 88.0 | 123.2 | 13.1 |
-| `r4400-jitv2` | R4400 | 100.0% | 570.4 | 354.3 | 18.7 |
-| `r5000-interp` | R5000 | 100.0% | 60.1 | 76.5 | 9.7 |
-| `r5000-jitv2` | R5000 | 100.0% | 514.1 | 338.8 | 30.1 |
+| `r4400-jitv2` | R4400 | 100.0% | 763.6 | 753.1 | 50.0 |
 
-Full history table: [data/bench_history.md](data/bench_history.md) (13 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Normalised benchmark across all 404 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
+
+![normalised benchmark history](data/bench_history_eff.svg)
+
+Full history table: [data/bench_history.md](data/bench_history.md) (404 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
