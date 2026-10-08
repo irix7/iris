@@ -398,7 +398,7 @@ impl Wd33c93a {
         overlay: bool,
         overlay_path_override: Option<&str>,
     ) -> std::io::Result<()> {
-        use crate::cow_disk::CowDisk;
+        use crate::block_node::{BlockNode, ChdCdNode, ChdNode, CowNode, RawNode};
         use crate::scsi::DiskBackend;
 
         // Empty CD-ROM (drive present, tray empty). Stored backend=None so
@@ -416,9 +416,8 @@ impl Wd33c93a {
 
         let (backend, size) = if is_chd_path {
             {
-                use crate::chd_disk::{ChdCd, ChdHd};
                 if is_cdrom {
-                    let cd = ChdCd::open(path)?;
+                    let cd = ChdCdNode::open(path)?;
                     let sz = cd.size();
                     (DiskBackend::ChdCd(cd), sz)
                 } else {
@@ -427,7 +426,7 @@ impl Wd33c93a {
                     // gets a diff) and never auto-fold on exit (commit/roll back
                     // manually); COW off → write in place (uncompressed) or a diff
                     // that auto-folds on a clean exit (compressed).
-                    let hd = ChdHd::open(path, overlay)?;
+                    let hd = ChdNode::open(path, overlay)?;
                     let sz = hd.size();
                     (DiskBackend::ChdHd(hd), sz)
                 }
@@ -436,16 +435,19 @@ impl Wd33c93a {
             let overlay_path = overlay_path_override
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}.overlay", path));
-            let cow = CowDisk::new(path, &overlay_path)?;
-            let sz = cow.size();
+            let backing = RawNode::open_readonly(std::path::Path::new(path))?;
+            let sz = backing.size();
+            let cow = CowNode::new(Some(Box::new(backing)), &overlay_path, sz)?
+                .with_base_path(path);
             (DiskBackend::Cow(cow), sz)
         } else {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(!is_cdrom)
-                .open(path)?;
-            let sz = file.metadata()?.len();
-            (DiskBackend::Direct(file), sz)
+            let node = if is_cdrom {
+                RawNode::open_readonly(std::path::Path::new(path))?
+            } else {
+                RawNode::open(std::path::Path::new(path))?
+            };
+            let sz = node.size();
+            (DiskBackend::Direct(node), sz)
         };
 
         let disc_list = if is_cdrom { discs } else { vec![] };
@@ -2488,7 +2490,8 @@ mod data_out_phase_tests {
         {
             let mut s = dev.state.lock();
             s.devices[2] = Some(ScsiDevice::new(
-                scsi::DiskBackend::Direct(file), 1 << 20, false, path.display().to_string(), Vec::new()));
+                scsi::DiskBackend::Direct(crate::block_node::RawNode::from_file(file, 1 << 20)),
+                1 << 20, false, path.display().to_string(), Vec::new()));
             s.advanced_mode = true;
             s.target_id = 2;
             s.regs[regs::DESTINATION_ID as usize] = 2;
