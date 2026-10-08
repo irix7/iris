@@ -7189,3 +7189,21 @@ fn precompiled_shaders_handle_batched_transfers() {
     }
 }
 
+
+/// The registered rex3 description catches a renamed/removed field: the
+/// generated payload verifies, but moving a key fails Verify.
+#[test]
+fn state_desc_verify_rejects_a_renamed_field() {
+    let rex = make_rex3();
+    let desc = rex.state_desc().expect("rex3 has a state description");
+    let saved = desc.save();
+    desc.verify(&saved).expect("freshly saved rex3 value verifies");
+    assert_eq!(desc.measure(), desc.signature());
+
+    let mut t = saved.as_table().cloned().unwrap();
+    let ctx = t.remove("context").unwrap();
+    t.insert("ctx".into(), ctx);
+    let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+    assert!(err.contains("context"), "names the field: {err}");
+    assert!(err.contains("missing") || err.contains("unknown"), "{err}");
+}

@@ -1130,80 +1130,218 @@ impl Device for Gr2 {
 
 impl Saveable for Gr2 {
     // Registers, microcode, SRAMs and colour tables. VRAM is not saved yet.
-    fn save_state(&self) -> toml::Value {
-        let r = self.regs();
-        let mut t = toml::map::Map::new();
-        t.insert("shram".into(), u32_slice_to_toml(&r.shram));
-        t.insert("hq_ucode".into(), u32_slice_to_toml(&r.hq.ucode));
-        t.insert("hq_attrjmp".into(), u32_slice_to_toml(&r.hq.attrjmp));
-        t.insert("hq_gepc".into(), hex_u32(r.hq.gepc));
-        t.insert("hq_numge".into(), hex_u32(r.hq.numge));
-        t.insert("hq_running".into(), hex_u32(r.hq.running));
-        t.insert("hq_fin1".into(), hex_u32(r.hq.fin[hq2::FIN1].load(Ordering::Acquire)));
-        t.insert("hq_fin2".into(), hex_u32(r.hq.fin[hq2::FIN2].load(Ordering::Acquire)));
-        t.insert("hq_fin3".into(), hex_u32(r.hq.fin[hq2::FIN3].load(Ordering::Acquire)));
-        t.insert("vc1_regs".into(), u8_slice_to_toml(&r.vc1.regs));
-        t.insert("vc1_sram".into(), u8_slice_to_toml(&r.vc1.sram));
-        t.insert("vc1_sysctl".into(), hex_u32(r.vc1.sysctl as u32));
-        for (i, x) in r.xmap.iter().enumerate() {
-            t.insert(format!("xmap{i}_mode"), u32_slice_to_toml(&x.mode));
-            t.insert(format!("xmap{i}_clut"), u32_slice_to_toml(&x.clut));
-            t.insert(format!("xmap{i}_misc"), u8_slice_to_toml(&x.misc));
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        let mut d = StateDesc::new("gr2", 1)
+            .field(
+                "shram",
+                FieldKind::U32Array,
+                1,
+                |t| { t.insert("shram".into(), u32_slice_to_toml(&self.regs().shram)); },
+                |v| { load_u32_slice(v, &mut self.regs().shram); Ok(()) },
+            )
+            .field(
+                "hq_ucode",
+                FieldKind::U32Array,
+                1,
+                |t| { t.insert("hq_ucode".into(), u32_slice_to_toml(&self.regs().hq.ucode)); },
+                |v| { load_u32_slice(v, &mut self.regs().hq.ucode); Ok(()) },
+            )
+            .field(
+                "hq_attrjmp",
+                FieldKind::U32Array,
+                1,
+                |t| { t.insert("hq_attrjmp".into(), u32_slice_to_toml(&self.regs().hq.attrjmp)); },
+                |v| { load_u32_slice(v, &mut self.regs().hq.attrjmp); Ok(()) },
+            )
+            .field(
+                "hq_gepc",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_gepc".into(), hex_u32(self.regs().hq.gepc)); },
+                |v| { self.regs().hq.gepc = toml_u32(v).unwrap_or(0); Ok(()) },
+            )
+            .field(
+                "hq_numge",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_numge".into(), hex_u32(self.regs().hq.numge)); },
+                |v| { self.regs().hq.numge = toml_u32(v).unwrap_or(0); Ok(()) },
+            )
+            .field(
+                "hq_running",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_running".into(), hex_u32(self.regs().hq.running)); },
+                |v| { self.regs().hq.running = toml_u32(v).unwrap_or(0); Ok(()) },
+            )
+            .field(
+                "hq_fin1",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_fin1".into(), hex_u32(self.regs().hq.fin[hq2::FIN1].load(Ordering::Acquire))); },
+                |v| { self.regs().hq.fin[hq2::FIN1].store(toml_u32(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "hq_fin2",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_fin2".into(), hex_u32(self.regs().hq.fin[hq2::FIN2].load(Ordering::Acquire))); },
+                |v| { self.regs().hq.fin[hq2::FIN2].store(toml_u32(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "hq_fin3",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("hq_fin3".into(), hex_u32(self.regs().hq.fin[hq2::FIN3].load(Ordering::Acquire))); },
+                |v| { self.regs().hq.fin[hq2::FIN3].store(toml_u32(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "vc1_regs",
+                FieldKind::U8Array,
+                1,
+                |t| { t.insert("vc1_regs".into(), u8_slice_to_toml(&self.regs().vc1.regs)); },
+                |v| { load_u8_slice(v, &mut self.regs().vc1.regs); Ok(()) },
+            )
+            .field(
+                "vc1_sram",
+                FieldKind::U8Array,
+                1,
+                |t| { t.insert("vc1_sram".into(), u8_slice_to_toml(&self.regs().vc1.sram)); },
+                |v| { load_u8_slice(v, &mut self.regs().vc1.sram); Ok(()) },
+            )
+            .field(
+                "vc1_sysctl",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("vc1_sysctl".into(), hex_u32(self.regs().vc1.sysctl as u32)); },
+                |v| { self.regs().vc1.sysctl = toml_u32(v).unwrap_or(0) as u8; Ok(()) },
+            );
+
+        for i in 0..5 {
+            d = d
+                .field(
+                    format!("xmap{i}_mode"),
+                    FieldKind::U32Array,
+                    1,
+                    move |t| { t.insert(format!("xmap{i}_mode"), u32_slice_to_toml(&self.regs().xmap[i].mode)); },
+                    move |v| { load_u32_slice(v, &mut self.regs().xmap[i].mode); Ok(()) },
+                )
+                .field(
+                    format!("xmap{i}_clut"),
+                    FieldKind::U32Array,
+                    1,
+                    move |t| { t.insert(format!("xmap{i}_clut"), u32_slice_to_toml(&self.regs().xmap[i].clut)); },
+                    move |v| { load_u32_slice(v, &mut self.regs().xmap[i].clut); Ok(()) },
+                )
+                .field(
+                    format!("xmap{i}_misc"),
+                    FieldKind::U8Array,
+                    1,
+                    move |t| { t.insert(format!("xmap{i}_misc"), u8_slice_to_toml(&self.regs().xmap[i].misc)); },
+                    move |v| { load_u8_slice(v, &mut self.regs().xmap[i].misc); Ok(()) },
+                );
         }
-        for (i, d) in r.dac.iter().enumerate() {
-            t.insert(format!("dac{i}_palette"), u8_slice_to_toml(&d.palette));
-            t.insert(format!("dac{i}_ctrl"), u8_slice_to_toml(&[d.readmask, d.blinkmask, d.cmd, d.test]));
+
+        for i in 0..3 {
+            d = d
+                .field(
+                    format!("dac{i}_palette"),
+                    FieldKind::U8Array,
+                    1,
+                    move |t| { t.insert(format!("dac{i}_palette"), u8_slice_to_toml(&self.regs().dac[i].palette)); },
+                    move |v| { load_u8_slice(v, &mut self.regs().dac[i].palette); Ok(()) },
+                )
+                .field(
+                    format!("dac{i}_ctrl"),
+                    FieldKind::U8Array,
+                    1,
+                    move |t| {
+                        let d = &self.regs().dac[i];
+                        t.insert(format!("dac{i}_ctrl"), u8_slice_to_toml(&[d.readmask, d.blinkmask, d.cmd, d.test]));
+                    },
+                    move |v| {
+                        let mut c = [0u8; 4];
+                        load_u8_slice(v, &mut c);
+                        let d = &mut self.regs().dac[i];
+                        (d.readmask, d.blinkmask, d.cmd, d.test) = (c[0], c[1], c[2], c[3]);
+                        Ok(())
+                    },
+                );
         }
+
         // Engine sequence counters and the FIN2/FIN3/GEDMA wait state, so a
         // restored snapshot keeps the same notion of which command is done.
-        t.insert("hq_queued_seq".into(), hex_u64(self.hq_queued_seq.load(Ordering::Acquire)));
-        t.insert("hq_executed_seq".into(), hex_u64(self.hq_executed_seq.load(Ordering::Acquire)));
-        t.insert("re3_queued_seq".into(), hex_u64(self.re3_queued_seq.load(Ordering::Acquire)));
-        t.insert("re3_executed_seq".into(), hex_u64(self.re3_executed_seq.load(Ordering::Acquire)));
-        t.insert("fin2_wait".into(), hex_u32(self.fin2_wait.load(Ordering::Acquire)));
-        t.insert("fin2_target".into(), hex_u64(self.fin2_target.load(Ordering::Acquire)));
-        t.insert("fin3_target".into(), hex_u64(self.fin3_target.load(Ordering::Acquire)));
-        t.insert("gedma_target".into(), hex_u64(self.gedma_target.load(Ordering::Acquire)));
-        toml::Value::Table(t)
+        d = d
+            .field(
+                "hq_queued_seq",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("hq_queued_seq".into(), hex_u64(self.hq_queued_seq.load(Ordering::Acquire))); },
+                |v| { self.hq_queued_seq.store(toml_u64(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "hq_executed_seq",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("hq_executed_seq".into(), hex_u64(self.hq_executed_seq.load(Ordering::Acquire))); },
+                |v| { self.hq_executed_seq.store(toml_u64(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "re3_queued_seq",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("re3_queued_seq".into(), hex_u64(self.re3_queued_seq.load(Ordering::Acquire))); },
+                |v| { self.re3_queued_seq.store(toml_u64(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "re3_executed_seq",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("re3_executed_seq".into(), hex_u64(self.re3_executed_seq.load(Ordering::Acquire))); },
+                |v| { self.re3_executed_seq.store(toml_u64(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "fin2_wait",
+                FieldKind::U32,
+                1,
+                |t| { t.insert("fin2_wait".into(), hex_u32(self.fin2_wait.load(Ordering::Acquire))); },
+                |v| { self.fin2_wait.store(toml_u32(v).unwrap_or(0), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "fin2_target",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("fin2_target".into(), hex_u64(self.fin2_target.load(Ordering::Acquire))); },
+                |v| { self.fin2_target.store(toml_u64(v).unwrap_or(SEQ_NONE), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "fin3_target",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("fin3_target".into(), hex_u64(self.fin3_target.load(Ordering::Acquire))); },
+                |v| { self.fin3_target.store(toml_u64(v).unwrap_or(SEQ_NONE), Ordering::Release); Ok(()) },
+            )
+            .field(
+                "gedma_target",
+                FieldKind::U64,
+                1,
+                |t| { t.insert("gedma_target".into(), hex_u64(self.gedma_target.load(Ordering::Acquire))); },
+                |v| { self.gedma_target.store(toml_u64(v).unwrap_or(SEQ_NONE), Ordering::Release); Ok(()) },
+            )
+            // Loading registers/SRAMs must mark the board dirty so the display
+            // and engine re-read the restored state.
+            .after_load(|| { self.dirty.store(true, Ordering::Relaxed); Ok(()) });
+
+        Some(d)
+    }
+
+    fn save_state(&self) -> toml::Value {
+        self.state_desc().expect("gr2 has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let r = self.regs();
-        if let Some(x) = get_field(v, "shram") { load_u32_slice(x, &mut r.shram); }
-        if let Some(x) = get_field(v, "hq_ucode") { load_u32_slice(x, &mut r.hq.ucode); }
-        if let Some(x) = get_field(v, "hq_attrjmp") { load_u32_slice(x, &mut r.hq.attrjmp); }
-        if let Some(x) = get_field(v, "hq_gepc") { r.hq.gepc = toml_u32(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "hq_numge") { r.hq.numge = toml_u32(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "hq_running") { r.hq.running = toml_u32(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "hq_fin1") { r.hq.fin[hq2::FIN1].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "hq_fin2") { r.hq.fin[hq2::FIN2].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "hq_fin3") { r.hq.fin[hq2::FIN3].store(toml_u32(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "vc1_regs") { load_u8_slice(x, &mut r.vc1.regs); }
-        if let Some(x) = get_field(v, "vc1_sram") { load_u8_slice(x, &mut r.vc1.sram); }
-        if let Some(x) = get_field(v, "vc1_sysctl") { r.vc1.sysctl = toml_u32(x).unwrap_or(0) as u8; }
-        for (i, xm) in r.xmap.iter_mut().enumerate() {
-            if let Some(x) = get_field(v, &format!("xmap{i}_mode")) { load_u32_slice(x, &mut xm.mode); }
-            if let Some(x) = get_field(v, &format!("xmap{i}_clut")) { load_u32_slice(x, &mut xm.clut); }
-            if let Some(x) = get_field(v, &format!("xmap{i}_misc")) { load_u8_slice(x, &mut xm.misc); }
-        }
-        for (i, d) in r.dac.iter_mut().enumerate() {
-            if let Some(x) = get_field(v, &format!("dac{i}_palette")) { load_u8_slice(x, &mut d.palette); }
-            if let Some(x) = get_field(v, &format!("dac{i}_ctrl")) {
-                let mut c = [0u8; 4];
-                load_u8_slice(x, &mut c);
-                (d.readmask, d.blinkmask, d.cmd, d.test) = (c[0], c[1], c[2], c[3]);
-            }
-        }
-        if let Some(x) = get_field(v, "hq_queued_seq") { self.hq_queued_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "hq_executed_seq") { self.hq_executed_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "re3_queued_seq") { self.re3_queued_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "re3_executed_seq") { self.re3_executed_seq.store(toml_u64(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "fin2_wait") { self.fin2_wait.store(toml_u32(x).unwrap_or(0), Ordering::Release); }
-        if let Some(x) = get_field(v, "fin2_target") { self.fin2_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
-        if let Some(x) = get_field(v, "fin3_target") { self.fin3_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
-        if let Some(x) = get_field(v, "gedma_target") { self.gedma_target.store(toml_u64(x).unwrap_or(SEQ_NONE), Ordering::Release); }
-        self.dirty.store(true, Ordering::Relaxed);
-        Ok(())
+        self.state_desc().expect("gr2 has a state description").load(v)
     }
 }
 

@@ -2546,3 +2546,21 @@ fn gl_spin_and_return_reads_current_color_for_index_clear() {
     }
     m.stop_engines();
 }
+
+/// The registered description covers mgras's (currently empty) field set:
+/// a stray field is rejected by Verify rather than loaded silently.
+#[test]
+fn state_desc_verify_rejects_an_unregistered_field() {
+    let m = live_board();
+    let desc = crate::traits::Saveable::state_desc(&*m)
+        .expect("mgras has a state description");
+    let saved = desc.save();
+    desc.verify(&saved).expect("freshly saved mgras value verifies");
+    assert_eq!(desc.measure(), desc.signature());
+
+    let mut t = saved.as_table().cloned().unwrap();
+    t.insert("stray".into(), toml::Value::Integer(1));
+    let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
+    assert!(err.contains("unknown field 'stray'"), "{err}");
+    m.stop_engines();
+}

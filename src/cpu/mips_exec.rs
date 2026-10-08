@@ -14899,156 +14899,228 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Resettable for MipsC
 }
 
 impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu<T, C> {
-    fn save_state(&self) -> toml::Value {
-        let exec = self.executor.lock();
-        let c = &exec.core;
-        let mut tbl = toml::map::Map::new();
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
 
-        // GPRs
-        tbl.insert("gpr".into(), u64_slice_to_toml(&c.gpr));
-        tbl.insert("pc".into(),  hex_u64(c.pc));
-        tbl.insert("hi".into(),  hex_u64(c.hi));
-        tbl.insert("lo".into(),  hex_u64(c.lo));
-
-        // CP0
-        let mut cp0 = toml::map::Map::new();
-        macro_rules! cp0u32 {
-            ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u32(c.$f)); }
-        }
-        macro_rules! cp0u64 {
-            ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u64(c.$f)); }
-        }
-        cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
-        cp0u64!(cp0_count); cp0u64!(cp0_compare);
-        // Count frequency. Without this, restore runs at the default 33 MHz
-        // until IRIX touches Compare again — the guest scheduler drifts
-        // noticeably for the first few seconds after every restore. The
-        // cycle anchor and memo are not saved: they are re-derived from
-        // `hot.cycles` on load by `reanchor_count_and_reschedule`.
-        cp0u64!(count_hz);
-        cp0u32!(cp0_status); cp0u32!(cp0_cause);
-        cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
-        cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
-        cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
-        cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
-        cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
-        cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
-        tbl.insert("cp0".into(), toml::Value::Table(cp0));
-
-        // FPU
-        let mut fpu = toml::map::Map::new();
-        fpu.insert("fpr".into(), u64_slice_to_toml(&c.fpr));
-        fpu.insert("fpu_fir".into(),  hex_u32(c.fpu_fir));
-        fpu.insert("fpu_fccr".into(), hex_u32(c.fpu_fccr));
-        fpu.insert("fpu_fexr".into(), hex_u32(c.fpu_fexr));
-        fpu.insert("fpu_fenr".into(), hex_u32(c.fpu_fenr));
-        fpu.insert("fpu_fcsr".into(), hex_u32(c.fpu_fcsr));
-        tbl.insert("fpu".into(), toml::Value::Table(fpu));
-
-        // Execution state
-        tbl.insert("in_delay_slot".into(),     toml::Value::Boolean(c.in_delay_slot));
-        tbl.insert("delay_slot_target".into(), hex_u64(c.delay_slot_target));
-
-        // TLB
-        tbl.insert("tlb".into(), exec.tlb.save_state());
-
-        // Cache (L1-I, L1-D, L2 tags + data, LL/SC state)
-        tbl.insert("cache".into(), exec.cache.save_cache_state());
+        let mut d = StateDesc::new("cpu", 1);
 
         // Guest-time timer queue (#43): named deadlines only. Transient
         // callbacks are never serialised (they are re-registered by their
         // owners on load), so no anonymous timer can block or corrupt a
-        // savestate. On load the queue re-sorts and the owners re-arm.
-        if let Some(t) = &c.guest_timers {
-            tbl.insert("timers".into(), t.save_state());
+        // savestate. Restored before the CP0 block below re-arms the Compare
+        // deadline, so the fresh deadline wins. Registered only when the
+        // machine has a queue, mirroring the legacy hand-written payload.
+        if self.executor.lock().core.guest_timers.is_some() {
+            d = d.field(
+                "timers",
+                FieldKind::Table,
+                1,
+                |t| {
+                    let exec = self.executor.lock();
+                    if let Some(q) = &exec.core.guest_timers {
+                        t.insert("timers".into(), q.save_state());
+                    }
+                },
+                |v| {
+                    let exec = self.executor.lock();
+                    if let Some(q) = &exec.core.guest_timers {
+                        q.load_state(v);
+                    }
+                    Ok(())
+                },
+            );
         }
 
-        toml::Value::Table(tbl)
+        d = d
+            .field(
+                "gpr",
+                FieldKind::U64Array,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("gpr".into(), u64_slice_to_toml(&exec.core.gpr)); },
+                |v| { let mut exec = self.executor.lock(); load_u64_slice(v, &mut exec.core.gpr); Ok(()) },
+            )
+            .field(
+                "pc",
+                FieldKind::U64,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("pc".into(), hex_u64(exec.core.pc)); },
+                |v| {
+                    let mut exec = self.executor.lock();
+                    let cur = exec.core.pc;
+                    exec.core.pc = toml_u64(v).unwrap_or(cur);
+                    Ok(())
+                },
+            )
+            .field(
+                "hi",
+                FieldKind::U64,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("hi".into(), hex_u64(exec.core.hi)); },
+                |v| {
+                    let mut exec = self.executor.lock();
+                    let cur = exec.core.hi;
+                    exec.core.hi = toml_u64(v).unwrap_or(cur);
+                    Ok(())
+                },
+            )
+            .field(
+                "lo",
+                FieldKind::U64,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("lo".into(), hex_u64(exec.core.lo)); },
+                |v| {
+                    let mut exec = self.executor.lock();
+                    let cur = exec.core.lo;
+                    exec.core.lo = toml_u64(v).unwrap_or(cur);
+                    Ok(())
+                },
+            )
+            .field(
+                "cp0",
+                FieldKind::Table,
+                1,
+                |t| {
+                    let exec = self.executor.lock();
+                    let c = &exec.core;
+                    let mut cp0 = toml::map::Map::new();
+                    macro_rules! cp0u32 { ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u32(c.$f)); } }
+                    macro_rules! cp0u64 { ($f:ident) => { cp0.insert(stringify!($f).into(), hex_u64(c.$f)); } }
+                    cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
+                    cp0u64!(cp0_count); cp0u64!(cp0_compare);
+                    // Count frequency. Without this, restore runs at the default
+                    // 33 MHz until IRIX touches Compare again — the guest
+                    // scheduler drifts noticeably for the first few seconds
+                    // after every restore. The cycle anchor and memo are not
+                    // saved: they are re-derived from `hot.cycles` on load by
+                    // `reanchor_count_and_reschedule`.
+                    cp0u64!(count_hz);
+                    cp0u32!(cp0_status); cp0u32!(cp0_cause);
+                    cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
+                    cp0u32!(cp0_watchlo); cp0u32!(cp0_watchhi); cp0u32!(cp0_ecc); cp0u32!(cp0_cacheerr);
+                    cp0u64!(cp0_taglo); cp0u32!(cp0_taghi);
+                    cp0u64!(cp0_badvaddr); cp0u64!(cp0_epc); cp0u64!(cp0_errorepc);
+                    cp0u64!(cp0_entrylo0); cp0u64!(cp0_entrylo1); cp0u64!(cp0_context);
+                    cp0u64!(cp0_pagemask); cp0u64!(cp0_entryhi); cp0u64!(cp0_xcontext);
+                    t.insert("cp0".into(), toml::Value::Table(cp0));
+                },
+                |v| {
+                    let mut exec = self.executor.lock();
+                    let c = &mut exec.core;
+                    macro_rules! ld32 { ($f:ident) => {
+                        if let Some(x) = get_field(v, stringify!($f)) {
+                            c.$f = toml_u32(x).unwrap_or(c.$f);
+                        }
+                    }}
+                    macro_rules! ld64 { ($f:ident) => {
+                        if let Some(x) = get_field(v, stringify!($f)) {
+                            c.$f = toml_u64(x).unwrap_or(c.$f);
+                        }
+                    }}
+                    ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
+                    ld64!(cp0_count); ld64!(cp0_compare);
+                    ld64!(count_hz);
+                    // Compat shim: pre-timer-based snapshots stored cp0_count/
+                    // cp0_compare and the learned deltas in 32.32 fixed-point
+                    // (hardware count in the high word). Values above u32::MAX
+                    // can only be that old format — shift down to plain hardware
+                    // counts. (Such snapshots carry count_step, not count_hz, so
+                    // count_hz stays at its default until the guest's tick is
+                    // re-recognized.)
+                    if c.cp0_count > u32::MAX as u64 { c.cp0_count >>= 32; }
+                    if c.cp0_compare > u32::MAX as u64 { c.cp0_compare >>= 32; }
+                    // Mirror count_hz into its atomic shadow (read by the
+                    // display thread) so the live UI matches the restored core
+                    // state.
+                    c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
+                    ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
+                    ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
+                    ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
+                    ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
+                    ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
+                    ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
+                    // Restart the virtual count from the restored value and
+                    // re-arm the compare timer — Instants from the previous run
+                    // are meaningless here.
+                    c.reanchor_count_and_reschedule();
+                    Ok(())
+                },
+            )
+            .field(
+                "fpu",
+                FieldKind::Table,
+                1,
+                |t| {
+                    let exec = self.executor.lock();
+                    let c = &exec.core;
+                    let mut fpu = toml::map::Map::new();
+                    fpu.insert("fpr".into(), u64_slice_to_toml(&c.fpr));
+                    fpu.insert("fpu_fir".into(),  hex_u32(c.fpu_fir));
+                    fpu.insert("fpu_fccr".into(), hex_u32(c.fpu_fccr));
+                    fpu.insert("fpu_fexr".into(), hex_u32(c.fpu_fexr));
+                    fpu.insert("fpu_fenr".into(), hex_u32(c.fpu_fenr));
+                    fpu.insert("fpu_fcsr".into(), hex_u32(c.fpu_fcsr));
+                    t.insert("fpu".into(), toml::Value::Table(fpu));
+                },
+                |v| {
+                    let mut exec = self.executor.lock();
+                    let c = &mut exec.core;
+                    if let Some(arr) = get_field(v, "fpr") { load_u64_slice(arr, &mut c.fpr); }
+                    macro_rules! ldf { ($f:ident) => {
+                        if let Some(x) = get_field(v, stringify!($f)) {
+                            c.$f = toml_u32(x).unwrap_or(c.$f);
+                        }
+                    }}
+                    ldf!(fpu_fir); ldf!(fpu_fccr); ldf!(fpu_fexr); ldf!(fpu_fenr); ldf!(fpu_fcsr);
+                    Ok(())
+                },
+            )
+            .field(
+                "in_delay_slot",
+                FieldKind::Bool,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("in_delay_slot".into(), toml::Value::Boolean(exec.core.in_delay_slot)); },
+                |v| { let mut exec = self.executor.lock(); exec.core.in_delay_slot = toml_bool(v).unwrap_or(false); Ok(()) },
+            )
+            .field(
+                "delay_slot_target",
+                FieldKind::U64,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("delay_slot_target".into(), hex_u64(exec.core.delay_slot_target)); },
+                |v| { let mut exec = self.executor.lock(); exec.core.delay_slot_target = toml_u64(v).unwrap_or(0); Ok(()) },
+            )
+            .field(
+                "tlb",
+                FieldKind::Table,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("tlb".into(), exec.tlb.save_state()); },
+                |v| { let mut exec = self.executor.lock(); exec.tlb.load_state(v)?; Ok(()) },
+            )
+            .field(
+                "cache",
+                FieldKind::Table,
+                1,
+                |t| { let exec = self.executor.lock(); t.insert("cache".into(), exec.cache.save_cache_state()); },
+                |v| { let exec = self.executor.lock(); exec.cache.load_cache_state(v)?; Ok(()) },
+            )
+            // cp0_status was restored by direct field write, so translate_fn and
+            // the fpr accessors still describe the *previous* machine.
+            // Deliberately last: the flush this routes through must retire
+            // translations made stale by the restored TLB, not run before it.
+            .after_load(|| {
+                let mut exec = self.executor.lock();
+                exec.resync_privilege_state();
+                Ok(())
+            });
+
+        Some(d)
+    }
+
+    fn save_state(&self) -> toml::Value {
+        self.state_desc().expect("cpu has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut exec = self.executor.lock();
-        let c = &mut exec.core;
-
-        // Restore the (re-sorted) guest-time queue before the CP0 block below
-        // re-arms the Compare deadline, so the fresh deadline wins. The PIT
-        // re-arms its channels in `start()` after this returns.
-        if let Some(t) = &c.guest_timers {
-            if let Some(tv) = get_field(v, "timers") {
-                t.load_state(tv);
-            }
-        }
-
-        if let Some(arr) = get_field(v, "gpr") { load_u64_slice(arr, &mut c.gpr); }
-        if let Some(x) = get_field(v, "pc")  { c.pc = toml_u64(x).unwrap_or(c.pc); }
-        if let Some(x) = get_field(v, "hi")  { c.hi = toml_u64(x).unwrap_or(c.hi); }
-        if let Some(x) = get_field(v, "lo")  { c.lo = toml_u64(x).unwrap_or(c.lo); }
-
-        if let Some(cp0) = get_field(v, "cp0") {
-            macro_rules! ld32 { ($f:ident) => {
-                if let Some(x) = get_field(cp0, stringify!($f)) {
-                    c.$f = toml_u32(x).unwrap_or(c.$f);
-                }
-            }}
-            macro_rules! ld64 { ($f:ident) => {
-                if let Some(x) = get_field(cp0, stringify!($f)) {
-                    c.$f = toml_u64(x).unwrap_or(c.$f);
-                }
-            }}
-            ld32!(cp0_index); ld32!(cp0_random); ld32!(cp0_wired);
-            ld64!(cp0_count); ld64!(cp0_compare);
-            ld64!(count_hz);
-            // Compat shim: pre-timer-based snapshots stored cp0_count/
-            // cp0_compare and the learned deltas in 32.32 fixed-point
-            // (hardware count in the high word). Values above u32::MAX can
-            // only be that old format — shift down to plain hardware counts.
-            // (Such snapshots carry count_step, not count_hz, so count_hz
-            // stays at its default until the guest's tick is re-recognized.)
-            if c.cp0_count > u32::MAX as u64 { c.cp0_count >>= 32; }
-            if c.cp0_compare > u32::MAX as u64 { c.cp0_compare >>= 32; }
-            // Mirror count_hz into its atomic shadow (read by the display
-            // thread) so the live UI matches the restored core state.
-            c.count_hz_atomic.store(c.count_hz, std::sync::atomic::Ordering::Relaxed);
-            ld32!(cp0_status); ld32!(cp0_cause); ld32!(cp0_prid);
-            ld32!(cp0_config); ld32!(cp0_lladdr); ld32!(cp0_watchlo); ld32!(cp0_watchhi);
-            ld32!(cp0_ecc); ld32!(cp0_cacheerr); ld64!(cp0_taglo); ld32!(cp0_taghi);
-            ld64!(cp0_entrylo0); ld64!(cp0_entrylo1); ld64!(cp0_context);
-            ld64!(cp0_pagemask); ld64!(cp0_badvaddr); ld64!(cp0_entryhi);
-            ld64!(cp0_xcontext); ld64!(cp0_epc); ld64!(cp0_errorepc);
-            // Restart the virtual count from the restored value and re-arm
-            // the compare timer — Instants from the previous run are
-            // meaningless here.
-            c.reanchor_count_and_reschedule();
-        }
-
-        if let Some(fpu) = get_field(v, "fpu") {
-            if let Some(arr) = get_field(fpu, "fpr") { load_u64_slice(arr, &mut c.fpr); }
-            macro_rules! ldf { ($f:ident) => {
-                if let Some(x) = get_field(fpu, stringify!($f)) {
-                    c.$f = toml_u32(x).unwrap_or(c.$f);
-                }
-            }}
-            ldf!(fpu_fir); ldf!(fpu_fccr); ldf!(fpu_fexr); ldf!(fpu_fenr); ldf!(fpu_fcsr);
-        }
-
-        if let Some(x) = get_field(v, "in_delay_slot")     { exec.core.in_delay_slot     = toml_bool(x).unwrap_or(false); }
-        if let Some(x) = get_field(v, "delay_slot_target") { exec.core.delay_slot_target = toml_u64(x).unwrap_or(0); }
-
-        if let Some(tlb_v) = get_field(v, "tlb") {
-            exec.tlb.load_state(tlb_v)?;
-        }
-
-        if let Some(cache_v) = get_field(v, "cache") {
-            exec.cache.load_cache_state(cache_v)?;
-        }
-
-        // cp0_status was restored above by direct field write, so translate_fn and the
-        // fpr accessors still describe the *previous* machine. Deliberately last: the
-        // flush this routes through must retire translations made stale by the restored
-        // TLB above, not run before it.
-        exec.resync_privilege_state();
-
-        Ok(())
+        self.state_desc().expect("cpu has a state description").load(v)
     }
 }
 

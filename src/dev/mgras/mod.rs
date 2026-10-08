@@ -1012,9 +1012,16 @@ impl Device for Mgras {
 }
 
 impl Saveable for Mgras {
-    // Bring-up: board state is not snapshotted yet.
+    // Bring-up: board state is not snapshotted yet. Register an empty
+    // description so the device is recorded as registered — the schema
+    // signature covers the (currently empty) field set, and `verify` rejects
+    // any field that is not registered.
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        Some(crate::state_desc::StateDesc::new("mgras", 1))
+    }
+
     fn save_state(&self) -> toml::Value {
-        toml::Value::Table(toml::map::Map::new())
+        self.state_desc().expect("mgras has a state description").save()
     }
 
     fn load_state(&self, _v: &toml::Value) -> Result<(), String> {
