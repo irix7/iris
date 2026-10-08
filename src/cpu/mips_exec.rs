@@ -9126,9 +9126,289 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         #[cfg(feature = "instr_stats")]
         self.instr_stats.record(d.op, d.rs, d.rt, d.funct, d.raw);
 
+        self.dispatch_instr(d)
+    }
+
+    /// Match-based direct dispatch mirroring `decode_into`'s handler selection
+    /// arm-for-arm. `d` is already decoded by the time this runs (every call
+    /// site runs `decode_into` first), so `d.imm` already holds the value the
+    /// selected `exec_*` handler expects and the `set_imm_*` side effects in
+    /// `decode_into`'s arms do not need repeating here.
+    ///
+    /// The `opcodefusion` arms cannot re-derive their fused-vs-plain choice
+    /// from `d.flags`: `decode_into` clears `FLAG_IMM_IS_NEXT` before it
+    /// returns, so `d.flags` is always 0 at dispatch time. The choice is
+    /// instead recovered from `d.handler`, which `decode_into` set to the
+    /// exact fused or plain fn pointer — the only persistent record of the
+    /// decision.
+    #[inline(always)]
+    fn dispatch_instr(&mut self, d: &DecodedInstr) -> ExecStatus {
         type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        f(self, d)
+
+        let op = d.op;
+        let funct = d.funct;
+        let rs = d.rs;
+        let rt = d.rt;
+
+        match op as u32 {
+            OP_SPECIAL => match funct as u32 {
+                FUNCT_SLL => self.exec_sll(d),
+                FUNCT_MOVCI => if C::MIPS4 { self.exec_movci(d) } else { self.exec_reserved(d) },
+                FUNCT_SRL => self.exec_srl(d),
+                FUNCT_SRA => self.exec_sra(d),
+                FUNCT_SLLV => self.exec_sllv(d),
+                FUNCT_SRLV => self.exec_srlv(d),
+                FUNCT_SRAV => self.exec_srav(d),
+                #[cfg(feature = "opcodefusion")]
+                FUNCT_JR => if d.handler == MipsExecutor::<T,C>::exec_jr_nop as Fn<T,C> as usize { self.exec_jr_nop(d) } else { self.exec_jr(d) },
+                #[cfg(not(feature = "opcodefusion"))]
+                FUNCT_JR => self.exec_jr(d),
+                FUNCT_JALR => self.exec_jalr(d),
+                FUNCT_MOVZ => if C::MIPS4 { self.exec_movz(d) } else { self.exec_reserved(d) },
+                FUNCT_MOVN => if C::MIPS4 { self.exec_movn(d) } else { self.exec_reserved(d) },
+                FUNCT_SYSCALL => self.exec_syscall(d),
+                FUNCT_BREAK => self.exec_break(d),
+                FUNCT_SYNC => self.exec_sync(d),
+                FUNCT_MFHI => self.exec_mfhi(d),
+                FUNCT_MTHI => self.exec_mthi(d),
+                FUNCT_MFLO => self.exec_mflo(d),
+                FUNCT_MTLO => self.exec_mtlo(d),
+                FUNCT_DSLLV => self.exec_dsllv(d),
+                FUNCT_DSRLV => self.exec_dsrlv(d),
+                FUNCT_DSRAV => self.exec_dsrav(d),
+                FUNCT_MULT => self.exec_mult(d),
+                FUNCT_MULTU => self.exec_multu(d),
+                FUNCT_DIV => self.exec_div(d),
+                FUNCT_DIVU => self.exec_divu(d),
+                FUNCT_DMULT => self.exec_dmult(d),
+                FUNCT_DMULTU => self.exec_dmultu(d),
+                FUNCT_DDIV => self.exec_ddiv(d),
+                FUNCT_DDIVU => self.exec_ddivu(d),
+                FUNCT_ADD => self.exec_add(d),
+                #[cfg(feature = "opcodefusion")]
+                FUNCT_ADDU => if d.handler == MipsExecutor::<T,C>::exec_addu_ls as Fn<T,C> as usize { self.exec_addu_ls(d) } else { self.exec_addu(d) },
+                #[cfg(not(feature = "opcodefusion"))]
+                FUNCT_ADDU => self.exec_addu(d),
+                FUNCT_SUB => self.exec_sub(d),
+                #[cfg(feature = "opcodefusion")]
+                FUNCT_SUBU => if d.handler == MipsExecutor::<T,C>::exec_subu_ls as Fn<T,C> as usize { self.exec_subu_ls(d) } else { self.exec_subu(d) },
+                #[cfg(not(feature = "opcodefusion"))]
+                FUNCT_SUBU => self.exec_subu(d),
+                FUNCT_AND => self.exec_and(d),
+                FUNCT_OR => self.exec_or(d),
+                FUNCT_XOR => self.exec_xor(d),
+                FUNCT_NOR => self.exec_nor(d),
+                FUNCT_SLT => self.exec_slt(d),
+                FUNCT_SLTU => self.exec_sltu(d),
+                FUNCT_DADD => self.exec_dadd(d),
+                FUNCT_DADDU => self.exec_daddu(d),
+                FUNCT_DSUB => self.exec_dsub(d),
+                FUNCT_DSUBU => self.exec_dsubu(d),
+                FUNCT_TGE => self.exec_tge(d),
+                FUNCT_TGEU => self.exec_tgeu(d),
+                FUNCT_TLT => self.exec_tlt(d),
+                FUNCT_TLTU => self.exec_tltu(d),
+                FUNCT_TEQ => self.exec_teq(d),
+                FUNCT_TNE => self.exec_tne(d),
+                FUNCT_DSLL => self.exec_dsll(d),
+                FUNCT_DSRL => self.exec_dsrl(d),
+                FUNCT_DSRA => self.exec_dsra(d),
+                FUNCT_DSLL32 => self.exec_dsll32(d),
+                FUNCT_DSRL32 => self.exec_dsrl32(d),
+                FUNCT_DSRA32 => self.exec_dsra32(d),
+                _ => self.exec_reserved(d),
+            },
+            OP_REGIMM => match rt as u32 {
+                RT_BLTZ => self.exec_bltz(d),
+                RT_BGEZ => self.exec_bgez(d),
+                RT_BLTZL => self.exec_bltzl_ri(d),
+                RT_BGEZL => self.exec_bgezl_ri(d),
+                RT_TGEI => self.exec_tgei(d),
+                RT_TGEIU => self.exec_tgeiu(d),
+                RT_TLTI => self.exec_tlti(d),
+                RT_TLTIU => self.exec_tltiu(d),
+                RT_TEQI => self.exec_teqi(d),
+                RT_TNEI => self.exec_tnei(d),
+                RT_BLTZAL => self.exec_bltzal(d),
+                RT_BGEZAL => self.exec_bgezal(d),
+                RT_BLTZALL => self.exec_bltzall(d),
+                RT_BGEZALL => self.exec_bgezall(d),
+                _ => self.exec_reserved(d),
+            },
+            #[cfg(feature = "opcodefusion")]
+            OP_J => if d.handler == MipsExecutor::<T,C>::exec_j_nop as Fn<T,C> as usize { self.exec_j_nop(d) } else { self.exec_j(d) },
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_J => self.exec_j(d),
+            #[cfg(feature = "opcodefusion")]
+            OP_JAL => if d.handler == MipsExecutor::<T,C>::exec_jal_nop as Fn<T,C> as usize { self.exec_jal_nop(d) } else { self.exec_jal(d) },
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_JAL => self.exec_jal(d),
+            #[cfg(feature = "opcodefusion")]
+            OP_BEQ => if d.handler == MipsExecutor::<T,C>::exec_beq_nop as Fn<T,C> as usize { self.exec_beq_nop(d) } else { self.exec_beq(d) },
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_BEQ => self.exec_beq(d),
+            #[cfg(feature = "opcodefusion")]
+            OP_BNE => if d.handler == MipsExecutor::<T,C>::exec_bne_nop as Fn<T,C> as usize { self.exec_bne_nop(d) } else { self.exec_bne(d) },
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_BNE => self.exec_bne(d),
+            OP_BLEZ => self.exec_blez(d),
+            OP_BGTZ => self.exec_bgtz(d),
+            OP_BEQL => self.exec_beql(d),
+            OP_BNEL => self.exec_bnel(d),
+            OP_BLEZL => self.exec_blezl(d),
+            OP_BGTZL => self.exec_bgtzl(d),
+            OP_ADDI => self.exec_addi(d),
+            #[cfg(feature = "opcodefusion")]
+            OP_ADDIU => if d.handler == MipsExecutor::<T,C>::exec_addiu_ls as Fn<T,C> as usize { self.exec_addiu_ls(d) } else { self.exec_addiu(d) },
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_ADDIU => self.exec_addiu(d),
+            OP_DADDI => self.exec_daddi(d),
+            OP_DADDIU => self.exec_daddiu(d),
+            OP_SLTI => self.exec_slti(d),
+            OP_SLTIU => self.exec_sltiu(d),
+            OP_ANDI => self.exec_andi(d),
+            OP_ORI => self.exec_ori(d),
+            OP_XORI => self.exec_xori(d),
+            #[cfg(feature = "opcodefusion")]
+            OP_LUI => {
+                if d.handler == MipsExecutor::<T,C>::exec_lui_imm32 as Fn<T,C> as usize {
+                    self.exec_lui_imm32(d)
+                } else if d.handler == MipsExecutor::<T,C>::exec_lui_simm32 as Fn<T,C> as usize {
+                    self.exec_lui_simm32(d)
+                } else {
+                    self.exec_lui(d)
+                }
+            }
+            #[cfg(not(feature = "opcodefusion"))]
+            OP_LUI => self.exec_lui(d),
+            OP_COP0 => self.exec_cop0(d),
+            OP_COP1 => match rs as u32 {
+                RS_MFC1 => self.exec_mfc1(d),
+                RS_DMFC1 => self.exec_dmfc1(d),
+                RS_CFC1 => self.exec_cfc1(d),
+                RS_MTC1 => self.exec_mtc1(d),
+                RS_DMTC1 => self.exec_dmtc1(d),
+                RS_CTC1 => self.exec_ctc1(d),
+                RS_BC1 => self.exec_bc1(d),
+                RS_S => match funct as u32 {
+                    FUNCT_FADD => self.exec_fadd_s(d),
+                    FUNCT_FSUB => self.exec_fsub_s(d),
+                    FUNCT_FMUL => self.exec_fmul_s(d),
+                    FUNCT_FDIV => self.exec_fdiv_s(d),
+                    FUNCT_FSQRT => self.exec_fsqrt_s(d),
+                    FUNCT_FABS => self.exec_fabs_s(d),
+                    FUNCT_FMOV => self.exec_fmov_s(d),
+                    FUNCT_FNEG => self.exec_fneg_s(d),
+                    FUNCT_FROUND_L => self.exec_fround_l_s(d),
+                    FUNCT_FTRUNC_L => self.exec_ftrunc_l_s(d),
+                    FUNCT_FCEIL_L => self.exec_fceil_l_s(d),
+                    FUNCT_FFLOOR_L => self.exec_ffloor_l_s(d),
+                    FUNCT_FROUND_W => self.exec_fround_w_s(d),
+                    FUNCT_FTRUNC_W => self.exec_ftrunc_w_s(d),
+                    FUNCT_FCEIL_W => self.exec_fceil_w_s(d),
+                    FUNCT_FFLOOR_W => self.exec_ffloor_w_s(d),
+                    FUNCT_FMOVCF => if C::MIPS4 { self.exec_fmovcf_s(d) } else { self.exec_reserved(d) },
+                    FUNCT_FMOVZ => if C::MIPS4 { self.exec_fmovz_s(d) } else { self.exec_reserved(d) },
+                    FUNCT_FMOVN => if C::MIPS4 { self.exec_fmovn_s(d) } else { self.exec_reserved(d) },
+                    FUNCT_FRECIP => if C::MIPS4 { self.exec_frecip_s(d) } else { self.exec_reserved(d) },
+                    FUNCT_FRSQRT => if C::MIPS4 { self.exec_frsqrt_s(d) } else { self.exec_reserved(d) },
+                    FUNCT_FCVT_D => self.exec_fcvt_d_s(d),
+                    FUNCT_FCVT_W => self.exec_fcvt_w_s(d),
+                    FUNCT_FCVT_L => self.exec_fcvt_l_s(d),
+                    FUNCT_FC_F ..= FUNCT_FC_NGT => self.exec_fcc_s(d),
+                    _ => self.exec_reserved(d),
+                },
+                RS_D => match funct as u32 {
+                    FUNCT_FADD => self.exec_fadd_d(d),
+                    FUNCT_FSUB => self.exec_fsub_d(d),
+                    FUNCT_FMUL => self.exec_fmul_d(d),
+                    FUNCT_FDIV => self.exec_fdiv_d(d),
+                    FUNCT_FSQRT => self.exec_fsqrt_d(d),
+                    FUNCT_FABS => self.exec_fabs_d(d),
+                    FUNCT_FMOV => self.exec_fmov_d(d),
+                    FUNCT_FNEG => self.exec_fneg_d(d),
+                    FUNCT_FROUND_L => self.exec_fround_l_d(d),
+                    FUNCT_FTRUNC_L => self.exec_ftrunc_l_d(d),
+                    FUNCT_FCEIL_L => self.exec_fceil_l_d(d),
+                    FUNCT_FFLOOR_L => self.exec_ffloor_l_d(d),
+                    FUNCT_FROUND_W => self.exec_fround_w_d(d),
+                    FUNCT_FTRUNC_W => self.exec_ftrunc_w_d(d),
+                    FUNCT_FCEIL_W => self.exec_fceil_w_d(d),
+                    FUNCT_FFLOOR_W => self.exec_ffloor_w_d(d),
+                    FUNCT_FMOVCF => if C::MIPS4 { self.exec_fmovcf_d(d) } else { self.exec_reserved(d) },
+                    FUNCT_FMOVZ => if C::MIPS4 { self.exec_fmovz_d(d) } else { self.exec_reserved(d) },
+                    FUNCT_FMOVN => if C::MIPS4 { self.exec_fmovn_d(d) } else { self.exec_reserved(d) },
+                    FUNCT_FRECIP => if C::MIPS4 { self.exec_frecip_d(d) } else { self.exec_reserved(d) },
+                    FUNCT_FRSQRT => if C::MIPS4 { self.exec_frsqrt_d(d) } else { self.exec_reserved(d) },
+                    FUNCT_FCVT_S => self.exec_fcvt_s_d(d),
+                    FUNCT_FCVT_W => self.exec_fcvt_w_d(d),
+                    FUNCT_FCVT_L => self.exec_fcvt_l_d(d),
+                    FUNCT_FC_F ..= FUNCT_FC_NGT => self.exec_fcc_d(d),
+                    _ => self.exec_reserved(d),
+                },
+                RS_W => match funct as u32 {
+                    FUNCT_FCVT_S => self.exec_fcvt_s_w(d),
+                    FUNCT_FCVT_D => self.exec_fcvt_d_w(d),
+                    _ => self.exec_reserved(d),
+                },
+                RS_L => match funct as u32 {
+                    FUNCT_FCVT_S => self.exec_fcvt_s_l(d),
+                    FUNCT_FCVT_D => self.exec_fcvt_d_l(d),
+                    _ => self.exec_reserved(d),
+                },
+                _ => self.exec_reserved(d),
+            },
+            OP_COP1X => if C::MIPS4 {
+                match funct as u32 {
+                    FUNCT_LWXC1 => self.exec_lwxc1(d),
+                    FUNCT_LDXC1 => self.exec_ldxc1(d),
+                    FUNCT_SWXC1 => self.exec_swxc1(d),
+                    FUNCT_SDXC1 => self.exec_sdxc1(d),
+                    FUNCT_PREFX => self.exec_prefx(d),
+                    FUNCT_MADD_S => self.exec_madd_s(d),
+                    FUNCT_MADD_D => self.exec_madd_d(d),
+                    FUNCT_MSUB_S => self.exec_msub_s(d),
+                    FUNCT_MSUB_D => self.exec_msub_d(d),
+                    FUNCT_NMADD_S => self.exec_nmadd_s(d),
+                    FUNCT_NMADD_D => self.exec_nmadd_d(d),
+                    FUNCT_NMSUB_S => self.exec_nmsub_s(d),
+                    FUNCT_NMSUB_D => self.exec_nmsub_d(d),
+                    _ => self.exec_reserved(d),
+                }
+            } else {
+                self.exec_reserved(d)
+            },
+            OP_LB => self.exec_lb(d),
+            OP_LH => self.exec_lh(d),
+            OP_LWL => self.exec_lwl(d),
+            OP_LW => self.exec_lw(d),
+            OP_LBU => self.exec_lbu(d),
+            OP_LHU => self.exec_lhu(d),
+            OP_LWR => self.exec_lwr(d),
+            OP_LWU => self.exec_lwu(d),
+            OP_SB => self.exec_sb(d),
+            OP_SH => self.exec_sh(d),
+            OP_SWL => self.exec_swl(d),
+            OP_SW => self.exec_sw(d),
+            OP_SDL => self.exec_sdl(d),
+            OP_SDR => self.exec_sdr(d),
+            OP_SWR => self.exec_swr(d),
+            OP_CACHE => self.exec_cache(d),
+            OP_LL => self.exec_ll(d),
+            OP_LWC1 => self.exec_lwc1(d),
+            OP_LDC1 => self.exec_ldc1(d),
+            OP_LDL => self.exec_ldl(d),
+            OP_LDR => self.exec_ldr(d),
+            OP_LD => self.exec_ld(d),
+            OP_SC => self.exec_sc(d),
+            OP_SWC1 => self.exec_swc1(d),
+            OP_SDC1 => self.exec_sdc1(d),
+            OP_SD => self.exec_sd(d),
+            OP_PREF => if C::MIPS4 { self.exec_pref(d) } else { self.exec_reserved(d) },
+            OP_LLD => self.exec_lld(d),
+            OP_SCD => self.exec_scd(d),
+            _ => self.exec_reserved(d),
+        }
     }
 
     /// Fetch, decode, and dispatch exactly one instruction at `core.pc`
@@ -9179,9 +9459,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // codegen instructions, never for this path.
         #[cfg(not(feature = "lightning"))]
         self.traceback.push(pc, d.raw, InstrOrigin::FallbackWord);
-        type Fn<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let f: Fn<T, C> = unsafe { std::mem::transmute(d.handler) };
-        let status = f(self, d);
+        let status = self.dispatch_instr(d);
         // jitv2_lockstep: a fallback runs the interpreter here, whose
         // read_data/write_data may set core.lockstep_mem. That capture is the
         // fallback's own committed access — it must NOT survive to be compared
@@ -9294,9 +9572,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         self.ins.flags = FLAG_NOT_DECODED;
         decode_into::<T, C>(&mut self.ins);
         let d: *const DecodedInstr = &self.ins;
-        type Fn2<T, C> = fn(&mut MipsExecutor<T, C>, &DecodedInstr) -> ExecStatus;
-        let handler: Fn2<T, C> = unsafe { std::mem::transmute((*d).handler) };
-        let interp_status = handler(self, unsafe { &*d });
+        let interp_status = self.dispatch_instr(unsafe { &*d });
         let interp = LockstepSnapshot::capture(&self.core);
         let delay_target_after = self.core.delay_slot_target;
 

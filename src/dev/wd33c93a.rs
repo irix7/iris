@@ -2198,7 +2198,10 @@ impl Wd33c93aState {
                     // may not be active yet. Spin up to 100ms to let the CPU thread arm it.
                     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                     while st.not_active() && std::time::Instant::now() < deadline {
-                        std::thread::yield_now();
+                        // Bounded sleep instead of yield_now(): yield busy-waits under
+                        // the `state` lock and can starve the CPU thread that arms the
+                        // channel. A short sleep lets the CPU thread run.
+                        std::thread::sleep(std::time::Duration::from_micros(50));
                         (st, _) = dma_dev.write(data[i] as u32, is_last);
                     }
                     if st.not_active() {
@@ -2276,7 +2279,9 @@ impl Wd33c93aState {
                                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
                                 let mut got = false;
                                 while std::time::Instant::now() < deadline {
-                                    std::thread::yield_now();
+                                    // Bounded sleep instead of yield_now(): see
+                                    // send_data_chunked's arm-spin comment.
+                                    std::thread::sleep(std::time::Duration::from_micros(50));
                                     if let Some((val, st, _)) = dma_dev.read() {
                                         data.push(val as u8);
                                         self.decrement_transfer_count();

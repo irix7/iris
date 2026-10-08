@@ -632,11 +632,15 @@ impl Device for Seeq8003 {
             let mut tx_prod = tx_prod;
             let mut rx_cons = rx_cons;
             while running_enet.load(Ordering::Relaxed) {
-                // Wait for an RX frame from NAT, or 1ms timeout to poll TX DMA
+                // Wait for an RX frame from NAT, bounded by a short backstop.
+                // Producers signal this condvar (kick_tx/kick_rx/NAT enqueue_rx),
+                // so the wait is event-driven; the 50ms timeout is only a backstop
+                // against a missed wakeup (and keeps the old 1ms poll from pinning
+                // this thread at ~1000 wakeups/s while idle).
                 {
                     let (lock, cvar) = &*rx_wake_enet;
                     let mut guard = lock.lock();
-                    let _ = cvar.wait_for(&mut guard, Duration::from_millis(1));
+                    let _ = cvar.wait_for(&mut guard, Duration::from_millis(50));
                 }
 
                 // Snapshot rx_cmd and station_addr for address filtering outside state lock.
@@ -669,6 +673,14 @@ impl Device for Seeq8003 {
                     }
                     r
                 } else { RxPumpResult::Nothing };
+
+                // Idle fast-path: nothing was pumped and nothing was delivered, so
+                // there is no writeback/status/interrupt to apply. Skip the second
+                // SeeqState lock acquisition and loop straight back to the wait.
+                if matches!(tx_result, TxPumpResult::Nothing)
+                    && matches!(rx_result, RxPumpResult::Nothing) {
+                    continue;
+                }
 
                 // Now take SeeqState lock once to apply all results atomically.
                 let mut st = lock_state!(state_enet);

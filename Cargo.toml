@@ -234,6 +234,7 @@ hostgl = ["hostcall", "dep:iris-hostgl"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
+mimalloc = "0.1"
 env_logger = "0.11"
 winit = "0.30"
 glutin = "0.32"
@@ -330,6 +331,13 @@ codegen-units = 1
 inherits = "release"
 debug = 2
 strip = false
+
+# PGO: build with `cargo build --profile release-pgo` after instrumenting via
+# cargo-pgo (see rules/build/allocator-pgo-native-defaults.md). Inherits release;
+# debug=0 because PGO training/profile builds don't need line tables.
+[profile.release-pgo]
+inherits = "release"
+debug = 0
 
 [[bin]]
 name = "iris"

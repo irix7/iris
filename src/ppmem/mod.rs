@@ -14,4 +14,7 @@ pub mod map;
 pub mod ppmem;
 
 pub use map::{align_up, granularity, is_aligned, AddrSpace, Prot, SharedMem};
-pub use ppmem::{MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT, WINDOW_SIZE};
+pub use ppmem::{
+    swap_word_halves, swap_word_halves_store, MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT,
+    WINDOW_SIZE,
+};

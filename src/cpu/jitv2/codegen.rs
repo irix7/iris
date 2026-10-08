@@ -2580,27 +2580,28 @@ impl Codegen {
 fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_offset: WordOffset) {
     let mem = MemFlagsData::trusted();
 
-    // Genuine atomic load, not a plain `load`: on an aligned, naturally-atomic
-    // width (u64, 8-byte aligned) these compile to the identical single load
-    // instruction on x86_64/aarch64 at the hardware level, but a plain
-    // Cranelift `load` carries none of Rust/LLVM-style atomics' *compiler*
-    // reordering guarantees — under opt_level=none (this codegen's default)
-    // that distinction was moot (no reordering optimization passes run to
-    // exploit it), but `Codegen::set_opt_level_speed`'s `speed` mode runs
-    // real optimization passes that are legally free to hoist, sink, or
-    // otherwise reorder a plain load across other memory operations in this
-    // region — which a pending-interrupt check must never allow (it needs to
-    // observe interrupts.store()'s effect promptly, not some stale
-    // hoisted-to-entry snapshot). `atomic_load` is specified as sequentially
-    // consistent (stronger than the interpreter's own Ordering::Relaxed
-    // load, which is a safe direction to differ in — this instruction still
-    // observes everything a Relaxed load would, just with the reordering
-    // freedom taken away). `atomic_load`'s format takes a bare pointer, not
-    // an (Offset32) field access like the plain `load` this replaced — the
-    // interrupts field's offset has to be folded into the pointer explicitly
-    // first via `iadd_imm_s`.
-    let interrupts_ptr = ctx.builder.ins().iadd_imm_s(ctx.core_ptr, core_offset_of_interrupts() as i64);
-    let pending = ctx.builder.ins().atomic_load(ir::types::I64, mem, interrupts_ptr);
+    // Plain (non-atomic) load of `core.hot.interrupts`, matching the
+    // interpreter's own `Ordering::Relaxed` read of the same word. Cranelift
+    // 0.134 has no relaxed atomic: `atomic_load` is hard-coded SeqCst
+    // (wasmtime#7722/#12679), and a SeqCst atomic is a full alias-analysis
+    // barrier that stops `opt_level=speed` from forwarding GPR stores to the
+    // next instruction's loads of the same register — the one real lever this
+    // preamble holds over emitted-code quality (see
+    // rules/jitv2/weaken-the-interrupt-load-not-the-frequency.md).
+    //
+    // A plain load is correct here, with no fence needed:
+    // - `MemFlagsData::trusted()` sets aligned|notrap but NOT
+    //   `readonly`/`can_move`, so the load is not "pure" and Cranelift's egraph
+    //   LICM will not hoist it out of the region (the original hoisting
+    //   concern); it is excluded from GVN merge, and with no AliasRegion it
+    //   may-alias the core-struct stores so it cannot sink past them either.
+    // - An aligned 8-byte load is naturally atomic on x86-64 and aarch64, so a
+    //   plain load cannot tear a value written by `interrupts.store(Relaxed)`.
+    // The flag is a single-writer, polled word needing only eventual visibility:
+    // relaxed semantics are exactly right, and on x86 this emits the same `mov`
+    // as the SeqCst `atomic_load` did (dropping `ldar`→`ldr` on aarch64).
+    let interrupts_off = ir::immediates::Offset32::new(core_offset_of_interrupts());
+    let pending = ctx.builder.ins().load(ir::types::I64, mem, ctx.core_ptr, interrupts_off);
     let zero = ctx.builder.ins().iconst(ir::types::I64, 0);
     let has_pending = ctx.builder.ins().icmp(IntCC::NotEqual, pending, zero);
 

@@ -708,7 +708,9 @@ pub struct Jitv2Config {
     pub cache_dir: String,
 }
 
-fn default_jitv2_threads() -> usize { 1 }
+fn default_jitv2_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get().clamp(1, 4)).unwrap_or(1)
+}
 
 impl Default for Jitv2Config {
     fn default() -> Self {

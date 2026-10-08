@@ -1497,7 +1497,6 @@ impl MipsCore {
         // GPR with the PC that did it. One cached bool and a compare against a
         // register number already in hand; unarmed it is a predictable branch.
         #[cfg(debug_assertions)]
-        let _ = ();
         {
             static WATCH: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
             let watch = *WATCH.get_or_init(|| {

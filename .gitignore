@@ -29,3 +29,8 @@ bench/build/
 jitv2_corpus/
 *.pcp
 pcp_dump_pfn_*.bin
+
+# flake.lock is machine-specific here: this devshell resolves nixpkgs via the
+# local registry (flake:nixpkgs). Pin flake.nix's input to a revision if you
+# want a portable lock.
+flake.lock

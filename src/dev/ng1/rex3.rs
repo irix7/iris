@@ -3117,15 +3117,9 @@ impl Rex3 {
                 }
             }
 
-            // Timing & VBLANK
-            let elapsed = start.elapsed();
-            if elapsed < frame_duration {
-                thread::sleep(frame_duration - elapsed);
-            }
-
-            // Sleep out the remainder of the frame. VBLANK stays asserted until
-            // the CPU reads STATUS, which clears STATUS_VRINT and deasserts the
-            // interrupt line (matching MAME newport behaviour).
+            // Timing & VBLANK. VBLANK stays asserted until the CPU reads
+            // STATUS, which clears STATUS_VRINT and deasserts the interrupt
+            // line (matching MAME newport behaviour).
             let elapsed = start.elapsed();
             if elapsed < frame_duration {
                 thread::sleep(frame_duration - elapsed);

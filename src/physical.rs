@@ -998,6 +998,11 @@ impl Device for Physical {
 impl BusDevice for Physical {
     #[inline(always)]
     fn read8(&self, addr: u32) -> BusRead8 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            let v = unsafe { *self.ppmem_base.add(off ^ 3) };
+            return BusRead8::ok(v);
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read8(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -1010,6 +1015,13 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write8(&self, addr: u32, val: u8) -> u32 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            unsafe { *self.ppmem_base.add(off ^ 3) = val };
+            #[cfg(feature = "jitv2")]
+            self.ppmem_bump_gen_range(addr, 1);
+            return BUS_OK;
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write8(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -1019,6 +1031,11 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read16(&self, addr: u32) -> BusRead16 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            let v = unsafe { *((self.ppmem_base as *const u16).add((off >> 1) ^ 1)) };
+            return BusRead16::ok(v);
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read16(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -1031,6 +1048,13 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write16(&self, addr: u32, val: u16) -> u32 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            unsafe { *((self.ppmem_base as *mut u16).add((off >> 1) ^ 1)) = val };
+            #[cfg(feature = "jitv2")]
+            self.ppmem_bump_gen_range(addr, 1);
+            return BUS_OK;
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write16(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -1040,6 +1064,11 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read32(&self, addr: u32) -> BusRead32 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            let v = unsafe { *(self.ppmem_base.add(off) as *const u32) };
+            return BusRead32::ok(v);
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read32(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -1052,6 +1081,13 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            unsafe { *(self.ppmem_base.add(off) as *mut u32) = val };
+            #[cfg(feature = "jitv2")]
+            self.ppmem_bump_gen_range(addr, 1);
+            return BUS_OK;
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write32(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -1061,6 +1097,11 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read64(&self, addr: u32) -> BusRead64 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            let v = unsafe { (*(self.ppmem_base.add(off) as *const u64)).rotate_left(32) };
+            return BusRead64::ok(v);
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let r = unsafe { (*device_ptr).read64(addr) };
         #[cfg(not(feature = "lightning"))]
@@ -1073,6 +1114,13 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        if self.ppmem_ptr(addr).is_some() {
+            let off = addr as usize;
+            unsafe { *(self.ppmem_base.add(off) as *mut u64) = val.rotate_left(32) };
+            #[cfg(feature = "jitv2")]
+            self.ppmem_bump_gen_range(addr, 1);
+            return BUS_OK;
+        }
         let device_ptr = self.device_map[(addr >> 16) as usize];
         let ws = unsafe { (*device_ptr).write64(addr, val) };
         #[cfg(not(feature = "lightning"))]
@@ -1155,10 +1203,9 @@ impl BusDevice for Physical {
             // Same layout as PpMemory::read_block — storage keeps qwords
             // rotate_left(32).
             unsafe {
-                for (i, slot) in buf.iter_mut().enumerate() {
-                    *slot = (*p.add(i)).rotate_left(32);
-                }
+                std::ptr::copy_nonoverlapping(p as *const u64, buf.as_mut_ptr(), buf.len());
             }
+            crate::ppmem::swap_word_halves(buf);
             return BUS_OK;
         }
         let device_ptr = self.device_map[(addr >> 16) as usize];
@@ -1168,11 +1215,7 @@ impl BusDevice for Physical {
     #[inline]
     fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
         if let Some(p) = self.ppmem_ptr(addr) {
-            unsafe {
-                for (i, &val) in buf.iter().enumerate() {
-                    *p.add(i) = val.rotate_left(32);
-                }
-            }
+            crate::ppmem::swap_word_halves_store(buf, p);
             // The gen bump still has to happen: a cache writeback mutates RAM
             // under any compiled artifact for those pages.
             #[cfg(feature = "jitv2")]

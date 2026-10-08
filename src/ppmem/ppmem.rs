@@ -172,6 +172,10 @@ pub struct PpMemory {
     /// Kept for interface compatibility with `Memory::set_addr_mask`. Under
     /// ppmem the *mapping* enforces mirroring for window accesses, but this
     /// still masks accesses arriving through the bus, so the two paths agree.
+    /// Atomic (Relaxed): `remap_banks` writes it on the CPU thread while device
+    /// threads (MC-DMA, seeq, VINO) read it through the bus path, and a plain
+    /// `u64` there is a data race. Relaxed is byte-identical to a plain load on
+    /// x86/aarch64, so the atomic costs nothing.
     addr_mask: AtomicU64,
     /// Its own private mapping, kept alive for `base`'s lifetime.
     _own: AddrSpace,
@@ -379,6 +383,71 @@ impl PpMemory {
     }
 }
 
+/// Swap the two 32-bit halves of every `u64` in `words`, in place.
+///
+/// Guest RAM stores each qword `rotate_left(32)` (word-swapped; endianness
+/// lives only at The Edge). Bulk copies need this on every word; expressed as
+/// a dword shuffle it lowers to `vpshufd`/`REV64.32` rather than three ALU ops
+/// per vector. The operation is an involution, so one routine serves both fill
+/// (swap after load) and writeback (swap before store).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn swap_word_halves_avx2(words: &mut [u64]) {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    while i + 4 <= words.len() {
+        let v = _mm256_loadu_si256(words.as_ptr().add(i) as *const _);
+        let s = _mm256_shuffle_epi32(v, 0b1011_0001);
+        _mm256_storeu_si256(words.as_mut_ptr().add(i) as *mut _, s);
+        i += 4;
+    }
+    for w in &mut words[i..] {
+        *w = w.rotate_left(32);
+    }
+}
+
+pub fn swap_word_halves(words: &mut [u64]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { swap_word_halves_avx2(words) };
+        return;
+    }
+    for w in words {
+        *w = w.rotate_left(32);
+    }
+}
+
+/// Swap the two 32-bit halves of every `u64` in `src` while copying into `dst`
+/// (the write-back direction, where `src` is immutable so `swap_word_halves`
+/// cannot run in place without a heap copy). `dst` must have room for
+/// `src.len()` u64s. Same dword-shuffle lowering as `swap_word_halves`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn swap_word_halves_store_avx2(src: &[u64], dst: *mut u64) {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    while i + 4 <= src.len() {
+        let v = _mm256_loadu_si256(src.as_ptr().add(i) as *const _);
+        let s = _mm256_shuffle_epi32(v, 0b1011_0001);
+        _mm256_storeu_si256(dst.add(i) as *mut _, s);
+        i += 4;
+    }
+    for j in i..src.len() {
+        *dst.add(j) = src[j].rotate_left(32);
+    }
+}
+
+pub fn swap_word_halves_store(src: &[u64], dst: *mut u64) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { swap_word_halves_store_avx2(src, dst) };
+        return;
+    }
+    for (j, &w) in src.iter().enumerate() {
+        unsafe { *dst.add(j) = w.rotate_left(32); }
+    }
+}
+
 impl Resettable for PpMemory {
     fn power_on(&self) {
         // Hole-punching frees the physical pages and zeroes every mapping of
@@ -480,10 +549,9 @@ impl BusDevice for PpMemory {
         unsafe {
             let p = self.base as *const u64;
             let off = self.off(addr) >> 3;
-            for (i, slot) in buf.iter_mut().enumerate() {
-                *slot = (*p.add(off + i)).rotate_left(32);
-            }
+            std::ptr::copy_nonoverlapping(p.add(off), buf.as_mut_ptr(), buf.len());
         }
+        swap_word_halves(buf);
         BUS_OK
     }
 
@@ -492,9 +560,7 @@ impl BusDevice for PpMemory {
         unsafe {
             let p = self.base as *mut u64;
             let off = self.off(addr) >> 3;
-            for (i, &val) in buf.iter().enumerate() {
-                *p.add(off + i) = val.rotate_left(32);
-            }
+            swap_word_halves_store(buf, p.add(off));
         }
         // Per-page write cursor: bump once per page touched, not per qword
         // (jit-v2-design.md §7.2).

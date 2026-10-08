@@ -71,6 +71,12 @@ compile_error!(
      cache (`--cpu r5000`) is unaffected."
 );
 
+// Faster multithreaded allocator (see rules/build/allocator-pgo-native-defaults.md).
+// A/B time AND RSS before shipping a default build; revert to system allocator
+// (delete this) if memory regresses.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
 /// surface "rebuild with ..." hints without duplicating the cargo feature set.
 pub mod build_features {

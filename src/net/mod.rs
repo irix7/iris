@@ -766,6 +766,10 @@ pub struct NatControl {
     pub debug_udp:  AtomicBool,
     pub debug_icmp: AtomicBool,
     pub snapshot:   Mutex<NatSnapshot>,
+    /// Set true whenever the NAT tables change; the NAT thread clears it after
+    /// rebuilding `snapshot`. Gates the (otherwise per-iteration) snapshot build
+    /// so it only runs when there is new state to report.
+    pub snapshot_dirty: AtomicBool,
     /// Set to true to flush all NAT tables on the next NatEngine loop iteration.
     /// The NAT thread clears the flag after flushing.
     pub reset_nat:  AtomicBool,
@@ -825,6 +829,7 @@ impl NatControl {
             debug_udp:  AtomicBool::new(false),
             debug_icmp: AtomicBool::new(false),
             snapshot:   Mutex::new(NatSnapshot::default()),
+            snapshot_dirty: AtomicBool::new(true),
             reset_nat:  AtomicBool::new(false),
             guest_frames: AtomicU64::new(0),
             routed: AtomicBool::new(false),
@@ -1468,12 +1473,20 @@ impl NatEngine {
 
     pub fn run(&mut self) {
         while self.running.load(Ordering::Relaxed) {
-            // Wait for new TX frames from the enet thread, or timeout to poll sockets.
-            // Timeout of 10ms is enough for UDP/TCP response polling.
+            // Wait for new TX frames from the enet thread, bounded by a short
+            // timeout that doubles as the host-socket poll cadence. Guest TX
+            // signals tx_wake, but host->guest data (ICMP replies, incoming
+            // port-forwards, one-shot UDP, idle TCP push) is only seen by
+            // polling the host sockets, which this thread does on every wake —
+            // there is no epoll/select over those fds yet. A seconds-scale
+            // timeout would add that many seconds of host->guest latency; 50 ms
+            // bounds it while costing ~20 empty-table wakeups/s at idle. The
+            // proper fix folds the host fds into a poll(2)/mio wait (see
+            // rules/perf/nat-and-enet-threads-poll-at-1ms.md).
             {
                 let (lock, cvar) = &*self.tx_wake;
                 let mut guard = lock.lock();
-                let _ = cvar.wait_for(&mut guard, Duration::from_millis(1));
+                let _ = cvar.wait_for(&mut guard, Duration::from_millis(50));
             }
 
             // Machine reset: flush all NAT tables, close all host sockets.
@@ -1486,6 +1499,7 @@ impl NatEngine {
                 self.xdmcp_sessions.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
                 self.ctl.routed.store(false, Ordering::Relaxed); // re-arm plug-and-play adoption
+                self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
             }
 
             // Live subnet change requested by an embedder: swap the gateway /
@@ -1504,6 +1518,7 @@ impl NatEngine {
                 self.tcp_fwd_pending.clear();
                 self.tcp_fwd_listeners.truncate(self.fwd_static_count); // drop transient FTP data forwards
                 self.ctl.routed.store(false, Ordering::Relaxed); // re-arm adoption onto the new subnet
+                self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
             }
 
             // Live port-forward reconfigure: rebind the static listeners.
@@ -1548,7 +1563,11 @@ impl NatEngine {
             self.poll_tcp_fwd_listeners();
             self.poll_udp_fwd_listeners();
             self.poll_tftp();
-            self.update_snapshot();
+            // Rebuild the status snapshot lazily: only when the tables changed since
+            // the last build (set by process()/the poll paths), not every iteration.
+            if self.ctl.snapshot_dirty.swap(false, Ordering::AcqRel) {
+                self.update_snapshot();
+            }
         }
     }
 
@@ -1594,6 +1613,9 @@ impl NatEngine {
 
     fn process(&mut self, frame: &[u8]) {
         if frame.len() < 14 { return; }
+        // A guest frame is about to (potentially) mutate the NAT tables; mark the
+        // snapshot dirty so the next lazy rebuild reflects it.
+        self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
         let src_mac: [u8; 6] = frame[6..12].try_into().unwrap();
         // Learn guest MAC from any outbound frame.
         if self.guest_mac.is_none() {
@@ -1844,7 +1866,10 @@ impl NatEngine {
                 replies.push((icmp, outer_src_u32, key));
             }
         }
-        for k in expired { self.icmp_nat.remove(&k); }
+        for k in &expired { self.icmp_nat.remove(k); }
+        if !expired.is_empty() || !replies.is_empty() {
+            self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
+        }
         for (mut icmp, outer_src_u32, key) in replies {
             if icmp.len() < 8 { continue; }
             let (dst_ip_u32, ident) = key;
@@ -2335,7 +2360,10 @@ impl NatEngine {
                 responses.push((buf[..n].to_vec(), key));
             }
         }
-        for k in expired { self.udp_nat.remove(&k); }
+        for k in &expired { self.udp_nat.remove(k); }
+        if !expired.is_empty() || !responses.is_empty() {
+            self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
+        }
         for (data, key) in responses {
             let (dst_ip_u32, dst_port, client_port) = key;
             if let Some(entry) = self.udp_nat.get(&key) {
@@ -2647,6 +2675,7 @@ impl NatEngine {
 
     fn poll_tcp(&mut self) {
         let mut expired  = Vec::new();   // timed out — just remove
+        let mut read_any = false;        // host → guest data read this pass
 
         for (&key, entry) in &mut self.tcp_nat {
             let timeout = if entry.fin_wait { Duration::from_secs(10) }
@@ -2713,6 +2742,7 @@ impl NatEngine {
                         entry.server_fin = true; break;
                     }
                     Ok(n) => {
+                        read_any = true;
                         let seq = entry.server_seq;
                         entry.server_seq = seq.wrapping_add(n as u32);
                         dlog_dev!(LogModule::Net, "NAT TCP poll_tcp PUSH {}:{} → {}:{} seq={} ack={} len={} win_rem={}",
@@ -2730,7 +2760,7 @@ impl NatEngine {
                 }
             }
         }
-        for k in expired { self.tcp_nat.remove(&k); }
+        for k in &expired { self.tcp_nat.remove(k); }
         // Expire old TIME_WAIT entries (4 seconds is plenty for a LAN).
         self.tcp_tw.retain(|_, t| t.elapsed() < Duration::from_secs(4));
         // Send our FIN to IRIX for connections where the server closed.
@@ -2761,9 +2791,12 @@ impl NatEngine {
                 closed.push(k);
             }
         }
-        for k in closed {
-            self.tcp_nat.remove(&k);
-            self.tcp_tw.insert(k, Instant::now());
+        for k in &closed {
+            self.tcp_nat.remove(k);
+            self.tcp_tw.insert(*k, Instant::now());
+        }
+        if !expired.is_empty() || !closed.is_empty() || read_any {
+            self.ctl.snapshot_dirty.store(true, Ordering::Relaxed);
         }
     }
 
