@@ -54,6 +54,12 @@ on:
     paths: *suite_paths
   workflow_dispatch:
 
+# The report job records results back to data/ and regenerates the README
+# graphs, so it needs to push. `[skip ci]` on that commit prevents a loop:
+# data/ and README.md are outside this workflow's push paths, but not rust.yml's.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -400,3 +406,29 @@ jobs:
           name: bench-report
           path: bench/build/report.md
           if-no-files-found: ignore
+
+      # Record this run into data/bench_history.json and regenerate the README
+      # benchmark section + SVG. Only on main pushes — PR runs must not write
+      # history. The commit is `[skip ci]` so the resulting data/README commit
+      # doesn't re-trigger rust.yml.
+      - name: Record and regenerate benchmark history
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          RUN_TITLE: ${{ github.event.head_commit.message }}
+        run: |
+          if [ ! -f bench/build/report.md ]; then echo "no report to record"; exit 0; fi
+          python3 tools/bench_history.py collect \
+            --report bench/build/report.md \
+            --source "irix7/iris" \
+            --commit "${{ github.sha }}" \
+            --ref "${{ github.ref_name }}" \
+            --date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --title "$RUN_TITLE"
+          python3 tools/bench_graphs.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/bench_history.json data/bench_cells.svg data/bench_history.md README.md
+          if git diff --cached --quiet; then echo "no changes to record"; exit 0; fi
+          git commit -m "bench: record CI results and regenerate graphs [skip ci]"
+          git push

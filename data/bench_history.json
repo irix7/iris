@@ -1,0 +1,598 @@
+{
+  "entries": [
+    {
+      "source": "techomancer/iris",
+      "commit": "052951752390bac6ac167fd4aad9e66d9618e5f2",
+      "ref": "main",
+      "date": "2026-10-02T11:02:06Z",
+      "title": "Fix Node.js related ci warnings 2",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 61.6,
+          "dmips": 89.4,
+          "whet": 3402.0,
+          "linpack": 10.47
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 459.8,
+          "dmips": 501.6,
+          "whet": 1263.0,
+          "linpack": 30.88
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 52.8,
+          "dmips": 70.6,
+          "whet": 2695.0,
+          "linpack": 8.97
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 405.1,
+          "dmips": 351.5,
+          "whet": 968.0,
+          "linpack": 27.02
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "e0f0e664554bdcd222532446c0e3c50d9c6b172f",
+      "ref": "main",
+      "date": "2026-10-02T09:13:53Z",
+      "title": "Fix Node.js version releated ci warnings",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 62.3,
+          "dmips": 92.0,
+          "whet": 3546.0,
+          "linpack": 10.83
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 436.5,
+          "dmips": 247.2,
+          "whet": 1153.0,
+          "linpack": 49.14
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 52.4,
+          "dmips": 69.8,
+          "whet": 2833.0,
+          "linpack": 8.87
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 354.7,
+          "dmips": 349.7,
+          "whet": 984.0,
+          "linpack": 49.01
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "320c38aa44013336a53cbb828674702e552afdd9",
+      "ref": "main",
+      "date": "2026-10-02T05:27:38Z",
+      "title": "fix ci test expectations",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 9V74 80-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 79.0,
+          "dmips": 117.2,
+          "whet": 4428.0,
+          "linpack": 14.38
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 456.2,
+          "dmips": 506.1,
+          "whet": 2193.0,
+          "linpack": 48.32
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 69.3,
+          "dmips": 92.8,
+          "whet": 4075.0,
+          "linpack": 12.37
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 363.6,
+          "dmips": 342.2,
+          "whet": 944.0,
+          "linpack": 31.79
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "71790bd95f8b99be35a74aa7cbcb3507405f289f",
+      "ref": "main",
+      "date": "2026-10-02T02:53:28Z",
+      "title": "jitv2: move the persistent code cache toggle into [jitv2] config",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 61.4,
+          "dmips": 87.6,
+          "whet": 3410.0,
+          "linpack": 10.39
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 779.1,
+          "dmips": 895.4,
+          "whet": 1791.0,
+          "linpack": 39.93
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 113.2,
+          "dmips": 148.0,
+          "whet": 6397.0,
+          "linpack": 17.92
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 423.8,
+          "dmips": 387.9,
+          "whet": 976.0,
+          "linpack": 48.79
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "0f5c65c9fe8ec4f34e49aa7bb3003b8c3d4bf490",
+      "ref": "main",
+      "date": "2026-10-01T02:19:53Z",
+      "title": "bench: refresh prebuilt provenance stamp",
+      "host": {
+        "raw": "linux x86_64 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz / 4 cores",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 68.7,
+          "dmips": 95.2,
+          "whet": 3781.0,
+          "linpack": 11.24
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 637.1,
+          "dmips": 901.7,
+          "whet": 2902.0,
+          "linpack": 70.43
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 52.7,
+          "dmips": 67.8,
+          "whet": 2872.0,
+          "linpack": 8.88
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 505.6,
+          "dmips": 308.6,
+          "whet": 1031.0,
+          "linpack": 25.42
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "837b048e5bfbcade27e409d4d14ac0c1d7f84698",
+      "ref": "main",
+      "date": "2026-09-30T08:43:27Z",
+      "title": "monitor: inject mouse input; status bar: count the kernel's clock ticks",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 63.0,
+          "dmips": 91.4,
+          "whet": 3578.0,
+          "linpack": 11.12
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 430.0,
+          "dmips": 364.5,
+          "whet": 1154.0,
+          "linpack": 55.74
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 69.0,
+          "dmips": 93.8,
+          "whet": 3745.0,
+          "linpack": 12.43
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 455.1,
+          "dmips": 240.1,
+          "whet": 1809.0,
+          "linpack": 38.9
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "a09186a6e4237db08fbda05fc968d6392a54cd1f",
+      "ref": "main",
+      "date": "2026-09-30T03:12:26Z",
+      "title": "mips: MTC0 moves the whole register into a 64-bit CP0 register",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 9V74 80-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 83.5,
+          "dmips": 122.5,
+          "whet": 4964.0,
+          "linpack": 16.04
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 1190.8,
+          "dmips": 1325.2,
+          "whet": 13789.0,
+          "linpack": 107.44
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 110.3,
+          "dmips": 146.5,
+          "whet": 6081.0,
+          "linpack": 16.81
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 387.7,
+          "dmips": 390.9,
+          "whet": 909.0,
+          "linpack": 31.19
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "da4223abe01922de5c94a0237ae68bd5231c40b4",
+      "ref": "main",
+      "date": "2026-09-30T02:20:49Z",
+      "title": "mips: a Compare parked far away is not a missed deadline",
+      "host": {
+        "raw": "linux x86_64 / Intel(R) Xeon(R) 6973P-C / 4 cores",
+        "cpu": "Intel(R) Xeon(R) 6973P-C",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 119.6,
+          "dmips": 150.7,
+          "whet": 6726.0,
+          "linpack": 19.33
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 405.0,
+          "dmips": 376.4,
+          "whet": 2174.0,
+          "linpack": 47.68
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 51.5,
+          "dmips": 70.6,
+          "whet": 1672.0,
+          "linpack": 8.96
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 1062.6,
+          "dmips": 715.6,
+          "whet": 2450.0,
+          "linpack": 52.58
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "b7d2a18bd81aeafb61382d505189a3af1f0d7fc0",
+      "ref": "main",
+      "date": "2026-09-30T01:49:47Z",
+      "title": "mips: derive XContext's field layout from the CPU's virtual address w\u2026",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 9V74 80-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 81.5,
+          "dmips": 118.2,
+          "whet": 4797.0,
+          "linpack": 15.38
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 50.7,
+          "dmips": 90.2,
+          "whet": 1706.0,
+          "linpack": 10.51
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 51.7,
+          "dmips": 67.9,
+          "whet": 2835.0,
+          "linpack": 8.8
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 30.1,
+          "dmips": 50.0,
+          "whet": 962.0,
+          "linpack": 5.33
+        }
+      ]
+    },
+    {
+      "source": "techomancer/iris",
+      "commit": "70a5e39493339358bcc551f915c52a30be7bb1ae",
+      "ref": "main",
+      "date": "2026-09-30T01:47:10Z",
+      "title": "cache: Index_Store_Tag must not write the line back",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 63.5,
+          "dmips": 92.4,
+          "whet": 3271.0,
+          "linpack": 11.25
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 48.7,
+          "dmips": 91.2,
+          "whet": 2936.0,
+          "linpack": 10.25
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "r5k mips4 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 51.4,
+          "dmips": 71.0,
+          "whet": 2840.0,
+          "linpack": 9.0
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "r5k mips4 jitv2 tlbvmap",
+          "accuracy": 100.0,
+          "mips": 31.7,
+          "dmips": 55.4,
+          "whet": 1080.0,
+          "linpack": 3.78
+        }
+      ]
+    },
+    {
+      "source": "irix7/iris",
+      "commit": "ee8cddb6df138e95e6f9dbd4542bbaf130f89115",
+      "ref": "main",
+      "date": "2026-10-08T02:04:25Z",
+      "title": "fork: perf deep-dive (dispatch, ppmem, device idle, bulk DMA, NAT poll, WAIT park)",
+      "host": {
+        "raw": "linux x86_64 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz / 4 cores",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 65.8,
+          "dmips": 90.5,
+          "whet": 3288.0,
+          "linpack": 10.9
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 1057.6,
+          "dmips": 913.8,
+          "whet": 21799.0,
+          "linpack": 94.23
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 49.6,
+          "dmips": 68.5,
+          "whet": 2865.0,
+          "linpack": 9.1
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 496.0,
+          "dmips": 340.3,
+          "whet": 895.0,
+          "linpack": 25.9
+        }
+      ]
+    }
+  ]
+}

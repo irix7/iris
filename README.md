@@ -271,3 +271,24 @@ Dominik Behr and contributors
 
 We have no problems with LLM generated code. In fact most of IRIS is made with LLMs.
 But that doesn't mean we don't do proper software engineering. So lets keep PRs small and reasonable to review. One issue/fix per PR, preferably in one commit, since LLM code churn doesn't help with clarity. Lets keep this bisectable too.
+
+<!-- BENCHMARKS -->
+
+## Benchmarks
+
+The latest benchmark run on an Intel Xeon Platinum 8370C demonstrates a substantial performance gain from using the JIT compiler over the interpreter, with the r4400-jitv2 configuration achieving 1057.6 MIPS and 913.8 DMIPS compared to just 65.8 MIPS and 90.5 DMIPS for the r4400-interp. Similarly, the r5000-jitv2 implementation delivers 496.0 MIPS and 340.3 DMIPS, significantly outpacing the r5000-interp's 49.6 MIPS and 68.5 DMIPS. These results, which all report a 100.0% completion rate, are part of a total of 11 recorded runs for the SGI Indy emulator.
+
+![latest benchmark cells](data/bench_cells.svg)
+
+Latest run's four cells:
+
+| cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
+|---|---|---:|---:|---:|---:|
+| `r4400-interp` | R4400 | 100.0% | 65.8 | 90.5 | 10.9 |
+| `r4400-jitv2` | R4400 | 100.0% | 1057.6 | 913.8 | 94.2 |
+| `r5000-interp` | R5000 | 100.0% | 49.6 | 68.5 | 9.1 |
+| `r5000-jitv2` | R5000 | 100.0% | 496.0 | 340.3 | 25.9 |
+
+Full history: [data/bench_history.md](data/bench_history.md) (11 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+
+<!-- BENCHMARKS -->
