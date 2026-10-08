@@ -1101,23 +1101,41 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
 }
 
 impl Saveable for Z85c30 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("scc", 1)
+                .field(
+                    "ch_a",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("ch_a".into(), channel_to_toml(&self.channel_a.0.lock())); },
+                    |v| {
+                        channel_from_toml(v, &mut self.channel_a.0.lock());
+                        self.channel_a.1.notify_all();
+                        Ok(())
+                    },
+                )
+                .field(
+                    "ch_b",
+                    FieldKind::Table,
+                    1,
+                    |t| { t.insert("ch_b".into(), channel_to_toml(&self.channel_b.0.lock())); },
+                    |v| {
+                        channel_from_toml(v, &mut self.channel_b.0.lock());
+                        self.channel_b.1.notify_all();
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("ch_a".into(), channel_to_toml(&self.channel_a.0.lock()));
-        tbl.insert("ch_b".into(), channel_to_toml(&self.channel_b.0.lock()));
-        toml::Value::Table(tbl)
+        self.state_desc().expect("scc has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        if let Some(ca) = get_field(v, "ch_a") {
-            channel_from_toml(ca, &mut self.channel_a.0.lock());
-            self.channel_a.1.notify_all();
-        }
-        if let Some(cb) = get_field(v, "ch_b") {
-            channel_from_toml(cb, &mut self.channel_b.0.lock());
-            self.channel_b.1.notify_all();
-        }
-        Ok(())
+        self.state_desc().expect("scc has a state description").load(v)
     }
 }
 

@@ -624,22 +624,29 @@ mod tests {
 }
 
 impl Saveable for Pit8254 {
-    fn save_state(&self) -> toml::Value {
-        let mut tbl = toml::map::Map::new();
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        let mut d = StateDesc::new("pit", 1);
         for (i, channel_arc) in self.channels.iter().enumerate() {
-            let chan = channel_arc.lock();
-            tbl.insert(format!("ch{}", i), chan_to_toml(&chan));
+            let save_arc = channel_arc.clone();
+            let load_arc = channel_arc.clone();
+            let name = format!("ch{}", i);
+            d = d.field(
+                name,
+                FieldKind::Table,
+                1,
+                move |t| { t.insert(format!("ch{}", i), chan_to_toml(&save_arc.lock())); },
+                move |v| { chan_from_toml(v, &mut load_arc.lock()); Ok(()) },
+            );
         }
-        toml::Value::Table(tbl)
+        Some(d)
+    }
+
+    fn save_state(&self) -> toml::Value {
+        self.state_desc().expect("pit has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let mut chan = channel_arc.lock();
-            if let Some(ct) = get_field(v, &format!("ch{}", i)) {
-                chan_from_toml(ct, &mut chan);
-            }
-        }
-        Ok(())
+        self.state_desc().expect("pit has a state description").load(v)
     }
 }

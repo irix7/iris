@@ -1461,40 +1461,97 @@ impl Resettable for Wd33c93a {
 }
 
 impl Saveable for Wd33c93a {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        let device = if self.state.lock().id == 0 { "scsi" } else { "scsi1" };
+        fn u8f(t: &mut crate::state_desc::TomlMap, name: &str, v: u8) {
+            t.insert(name.into(), hex_u8(v));
+        }
+        Some(
+            StateDesc::new(device, 1)
+                .field(
+                    "regs",
+                    FieldKind::U8Array,
+                    1,
+                    |t| { t.insert("regs".into(), u8_slice_to_toml(&self.state.lock().regs)); },
+                    |v| { load_u8_slice(v, &mut self.state.lock().regs); Ok(()) },
+                )
+                .field(
+                    "ar",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "ar", self.state.lock().ar); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().ar = n; } Ok(()) },
+                )
+                .field(
+                    "asr",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "asr", self.state.lock().asr); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().set_asr(n); } Ok(()) },
+                )
+                .field(
+                    "data_direction_in",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("data_direction_in".into(), toml::Value::Boolean(self.state.lock().data_direction_in)); },
+                    |v| { if let Some(b) = toml_bool(v) { self.state.lock().data_direction_in = b; } Ok(()) },
+                )
+                .field(
+                    "target_id",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "target_id", self.state.lock().target_id as u8); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().target_id = n as usize; } Ok(()) },
+                )
+                .field(
+                    "target_lun",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "target_lun", self.state.lock().target_lun); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().target_lun = n; } Ok(()) },
+                )
+                .field(
+                    "pending_status",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "pending_status", self.state.lock().pending_status); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().pending_status = n; } Ok(()) },
+                )
+                .field(
+                    "pending_msg",
+                    FieldKind::U8,
+                    1,
+                    |t| { u8f(t, "pending_msg", self.state.lock().pending_msg); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().pending_msg = n; } Ok(()) },
+                )
+                .field(
+                    "advanced_mode",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("advanced_mode".into(), toml::Value::Boolean(self.state.lock().advanced_mode)); },
+                    |v| { if let Some(b) = toml_bool(v) { self.state.lock().advanced_mode = b; } Ok(()) },
+                )
+                // Transient command/fifo state is cleared on load, as before.
+                .after_load(|| {
+                    let mut s = self.state.lock();
+                    s.fifo.clear();
+                    s.xfer_data.clear();
+                    s.xfer_offset = 0;
+                    s.pending_command = None;
+                    s.last_read_asr = None;
+                    s.last_read_reg = None;
+                    Ok(())
+                }),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let state = self.state.lock();
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("regs".into(),              u8_slice_to_toml(&state.regs));
-        tbl.insert("ar".into(),                hex_u8(state.ar));
-        tbl.insert("asr".into(),               hex_u8(state.asr));
-        tbl.insert("data_direction_in".into(), toml::Value::Boolean(state.data_direction_in));
-        tbl.insert("target_id".into(),         hex_u8(state.target_id as u8));
-        tbl.insert("target_lun".into(),        hex_u8(state.target_lun));
-        tbl.insert("pending_status".into(),    hex_u8(state.pending_status));
-        tbl.insert("pending_msg".into(),       hex_u8(state.pending_msg));
-        tbl.insert("advanced_mode".into(),     toml::Value::Boolean(state.advanced_mode));
-        toml::Value::Table(tbl)
+        self.state_desc().expect("scsi has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut state = self.state.lock();
-        if let Some(r) = get_field(v, "regs") { load_u8_slice(r, &mut state.regs); }
-        if let Some(x) = get_field(v, "ar")               { if let Some(n) = toml_u8(x)   { state.ar = n; } }
-        if let Some(x) = get_field(v, "asr")              { if let Some(n) = toml_u8(x)   { state.set_asr(n); } }
-        if let Some(x) = get_field(v, "data_direction_in"){ if let Some(b) = toml_bool(x) { state.data_direction_in = b; } }
-        if let Some(x) = get_field(v, "target_id")        { if let Some(n) = toml_u8(x)   { state.target_id = n as usize; } }
-        if let Some(x) = get_field(v, "target_lun")       { if let Some(n) = toml_u8(x)   { state.target_lun = n; } }
-        if let Some(x) = get_field(v, "pending_status")   { if let Some(n) = toml_u8(x)   { state.pending_status = n; } }
-        if let Some(x) = get_field(v, "pending_msg")      { if let Some(n) = toml_u8(x)   { state.pending_msg = n; } }
-        if let Some(x) = get_field(v, "advanced_mode")    { if let Some(b) = toml_bool(x) { state.advanced_mode = b; } }
-        // Transient state cleared on load.
-        state.fifo.clear();
-        state.xfer_data.clear();
-        state.xfer_offset = 0;
-        state.pending_command = None;
-        state.last_read_asr = None;
-        state.last_read_reg = None;
-        Ok(())
+        self.state_desc().expect("scsi has a state description").load(v)
     }
 }
 

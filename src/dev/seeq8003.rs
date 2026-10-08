@@ -22,7 +22,7 @@ use rtrb::RingBuffer;
 
 use crate::net::{eth_summary, mac_str, GatewayConfig, NatControl, NatEngine};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, DmaClient, DmaStatus, Resettable, Saveable};
-use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
+use crate::snapshot::{toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 
 // ── Register offsets (A2:A0) ──────────────────────────────────────────────────
 pub const SEEQ_STATION_ADDR_0: u32 = 0x00;
@@ -888,25 +888,54 @@ impl Resettable for Seeq8003 {
 }
 
 impl Saveable for Seeq8003 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("seeq", 1)
+                .field(
+                    "station_addr",
+                    FieldKind::U8Array,
+                    1,
+                    |t| { t.insert("station_addr".into(), u8_slice_to_toml(&self.state.lock().station_addr)); },
+                    |v| { load_u8_slice(v, &mut self.state.lock().station_addr); Ok(()) },
+                )
+                .field(
+                    "rx_cmd",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("rx_cmd".into(), hex_u8(self.state.lock().rx_cmd)); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().rx_cmd = n; } Ok(()) },
+                )
+                .field(
+                    "rx_stat",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("rx_stat".into(), hex_u8(self.state.lock().rx_stat)); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().rx_stat = n; } Ok(()) },
+                )
+                .field(
+                    "tx_cmd",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("tx_cmd".into(), hex_u8(self.state.lock().tx_cmd)); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().tx_cmd = n; } Ok(()) },
+                )
+                .field(
+                    "tx_stat",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("tx_stat".into(), hex_u8(self.state.lock().tx_stat)); },
+                    |v| { if let Some(n) = toml_u8(v) { self.state.lock().tx_stat = n; } Ok(()) },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let st = self.state.lock();
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("station_addr".into(), u8_slice_to_toml(&st.station_addr));
-        tbl.insert("rx_cmd".into(),  hex_u8(st.rx_cmd));
-        tbl.insert("rx_stat".into(), hex_u8(st.rx_stat));
-        tbl.insert("tx_cmd".into(),  hex_u8(st.tx_cmd));
-        tbl.insert("tx_stat".into(), hex_u8(st.tx_stat));
-        toml::Value::Table(tbl)
+        self.state_desc().expect("seeq has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut st = self.state.lock();
-        if let Some(r) = get_field(v, "station_addr") { load_u8_slice(r, &mut st.station_addr); }
-        if let Some(x) = get_field(v, "rx_cmd")  { if let Some(n) = toml_u8(x) { st.rx_cmd  = n; } }
-        if let Some(x) = get_field(v, "rx_stat") { if let Some(n) = toml_u8(x) { st.rx_stat = n; } }
-        if let Some(x) = get_field(v, "tx_cmd")  { if let Some(n) = toml_u8(x) { st.tx_cmd  = n; } }
-        if let Some(x) = get_field(v, "tx_stat") { if let Some(n) = toml_u8(x) { st.tx_stat = n; } }
-        Ok(())
+        self.state_desc().expect("seeq has a state description").load(v)
     }
 }
 

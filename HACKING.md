@@ -80,7 +80,11 @@ pub trait Device: Send + Sync {
     fn execute_command(&self, cmd: &str, args: &[&str], w: Box<dyn Write + Send>) -> Result<(), String>;
 }
 
-pub trait Saveable { fn save_state(&self) -> toml::Value; fn load_state(&self, v: &toml::Value) -> Result<(), String>; }
+pub trait Saveable {
+    fn save_state(&self) -> toml::Value;                    // legacy hand-written codec
+    fn load_state(&self, v: &toml::Value) -> Result<(), String>;
+    fn state_desc(&self) -> Option<StateDesc<'_>> { None }  // registered codec (see src/state_desc.rs)
+}
 pub trait Resettable { fn power_on(&self); }
 ```
 

@@ -2,7 +2,7 @@ use crate::devlog::LogModule;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, BusDevice, Device, Resettable, Saveable};
-use crate::snapshot::{get_field, u8_slice_to_toml, load_u8_slice};
+use crate::snapshot::{u8_slice_to_toml, load_u8_slice};
 use crate::config::{format_unix_utc, RtcOffset};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use std::fs::File;
@@ -469,27 +469,45 @@ impl Resettable for Ds1x86 {
 }
 
 impl Saveable for Ds1x86 {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("rtc", 1)
+                .field(
+                    "regs",
+                    FieldKind::U8Array,
+                    1,
+                    |t| {
+                        let mut data = self.data.lock();
+                        // Flush current time into regs before saving.
+                        if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
+                            self.update_time(&mut data);
+                        }
+                        t.insert("regs".into(), u8_slice_to_toml(&data.regs));
+                    },
+                    |v| {
+                        let mut data = self.data.lock();
+                        load_u8_slice(v, &mut data.regs);
+                        Ok(())
+                    },
+                )
+                // Recompute base_centiseconds from the restored register values,
+                // same as load_nvram does — no need to store it separately.
+                .after_load(|| {
+                    let mut data = self.data.lock();
+                    data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
+                    data.time_base = Instant::now();
+                    Ok(())
+                }),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let mut data = self.data.lock();
-        // Flush current time into regs before saving.
-        if (data.regs[CMD_REG_OFFSET] & TE_BIT) != 0 {
-            self.update_time(&mut data);
-        }
-        let mut tbl = toml::map::Map::new();
-        tbl.insert("regs".into(), u8_slice_to_toml(&data.regs));
-        toml::Value::Table(tbl)
+        self.state_desc().expect("rtc has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut data = self.data.lock();
-        if let Some(r) = get_field(v, "regs") {
-            load_u8_slice(r, &mut data.regs);
-        }
-        // Recompute base_centiseconds from the restored register values,
-        // same as load_nvram does — no need to store it separately.
-        data.base_centiseconds = self.regs_to_centiseconds(&data.regs, 0);
-        data.time_base = Instant::now();
-        Ok(())
+        self.state_desc().expect("rtc has a state description").load(v)
     }
 }
 

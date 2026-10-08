@@ -1063,97 +1063,166 @@ impl Resettable for Ps2Controller {
 }
 
 impl Saveable for Ps2Controller {
+    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
+        use crate::state_desc::{FieldKind, StateDesc};
+        Some(
+            StateDesc::new("ps2", 1)
+                .field(
+                    "rx_queue",
+                    FieldKind::Array,
+                    1,
+                    |t| {
+                        let state = self.state.lock();
+                        let queue: Vec<toml::Value> = state.rx_queue.iter().map(|(byte, src)| {
+                            let src_val = match src {
+                                Ps2Source::Keyboard => 0,
+                                Ps2Source::Mouse => 1,
+                                Ps2Source::MouseCmd => 2,
+                            };
+                            let mut entry = toml::map::Map::new();
+                            entry.insert("byte".into(), hex_u8(*byte));
+                            entry.insert("src".into(), toml::Value::Integer(src_val));
+                            toml::Value::Table(entry)
+                        }).collect();
+                        t.insert("rx_queue".into(), toml::Value::Array(queue));
+                    },
+                    |v| {
+                        let mut state = self.state.lock();
+                        if let Some(arr) = v.as_array() {
+                            state.rx_queue.clear();
+                            state.mouse_queue_bytes = 0;
+                            for item in arr {
+                                if let (Some(b), Some(s)) = (get_field(item, "byte"), get_field(item, "src")) {
+                                    let byte = toml_u8(b).unwrap_or(0);
+                                    let src = match s.as_integer().unwrap_or(0) {
+                                        1 => Ps2Source::Mouse,
+                                        2 => Ps2Source::MouseCmd,
+                                        _ => Ps2Source::Keyboard,
+                                    };
+                                    if matches!(src, Ps2Source::Mouse) { state.mouse_queue_bytes += 1; }
+                                    state.rx_queue.push_back((byte, src));
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "next_write_is_mouse",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("next_write_is_mouse".into(), toml::Value::Boolean(self.state.lock().next_write_is_mouse)); },
+                    |v| { self.state.lock().next_write_is_mouse = toml_bool(v).unwrap_or(false); Ok(()) },
+                )
+                .field(
+                    "led_state",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("led_state".into(), hex_u8(self.state.lock().led_state)); },
+                    |v| { self.state.lock().led_state = toml_u8(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "scancode_set",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("scancode_set".into(), hex_u8(self.state.lock().scancode_set)); },
+                    |v| { self.state.lock().scancode_set = toml_u8(v).unwrap_or(2); Ok(()) },
+                )
+                .field(
+                    "config",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("config".into(), hex_u8(self.state.lock().config)); },
+                    |v| { self.state.lock().config = toml_u8(v).unwrap_or(0x47); Ok(()) },
+                )
+                .field(
+                    "command_state",
+                    FieldKind::I64,
+                    1,
+                    |t| {
+                        let cmd_state = match self.state.lock().command_state {
+                            CommandState::Idle => 0,
+                            CommandState::SetLeds => 1,
+                            CommandState::SetScancodeSet => 2,
+                            CommandState::WriteConfig => 3,
+                            CommandState::SetTypematic => 4,
+                            CommandState::MouseData => 5,
+                            CommandState::AuxLoop => 6,
+                        };
+                        t.insert("command_state".into(), toml::Value::Integer(cmd_state));
+                    },
+                    |v| {
+                        self.state.lock().command_state = match v.as_integer().unwrap_or(0) {
+                            1 => CommandState::SetLeds,
+                            2 => CommandState::SetScancodeSet,
+                            3 => CommandState::WriteConfig,
+                            4 => CommandState::SetTypematic,
+                            5 => CommandState::MouseData,
+                            6 => CommandState::AuxLoop,
+                            _ => CommandState::Idle,
+                        };
+                        Ok(())
+                    },
+                )
+                .field(
+                    "scanning_enabled",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("scanning_enabled".into(), toml::Value::Boolean(self.state.lock().scanning_enabled)); },
+                    |v| { self.state.lock().scanning_enabled = toml_bool(v).unwrap_or(false); Ok(()) },
+                )
+                .field(
+                    "mouse_enabled",
+                    FieldKind::Bool,
+                    1,
+                    |t| { t.insert("mouse_enabled".into(), toml::Value::Boolean(self.state.lock().mouse_enabled)); },
+                    |v| { self.state.lock().mouse_enabled = toml_bool(v).unwrap_or(false); Ok(()) },
+                )
+                .field(
+                    "last_read",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("last_read".into(), hex_u8(self.state.lock().last_read)); },
+                    |v| { self.state.lock().last_read = toml_u8(v).unwrap_or(0xAA); Ok(()) },
+                )
+                .field(
+                    "mouse_id",
+                    FieldKind::U8,
+                    1,
+                    |t| { t.insert("mouse_id".into(), hex_u8(self.state.lock().mouse_id)); },
+                    |v| { self.state.lock().mouse_id = toml_u8(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "sample_rate_history",
+                    FieldKind::U8Array,
+                    1,
+                    |t| {
+                        let s = self.state.lock();
+                        t.insert("sample_rate_history".into(), toml::Value::Array(vec![
+                            hex_u8(s.sample_rate_history[0]),
+                            hex_u8(s.sample_rate_history[1]),
+                        ]));
+                    },
+                    |v| {
+                        if let Some(arr) = v.as_array() {
+                            if arr.len() == 2 {
+                                let mut s = self.state.lock();
+                                s.sample_rate_history[0] = toml_u8(&arr[0]).unwrap_or(0);
+                                s.sample_rate_history[1] = toml_u8(&arr[1]).unwrap_or(0);
+                            }
+                        }
+                        Ok(())
+                    },
+                ),
+        )
+    }
+
     fn save_state(&self) -> toml::Value {
-        let state = self.state.lock();
-        let mut tbl = toml::map::Map::new();
-        
-        let queue: Vec<toml::Value> = state.rx_queue.iter().map(|(byte, src)| {
-            let src_val = match src { Ps2Source::Keyboard => 0, Ps2Source::Mouse => 1, Ps2Source::MouseCmd => 2 };
-            let mut entry = toml::map::Map::new();
-            entry.insert("byte".into(), hex_u8(*byte));
-            entry.insert("src".into(), toml::Value::Integer(src_val));
-            toml::Value::Table(entry)
-        }).collect();
-        tbl.insert("rx_queue".into(), toml::Value::Array(queue));
-
-        tbl.insert("next_write_is_mouse".into(), toml::Value::Boolean(state.next_write_is_mouse));
-        tbl.insert("led_state".into(), hex_u8(state.led_state));
-        tbl.insert("scancode_set".into(), hex_u8(state.scancode_set));
-        tbl.insert("config".into(), hex_u8(state.config));
-        
-        let cmd_state = match state.command_state {
-            CommandState::Idle => 0,
-            CommandState::SetLeds => 1,
-            CommandState::SetScancodeSet => 2,
-            CommandState::WriteConfig => 3,
-            CommandState::SetTypematic => 4,
-            CommandState::MouseData => 5,
-            CommandState::AuxLoop => 6,
-        };
-        tbl.insert("command_state".into(), toml::Value::Integer(cmd_state));
-        
-        tbl.insert("scanning_enabled".into(), toml::Value::Boolean(state.scanning_enabled));
-        tbl.insert("mouse_enabled".into(), toml::Value::Boolean(state.mouse_enabled));
-        tbl.insert("last_read".into(), hex_u8(state.last_read));
-        tbl.insert("mouse_id".into(), hex_u8(state.mouse_id));
-        tbl.insert("sample_rate_history".into(), toml::Value::Array(vec![
-            hex_u8(state.sample_rate_history[0]),
-            hex_u8(state.sample_rate_history[1]),
-        ]));
-
-        toml::Value::Table(tbl)
+        self.state_desc().expect("ps2 has a state description").save()
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        let mut state = self.state.lock();
-        
-        if let Some(q) = get_field(v, "rx_queue") {
-            if let toml::Value::Array(arr) = q {
-                state.rx_queue.clear(); state.mouse_queue_bytes = 0;
-                for item in arr {
-                    if let (Some(b), Some(s)) = (get_field(item, "byte"), get_field(item, "src")) {
-                        let byte = toml_u8(b).unwrap_or(0);
-                        let src = match s.as_integer().unwrap_or(0) {
-                            1 => Ps2Source::Mouse,
-                            2 => Ps2Source::MouseCmd,
-                            _ => Ps2Source::Keyboard,
-                        };
-                        if matches!(src, Ps2Source::Mouse) { state.mouse_queue_bytes += 1; }
-                        state.rx_queue.push_back((byte, src));
-                    }
-                }
-            }
-        }
-
-        if let Some(x) = get_field(v, "next_write_is_mouse") { state.next_write_is_mouse = toml_bool(x).unwrap_or(false); }
-        if let Some(x) = get_field(v, "led_state") { state.led_state = toml_u8(x).unwrap_or(0); }
-        if let Some(x) = get_field(v, "scancode_set") { state.scancode_set = toml_u8(x).unwrap_or(2); }
-        if let Some(x) = get_field(v, "config") { state.config = toml_u8(x).unwrap_or(0x47); }
-        
-        if let Some(x) = get_field(v, "command_state") {
-            state.command_state = match x.as_integer().unwrap_or(0) {
-                1 => CommandState::SetLeds,
-                2 => CommandState::SetScancodeSet,
-                3 => CommandState::WriteConfig,
-                4 => CommandState::SetTypematic,
-                5 => CommandState::MouseData,
-                6 => CommandState::AuxLoop,
-                _ => CommandState::Idle,
-            };
-        }
-
-        if let Some(x) = get_field(v, "scanning_enabled") { state.scanning_enabled = toml_bool(x).unwrap_or(false); }
-        if let Some(x) = get_field(v, "mouse_enabled") { state.mouse_enabled = toml_bool(x).unwrap_or(false); }
-        if let Some(x) = get_field(v, "last_read") { state.last_read = toml_u8(x).unwrap_or(0xAA); }
-        if let Some(x) = get_field(v, "mouse_id") { state.mouse_id = toml_u8(x).unwrap_or(0); }
-        if let Some(toml::Value::Array(arr)) = get_field(v, "sample_rate_history") {
-            if arr.len() == 2 {
-                state.sample_rate_history[0] = toml_u8(&arr[0]).unwrap_or(0);
-                state.sample_rate_history[1] = toml_u8(&arr[1]).unwrap_or(0);
-            }
-        }
-
-        Ok(())
+        self.state_desc().expect("ps2 has a state description").load(v)
     }
 }
 
