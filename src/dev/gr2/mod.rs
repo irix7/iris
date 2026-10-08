@@ -40,7 +40,7 @@ use std::io::Write as IoWrite;
 use std::mem::MaybeUninit;
 use std::ptr::addr_of_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use parking_lot::Mutex;
@@ -228,6 +228,13 @@ pub struct Gr2 {
     pub screenshot_pending: AtomicBool,
     screenshot_counter: AtomicU32,
     retrace_cb: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    /// Poked on the HQ2 or RE3 consumer thread when its FIFO drains to empty,
+    /// i.e. when it frees space a blocked VDMA producer was waiting for. Set
+    /// once by the machine wiring to the MC's `GioDma` condvar; `OnceLock`
+    /// keeps the consumer's read lock-free. The same contract REX3's
+    /// `dma_space_cb` provides, so a GR2 `BUS_BUSY` re-dispatches promptly
+    /// instead of waiting the fallback timeout.
+    dma_space_cb: OnceLock<Arc<dyn Fn() + Send + Sync>>,
     stats: Gr2Stats,
     cycles: Cell<CyclesPtr>,
     /// Annotated FIFO capture (`gr2 trace`); `trace_mask` gates the hot path.
@@ -267,6 +274,7 @@ impl Gr2 {
             addr_of_mut!((*p).screenshot_pending).write(AtomicBool::new(false));
             addr_of_mut!((*p).screenshot_counter).write(AtomicU32::new(0));
             addr_of_mut!((*p).retrace_cb).write(Mutex::new(None));
+            addr_of_mut!((*p).dma_space_cb).write(OnceLock::new());
             addr_of_mut!((*p).stats).write(stats);
             addr_of_mut!((*p).cycles).write(Cell::new(CyclesPtr::dangling()));
             addr_of_mut!((*p).trace).write(Mutex::new(debug::Gr2Trace::new()));
@@ -284,6 +292,12 @@ impl Gr2 {
 
     pub fn set_retrace_callback(&self, cb: Arc<dyn Fn(bool) + Send + Sync>) {
         *self.retrace_cb.lock() = Some(cb);
+    }
+
+    /// Register the "FIFO freed space" callback the VDMA worker waits on. Set
+    /// once at machine construction; see [`Self::dma_space_cb`].
+    pub fn set_dma_space_callback(&self, cb: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.dma_space_cb.set(cb);
     }
 
     pub fn set_cpu_cycles(&self, ptr: CyclesPtr) {
@@ -837,12 +851,14 @@ impl Gr2 {
         *self.hq_thread.lock() = Some(thread::current());
         let mut sink = Sink(self);
         let backoff = crossbeam_utils::Backoff::new();
+        let mut is_busy = false;
         while self.running.load(Ordering::Relaxed) {
             if let Some((index, val)) = self.hq_fifo.peek() {
                 if index == u32::MAX {
                     break;
                 }
                 self.hq_busy.store(true, Ordering::Release);
+                is_busy = true;
                 // SAFETY: the HQ2 thread owns the engine.
                 let engine = unsafe { &mut *self.hq_engine.get() };
                 if self.tracing(debug::TRACE_HQ) {
@@ -860,6 +876,12 @@ impl Gr2 {
             } else {
                 self.hq_fifo.flush_head();
                 self.hq_busy.store(false, Ordering::Release);
+                if is_busy {
+                    is_busy = false;
+                    // The queue just drained: wake any VDMA producer parked on
+                    // BUS_BUSY so it can re-dispatch. Cheap when nobody waits.
+                    if let Some(cb) = self.dma_space_cb.get() { cb(); }
+                }
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
@@ -873,12 +895,14 @@ impl Gr2 {
     fn re3_loop(&self) {
         *self.re3_thread.lock() = Some(thread::current());
         let backoff = crossbeam_utils::Backoff::new();
+        let mut is_busy = false;
         while self.running.load(Ordering::Relaxed) {
             if let Some((addr, val)) = self.re3_fifo.peek() {
                 if addr == re3::RE3_OP_EXIT {
                     break;
                 }
                 self.re3_busy.store(true, Ordering::Release);
+                is_busy = true;
                 // SAFETY: the RE3 thread owns `re3` while it runs.
                 let re3 = unsafe { &mut *self.re3.get() };
                 if self.tracing(debug::TRACE_RE3) {
@@ -941,6 +965,12 @@ impl Gr2 {
             } else {
                 self.re3_fifo.flush_head();
                 self.re3_busy.store(false, Ordering::Release);
+                if is_busy {
+                    is_busy = false;
+                    // The queue just drained: wake any VDMA producer parked on
+                    // BUS_BUSY so it can re-dispatch. Cheap when nobody waits.
+                    if let Some(cb) = self.dma_space_cb.get() { cb(); }
+                }
                 if backoff.is_completed() {
                     thread::park_timeout(std::time::Duration::from_millis(2));
                 } else {
