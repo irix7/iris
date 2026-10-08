@@ -239,6 +239,13 @@ hashes are given where a change is easiest to understand by reading the commit.
   so the latch/readback timing tests are deterministic and re-enabled. Named
   deadlines are serialisable and re-sorted on load; transient callbacks are
   never saved, so an anonymous timer cannot corrupt a snapshot.
+- **2026-10-09 — Idle wake latency to the next guest deadline is measured
+  (#68).** The idle-park test suite records the host wall-clock latency *after*
+  the soonest guest-time deadline at which the CPU thread wakes, and bounds the
+  best of five samples at 500 us for a 300 us deadline. Measured intrinsic
+  overshoot is ~60-75 us on an idle dev host; the bound is under the retired
+  fixed 1 ms slice, so a reversion to slice parking fails. The figure is
+  recorded in `rules/perf/idle-pause-wake-the-parked-cpu.md`.
 
 ### Snapshots / save-state codec
 
