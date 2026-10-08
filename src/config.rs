@@ -1093,7 +1093,35 @@ impl Default for PerfConfig {
     }
 }
 
-/// HAL2 / cpal audio output tuning.
+/// HAL2 Codec A resampler quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResamplerKind {
+    /// 4-point Catmull-Rom spline. Cheap, and adequate at 44.1↔48 kHz.
+    #[default]
+    CatmullRom,
+    /// Windowed-sinc (band-limited). Removes the images Catmull-Rom leaves at
+    /// low guest rates (8–22 kHz) at the cost of a few taps per output sample.
+    Sinc,
+}
+
+/// Which host audio backend HAL2 opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioBackendKind {
+    /// The wav sink when `IRIS_HAL2_CAPTURE` is set, otherwise cpal.
+    #[default]
+    Auto,
+    /// cpal (the real host sound device).
+    Cpal,
+    /// Write a RIFF/WAVE file instead of playing. No sound card required, so
+    /// CI can capture audio headlessly.
+    Wav,
+    /// Accept and discard everything (headless timing without a device).
+    Null,
+}
+
+/// HAL2 audio output tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
@@ -1108,13 +1136,25 @@ pub struct AudioConfig {
     /// clamp is no longer needed.
     #[serde(default)]
     pub read_ahead_clamp: bool,
+    /// Codec A resampler quality. Default Catmull-Rom.
+    #[serde(default)]
+    pub resampler: ResamplerKind,
+    /// Host audio backend. Default Auto (capture env var, else cpal).
+    #[serde(default)]
+    pub backend: AudioBackendKind,
 }
 
 fn default_audio_prebuf_ms() -> u64 { 20 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
-        Self { prebuf_ms: default_audio_prebuf_ms(), cpal_buffer_frames: None, read_ahead_clamp: false }
+        Self {
+            prebuf_ms: default_audio_prebuf_ms(),
+            cpal_buffer_frames: None,
+            read_ahead_clamp: false,
+            resampler: ResamplerKind::default(),
+            backend: AudioBackendKind::default(),
+        }
     }
 }
 

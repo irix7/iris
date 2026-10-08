@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::config::AudioConfig;
+use crate::config::{AudioBackendKind, AudioConfig, ResamplerKind};
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -202,10 +202,30 @@ const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
 
 // ─── Audio output (owned by Codec A, opened once at start, closed at stop) ───
 
+/// A host audio output the codec feeds. cpal is one implementation; the wav and
+/// null sinks make CI capture and headless runs first-class with no sound card.
+trait AudioOutput: Send {
+    fn stream_rate(&self) -> u32;
+    /// Free stereo frames the buffer can accept right now. `usize::MAX` means
+    /// unbounded (a file, or a sink that consumes immediately).
+    fn free_frames(&self) -> usize;
+    /// Push interleaved stereo i16 samples; returns the frames accepted.
+    fn push_frames(&mut self, samples: &[i16]) -> usize;
+    fn underruns(&self) -> u64;
+    /// Gate underrun counting: false while prebuffering or idle.
+    fn set_playing(&self, playing: bool);
+}
+
+/// Opens a host audio output. Selected from `[audio] backend` and the
+/// `IRIS_HAL2_CAPTURE` environment variable.
+trait AudioBackend {
+    fn open(&self, cfg: &AudioConfig) -> Option<Box<dyn AudioOutput>>;
+}
+
 // Opened once at `start()` at the best available host rate; the codec A timer
 // pushes i16 stereo pairs through a resampler into the ring buffer producer.
 // The stream plays silence when the ring is empty (cpal fills with 0).
-struct AudioOut {
+struct CpalOutput {
     stream_rate: u32,
     producer: Producer<i16>,
     underruns: Arc<AtomicU64>,
@@ -213,34 +233,200 @@ struct AudioOut {
     // the codec is disarmed/reset. Gates underrun counting so idle silence
     // (stream open, nothing enabled yet) isn't reported as an underrun.
     playing: Arc<AtomicBool>,
-    // Keep stream alive; dropped when AudioOut is dropped at stop(). `None`
-    // in tests that exercise the ring/backpressure path without a host device.
-    _stream: Option<cpal::Stream>,
+    // Keep stream alive; dropped when CpalOutput is dropped at stop().
+    _stream: cpal::Stream,
 }
 
 // cpal::Stream is !Send/!Sync on some platforms (ALSA uses raw pointers internally),
 // but it is safe to hold inside a Mutex.
-unsafe impl Send for AudioOut {}
-unsafe impl Sync for AudioOut {}
+unsafe impl Send for CpalOutput {}
 
-impl AudioOut {
-    /// Free stereo frames the ring can accept right now. This is the headroom
-    /// bounded-buffer backpressure sizes the per-wake read against.
+impl AudioOutput for CpalOutput {
+    fn stream_rate(&self) -> u32 { self.stream_rate }
     fn free_frames(&self) -> usize { self.producer.slots() / 2 }
+    fn push_frames(&mut self, samples: &[i16]) -> usize {
+        let mut n = 0usize;
+        for &s in samples {
+            if self.producer.push(s).is_err() { break; }
+            n += 1;
+        }
+        // n is i16 samples; a frame is two (stereo).
+        n / 2
+    }
+    fn underruns(&self) -> u64 { self.underruns.load(Ordering::Relaxed) }
+    fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
 }
 
-// Simple skip/repeat resampler using a fixed-point accumulator.
-// Produces output at `out_rate` from input at `in_rate`.
-// Call `push_sample` for every input sample pair; it pushes 0, 1, or 2 pairs to the ring.
-/// Converts the codec's rate to the host stream's by Catmull-Rom interpolation.
+/// A sink that accepts and discards everything, at a nominal rate.
+struct NullOutput { rate: u32 }
+
+impl AudioOutput for NullOutput {
+    fn stream_rate(&self) -> u32 { self.rate }
+    fn free_frames(&self) -> usize { usize::MAX }
+    fn push_frames(&mut self, samples: &[i16]) -> usize { samples.len() / 2 }
+    fn underruns(&self) -> u64 { 0 }
+    fn set_playing(&self, _playing: bool) {}
+}
+
+/// Writes interleaved stereo 16-bit little-endian PCM to a RIFF/WAVE file.
+/// Reuses the `IRIS_HAL2_CAPTURE` capture path so CI can record audio without a
+/// sound card. Header sizes are patched on drop.
+struct WavOutput {
+    writer: std::io::BufWriter<std::fs::File>,
+    stream_rate: u32,
+    frames: u64,
+    playing: AtomicBool,
+}
+
+fn wav_header(rate: u32, data_bytes: u32) -> [u8; 44] {
+    let channels = 2u16;
+    let bits = 16u16;
+    let block_align = channels * bits / 8;
+    let byte_rate = rate * block_align as u32;
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36 + data_bytes).to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes());
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // PCM
+    h[22..24].copy_from_slice(&channels.to_le_bytes());
+    h[24..28].copy_from_slice(&rate.to_le_bytes());
+    h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    h[32..34].copy_from_slice(&block_align.to_le_bytes());
+    h[34..36].copy_from_slice(&bits.to_le_bytes());
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data_bytes.to_le_bytes());
+    h
+}
+
+impl WavOutput {
+    fn new(path: &std::path::Path, rate: u32) -> std::io::Result<Self> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&wav_header(rate, 0))?;
+        Ok(Self { writer, stream_rate: rate, frames: 0, playing: AtomicBool::new(false) })
+    }
+}
+
+impl AudioOutput for WavOutput {
+    fn stream_rate(&self) -> u32 { self.stream_rate }
+    fn free_frames(&self) -> usize { usize::MAX }
+    fn push_frames(&mut self, samples: &[i16]) -> usize {
+        for &s in samples { let _ = self.writer.write_all(&s.to_le_bytes()); }
+        self.frames += (samples.len() / 2) as u64;
+        samples.len() / 2
+    }
+    fn underruns(&self) -> u64 { 0 }
+    fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
+}
+
+impl Drop for WavOutput {
+    fn drop(&mut self) {
+        let data_bytes = (self.frames * 4).min(u32::MAX as u64) as u32;
+        use std::io::Seek;
+        let _ = self.writer.flush();
+        if self.writer.seek(std::io::SeekFrom::Start(4)).is_ok() {
+            let _ = self.writer.write_all(&(36 + data_bytes).to_le_bytes());
+        }
+        if self.writer.seek(std::io::SeekFrom::Start(40)).is_ok() {
+            let _ = self.writer.write_all(&data_bytes.to_le_bytes());
+        }
+        let _ = self.writer.flush();
+    }
+}
+
+struct CpalBackend { underruns: Arc<AtomicU64> }
+
+impl AudioBackend for CpalBackend {
+    fn open(&self, cfg: &AudioConfig) -> Option<Box<dyn AudioOutput>> {
+        open_cpal_output(self.underruns.clone(), Arc::new(AtomicBool::new(false)), cfg)
+            .map(|o| Box::new(o) as Box<dyn AudioOutput>)
+    }
+}
+
+struct NullBackend;
+
+impl AudioBackend for NullBackend {
+    fn open(&self, _cfg: &AudioConfig) -> Option<Box<dyn AudioOutput>> {
+        Some(Box::new(NullOutput { rate: PREFERRED_RATES[0] }))
+    }
+}
+
+struct WavBackend { path: std::path::PathBuf }
+
+impl AudioBackend for WavBackend {
+    fn open(&self, _cfg: &AudioConfig) -> Option<Box<dyn AudioOutput>> {
+        match WavOutput::new(&self.path, PREFERRED_RATES[0]) {
+            Ok(w) => Some(Box::new(w)),
+            Err(e) => {
+                eprintln!("HAL2: cannot open capture file {}: {}", self.path.display(), e);
+                None
+            }
+        }
+    }
+}
+
+/// Choose the output backend. `IRIS_HAL2_CAPTURE` wins so a CI run records
+/// audio through the wav sink with no device; `[audio] backend` selects the
+/// rest explicitly.
+fn select_backend(cfg: &AudioConfig, underruns: Arc<AtomicU64>) -> Box<dyn AudioBackend> {
+    if let Some(path) = std::env::var_os("IRIS_HAL2_CAPTURE") {
+        return Box::new(WavBackend { path: std::path::PathBuf::from(path) });
+    }
+    match cfg.backend {
+        AudioBackendKind::Null => Box::new(NullBackend),
+        AudioBackendKind::Wav => Box::new(WavBackend { path: std::path::PathBuf::from("hal2-capture.wav") }),
+        AudioBackendKind::Cpal | AudioBackendKind::Auto => Box::new(CpalBackend { underruns }),
+    }
+}
+
+// ─── Resampling ───────────────────────────────────────────────────────────────
+
+/// Converts the codec's guest-rate stereo frames to the host stream rate.
 ///
-/// It used to repeat the last sample (zero-order hold). From 44.1 or 48 kHz
-/// to 48 kHz that is nearly harmless, but Quake plays at 11025 Hz, where each
+/// The codec holds this behind a trait so quality is a config choice:
+/// Catmull-Rom is the cheap default; windowed-sinc is band-limited for the low
+/// guest rates (8–22 kHz) where Catmull-Rom alone leaves audible images.
+trait Resampler: Send {
+    fn input_rate(&self) -> u32;
+    fn output_rate(&self) -> u32;
+    /// Output stereo frames the next `process` will emit, without changing
+    /// state. Backpressure uses it to decide whether one input frame fits.
+    fn pending_frames(&self) -> usize;
+    /// Feed one input stereo frame; append interleaved output samples to `out`.
+    fn process(&mut self, l: i16, r: i16, out: &mut Vec<i16>);
+}
+
+/// Shared fixed-point accumulator: how many output frames a step of `in_rate`
+/// produces while `acc < out_rate`. Both resamplers time identically, so
+/// switching implementations does not change the output rate.
+fn pending_outputs(acc: u64, in_rate: u32, out_rate: u32) -> usize {
+    let out = out_rate as u64;
+    let mut acc = acc;
+    let mut n = 0usize;
+    while acc < out { n += 1; acc += in_rate as u64; }
+    n
+}
+
+fn clamp_i16(v: f32) -> i16 { v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16 }
+
+fn make_resampler(kind: ResamplerKind, in_rate: u32, out_rate: u32) -> Box<dyn Resampler> {
+    match kind {
+        ResamplerKind::CatmullRom => Box::new(CatmullRomResampler::new(in_rate, out_rate)),
+        ResamplerKind::Sinc => Box::new(SincResampler::new(in_rate, out_rate)),
+    }
+}
+
+/// 4-point Catmull-Rom interpolation between input samples.
+///
+/// It used to repeat the last sample (zero-order hold). From 44.1 or 48 kHz to
+/// 48 kHz that is nearly harmless, but Quake plays at 11025 Hz, where each
 /// sample became a 4-or-5-sample step: the staircase put loud images of every
 /// sound around 11 kHz and its multiples, and the games sounded metallic and
-/// robotic. A real DAC at 11025 Hz filters those images out; interpolating
-/// through the samples does most of the same.
-struct Resampler {
+/// robotic. Interpolating through the samples does most of the same as a real
+/// DAC's reconstruction filter.
+struct CatmullRomResampler {
     in_rate: u32,
     out_rate: u32,
     // Position of the next output between h[1] and h[2], in 1/out_rate
@@ -251,43 +437,35 @@ struct Resampler {
     h: [[f32; 2]; 4],
 }
 
-impl Resampler {
+impl CatmullRomResampler {
     fn new(in_rate: u32, out_rate: u32) -> Self {
         Self { in_rate, out_rate, acc: 0, h: [[0.0; 2]; 4] }
     }
+}
 
-    fn passthrough(&self) -> bool { self.in_rate == self.out_rate }
-
-    /// Output stereo frames the next `push` will emit, without advancing any
-    /// state. Backpressure uses it to decide whether one more input frame fits
-    /// in the ring.
+impl Resampler for CatmullRomResampler {
+    fn input_rate(&self) -> u32 { self.in_rate }
+    fn output_rate(&self) -> u32 { self.out_rate }
     fn pending_frames(&self) -> usize {
-        if self.passthrough() { return 1; }
-        let out = self.out_rate as u64;
-        let mut acc = self.acc;
-        let mut n = 0usize;
-        while acc < out { n += 1; acc += self.in_rate as u64; }
-        n
+        if self.in_rate == self.out_rate { 1 } else { pending_outputs(self.acc, self.in_rate, self.out_rate) }
     }
-
-    /// Push one input stereo pair; emits the output pairs it completes.
-    fn push(&mut self, l: i16, r: i16, prod: &mut Producer<i16>) {
-        if self.passthrough() {
-            let _ = prod.push(l);
-            let _ = prod.push(r);
+    fn process(&mut self, l: i16, r: i16, out: &mut Vec<i16>) {
+        if self.in_rate == self.out_rate {
+            out.push(l);
+            out.push(r);
             return;
         }
         self.h = [self.h[1], self.h[2], self.h[3], [l as f32, r as f32]];
-        let out = self.out_rate as u64;
-        while self.acc < out {
-            let t = self.acc as f32 / out as f32;
+        let or = self.out_rate as u64;
+        while self.acc < or {
+            let t = self.acc as f32 / or as f32;
             for c in 0..2 {
                 let v = catmull_rom(self.h[0][c], self.h[1][c], self.h[2][c], self.h[3][c], t);
-                let _ = prod.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+                out.push(clamp_i16(v));
             }
             self.acc += self.in_rate as u64;
         }
-        self.acc -= out;
+        self.acc -= or;
     }
 }
 
@@ -301,15 +479,89 @@ fn catmull_rom(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
         + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
 }
 
+/// Half-width of the windowed-sinc kernel, in input frames.
+const SINC_TAPS: usize = 16;
+
+/// Windowed-sinc band-limited resampler. Each output is a normalised sinc sum
+/// over `2*SINC_TAPS` input frames, Hann-windowed and band-limited to the lower
+/// Nyquist when downsampling. This removes the images a real DAC's
+/// reconstruction filter would remove, which Catmull-Rom leaves at low rates.
+struct SincResampler {
+    in_rate: u32,
+    out_rate: u32,
+    acc: u64,
+    cutoff: f32,
+    hist: Vec<f32>, // interleaved L/R, 2*SINC_TAPS frames, oldest first
+}
+
+impl SincResampler {
+    fn new(in_rate: u32, out_rate: u32) -> Self {
+        let nyquist = (out_rate as f32 / in_rate as f32).min(1.0);
+        Self {
+            in_rate,
+            out_rate,
+            acc: 0,
+            // 0.95 keeps the transition band inside Nyquist rather than on it.
+            cutoff: 0.95 * nyquist,
+            hist: vec![0.0; SINC_TAPS * 4],
+        }
+    }
+}
+
+fn sinc(x: f32) -> f32 {
+    if x.abs() < 1e-6 { 1.0 } else {
+        let px = std::f32::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+fn hann(x: f32) -> f32 {
+    if x.abs() > 1.0 { 0.0 } else { 0.5 * (1.0 + (std::f32::consts::PI * x).cos()) }
+}
+
+impl Resampler for SincResampler {
+    fn input_rate(&self) -> u32 { self.in_rate }
+    fn output_rate(&self) -> u32 { self.out_rate }
+    fn pending_frames(&self) -> usize { pending_outputs(self.acc, self.in_rate, self.out_rate) }
+    fn process(&mut self, l: i16, r: i16, out: &mut Vec<i16>) {
+        let n = self.hist.len();
+        self.hist.copy_within(2.., 0);
+        self.hist[n - 2] = l as f32;
+        self.hist[n - 1] = r as f32;
+        let or = self.out_rate as u64;
+        let taps = SINC_TAPS as f32;
+        while self.acc < or {
+            let t = self.acc as f32 / or as f32;
+            let pos = (taps - 1.0) + t;
+            let (mut sl, mut sr, mut wsum) = (0.0f32, 0.0f32, 0.0f32);
+            for k in 0..SINC_TAPS * 2 {
+                let d = pos - k as f32;
+                let w = sinc(self.cutoff * d) * hann(d / taps);
+                sl += self.hist[k * 2] * w;
+                sr += self.hist[k * 2 + 1] * w;
+                wsum += w;
+            }
+            if wsum.abs() > 1e-9 { sl /= wsum; sr /= wsum; }
+            out.push(clamp_i16(sl));
+            out.push(clamp_i16(sr));
+            self.acc += self.in_rate as u64;
+        }
+        self.acc -= or;
+    }
+}
+
 // ─── Per-channel mutable state, lives inside a Mutex ─────────────────────────
 
 struct CodecAState {
-    // AudioOut is opened once at start() and lives until stop().
+    // Output is opened once at start() and lives until stop().
     // None only before start() or after stop().
-    out: Option<AudioOut>,
+    out: Option<Box<dyn AudioOutput>>,
     // Resampler from codec rate → stream rate.  Built (or rebuilt) when
     // codec rate first becomes known or changes.
-    resampler: Option<Resampler>,
+    resampler: Option<Box<dyn Resampler>>,
+    // Interleaved output scratch reused across pushes, so `push_to_ring` does
+    // not allocate per frame.
+    scratch: Vec<i16>,
     // True while we're still filling the initial prebuffer before feeding the ring.
     prebuffering: bool,
     prebuf: Vec<i16>,
@@ -326,7 +578,7 @@ struct CodecAState {
 
 impl CodecAState {
     fn new() -> Self {
-        Self { out: None, resampler: None, prebuffering: true, prebuf: Vec::new(),
+        Self { out: None, resampler: None, scratch: Vec::new(), prebuffering: true, prebuf: Vec::new(),
                dry: 0, nonzero_seen: false, timer_id: None,
                armed_ch: None, calls: 0, frames: 0, dry_reads: 0 }
     }
@@ -342,18 +594,18 @@ impl CodecAState {
         self.frames = 0;
         self.dry_reads = 0;
         if let Some(o) = &self.out {
-            o.playing.store(false, Ordering::Relaxed);
+            o.set_playing(false);
         }
     }
-    /// Push interleaved i16 stereo pairs through the resampler into the ring buffer.
+    /// Push interleaved i16 stereo pairs through the resampler into the output.
     fn push_to_ring(&mut self, samples: &[i16]) {
-        if let Some(rs) = &mut self.resampler {
-            if let Some(o) = &mut self.out {
-                for chunk in samples.chunks_exact(2) {
-                    rs.push(chunk[0], chunk[1], &mut o.producer);
-                }
-            }
+        let CodecAState { out, resampler, scratch, .. } = self;
+        let (Some(out), Some(rs)) = (out.as_mut(), resampler.as_mut()) else { return };
+        scratch.clear();
+        for chunk in samples.chunks_exact(2) {
+            rs.process(chunk[0], chunk[1], scratch);
         }
+        out.push_frames(scratch);
     }
 
     /// True when the host ring can accept one more input frame's worth of
@@ -492,7 +744,7 @@ fn audio_output_sizing(cfg: &AudioConfig, rate: u32) -> AudioOutputSizing {
 
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
 /// The stream plays silence when the ring buffer is empty.
-fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &AudioConfig) -> Option<AudioOut> {
+fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &AudioConfig) -> Option<CpalOutput> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
 
@@ -511,12 +763,6 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, c
             let (p, mut c) = RingBuffer::<i16>::new(ring_size);
             let underruns_cb = underruns.clone();
             let playing_cb = playing.clone();
-            // IRIS_HAL2_CAPTURE=<file>: also write what the host plays, raw
-            // interleaved 16-bit little-endian stereo at the stream rate --
-            // the end of the whole chain, to check or listen to offline.
-            let mut capture = std::env::var_os("IRIS_HAL2_CAPTURE")
-                .and_then(|p| std::fs::File::create(p).ok())
-                .map(std::io::BufWriter::new);
             let data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 for sample in data.iter_mut() {
                     let v = match c.pop() {
@@ -528,10 +774,6 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, c
                             0
                         }
                     };
-                    if let Some(w) = capture.as_mut() {
-                        use std::io::Write;
-                        let _ = w.write_all(&v.to_le_bytes());
-                    }
                     *sample = v as f32 / 32768.0;
                 }
             };
@@ -568,12 +810,12 @@ fn open_persistent_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, c
         if stream.play().is_err() { continue; }
         // cpal 0.18 dropped DeviceTrait::name(); a Device's Display impl is its name.
         println!("HAL2: audio output: {} via {:?} at {}Hz", device, host.id(), rate);
-        return Some(AudioOut {
+        return Some(CpalOutput {
             stream_rate: rate,
             producer,
             underruns,
             playing,
-            _stream: Some(stream),
+            _stream: stream,
         });
     }
 
@@ -674,6 +916,7 @@ impl Hal2 {
         let ca_state = self.ca_state.clone();
         let prebuf_ms = self.audio_config.prebuf_ms;
         let read_ahead_clamp = self.audio_config.read_ahead_clamp;
+        let resampler_kind = self.audio_config.resampler;
         let mut pacer = Pacer::new(pitch_rate);
 
         self.ca_state.lock().armed_ch = Some(dma_ch);
@@ -698,7 +941,7 @@ impl Hal2 {
                 return TimerReturn::Continue;
             }
             let mut st = ca_state.lock();
-            let moved = drain_codec_a(&mut st, &dma_client, mode, pitch_rate, rate, prebuf_ms, due);
+            let moved = drain_codec_a(&mut st, &dma_client, mode, pitch_rate, rate, prebuf_ms, resampler_kind, due);
             drop(st);
             // Frames the ring would not accept stay due: the read stalled, so
             // CBP did not advance, and the pacer retries once the ring drains.
@@ -1198,6 +1441,7 @@ fn drain_codec_a(
     pitch_rate: u32,
     rate: u32,
     prebuf_ms: u64,
+    resampler_kind: ResamplerKind,
     due: u64,
 ) -> u64 {
     st.calls += 1;
@@ -1205,7 +1449,7 @@ fn drain_codec_a(
     // No audio output — still drain DMA so the kernel doesn't hang waiting for
     // PDMA_CTRL_ACT to clear.
     let stream_rate = match st.out.as_ref() {
-        Some(o) => o.stream_rate,
+        Some(o) => o.stream_rate(),
         None => {
             for _ in 0..due {
                 let _ = read_frame_from(dma_client, mode);
@@ -1214,9 +1458,9 @@ fn drain_codec_a(
         }
     };
 
-    // (Re)build resampler if codec rate changed.
-    if st.resampler.as_ref().map_or(true, |r| r.in_rate != pitch_rate) {
-        st.resampler = Some(Resampler::new(pitch_rate, stream_rate));
+    // (Re)build resampler if codec rate (or kind) changed.
+    if st.resampler.as_ref().map_or(true, |r| r.input_rate() != pitch_rate) {
+        st.resampler = Some(make_resampler(resampler_kind, pitch_rate, stream_rate));
         dlog_dev!(LogModule::Hal2, "HAL2: Codec A resampler {}Hz (pitch={}) → {}Hz", rate, pitch_rate, stream_rate);
     }
 
@@ -1270,7 +1514,7 @@ fn drain_codec_a(
         // so the cpal callback can start treating an empty ring as a genuine underrun.
         if was_prebuffering && !st.prebuffering {
             if let Some(o) = &st.out {
-                o.playing.store(true, Ordering::Relaxed);
+                o.set_playing(true);
             }
         }
         moved += 1;
@@ -1315,11 +1559,8 @@ impl Device for Hal2 {
 
     fn start(&self) {
         // Open persistent audio output once.  Codec A timer will push into it.
-        let audio = open_persistent_output(
-            self.underruns.clone(),
-            Arc::new(AtomicBool::new(false)),
-            &self.audio_config,
-        );
+        let audio = select_backend(&self.audio_config, self.underruns.clone())
+            .open(&self.audio_config);
         if audio.is_none() {
             eprintln!("HAL2: no audio output available");
         }
@@ -1400,8 +1641,8 @@ impl Device for Hal2 {
 
                 let ca = self.ca_state.lock();
                 writeln!(writer, "Codec A out: {}  pitch: {}  prebuf: {}  prebuffering: {}  timer: {}",
-                    ca.out.as_ref().map_or("none".to_string(), |o| format!("{}Hz", o.stream_rate)),
-                    ca.resampler.as_ref().map_or("none".to_string(), |r| format!("{}Hz", r.in_rate)),
+                    ca.out.as_ref().map_or("none".to_string(), |o| format!("{}Hz", o.stream_rate())),
+                    ca.resampler.as_ref().map_or("none".to_string(), |r| format!("{}Hz", r.input_rate())),
                     ca.prebuf.len() / 2,
                     ca.prebuffering,
                     ca.timer_id.map_or("none".to_string(), |id| format!("{:#x}", id)),
@@ -1564,17 +1805,32 @@ mod tests {
     }
 
     /// A host output backed by a real ring with no cpal stream, so the
-    /// backpressure path is exercisable without audio hardware.
-    fn test_output(frames: usize) -> (AudioOut, rtrb::Consumer<i16>) {
+    /// backpressure and sink paths are exercisable without audio hardware.
+    struct TestOutput {
+        rate: u32,
+        producer: Producer<i16>,
+        playing: AtomicBool,
+    }
+
+    impl AudioOutput for TestOutput {
+        fn stream_rate(&self) -> u32 { self.rate }
+        fn free_frames(&self) -> usize { self.producer.slots() / 2 }
+        fn push_frames(&mut self, samples: &[i16]) -> usize {
+            let mut n = 0usize;
+            for &s in samples {
+                if self.producer.push(s).is_err() { break; }
+                n += 1;
+            }
+            n / 2
+        }
+        fn underruns(&self) -> u64 { 0 }
+        fn set_playing(&self, playing: bool) { self.playing.store(playing, Ordering::Relaxed); }
+    }
+
+    fn test_output(frames: usize) -> (Box<dyn AudioOutput>, rtrb::Consumer<i16>) {
         let (producer, consumer) = RingBuffer::<i16>::new(frames * 2);
-        let out = AudioOut {
-            stream_rate: 48000,
-            producer,
-            underruns: Arc::new(AtomicU64::new(0)),
-            playing: Arc::new(AtomicBool::new(false)),
-            _stream: None,
-        };
-        (out, consumer)
+        let out = TestOutput { rate: 48000, producer, playing: AtomicBool::new(false) };
+        (Box::new(out), consumer)
     }
 
     /// Bounded-buffer backpressure: a full ring stalls the codec read instead
@@ -1585,14 +1841,14 @@ mod tests {
         let (out, mut cons) = test_output(cap);
         let mut st = CodecAState::new();
         st.out = Some(out);
-        st.resampler = Some(Resampler::new(48000, 48000)); // passthrough
+        st.resampler = Some(make_resampler(ResamplerKind::CatmullRom, 48000, 48000));
 
         let dma = Arc::new(CountingDma { reads: AtomicU64::new(0) });
         let client: Arc<dyn DmaClient> = dma.clone();
 
         // prebuf_ms = 0 forces the initial prebuffer to flush on the first
         // frame, so the ring fills and then stalls within one wake.
-        let moved = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, 100);
+        let moved = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, ResamplerKind::CatmullRom, 100);
         assert_eq!(moved, cap as u64, "ring capacity must bound one wake's drain");
         assert_eq!(
             dma.reads.load(Ordering::Relaxed),
@@ -1605,8 +1861,61 @@ mod tests {
             assert!(cons.pop().is_ok());
             assert!(cons.pop().is_ok());
         }
-        let moved2 = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, 100);
+        let moved2 = drain_codec_a(&mut st, &client, MODE_STEREO, 48000, 48000, 0, ResamplerKind::CatmullRom, 100);
         assert_eq!(moved2, cap as u64, "the read resumes once the ring drains");
+    }
+
+    /// The wav sink writes a RIFF/WAVE file with a valid header and the pushed
+    /// samples, so CI can capture audio with no sound card.
+    #[test]
+    fn wav_sink_writes_a_valid_capture() {
+        let path = std::env::temp_dir().join(format!("iris-hal2-wav-{}.wav", std::process::id()));
+        {
+            let mut w = WavOutput::new(&path, 44100).expect("create wav");
+            assert_eq!(w.stream_rate(), 44100);
+            assert_eq!(w.free_frames(), usize::MAX);
+            assert_eq!(w.push_frames(&[100, -100, 200, -200]), 2);
+        } // drop patches the header sizes
+        let b = std::fs::read(&path).expect("read wav");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(b.len(), 44 + 8, "header plus four samples");
+        assert_eq!(&b[0..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        assert_eq!(&b[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([b[20], b[21]]), 1); // PCM
+        assert_eq!(u16::from_le_bytes([b[22], b[23]]), 2); // stereo
+        assert_eq!(u32::from_le_bytes([b[24], b[25], b[26], b[27]]), 44100);
+        assert_eq!(u16::from_le_bytes([b[34], b[35]]), 16); // bits
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 36 + 8);
+        assert_eq!(&b[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([b[40], b[41], b[42], b[43]]), 8);
+        assert_eq!(i16::from_le_bytes([b[44], b[45]]), 100);
+        assert_eq!(i16::from_le_bytes([b[46], b[47]]), -100);
+    }
+
+    /// The null and wav backends open through the trait with no device.
+    #[test]
+    fn null_and_wav_backends_open_through_the_trait() {
+        let null = NullBackend.open(&AudioConfig::default()).expect("null opens");
+        assert_eq!(null.stream_rate(), 48000);
+
+        let path = std::env::temp_dir().join(format!("iris-hal2-be-{}.wav", std::process::id()));
+        let backend = WavBackend { path: path.clone() };
+        let mut out = backend.open(&AudioConfig::default()).expect("wav opens");
+        out.push_frames(&[7, -7]);
+        drop(out);
+        assert!(path.exists(), "the wav backend created its capture file");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn null_sink_accepts_and_discards() {
+        let mut n = NullOutput { rate: 48000 };
+        assert_eq!(n.stream_rate(), 48000);
+        assert_eq!(n.free_frames(), usize::MAX);
+        assert_eq!(n.push_frames(&[1, 2, 3, 4, 5, 6]), 3);
+        assert_eq!(n.underruns(), 0);
     }
 
     #[test]
@@ -1658,42 +1967,55 @@ mod tests {
         assert_eq!(bres_rate(48000, 0, 0u16.wrapping_sub(4).wrapping_sub(1)), 0);
     }
 
-    fn resample(in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
-        let (mut prod, mut cons) = RingBuffer::<i16>::new(n_frames * 4 + 16);
-        let mut r = Resampler::new(in_rate, out_rate);
+    fn resample(kind: ResamplerKind, in_rate: u32, out_rate: u32, n_frames: usize) -> usize {
+        let mut r = make_resampler(kind, in_rate, out_rate);
+        let mut out = Vec::new();
         for i in 0..n_frames {
-            r.push(i as i16, i as i16, &mut prod);
+            r.process(i as i16, i as i16, &mut out);
         }
-        drop(prod);
-        let mut count = 0;
-        while cons.pop().is_ok() { count += 1; }
-        count / 2  // stereo pairs → frames
+        out.len() / 2 // stereo pairs → frames
+    }
+
+    /// The resampler option is a config choice; both implementations honour the
+    /// same output count, so a swap does not change the stream rate.
+    #[test]
+    fn resampler_config_selects_an_implementation() {
+        assert_eq!(AudioConfig::default().resampler, ResamplerKind::CatmullRom);
+        let cat = make_resampler(ResamplerKind::CatmullRom, 44100, 48000);
+        let sinc = make_resampler(ResamplerKind::Sinc, 44100, 48000);
+        assert_eq!(cat.input_rate(), 44100);
+        assert_eq!(cat.output_rate(), 48000);
+        assert_eq!(sinc.input_rate(), 44100);
+        assert_eq!(sinc.output_rate(), 48000);
+        for kind in [ResamplerKind::CatmullRom, ResamplerKind::Sinc] {
+            assert_eq!(resample(kind, 44100, 48000, 44100), 48000);
+        }
     }
 
     #[test]
     fn resampler_passthrough() {
         // 1:1 — every input frame produces exactly one output frame
-        assert_eq!(resample(44100, 44100, 1000), 1000);
+        assert_eq!(resample(ResamplerKind::CatmullRom, 44100, 44100, 1000), 1000);
     }
 
     #[test]
     fn resampler_downsample_2x() {
         // 44100 → 22050: every 2 inputs → 1 output, so 1000 in → 500 out
-        let out = resample(44100, 22050, 1000);
+        let out = resample(ResamplerKind::CatmullRom, 44100, 22050, 1000);
         assert_eq!(out, 500, "44100→22050: expected 500 frames, got {}", out);
     }
 
     #[test]
     fn resampler_upsample_2x() {
         // 22050 → 44100: every input → 2 outputs, so 1000 in → 2000 out
-        let out = resample(22050, 44100, 1000);
+        let out = resample(ResamplerKind::CatmullRom, 22050, 44100, 1000);
         assert_eq!(out, 2000, "22050→44100: expected 2000 frames, got {}", out);
     }
 
     #[test]
     fn resampler_upsample_44100_to_48000() {
         // 44100 → 48000: ratio ~1.0884, so 44100 in → 48000 out (over one second of audio)
-        let out = resample(44100, 48000, 44100);
+        let out = resample(ResamplerKind::CatmullRom, 44100, 48000, 44100);
         assert_eq!(out, 48000, "44100→48000: expected 48000 frames, got {}", out);
     }
 
@@ -1719,16 +2041,13 @@ mod tests {
     fn resampler_11025_to_48000_follows_the_waveform() {
         let (inr, outr, f, amp) = (11025u32, 48000u32, 1000.0f64, 16000.0f64);
         let n = 11025;
-        let (mut prod, mut cons) = RingBuffer::<i16>::new(n * 12);
-        let mut r = Resampler::new(inr, outr);
+        let mut r = make_resampler(ResamplerKind::CatmullRom, inr, outr);
+        let mut out = Vec::new();
         for k in 0..n {
             let v = (amp * (2.0 * std::f64::consts::PI * f * k as f64 / inr as f64).sin()) as i16;
-            r.push(v, v, &mut prod);
+            r.process(v, v, &mut out);
         }
-        drop(prod);
-        let mut out = Vec::new();
-        while let Ok(v) = cons.pop() { out.push(v as f64); }
-        let left: Vec<f64> = out.iter().step_by(2).copied().collect();
+        let left: Vec<f64> = out.iter().step_by(2).map(|&v| v as f64).collect();
         let body = &left[1000..left.len() - 1000];
         let mut best = f64::MAX;
         for step in 0..400 {
@@ -1744,10 +2063,52 @@ mod tests {
         assert!(best < 0.03, "RMS error {:.3} of the amplitude", best);
     }
 
+    /// Magnitude of a single frequency in `sig` (sampled at `rate`) via a DFT.
+    fn tone_magnitude(sig: &[f64], rate: f64, f: f64) -> f64 {
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, &v) in sig.iter().enumerate() {
+            let ph = 2.0 * std::f64::consts::PI * f * i as f64 / rate;
+            re += v * ph.cos();
+            im += v * ph.sin();
+        }
+        (re * re + im * im).sqrt() * 2.0 / sig.len() as f64
+    }
+
+    /// Magnitude of the 3 kHz alias produced by downsampling a 5 kHz tone from
+    /// 11025 Hz to 8000 Hz. 5 kHz is above the output's 4 kHz Nyquist, so a
+    /// band-limited resampler must remove it before decimating.
+    fn alias_magnitude(kind: ResamplerKind) -> f64 {
+        let (inr, outr, f, amp, n) = (11025u32, 8000u32, 5000.0f64, 12000.0f64, 11025usize);
+        let mut r = make_resampler(kind, inr, outr);
+        let mut out = Vec::new();
+        for k in 0..n {
+            let v = (amp * (2.0 * std::f64::consts::PI * f * k as f64 / inr as f64).sin()) as i16;
+            r.process(v, v, &mut out);
+        }
+        let left: Vec<f64> = out.iter().step_by(2).map(|&v| v as f64).collect();
+        let body = &left[2000..]; // drop the filter transient
+        tone_magnitude(body, outr as f64, 3000.0)
+    }
+
+    /// Catmull-Rom interpolates through the samples but does not band-limit, so
+    /// a tone above the output Nyquist folds down; the windowed-sinc option
+    /// suppresses it.
+    #[test]
+    fn sinc_resampler_suppresses_imaging_that_catmull_rom_leaves() {
+        let cat = alias_magnitude(ResamplerKind::CatmullRom);
+        let sinc = alias_magnitude(ResamplerKind::Sinc);
+        assert!(cat > 300.0, "catmull should alias a 5 kHz tone; got {:.0}", cat);
+        assert!(
+            sinc < 0.25 * cat,
+            "sinc should suppress the alias: cat={:.0} sinc={:.0}",
+            cat, sinc
+        );
+    }
+
     #[test]
     fn resampler_downsample_48000_to_44100() {
         // 48000 → 44100: ratio ~0.919, so 48000 in → 44100 out
-        let out = resample(48000, 44100, 48000);
+        let out = resample(ResamplerKind::CatmullRom, 48000, 44100, 48000);
         assert_eq!(out, 44100, "48000→44100: expected 44100 frames, got {}", out);
     }
 }
