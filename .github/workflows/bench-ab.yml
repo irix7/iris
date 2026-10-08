@@ -1,0 +1,95 @@
+# Direct A/B of two emulator commits on ONE runner.
+#
+# The backfill measures each commit on whatever runner it lands on and
+# normalises by a native baseline; this instead builds both commits and runs
+# each against the same suite, on the same machine, back to back, so the ratio
+# is not carrying any host or baseline error. Use it to answer "is HEAD as fast
+# as commit X" when the difference is smaller than the run-to-run noise.
+#
+# Same machinery as tools/bench-backfill.sh, with a two-line commit file and
+# one shard (so both commits run in this job), and a higher repeat count.
+name: Benchmark A/B
+
+on:
+  workflow_dispatch:
+    inputs:
+      refs:
+        description: "Two commits to compare, oldest first (space separated)"
+        required: true
+      cpu:
+        description: "Emulated CPU (r4400 or r5000)"
+        required: true
+        default: "r4400"
+      engine:
+        description: "interp or jitv2"
+        required: true
+        default: "jitv2"
+      repeat:
+        description: "Suite samples per commit"
+        required: true
+        default: "8"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ab:
+    name: A/B on one runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run both commits on this runner
+        env:
+          BACKFILL_REPEAT: ${{ inputs.repeat }}
+          BACKFILL_HOST_REPEAT: "5"
+        run: |
+          set -o pipefail
+          printf '%s\n' ${{ inputs.refs }} > /tmp/ab-commits.txt
+          cat /tmp/ab-commits.txt
+          BACKFILL_FRAG="$PWD/ab-history.json" \
+            tools/bench-backfill.sh /tmp/ab-commits.txt 1 \
+              "${{ inputs.cpu }}" "${{ inputs.engine }}" \
+            2>&1 | tee ab.log
+
+      - name: Compare
+        run: |
+          python3 - <<'PY'
+          import json
+          cell = "${{ inputs.cpu }}-${{ inputs.engine }}"
+          d = json.load(open("ab-history.json"))
+          rows = []
+          for e in d["entries"]:
+              for c in e["cells"]:
+                  if c["name"] == cell and c.get("efficiency") is not None:
+                      rows.append((e["date"], e["commit"], c.get("mips"), c["efficiency"],
+                                   e.get("title", "")[:40]))
+          rows.sort()
+          print(f"cell {cell}, {len(rows)} samples on {d['entries'][0]['host'].get('cpu','?')}")
+          for dt, sha, mips, eff, title in rows:
+              print(f"  {dt[:10]} {sha[:9]}  mips={mips:8.1f}  eff={eff:.4f}  {title}")
+          if len(rows) == 2:
+              (_, sha_a, _, eff_a, _), (_, sha_b, _, eff_b, _) = rows[:2]
+              print(f"\n{sha_b[:9]} is {eff_b/eff_a:.3f}x {sha_a[:9]} "
+                    f"({(eff_b/eff_a-1)*100:+.1f}%)")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-ab
+          path: |
+            ab-history.json
+            ab.log
+          if-no-files-found: ignore
