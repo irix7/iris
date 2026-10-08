@@ -148,51 +148,69 @@ def _short_host(cpu):
 
 
 def history_svg(entries, metric="mips"):
-    """Time series of every recorded run, grouped by CPU (R4400 / R5000).
+    """Time series of every recorded commit, grouped by CPU (R4400 / R5000).
 
-    `metric="mips"` plots raw guest MIPS on a log axis and breaks a line where
-    the host CPU changes, because raw MIPS is only comparable within one host.
-    `metric="efficiency"` plots the host-normalised fraction of the runner's own
-    native rate, which cancels the host, so those lines connect across host
-    changes. A coloured host strip under the panels still shows which runs
-    shared a host.
+    `metric="mips"` plots raw guest MIPS on a log axis, breaking a line where the
+    host CPU changes. `metric="efficiency"` plots the host-normalised fraction of
+    the runner's own native rate as a percentage: the host is divided out, so the
+    lines are comparable across runners and carry no host detail. Each cell is
+    faint raw points under a bold centred moving average.
     """
     import math
 
-    entries = sorted(entries, key=lambda e: e["date"])
-    n = len(entries)
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    def month_day(date):
+        try:
+            _, m_, d_ = date[:10].split("-")
+            return f"{int(d_)} {months[int(m_) - 1]}"
+        except Exception:
+            return date[:10]
+
+    if metric == "mips":
+        columns = [{"date": e["date"], "host": e["host"].get("cpu", "?"),
+                    "cells": {c["name"]: _num(c.get(metric))
+                              for c in e["cells"] if c.get(metric) is not None}}
+                   for e in entries]
+        columns = [c for c in columns if c["cells"]]
+    else:
+        # Efficiency entries carry one cell each (the interp and jitv2 backfills
+        # are separate runs), so join them into one column per commit — that is
+        # what puts both lines on a shared x axis.
+        by_commit = {}
+        for e in entries:
+            d = by_commit.setdefault(e["commit"], {
+                "date": e["date"], "host": e["host"].get("cpu", "?"), "cells": {}})
+            for c in e["cells"]:
+                if c.get(metric) is not None:
+                    d["cells"][c["name"]] = _num(c.get(metric))
+        columns = sorted((c for c in by_commit.values() if c["cells"]),
+                         key=lambda c: c["date"])
+    n = len(columns)
     if n == 0:
         return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
 
     hosts = []
-    for e in entries:
-        h = e["host"].get("cpu", "?")
-        if h not in hosts:
-            hosts.append(h)
+    for col in columns:
+        if col["host"] not in hosts:
+            hosts.append(col["host"])
     host_color = {h: HOST_COLORS[i % len(HOST_COLORS)] for i, h in enumerate(hosts)}
 
     all_groups = [("R4400", ["r4400-interp", "r4400-jitv2"]),
                   ("R5000", ["r5000-interp", "r5000-jitv2"])]
-
-    def group_has_data(cells):
-        return any(c["name"] in cells and c.get(metric) is not None
-                   for e in entries for c in e["cells"])
-
-    groups = [g for g in all_groups if group_has_data(g[1])]
+    groups = [g for g in all_groups
+              if any(name in col["cells"] for col in columns for name in g[1])]
     if not groups:
         return '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>'
-    # The raw-MIPS chart carries a host strip and breaks lines at host changes
-    # because raw MIPS is only comparable within a host. The normalised chart
-    # has the host divided out, so none of that belongs on it.
     show_host = metric == "mips"
 
-    W = 880
-    pad_l, pad_r, pad_t = 84, 18, 104
-    panel_h, gap = 150, 34
+    W = 900
+    pad_l, pad_r, pad_t, pad_b = 84, 22, 100, 56
+    panel_h, gap = 168, 30
     plot_w = W - pad_l - pad_r
-    host_gap, host_band, xlabel_h = 14, 12, 46
     ngroup = len(groups)
-    H = pad_t + ngroup * (panel_h + gap) - gap + host_gap + host_band + xlabel_h
+    H = pad_t + ngroup * (panel_h + gap) - gap + pad_b
 
     def xpos(i):
         return pad_l + plot_w * (i + 0.5) / n
@@ -200,12 +218,9 @@ def history_svg(entries, metric="mips"):
     def panel_top(j):
         return pad_t + j * (panel_h + gap)
 
-    # Metric-specific scale, title and line-breaking. Raw MIPS is only comparable
-    # within a host; host-normalised efficiency cancels the host, so its lines
-    # connect across host changes.
     if metric == "mips":
-        title = f"Guest MIPS across all {n} recorded runs — grouped by CPU"
-        subtitle = "log scale · a line breaks where the host CPU changes (host strip, bottom)"
+        title = f"Guest MIPS across {n} recorded commits — grouped by CPU"
+        subtitle = "log scale · a line breaks where the host CPU changes"
         ymin, ymax = 20.0, 2000.0
         logspan = math.log10(ymax / ymin)
         grid_values = [20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0]
@@ -218,102 +233,121 @@ def history_svg(entries, metric="mips"):
         def fmt_grid(v):
             return f"{v:.0f}"
     else:
-        title = f"Host-normalised efficiency (all {n} recorded runs) — grouped by CPU"
-        subtitle = ("fraction of the runner's own native rate; host-independent, "
-                    "so lines connect across host changes")
-        vals = [_num(c.get(metric)) for e in entries for c in e["cells"]
-                if c.get(metric) is not None]
-        lo = min(vals) if vals else 0.0
-        hi = max(vals) if vals else 1.0
-        span = max(hi - lo, hi * 0.1, 1e-6)
-        ymin = max(0.0, lo - span * 0.1)
-        ymax = hi + span * 0.1
+        title = f"Normalised benchmark across {n} commits — grouped by CPU"
+        subtitle = ("percentage of the runner's own native rate; the bold line is a "
+                    "centred moving average")
+        vals = [v * 100.0 for col in columns for v in col["cells"].values()]
+        lo, hi = min(vals), max(vals)
+        pad = max((hi - lo) * 0.12, hi * 0.08, 1e-6)
+        ymin, ymax = max(0.0, lo - pad), hi + pad
         grid_values = [ymin + (ymax - ymin) * k / 4 for k in range(5)]
         break_on_host = False
 
         def yval(j, v):
-            frac = (v - ymin) / (ymax - ymin) if ymax > ymin else 0.0
+            frac = (v * 100.0 - ymin) / (ymax - ymin) if ymax > ymin else 0.0
             return panel_top(j) + (1 - frac) * panel_h
 
         def fmt_grid(v):
-            return f"{v:.3f}" if ymax <= 1.0 else f"{v:.1f}"
+            return f"{v:.0f}%"
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
              f'viewBox="0 0 {W} {H}" font-family="system-ui,sans-serif">']
-    parts.append(f'<text x="{pad_l}" y="26" font-size="17" font-weight="600" fill="#222">'
-                 f'{title}</text>')
-    parts.append(f'<text x="{pad_l}" y="44" font-size="12" fill="#666">'
-                 f'{subtitle}</text>')
-
+    parts.append(f'<text x="{pad_l}" y="26" font-size="17" font-weight="600" fill="#222">{title}</text>')
+    parts.append(f'<text x="{pad_l}" y="44" font-size="12" fill="#666">{subtitle}</text>')
     lx = pad_l
     for label, color in (("interp", COLORS["interp"]), ("jitv2", COLORS["jitv2"])):
         parts.append(f'<rect x="{lx}" y="56" width="10" height="10" fill="{color}"/>')
         parts.append(f'<text x="{lx + 14}" y="65" font-size="11" fill="#444">{label}</text>')
         lx += 14 + 7 * len(label) + 22
+    parts.append(f'<line x1="{lx}" y1="61" x2="{lx + 20}" y2="61" stroke="#888" '
+                 f'stroke-width="2.8" stroke-linecap="round"/>')
+    parts.append(f'<text x="{lx + 25}" y="65" font-size="11" fill="#444">trend (moving average)</text>')
 
-    if show_host:
-        lx = pad_l
-        for h in hosts:
-            label = _short_host(h)
-            parts.append(f'<rect x="{lx:.1f}" y="78" width="10" height="10" fill="{host_color[h]}"/>')
-            parts.append(f'<text x="{lx + 14:.1f}" y="87" font-size="11" fill="#444">{label}</text>')
-            lx += 14 + 7 * len(label) + 16
+    nticks = min(6, n)
+    tick_idx = sorted({round(k * (n - 1) / (nticks - 1)) for k in range(nticks)}) if n > 1 else [0]
 
-    band_y = panel_top(ngroup - 1) + panel_h + host_gap
+    windows = []
+    if not show_host:
+        flags = []
+        for col in columns:
+            iv = col["cells"].get("r4400-interp")
+            jv = col["cells"].get("r4400-jitv2")
+            flags.append(iv is not None and jv is not None and jv < iv)
+        s = None
+        for k, f in enumerate(flags + [False]):
+            if f and s is None:
+                s = k
+            elif not f and s is not None:
+                windows.append((s, k - 1)); s = None
 
-    # Host-change separators span the panels, drawn first so points sit on top.
-    if show_host:
-        for i in range(1, n):
-            if entries[i]["host"].get("cpu", "?") != entries[i - 1]["host"].get("cpu", "?"):
-                x = pad_l + plot_w * i / n
-                parts.append(f'<line x1="{x:.1f}" y1="{pad_t - 4}" x2="{x:.1f}" '
-                             f'y2="{band_y + host_band:.1f}" stroke="#dddddd" stroke-width="1" '
-                             f'stroke-dasharray="3,3"/>')
+    def rolling(vals, w):
+        if w < 2 or len(vals) < 3:
+            return vals
+        half = w // 2
+        return [sum(vals[max(0, i - half):i + half + 1]) /
+                len(vals[max(0, i - half):i + half + 1]) for i in range(len(vals))]
 
-    for j, (title, cells) in enumerate(groups):
+    band_y = panel_top(ngroup - 1) + panel_h + 14
+    base = band_y + (12 if show_host else 0)
+
+    for j, (panel_title, cells) in enumerate(groups):
         top = panel_top(j)
         parts.append(f'<rect x="{pad_l}" y="{top:.1f}" width="{plot_w}" height="{panel_h}" '
-                     f'fill="#fbfbfb" stroke="#eeeeee"/>')
+                     f'fill="#ffffff" stroke="#e6e6e6"/>')
+        for (a, b) in windows:
+            x0 = xpos(a) - plot_w / n / 2
+            x1 = xpos(b) + plot_w / n / 2
+            parts.append(f'<rect x="{x0:.1f}" y="{top:.1f}" width="{(x1 - x0):.1f}" '
+                         f'height="{panel_h}" fill="#e0662f" opacity="0.09"/>')
         for gv in grid_values:
             yy = yval(j, gv)
             parts.append(f'<line x1="{pad_l}" y1="{yy:.1f}" x2="{W - pad_r}" y2="{yy:.1f}" '
-                         f'stroke="#e9e9e9" stroke-width="1"/>')
+                         f'stroke="#ececec" stroke-width="1"/>')
             parts.append(f'<text x="{pad_l - 8}" y="{yy + 4:.1f}" font-size="10" fill="#999" '
                          f'text-anchor="end">{fmt_grid(gv)}</text>')
+        for i in tick_idx:
+            x = xpos(i)
+            parts.append(f'<line x1="{x:.1f}" y1="{top:.1f}" x2="{x:.1f}" '
+                         f'y2="{top + panel_h:.1f}" stroke="#f3f3f3" stroke-width="1"/>')
         parts.append(f'<text x="{pad_l + 8}" y="{top + 18:.1f}" font-size="13" '
-                     f'font-weight="600" fill="#333">{title}</text>')
+                     f'font-weight="600" fill="#333">{panel_title}</text>')
 
         for name in cells:
             color = COLORS["interp"] if "interp" in name else COLORS["jitv2"]
+            pts = [(i, col["cells"][name]) for i, col in enumerate(columns)
+                   if name in col["cells"]]
+            if not pts:
+                continue
             prev = None
-            for i, e in enumerate(entries):
-                c = next((c for c in e["cells"] if c["name"] == name), None)
-                if c is None or c.get(metric) is None:
-                    prev = None
-                    continue
-                x, y = xpos(i), yval(j, _num(c.get(metric)))
-                h = e["host"].get("cpu", "?")
+            for i, v in pts:
+                x, y = xpos(i), yval(j, v)
+                h = columns[i]["host"]
                 if prev is not None and (not break_on_host or prev[2] == h):
                     parts.append(f'<line x1="{prev[0]:.1f}" y1="{prev[1]:.1f}" x2="{x:.1f}" '
-                                 f'y2="{y:.1f}" stroke="{color}" stroke-width="1.8"/>')
-                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3.4" fill="{color}" '
-                             f'stroke="#ffffff" stroke-width="1"/>')
+                                 f'y2="{y:.1f}" stroke="{color}" stroke-width="1" '
+                                 f'opacity="0.30"/>')
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.5" fill="{color}" '
+                             f'opacity="0.30"/>')
                 prev = (x, y, h)
+            ys = rolling([v for _, v in pts], max(5, len(pts) // 20))
+            for k in range(1, len(pts)):
+                x0, y0 = xpos(pts[k - 1][0]), yval(j, ys[k - 1])
+                x1, y1 = xpos(pts[k][0]), yval(j, ys[k])
+                parts.append(f'<line x1="{x0:.1f}" y1="{y0:.1f}" x2="{x1:.1f}" y2="{y1:.1f}" '
+                             f'stroke="{color}" stroke-width="2.8" stroke-linecap="round"/>')
 
-    # Host strip: one coloured cell per run, under the panels.
     if show_host:
         seg = plot_w / n
-        for i, e in enumerate(entries):
-            h = e["host"].get("cpu", "?")
+        for i, col in enumerate(columns):
             parts.append(f'<rect x="{pad_l + i * seg:.1f}" y="{band_y}" width="{seg:.1f}" '
-                         f'height="{host_band}" fill="{host_color[h]}"/>')
+                         f'height="12" fill="{host_color[col["host"]]}"/>')
 
-    base = band_y + host_band
-    for i, e in enumerate(entries):
-        x = xpos(i)
-        parts.append(f'<text x="{x:.1f}" y="{base + 16:.1f}" font-size="10" fill="#666" '
-                     f'text-anchor="end" transform="rotate(-45 {x:.1f} {base + 16:.1f})">'
-                     f'{e["date"][5:10]}</text>')
+    for i in tick_idx:
+        parts.append(f'<text x="{xpos(i):.1f}" y="{base + 22:.1f}" font-size="11" fill="#666" '
+                     f'text-anchor="middle">{month_day(columns[i]["date"])}</text>')
+    if windows:
+        parts.append(f'<text x="{W - pad_r}" y="{base + 22:.1f}" font-size="11" fill="#b5571f" '
+                     f'text-anchor="end">shaded: jitv2 slower than the interpreter</text>')
 
     parts.append("</svg>")
     return "\n".join(parts)

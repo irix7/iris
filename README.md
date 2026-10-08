@@ -305,7 +305,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-The latest benchmark run on an AMD EPYC 9V74 80-Core Processor achieved a score of 763.6 MIPS with the r4400-jitv2 build, representing a 100.0% speedup over the interpreter baseline. This performance corresponds to 753.1 DMIPS, marking the 404th recorded run in the dataset.
+The latest benchmark run on an AMD EPYC 9V74 80-Core Processor achieved a score of 763.6 MIPS using the r4400-jitv2 build, representing a 100.0% speedup over the baseline interpreter performance of 753.1 DMIPS. This result is part of a comprehensive dataset that now includes a total of 404 recorded runs.
 
 ![latest benchmark cells](data/bench_cells.svg)
 
