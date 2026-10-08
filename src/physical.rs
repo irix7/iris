@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::Write as IoWrite;
 
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device, BUS_OK};
@@ -303,7 +304,8 @@ struct DecodeTable {
 unsafe impl Send for DecodeTable {}
 unsafe impl Sync for DecodeTable {}
 
-/// The physical decode table as an atomically-published immutable snapshot.
+/// The physical decode table as an atomically-published immutable snapshot,
+/// with bounded retirement of the snapshots it supersedes.
 ///
 /// Readers call [`device_at`](Self::device_at), which loads the live snapshot
 /// once and indexes it. The MC-DMA worker and other device threads do this
@@ -311,27 +313,59 @@ unsafe impl Sync for DecodeTable {}
 /// new snapshot (copy-on-write) and stores it with `Release`, so a reader
 /// observes either the entire old table or the entire new one.
 ///
-/// Superseded snapshots are **leaked on purpose**. Freeing one the instant it
-/// is superseded would be unsound: a reader that loaded the old pointer just
-/// before the swap may still be dereferencing it — a bus access can block on a
-/// device lock indefinitely — and there is no reader count to wait on. At
-/// MEMCFG's rebuild rate (a handful of bank moves during POST, plus IP28's
-/// refresh-bit rewrites, which [`apply_plan`](Self::apply_plan) detects and
-/// skips) leaking 1 MiB per *real* remap is the conservative trade the issue
-/// allows.
+/// A superseded snapshot is **not** freed the instant it is replaced: a reader
+/// that loaded the old pointer just before the swap may still be reading a
+/// slot out of it. It is pushed onto a bounded retire ring instead, and only
+/// the snapshot that falls off the far end of that ring is freed. The ring
+/// keeps [`RETIRED_KEEP`] generations behind the live one, so the live
+/// snapshot plus at most `RETIRED_KEEP` superseded ones are ever resident — a
+/// fixed `(RETIRED_KEEP + 1)` MiB rather than 1 MiB leaked per real remap.
+///
+/// # Safety
+///
+/// The only dereference of a snapshot is the `(*table).slots[addr >> 16]` in
+/// [`device_at`](Self::device_at): one `Acquire` load followed by a plain
+/// index, with no lock, allocation, syscall or yield in between, so a reader
+/// cannot *block* while holding a snapshot pointer. A reader would have to be
+/// descheduled across all `RETIRED_KEEP` subsequent *real* remaps to outlive
+/// the grace the ring provides, and a remap is serialised on the single CPU
+/// thread. IP28's frequent refresh-bit rewrites do not count: they leave every
+/// bank where it was, and [`apply_plan`](Self::apply_plan) diffs the plan and
+/// publishes nothing.
 struct DecodeMap {
     live: AtomicPtr<DecodeTable>,
+    /// Superseded snapshots, oldest first. Only the writer (the CPU thread,
+    /// through `publish`) touches this; the mutex exists because `DecodeMap`
+    /// is shared as part of `Physical`, not because readers contend on it.
+    retired: Mutex<VecDeque<Box<DecodeTable>>>,
+    /// How many superseded snapshots to retain. `RETIRED_KEEP` in production;
+    /// the tests widen it to keep a concurrent publish loop from reclaiming a
+    /// snapshot a reader is still looking at.
+    retire_keep: usize,
 }
+
+/// Superseded snapshots retained behind the live one — the grace period,
+/// counted in remaps rather than wall-clock time. Two is the "current plus the
+/// previous generation" the design calls for, plus one more for slack.
+const RETIRED_KEEP: usize = 2;
 
 impl DecodeMap {
     /// Start with every slot pointing at `BOOT_ERR`, exactly as the old
     /// in-line table did. `init`/`build_device_map` replaces it before any
     /// other thread holds the bus.
     fn boot() -> Self {
+        Self::with_retire_keep(RETIRED_KEEP)
+    }
+
+    /// `boot` with an explicit retire depth, so tests can publish concurrently
+    /// without reclaiming a snapshot a reader still holds (see the tests).
+    fn with_retire_keep(retire_keep: usize) -> Self {
         Self {
             live: AtomicPtr::new(Box::into_raw(Box::new(DecodeTable {
                 slots: [BOOT_PTR; 65536],
             }))),
+            retired: Mutex::new(VecDeque::new()),
+            retire_keep,
         }
     }
 
@@ -346,8 +380,9 @@ impl DecodeMap {
         // the new pointer also observes the fully-built snapshot behind it.
         let table = self.live.load(Ordering::Acquire);
         // SAFETY: `table` is the boot snapshot or one published by
-        // `apply_plan`, all of which are kept alive for the life of the
-        // process (superseded ones are leaked). `addr >> 16` is always in
+        // `apply_plan`. The live snapshot is never freed while it is live, and
+        // a superseded one is held on the retire ring for `retire_keep` later
+        // publishes (see the type comment). `addr >> 16` is always in
         // `0..65536`, so the index is in bounds.
         unsafe { (*table).slots[(addr >> 16) as usize] }
     }
@@ -367,11 +402,30 @@ impl DecodeMap {
         })
     }
 
-    /// Publish `table` with a single release store, returning the superseded
-    /// pointer. The caller must not free the superseded table (see the type
-    /// comment).
-    fn publish(&self, table: Box<DecodeTable>) -> *mut DecodeTable {
-        self.live.swap(Box::into_raw(table), Ordering::Release)
+    /// Publish `table` with a single release store, retiring the snapshot it
+    /// supersedes onto the bounded ring.
+    ///
+    /// The snapshot that falls off the far end of the ring is dropped here.
+    /// It is `retire_keep` generations behind the new live snapshot, so any
+    /// reader that could still reach it had `retire_keep` real remaps to
+    /// finish a single non-blocking `device_at` (see the type comment).
+    fn publish(&self, table: Box<DecodeTable>) {
+        let old = self.live.swap(Box::into_raw(table), Ordering::Release);
+        let mut retired = self.retired.lock().unwrap();
+        // SAFETY: `old` was produced by an earlier `live.swap`/`Box::into_raw`
+        // and is now unreachable through `live`; nothing else has a copy.
+        if !old.is_null() {
+            retired.push_back(unsafe { Box::from_raw(old) });
+        }
+        while retired.len() > self.retire_keep {
+            retired.pop_front();
+        }
+    }
+
+    /// Superseded snapshots currently retained. Tests only.
+    #[cfg(test)]
+    fn retired_len(&self) -> usize {
+        self.retired.lock().unwrap().len()
     }
 
     /// Apply a [`plan_bank_slots`] plan to a copy of the live table and
@@ -406,6 +460,19 @@ impl DecodeMap {
         }
         self.publish(table);
         true
+    }
+}
+
+impl Drop for DecodeMap {
+    fn drop(&mut self) {
+        // Reclaim the live snapshot; the retired ring drops with its field.
+        // Dropping the map means `Physical` is going away, so no reader can
+        // reach either any more.
+        let live = *self.live.get_mut();
+        if !live.is_null() {
+            // SAFETY: `live` came from `Box::into_raw` and is not shared.
+            unsafe { drop(Box::from_raw(live)); }
+        }
     }
 }
 
@@ -777,8 +844,8 @@ impl Physical {
         table.slots[(0x1F080000u32 >> 16) as usize] = vino_gio_alias_ptr;
 
         // Publish. `init` runs before any other thread holds the bus, so the
-        // boot snapshot being replaced is not observable; it is leaked like any
-        // other superseded table (see `DecodeMap`).
+        // boot snapshot being replaced is not observable; it is retired onto
+        // the bounded ring like any other superseded table (see `DecodeMap`).
         self.device_map.publish(table);
     }
 
@@ -877,8 +944,8 @@ impl Physical {
         // Publish the new placement as a whole immutable snapshot, swapped in
         // with a single release store. The DMA worker can be dispatching
         // through the old table right now; it either keeps using that one (now
-        // leaked, not freed) or picks up the complete new one, so it can never
-        // see a torn 16-byte fat pointer. See `DecodeMap`.
+        // on the retire ring, not yet freed) or picks up the complete new one,
+        // so it can never see a torn 16-byte fat pointer. See `DecodeMap`.
         let (plan, outside) = plan_bank_slots(&bank_addrs, &self.banks_outside_windows);
         self.banks_outside_windows = outside;
         self.device_map.apply_plan(&plan, bank_ptrs, unmapped_ptr);
@@ -1710,7 +1777,9 @@ mod decode_map_tests {
 
             // ...while a reader that already loaded the old pointer still sees
             // the complete old table: it was not freed, and not mutated in
-            // place (every boot slot is still `BOOT_PTR`).
+            // place (every boot slot is still `BOOT_PTR`). It now sits on the
+            // retire ring rather than being leaked.
+            assert_eq!(map.retired_len(), 1, "the superseded snapshot was not retired");
             for i in [0usize, 1, (LOMEM_BASE >> 16) as usize, 65535] {
                 let p = unsafe { (*old).slots[i] };
                 assert!(
@@ -1719,7 +1788,7 @@ mod decode_map_tests {
                 );
             }
 
-            // A MEMCFG write that moves no bank must not publish (and so leak
+            // A MEMCFG write that moves no bank must not publish (and so retire
             // nothing).
             let live = map.snapshot();
             assert!(
@@ -1730,6 +1799,37 @@ mod decode_map_tests {
                 std::ptr::addr_eq(map.snapshot(), live),
                 "an unchanged remap swapped the table"
             );
+            assert_eq!(map.retired_len(), 1, "an unchanged remap retired a snapshot");
+        });
+    }
+
+    /// The leak the pointer-swap change introduced is bounded: superseded
+    /// snapshots are retained for a grace period (a fixed number of remaps)
+    /// and then freed, so a long run of real remaps does not grow the heap by
+    /// 1 MiB each time.
+    #[test]
+    fn superseded_tables_are_bounded() {
+        on_big_stack(|| {
+            let map = DecodeMap::with_retire_keep(2);
+            let banks = [dummy(), dummy(), dummy(), dummy()];
+            let unmapped = dummy();
+
+            // A run of real remaps, each publishing a distinctly-mutated copy
+            // of the live table so the ring never sees the same snapshot twice.
+            for i in 0..64u32 {
+                let mut table = map.clone_live();
+                table.slots[(LOMEM_BASE >> 16) as usize] = banks[(i % 4) as usize];
+                table.slots[((HIMEM_BASE >> 16) as usize) + (i as usize % 4096)] = unmapped;
+                map.publish(table);
+                assert!(
+                    map.retired_len() <= map.retire_keep,
+                    "retire ring grew past its bound at publish {i}"
+                );
+            }
+
+            // Sixty-four publishes, at most `retire_keep` superseded snapshots
+            // resident: everything older was dropped, so the leak is bounded.
+            assert_eq!(map.retired_len(), map.retire_keep);
         });
     }
 
@@ -1738,14 +1838,16 @@ mod decode_map_tests {
         use std::sync::Arc;
 
         on_big_stack(|| {
-            let map = Arc::new(DecodeMap::boot());
+            // A retire depth wider than the whole publish run, so no snapshot
+            // is reclaimed underneath the concurrent reader. This test is
+            // about tear-freedom, not reclamation; the ring bounds the leak.
+            const PUBLISHES: usize = 16;
+            let map = Arc::new(DecodeMap::with_retire_keep(2 * PUBLISHES + 2));
             let a = SendPtr(dummy());
             let b = SendPtr(dummy());
             assert!(!std::ptr::addr_eq(a.0, b.0));
 
-            // Alternate publishing two homogeneous tables. Superseded tables
-            // are leaked, so keep the count small (16 × 2 × 1 MiB).
-            const PUBLISHES: usize = 16;
+            // Alternate publishing two homogeneous tables.
             let writer = {
                 let map = map.clone();
                 std::thread::Builder::new()
@@ -1778,6 +1880,10 @@ mod decode_map_tests {
                 reads += 1;
             }
             writer.join().unwrap();
+            assert!(
+                map.retired_len() <= map.retire_keep,
+                "the retire ring grew past its bound"
+            );
         });
     }
 }
