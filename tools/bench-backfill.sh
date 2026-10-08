@@ -33,7 +33,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 TARGET="${BACKFILL_TARGET:-$ROOT/target/backfill}"
 OUT="${BACKFILL_OUT:-$ROOT/bench/build/results}"
-FRAG="$OUT/history.json"               # this shard's history fragment
+# Outside $OUT: iris-bench report parses every *.json in the results dir as a
+# saved Run, so a history fragment there would be skipped with a warning.
+FRAG="${BACKFILL_FRAG:-$ROOT/bench/build/backfill-history.json}"
 EMU="$(mktemp -d "${TMPDIR:-/tmp}/iris-backfill-emu.XXXXXX")"
 EMU="${EMU}/emu"                     # worktree dir inside the temp dir
 
@@ -83,7 +85,8 @@ if [ "$SHARDS" -gt 1 ]; then
   done
   COMMITS=("${sliced[@]}")
 fi
-echo "backfill: ${#COMMITS[@]}/$total commits (shard ${SHARD}/${SHARDS}), cpu=$CPU engine=$ENGINE repeat=$REPEAT"
+total="${#COMMITS[@]}"
+echo "backfill: $total commits (shard ${SHARD}/${SHARDS}), cpu=$CPU engine=$ENGINE repeat=$REPEAT"
 
 i=0
 for sha in "${COMMITS[@]}"; do
