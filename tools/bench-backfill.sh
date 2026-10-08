@@ -15,7 +15,7 @@
 #
 # Usage:
 #   tools/bench-backfill.sh <rev-list-spec> [step] [cpu] [engine]
-#   tools/bench-backfill.sh 'main~30..main' 1 r4400 interp
+#   tools/bench-backfill.sh 'HEAD~30..HEAD' 1 r4400 interp
 #
 # Env:
 #   BACKFILL_REPEAT  samples per commit        (default 3)
@@ -55,6 +55,10 @@ echo "backfill: apparatus ready; host baseline recorded"
 # ── commit list, oldest first ────────────────────────────────────────────────
 mapfile -t COMMITS < <(git rev-list --reverse "$SPEC" | awk -v s="$STEP" 'NR % s == 1')
 total="${#COMMITS[@]}"
+if [ "$total" -eq 0 ]; then
+  echo "backfill: '$SPEC' matched no commits (does the ref exist in this checkout?)" >&2
+  exit 2
+fi
 echo "backfill: $total commits, cpu=$CPU engine=$ENGINE repeat=$REPEAT"
 
 i=0

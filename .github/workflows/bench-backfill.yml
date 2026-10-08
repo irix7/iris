@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       spec:
-        description: "git rev-list spec, oldest..newest (e.g. main~30..main)"
+        description: "git rev-list spec, oldest..newest (e.g. HEAD~30..HEAD)"
         required: true
-        default: "main~30..main"
+        default: "HEAD~30..HEAD"
       step:
         description: "Take every Nth commit"
         required: true
