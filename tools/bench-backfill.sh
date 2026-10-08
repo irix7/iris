@@ -102,7 +102,9 @@ for sha in "${COMMITS[@]}"; do
   # shellcheck disable=SC2086
   if ! CARGO_TARGET_DIR="$TARGET" cargo build --release ${FEATURES:+--features $FEATURES} \
         --manifest-path "$EMU/Cargo.toml" --bin iris >/tmp/backfill-build.log 2>&1; then
-    echo "   skip: does not build on this toolchain (/tmp/backfill-build.log)"; continue
+    echo "   skip: does not build on this toolchain"
+    tail -n 3 /tmp/backfill-build.log | sed 's/^/     /'
+    continue
   fi
   EMU_BIN="$TARGET/release/iris"
 
@@ -112,7 +114,9 @@ for sha in "${COMMITS[@]}"; do
         --elf "$SUITE_ELF" --config "$ROOT/bench/run/bare.toml" \
         --label "$CPU-$ENGINE" --repeat "$REPEAT" --out "$OUT" \
         -- --cpu "$CPU" >/tmp/backfill-run.log 2>&1; then
-    echo "   skip: did not complete the suite (/tmp/backfill-run.log)"; continue
+    echo "   skip: did not complete the suite"
+    tail -n 5 /tmp/backfill-run.log | sed 's/^/     /'
+    continue
   fi
 
   ./target/release/iris-bench report --format md --dir "$OUT" >/tmp/backfill-report.md
