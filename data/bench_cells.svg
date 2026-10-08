@@ -1,40 +1,52 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="system-ui,sans-serif">
-<text x="70" y="24" font-size="17" font-weight="600" fill="#222">Guest MIPS / DMIPS — irix7/iris 0f15003b (2026-10-08)</text>
-<text x="70" y="40" font-size="12" fill="#666">host: AMD EPYC 9V45 96-Core Processor · 4 cores</text>
-<line x1="70" y1="374.0" x2="740" y2="374.0" stroke="#e5e5e5" stroke-width="1"/>
-<text x="62" y="378.0" font-size="11" fill="#888" text-anchor="end">0</text>
-<line x1="70" y1="292.0" x2="740" y2="292.0" stroke="#e5e5e5" stroke-width="1"/>
-<text x="62" y="296.0" font-size="11" fill="#888" text-anchor="end">213</text>
-<line x1="70" y1="210.0" x2="740" y2="210.0" stroke="#e5e5e5" stroke-width="1"/>
-<text x="62" y="214.0" font-size="11" fill="#888" text-anchor="end">425</text>
-<line x1="70" y1="128.0" x2="740" y2="128.0" stroke="#e5e5e5" stroke-width="1"/>
-<text x="62" y="132.0" font-size="11" fill="#888" text-anchor="end">638</text>
-<line x1="70" y1="46.0" x2="740" y2="46.0" stroke="#e5e5e5" stroke-width="1"/>
-<text x="62" y="50.0" font-size="11" fill="#888" text-anchor="end">851</text>
-<rect x="101.5" y="336.2" width="50.2" height="37.8" fill="#5b8db8"/>
-<text x="126.6" y="330.2" font-size="11" fill="#333" text-anchor="middle">98</text>
-<rect x="155.8" y="325.7" width="50.2" height="48.3" fill="#9aa7b0"/>
-<text x="180.9" y="319.7" font-size="11" fill="#555" text-anchor="middle">125</text>
-<text x="153.8" y="390.0" font-size="12" fill="#333" text-anchor="middle">r4400-interp</text>
-<rect x="269.0" y="136.3" width="50.2" height="237.7" fill="#c9763f"/>
-<text x="294.1" y="130.3" font-size="11" fill="#333" text-anchor="middle">616</text>
-<rect x="323.2" y="163.1" width="50.2" height="210.9" fill="#9aa7b0"/>
-<text x="348.4" y="157.1" font-size="11" fill="#555" text-anchor="middle">547</text>
-<text x="321.2" y="390.0" font-size="12" fill="#333" text-anchor="middle">r4400-jitv2</text>
-<rect x="436.5" y="348.6" width="50.2" height="25.4" fill="#5b8db8"/>
-<text x="461.6" y="342.6" font-size="11" fill="#333" text-anchor="middle">66</text>
-<rect x="490.8" y="341.0" width="50.2" height="33.0" fill="#9aa7b0"/>
-<text x="515.9" y="335.0" font-size="11" fill="#555" text-anchor="middle">86</text>
-<text x="488.8" y="390.0" font-size="12" fill="#333" text-anchor="middle">r5000-interp</text>
-<rect x="604.0" y="235.5" width="50.2" height="138.5" fill="#c9763f"/>
-<text x="629.1" y="229.5" font-size="11" fill="#333" text-anchor="middle">359</text>
-<rect x="658.2" y="88.8" width="50.2" height="285.2" fill="#9aa7b0"/>
-<text x="683.4" y="82.8" font-size="11" fill="#555" text-anchor="middle">740</text>
-<text x="656.2" y="390.0" font-size="12" fill="#333" text-anchor="middle">r5000-jitv2</text>
-<rect x="70" y="406" width="12" height="12" fill="#5b8db8"/>
-<text x="86" y="417" font-size="12" fill="#333">MIPS (interp)</text>
-<rect x="188" y="406" width="12" height="12" fill="#c9763f"/>
-<text x="204" y="417" font-size="12" fill="#333">MIPS (jitv2)</text>
-<rect x="300" y="406" width="12" height="12" fill="#9aa7b0"/>
-<text x="316" y="417" font-size="12" fill="#333">DMIPS</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="480" viewBox="0 0 920 480" font-family="system-ui,sans-serif">
+<text x="80" y="32" font-size="18" font-weight="600" fill="#222">Latest Benchmark — irix7/iris 0f15003b (2026-10-08)</text>
+<text x="80" y="50" font-size="12" fill="#666">host: AMD EPYC 9V45 96-Core Processor · 4 cores</text>
+<line x1="80" y1="420.0" x2="890" y2="420.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="424.0" font-size="10" fill="#888" text-anchor="end">0</text>
+<line x1="80" y1="348.0" x2="890" y2="348.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="352.0" font-size="10" fill="#888" text-anchor="end">1073</text>
+<line x1="80" y1="276.0" x2="890" y2="276.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="280.0" font-size="10" fill="#888" text-anchor="end">2146</text>
+<line x1="80" y1="204.0" x2="890" y2="204.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="208.0" font-size="10" fill="#888" text-anchor="end">3219</text>
+<line x1="80" y1="132.0" x2="890" y2="132.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="136.0" font-size="10" fill="#888" text-anchor="end">4292</text>
+<line x1="80" y1="60.0" x2="890" y2="60.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="64.0" font-size="10" fill="#888" text-anchor="end">5365</text>
+<rect x="119.0" y="370.3" width="40.5" height="49.7" fill="#5b8db8"/>
+<rect x="160.5" y="367.0" width="40.5" height="53.0" fill="#4a7ab8"/>
+<rect x="202.0" y="347.0" width="40.5" height="73.0" fill="#3a6ab8"/>
+<rect x="243.5" y="107.0" width="40.5" height="313.0" fill="#2a5ab8"/>
+<text x="263.8" y="103.0" font-size="9" fill="#333" text-anchor="middle">4665</text>
+<text x="181.2" y="438.0" font-size="12" fill="#333" text-anchor="middle">R4400 INTERP</text>
+<rect x="321.5" y="107.0" width="40.5" height="313.0" fill="#c9763f"/>
+<text x="341.8" y="103.0" font-size="9" fill="#333" text-anchor="middle">616</text>
+<rect x="363.0" y="188.5" width="40.5" height="231.5" fill="#b86632"/>
+<text x="383.2" y="184.5" font-size="9" fill="#333" text-anchor="middle">547</text>
+<rect x="404.5" y="197.2" width="40.5" height="222.8" fill="#a85628"/>
+<rect x="446.0" y="311.0" width="40.5" height="109.0" fill="#98461e"/>
+<text x="466.2" y="307.0" font-size="9" fill="#333" text-anchor="middle">1625</text>
+<text x="383.8" y="438.0" font-size="12" fill="#333" text-anchor="middle">R4400 JITV2</text>
+<rect x="524.0" y="386.5" width="40.5" height="33.5" fill="#5b8db8"/>
+<rect x="565.5" y="383.8" width="40.5" height="36.2" fill="#4a7ab8"/>
+<rect x="607.0" y="373.3" width="40.5" height="46.7" fill="#3a6ab8"/>
+<rect x="648.5" y="214.5" width="40.5" height="205.5" fill="#2a5ab8"/>
+<text x="668.8" y="210.5" font-size="9" fill="#333" text-anchor="middle">3063</text>
+<text x="586.2" y="438.0" font-size="12" fill="#333" text-anchor="middle">R5000 INTERP</text>
+<rect x="726.5" y="237.6" width="40.5" height="182.4" fill="#c9763f"/>
+<text x="746.8" y="233.6" font-size="9" fill="#333" text-anchor="middle">359</text>
+<rect x="768.0" y="107.0" width="40.5" height="313.0" fill="#b86632"/>
+<text x="788.2" y="103.0" font-size="9" fill="#333" text-anchor="middle">740</text>
+<rect x="809.5" y="107.0" width="40.5" height="313.0" fill="#a85628"/>
+<rect x="851.0" y="116.4" width="40.5" height="303.6" fill="#98461e"/>
+<text x="871.2" y="112.4" font-size="9" fill="#333" text-anchor="middle">4525</text>
+<text x="788.8" y="438.0" font-size="12" fill="#333" text-anchor="middle">R5000 JITV2</text>
+<rect x="80" y="452" width="12" height="12" fill="#5b8db8" opacity="0.9"/>
+<text x="96" y="461" font-size="11" fill="#444">MIPS</text>
+<rect x="142" y="452" width="12" height="12" fill="#4a7ab8" opacity="0.9"/>
+<text x="158" y="461" font-size="11" fill="#444">DMIPS</text>
+<rect x="211" y="452" width="12" height="12" fill="#3a6ab8" opacity="0.9"/>
+<text x="227" y="461" font-size="11" fill="#444">LINPACK MFLOPS</text>
+<rect x="343" y="452" width="12" height="12" fill="#2a5ab8" opacity="0.9"/>
+<text x="359" y="461" font-size="11" fill="#444">Whetstone k/s</text>
 </svg>

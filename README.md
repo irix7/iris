@@ -308,22 +308,50 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On this host the JIT (jitv2) runs the R4400 guest at 616 MIPS versus 98 MIPS interpreted (6.3x).
+On the AMD EPYC 9V45 host, the JIT compiler (jitv2) delivers substantial performance improvements over the interpreter, boosting MIPS from 97.9 to 616.5 for the r4400 and from 65.9 to 359.2 for the r5000. Notably, the r5000-jitv2 configuration achieves the highest overall score with 739.6 DMIPS, outperforming the r4400-jitv2's 546.9 DMIPS, while all four configurations maintain a 100.0% pass rate across the 410 recorded runs.
+
+### Latest Run
 
 ![latest benchmark cells](data/bench_cells.svg)
 
-Latest run's four cells:
+Latest run's four cells (MIPS, DMIPS, LINPACK MFLOPS, Whetstone k passes/s):
 
-| cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS |
-|---|---|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 97.9 | 125.2 | 15.8 |
-| `r4400-jitv2` | R4400 | 100.0% | 616.5 | 546.9 | 48.2 |
-| `r5000-interp` | R5000 | 100.0% | 65.9 | 85.6 | 10.1 |
-| `r5000-jitv2` | R5000 | 100.0% | 359.2 | 739.6 | 67.7 |
+| cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS | Whetstone k/s |
+|---|---|---:|---:|---:|---:|---:|
+| `r4400-interp` | R4400 | 100.0% | 97.9 | 125.2 | 15.8 | 4665.0 |
+| `r4400-jitv2` | R4400 | 100.0% | 616.5 | 546.9 | 48.2 | 1625.0 |
+| `r5000-interp` | R5000 | 100.0% | 65.9 | 85.6 | 10.1 | 3063.0 |
+| `r5000-jitv2` | R5000 | 100.0% | 359.2 | 739.6 | 67.7 | 4525.0 |
 
-Normalised benchmark across all 410 recorded runs — each run divided by its own runner's native rate, so the same number means the same thing on every CI runner (interpreter vs jitv2):
+### Raw Guest MIPS History
 
-![normalised benchmark history](data/bench_history_eff.svg)
+![raw MIPS history](data/bench_history.svg)
+
+*Logarithmic scale. Lines break where the CI host CPU changes (different runner hardware). Faint points = individual runs, bold lines = centred moving average.*
+
+### Normalised Efficiency (Cross-Runner Comparable)
+
+![normalised efficiency history](data/bench_history_eff.svg)
+
+*Each run divided by its own runner's native baseline, so 100% = same speed as native host code. This removes host hardware variance, making the trend purely about emulator changes.*
+
+### JIT vs Interpreter Speedup
+
+![JIT speedup](data/bench_speedup.svg)
+
+*Ratio of JIT guest MIPS to interpreter guest MIPS for each CPU. Values above 1.0× mean the JIT is faster; logarithmic scale.*
+
+### Efficiency by Kernel Group
+
+![efficiency by group](data/bench_groups.svg)
+
+*Per-kernel-group efficiency (fraction of native host speed) for the latest run with group data. Groups: **int**=integer ALU, **fpu**=floating point, **mem**=memory, **img**=imaging, **vid**=video, **codec**=compression, **sys**=system (TLB, exceptions, cache).*
+
+### Group Efficiency Heatmap
+
+![group efficiency heatmap](data/bench_heatmap.svg)
+
+*JIT efficiency per kernel group across recent commits. Blue→Yellow→Red = low→medium→high efficiency. Only commits with group-level data are shown.*
 
 Full history table: [data/bench_history.md](data/bench_history.md) (410 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
