@@ -82,22 +82,24 @@ pub const CAUSE_IP7: u32 = 1 << 15;            // Timer interrupt (IP7)
 pub const DEFAULT_COUNT_HZ: u64 = 33_000_000;
 
 
-/// ci_clock: synthetic nanoseconds per retired instruction (~100 MIPS R4400).
-/// Virtual time is derived from `hot.cycles` instead of the wall clock so the
-/// snapshot determinism validator stays reproducible at any host speed.
-#[cfg(feature = "ci_clock")]
+/// Synthetic nanoseconds per retired instruction (~100 MIPS R4400).
+///
+/// Guest-visible time is derived from `hot.cycles` at this fixed rate, not
+/// from the host clock: CP0 Count (and therefore the Compare/IP7 deadline) is
+/// a pure function of retired cycles, so a replay is reproducible at any host
+/// speed. `count_hz` still decides how many guest Count ticks one synthetic
+/// nanosecond is worth (the frequency IRIX reads back), and host time is kept
+/// only to pace idle parking in `idle_park.rs`.
 pub const NS_PER_GUEST_CYCLE: u64 = 10;
 
 /// Claim the right to deliver IP7 for the armed deadline `ticket`.
 ///
-/// Both deliverers race here: the CPU thread (when `count_now` steps Count
-/// over Compare, or when a Compare write is classified as an already-missed
-/// deadline) and the hptimer callback (when its one-shot expires). The
-/// sequence word holds the ticket of the currently-armed deadline; the winner
-/// swaps it to `IP7_SEQ_CONSUMED` and asserts IP7, and every later claim for
-/// the same ticket -- including an in-flight timer callback whose arm the
-/// guest has already superseded -- fails the compare-exchange and does
-/// nothing.
+/// Two CPU-thread paths can deliver the same deadline: `count_now` when it
+/// steps Count over Compare, and `write_cp0` reg 11 when it classifies an
+/// already-missed deadline. The sequence word holds the ticket of the
+/// currently-armed deadline; the winner swaps it to `IP7_SEQ_CONSUMED` and
+/// asserts IP7, and every later claim for the same ticket fails the
+/// compare-exchange and does nothing.
 ///
 /// Returns true if this caller delivered the interrupt.
 ///
@@ -128,14 +130,6 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
 /// counter starting at 1.
 const IP7_SEQ_CONSUMED: u64 = 0;
 
-/// Raw pointer to a `MipsCore`'s `hot.interrupts` word, captured by the armed
-/// compare-timer callback so the hptimer thread can raise IP7. Same
-/// process-lifetime validity argument as `CyclesPtr` above and
-/// `Ioc::set_interrupts`'s stored pointer: it points into the core owned by
-/// the executor's top-level `Arc<Mutex<..>>`, and `Drop for MipsCore` removes
-/// the timer before the core goes away.
-struct TimerIrqPtr(*const AtomicU64);
-unsafe impl Send for TimerIrqPtr {}
 pub const CAUSE_CE_MASK: u32 = 0x3 << 28;      // Coprocessor Error mask
 pub const CAUSE_CE_SHIFT: u32 = 28;            // Coprocessor Error shift
 pub const CAUSE_BD: u32 = 1 << 31;             // Branch Delay
@@ -170,8 +164,8 @@ pub struct Hot {
     /// IP0..IP7) so the preamble can mask and merge without shifting.
     ///
     /// Only **IP2..IP7** are ever set here, though: those are the external
-    /// lines (devices via the IOC, plus IP7 from the compare timer on the
-    /// hptimer thread), and `EXT_INT_MASK` in mips_exec.rs merges exactly
+    /// lines (devices via the IOC, plus IP7 raised from the CP0 compare
+    /// deadline), and `EXT_INT_MASK` in mips_exec.rs merges exactly
     /// that range into Cause. **IP0/IP1 are software interrupts, written
     /// only by `mtc0 Cause`** (see `write_cp0`), and live in `cp0_cause`
     /// alone — nothing external ever sets bits 8/9 of this word.
@@ -301,11 +295,12 @@ pub struct MipsCore {
     // Timer pair — CP0 Count is *virtual*: nothing increments it per
     // instruction. `cp0_count` holds the value last materialized by
     // `count_now()` (plain hardware counts in the low 32 bits), advanced
-    // lazily from the wall-clock anchor (`count_anchor_instant` ×
-    // `count_hz`) whenever the guest reads Count or writes Compare. The
-    // Count==Compare interrupt is delivered by an hptimer one-shot armed on
-    // every Compare write, whose callback just sets IP7 in `hot.interrupts`
-    // — the step() preamble's existing pending-interrupt merge does the rest.
+    // lazily from `hot.cycles` (`count_anchor_cycle` ×
+    // `NS_PER_GUEST_CYCLE` × `count_hz`) whenever the guest reads Count or
+    // writes Compare. The Count==Compare interrupt is delivered
+    // deterministically by the step() preamble's cycle-threshold check
+    // (`count_fire_cycle`) and by a Count read that steps over Compare — not
+    // by a host timer.
     pub cp0_count: u64,       // 9: Timer Count at last materialization (plain hw counts, low 32 bits)
     pub cp0_compare: u64,     // 11: Timer Compare (plain hw counts, low 32 bits)
 
@@ -869,43 +864,35 @@ pub struct MipsCore {
     /// Atomic shadow of `count_hz`, set once at construction. Shared with
     /// the display refresh thread for the status bar.
     pub count_hz_atomic: Arc<AtomicU64>,
-    /// Wall-clock instant `cp0_count` was last materialized at. Advanced by
-    /// exactly the whole-tick duration consumed on each materialization so
-    /// the sub-tick remainder is never rounded away. Reset to
-    /// `Instant::now()` on snapshot load — Instants from a previous run are
-    /// meaningless across a restore.
-    pub(crate) count_anchor_instant: std::time::Instant,
     /// `hot.cycles` at the last `count_now()` materialization. Memo key: a
     /// second read within the same instruction returns the identical value
     /// (jitv2_lockstep re-executes an instruction on both engines and must
     /// see the same Count both times).
     pub(crate) count_read_cycle: u64,
-    /// Inferred CP0 Count frequency in Hz. Default 33 MHz (user-facing
-    /// assumption for an uncalibrated core); replaced as soon as a Compare
-    /// delta matches a recognized slow (100 Hz) or fast (1 kHz) tick.
+    /// CP0 Count frequency in Hz — the *rate* reported to the guest (IRIX's
+    /// `hinv` derives CPU MHz from it). Fixed for the life of the core;
+    /// there is no runtime inference any more. Count itself is derived from
+    /// `hot.cycles`, so this only scales synthetic time into guest ticks.
     pub count_hz: u64,
     /// True while the CPU thread is stopped (`on_cpu_stop`): the virtual
     /// count is latched at `cp0_count` (reads don't advance it) and the
-    /// compare timer is silenced, so monitor `cpu stop` / debugger stepping
-    /// sees a frozen Count and no IP7 firing underneath it. Cleared by
-    /// `on_cpu_start`, which re-anchors and re-arms. Ignored under ci_clock
-    /// (count follows `hot.cycles` there — debug steps advancing it is the
-    /// deterministic behavior CI wants).
+    /// compare deadline is silenced, so monitor `cpu stop` / debugger
+    /// stepping sees a frozen Count and no IP7 firing underneath it. Cleared
+    /// by `on_cpu_start`, which re-anchors and re-arms. Count follows
+    /// `hot.cycles` there, and debug steps advancing it is the deterministic
+    /// behaviour CI wants.
     pub(crate) count_paused: bool,
-    /// hptimer that delivers the Count==Compare interrupt: its callback sets
-    /// IP7 in `hot.interrupts` and bumps `fasttick_count`. Re-armed
-    /// (remove + add_one_shot) on every Compare or Count write. None until
-    /// `set_timer_manager` is wired (unit tests, ci_clock builds).
+    /// hptimer manager, kept only so the core's `Drop` can cancel any timer
+    /// armed by an older build's snapshot; the cycle-derived clock arms no
+    /// hptimer of its own. None until `set_timer_manager` is wired.
     pub(crate) timer_mgr: Option<Arc<crate::hptimer::TimerManager>>,
     pub(crate) timer_id: Option<crate::hptimer::TimerId>,
-    /// ci_clock: `hot.cycles` value the virtual count is anchored at
-    /// (synthetic 10 ns per instruction instead of wall clock, so CI runs
-    /// stay deterministic).
-    #[cfg(feature = "ci_clock")]
+    /// `hot.cycles` value the virtual count is anchored at (synthetic
+    /// `NS_PER_GUEST_CYCLE` ns per retired cycle, instead of the wall clock,
+    /// so runs stay deterministic).
     pub(crate) count_anchor_cycle: u64,
-    /// ci_clock: `hot.cycles` value at which IP7 fires (checked in step()'s
-    /// preamble instead of an hptimer). u64::MAX = disarmed.
-    #[cfg(feature = "ci_clock")]
+    /// `hot.cycles` value at which IP7 fires (checked in step()'s preamble
+    /// and by idle parking instead of an hptimer). u64::MAX = disarmed.
     pub count_fire_cycle: u64,
     /// developer_ip7: total CP0 Compare writes seen, and how many of those
     /// landed behind Count (which arms a full-wrap ~2^32 wait).
@@ -924,22 +911,18 @@ pub struct MipsCore {
     /// `arm_ip7_sequence` on every Compare write / re-arm; the value it
     /// becomes is the ticket that the *next* IP7 delivery must present.
     ///
-    /// Only the CPU thread writes this; the timer thread never touches it.
+    /// Only the CPU thread touches this (both the crossing detection in
+    /// `count_now` and the late-deadline classification in `write_cp0`).
     pub(crate) ip7_seq: u64,
-    /// IP7 delivery sequence, shared with the hptimer callback. Holds the
+    /// IP7 delivery sequence, shared with the crossing claim. Holds the
     /// ticket of the currently-armed deadline. Exactly one deliverer --
-    /// whichever of the CPU thread (crossing detection / late-deadline
-    /// classification) or the timer callback gets there first -- wins the
+    /// whichever of the two CPU-thread paths gets there first -- wins the
     /// compare-exchange that consumes it; the loser does nothing.
     ///
-    /// This is what makes IP7 delivery exactly-once per armed deadline. The
-    /// hptimer's `remove()` cannot retract a callback the timer thread has
-    /// already dequeued and is about to run outside the lock, so a one-shot
-    /// armed for a superseded Compare can still execute after the guest has
-    /// acked -- re-raising the interrupt it just cleared, which is what
-    /// breaks Linux's second `c0_compare_int_usable` verification window.
-    /// Bumping the sequence at the top of the Compare write invalidates any
-    /// such in-flight callback by construction rather than by timing.
+    /// This is what makes IP7 delivery exactly-once per armed deadline:
+    /// bumping the sequence at the top of the Compare write invalidates any
+    /// claim still pending for a superseded deadline, so the crossing check
+    /// cannot re-raise an interrupt the guest just acked.
     pub(crate) ip7_seq_shared: Arc<AtomicU64>,
     /// developer_ip7: Compare writes classified as a pure acknowledgement.
     #[cfg(feature = "developer_ip7")]
@@ -1236,9 +1219,9 @@ unsafe impl Send for MipsCore {}
 
 impl Drop for MipsCore {
     fn drop(&mut self) {
-        // The armed compare timer's callback holds a raw pointer into this
-        // core (`TimerIrqPtr`) — take it out of the manager before the
-        // pointee goes away.
+        // The cycle-derived clock arms no hptimer of its own, but a snapshot
+        // restored from an older build may have left one armed; drop it
+        // before this core's memory goes away.
         self.disarm_compare_timer();
     }
 }
@@ -1375,15 +1358,12 @@ impl MipsCore {
             running: false,
             halted: false,
             count_hz_atomic: Arc::new(AtomicU64::new(DEFAULT_COUNT_HZ)),
-            count_anchor_instant: std::time::Instant::now(),
             count_read_cycle: 0,
             count_hz: DEFAULT_COUNT_HZ,
             count_paused: false,
             timer_mgr: None,
             timer_id: None,
-            #[cfg(feature = "ci_clock")]
             count_anchor_cycle: 0,
-            #[cfg(feature = "ci_clock")]
             count_fire_cycle: u64::MAX,
             #[cfg(feature = "developer_ip7")]
             ip7_writes: 0,
@@ -1432,12 +1412,8 @@ impl MipsCore {
             self.cp0_compare = 0;
             self.hot.cycles = 0;
             self.count_read_cycle = 0;
-            self.count_anchor_instant = std::time::Instant::now();
-            #[cfg(feature = "ci_clock")]
-            {
-                self.count_anchor_cycle = 0;
-                self.count_fire_cycle = u64::MAX;
-            }
+            self.count_anchor_cycle = 0;
+            self.count_fire_cycle = u64::MAX;
             self.disarm_compare_timer();
             self.cp0_random = self.tlb_entries - 1;
             self.cp0_random_cycle = 0;
@@ -1661,30 +1637,20 @@ impl MipsCore {
     /// `deliver_crossing` is false on exactly one path: the Compare *write*.
     /// A crossing raised there is cleared two lines later by that write's own
     /// acknowledgement, so the guest never sees it -- and `claim_ip7` consumes
-    /// the ticket the write is about to arm its one-shot with, leaving that
-    /// one-shot unable to claim and self-deleting on its first fire, which
-    /// ends the timer. An overrun deadline is already the write's own case 2
-    /// below, which delivers after the ack with a live ticket.
+    /// the ticket the write is about to arm the deadline with, leaving the
+    /// write's own missed-deadline check (case 2 below) unable to deliver.
+    /// An overrun deadline is already that write's case 2, which delivers
+    /// after the ack with a live ticket.
     fn materialize_count(&mut self, deliver_crossing: bool) -> u32 {
-        #[cfg(not(feature = "ci_clock"))]
-        if self.count_paused {
-            return self.cp0_count as u32;
-        }
         let cycles = self.hot.cycles;
         if cycles == self.count_read_cycle {
             return self.cp0_count as u32;
         }
-        #[cfg(feature = "ci_clock")]
         let elapsed_ns = cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
-        #[cfg(not(feature = "ci_clock"))]
-        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
         let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
         if ticks != 0 {
             let consumed_ns = ((ticks as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-            #[cfg(feature = "ci_clock")]
-            { self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE); }
-            #[cfg(not(feature = "ci_clock"))]
-            { self.count_anchor_instant += std::time::Duration::from_nanos(consumed_ns); }
+            self.count_anchor_cycle = self.count_anchor_cycle.wrapping_add(consumed_ns / NS_PER_GUEST_CYCLE);
             let before = self.cp0_count as u32;
             let after = before.wrapping_add(ticks as u32);
             self.cp0_count = after as u64;
@@ -1694,30 +1660,22 @@ impl MipsCore {
             // tick at a time. Here Count is virtual and materialized in
             // lumps: a single `count_now` can carry it from before Compare to
             // well past it in one step, and nothing else notices — IP7 is
-            // otherwise raised only by the hptimer one-shot, which is racing
-            // on another thread against the wall clock rather than against
-            // this Count value.
+            // otherwise raised only by step()'s cycle-threshold check, which
+            // runs while the guest executes instructions, not on a read.
             //
-            // That race is what breaks short deadline checks. Linux's
+            // That gap is what breaks short deadline checks. Linux's
             // c0_compare_int_usable() waits for Count to pass its programmed
             // Compare, then looks for IP7 within COMPARE_INT_SEEN_TICKS (50
             // counts). Our polling `mfc0` loop overshoots Compare by hundreds
             // of counts in one materialization, so the 50-count window is
             // already behind us when the wait loop exits, and whether IP7 is
-            // pending at that instant depends purely on whether the timer
-            // thread happened to fire yet. It usually has not, so the probe
-            // returns 0, r4k_clockevent_init() gets -ENXIO, no clockevent is
-            // registered, jiffies never advance, and the kernel spins in
-            // calibrate_delay_converge forever.
-            //
-            // Restore the invariant directly: if this advance stepped over
-            // Compare, raise IP7 at the crossing. `wrapping_sub` makes the
-            // test wrap-safe -- the distance from `before` to Compare being
-            // within the distance we just travelled is exactly "we passed
-            // it", for any rollover. This does not replace the hptimer (which
-            // still delivers IP7 while the guest is running code that never
-            // reads Count); it just makes a Count read agree with what the
-            // guest would have seen on real hardware.
+            // pending at that instant depends on when the threshold check last
+            // ran. Restore the invariant directly: if this advance stepped
+            // over Compare, raise IP7 at the crossing. `wrapping_sub` makes
+            // the test wrap-safe -- the distance from `before` to Compare
+            // being within the distance we just travelled is exactly "we
+            // passed it", for any rollover. The step() threshold covers the
+            // guest that runs on without reading Count; this covers the read.
             //
             // Writing Compare is what acks IP7 (see write_cp0 reg 11), so an
             // ack that leaves Compare just behind Count does not re-trigger
@@ -1725,7 +1683,7 @@ impl MipsCore {
             // and the next crossing is a full wrap away.
             let dist_to_compare = (self.cp0_compare as u32).wrapping_sub(before);
             if deliver_crossing && dist_to_compare != 0 && (dist_to_compare as u64) <= ticks {
-                // Same ticket the armed one-shot holds: whichever of us gets
+                // Same ticket the armed deadline holds: whichever path gets
                 // here first delivers, the other is a no-op.
                 let won = claim_ip7(
                     &self.ip7_seq_shared,
@@ -1752,14 +1710,7 @@ impl MipsCore {
     /// Non-mutating variant of `count_now` for debugger/monitor reads: same
     /// computation, but neither the anchor nor the memo state moves.
     pub fn count_peek(&self) -> u32 {
-        #[cfg(not(feature = "ci_clock"))]
-        if self.count_paused {
-            return self.cp0_count as u32;
-        }
-        #[cfg(feature = "ci_clock")]
         let elapsed_ns = self.hot.cycles.wrapping_sub(self.count_anchor_cycle).saturating_mul(NS_PER_GUEST_CYCLE);
-        #[cfg(not(feature = "ci_clock"))]
-        let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
         let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
         (self.cp0_count as u32).wrapping_add(ticks as u32)
     }
@@ -1780,12 +1731,11 @@ impl MipsCore {
 
     /// Issue a fresh IP7 delivery ticket, invalidating any previously armed
     /// one. Called from the CPU thread at the top of a Compare write, before
-    /// IP7 is cleared, so that a timer callback racing us cannot re-assert
-    /// the interrupt the guest is in the middle of acknowledging.
+    /// IP7 is cleared, so that a stale claim cannot re-assert the interrupt
+    /// the guest is in the middle of acknowledging.
     ///
-    /// Returns the new ticket, which the caller hands to whoever may deliver
-    /// this deadline (the armed one-shot, and the CPU thread's own crossing
-    /// and late-deadline checks).
+    /// Returns the new ticket, which the caller hands to whichever of the
+    /// crossing and late-deadline checks may deliver this deadline.
     fn arm_ip7_sequence(&mut self) -> u64 {
         self.ip7_seq = self.ip7_seq.wrapping_add(1);
         if self.ip7_seq == IP7_SEQ_CONSUMED {
@@ -1799,12 +1749,9 @@ impl MipsCore {
     /// `cp0_count`/`cp0_compare` values. Caller must have just materialized
     /// the count (`count_now`) so the delta is measured from *now*.
     ///
-    /// Real-time builds: removes the previous hptimer one-shot and arms a
-    /// fresh one whose callback claims this arm's IP7 ticket (see
-    /// `claim_ip7`) — so a one-shot the guest has already superseded cannot
-    /// re-raise the interrupt. ci_clock builds: computes the deterministic
-    /// `hot.cycles` value the interrupt fires at instead — step()'s preamble
-    /// checks it.
+    /// Count is derived from retired cycles, so the deadline is a
+    /// deterministic `hot.cycles` threshold. step()'s preamble (and idle
+    /// parking) checks it; there is no host timer involved.
     fn schedule_compare_timer(&mut self) {
         // Real MIPS Count==Compare semantics: IP7 fires when the free-running
         // 32-bit Count becomes numerically equal to Compare. If Count is
@@ -1819,103 +1766,42 @@ impl MipsCore {
             d => d,
         };
         let ns = ((delta as u128 * 1_000_000_000) / self.count_hz as u128) as u64;
-        #[cfg(feature = "ci_clock")]
-        {
-            self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
-        }
-        #[cfg(not(feature = "ci_clock"))]
-        {
-            if self.count_paused {
-                // CPU is stopped: stay disarmed; on_cpu_start re-arms from
-                // the then-current count/compare.
-                return;
-            }
-            let Some(tm) = self.timer_mgr.as_ref() else { return };
-            if let Some(id) = self.timer_id.take() {
-                tm.remove(id);
-            }
-            let irq = TimerIrqPtr(&self.hot.interrupts as *const AtomicU64);
-            let fasttick = self.fasttick_count.clone();
-            let ticket = self.ip7_seq;
-            let seq_ref = self.ip7_seq_shared.clone();
-            // After firing, hardware would next match Compare again after a
-            // full 32-bit Count wrap — self-reschedule that far out. In
-            // practice the guest's interrupt handler writes Compare long
-            // before then, which re-arms through this function afresh.
-            let wrap = std::time::Duration::from_nanos(
-                (((1u128 << 32) * 1_000_000_000) / self.count_hz as u128) as u64,
-            );
-            self.timer_id = Some(tm.add_one_shot(
-                std::time::Duration::from_nanos(ns),
-                (irq, fasttick, wrap, ticket, seq_ref),
-                |(irq, fasttick, wrap, ticket, seq_ref)| {
-                    // SAFETY: points into the MipsCore owned by the executor's
-                    // top-level Arc<Mutex<..>>, which outlives the armed timer
-                    // (Drop for MipsCore removes it). Same contract as
-                    // Ioc::set_interrupts's stored pointer.
-                    let irq_ref = unsafe { &*irq.0 };
-                    // Only deliver if this ticket is still the armed one. A
-                    // Compare write since this one-shot was scheduled has
-                    // already issued a new ticket, so this claim fails and the
-                    // interrupt the guest just acked is not re-asserted.
-                    let won = claim_ip7(seq_ref, *ticket, irq_ref, fasttick);
-                    if !won {
-                        return crate::hptimer::TimerReturn::Delete;
-                    }
-                    crate::hptimer::TimerReturn::RescheduleOneShot(*wrap)
-                },
-            ));
-        }
+        self.count_fire_cycle = self.hot.cycles.saturating_add(ns / NS_PER_GUEST_CYCLE);
     }
 
     /// Cancel any armed Count==Compare interrupt source.
     fn disarm_compare_timer(&mut self) {
-        #[cfg(feature = "ci_clock")]
-        { self.count_fire_cycle = u64::MAX; }
+        self.count_fire_cycle = u64::MAX;
         if let (Some(tm), Some(id)) = (self.timer_mgr.as_ref(), self.timer_id.take()) {
             tm.remove(id);
         }
     }
 
-    /// Wire the machine's hptimer manager in. Must be called after the core
-    /// has reached its final address (inside the executor's `Arc<Mutex<..>>`)
-    /// — the armed timer callback keeps a raw pointer to `hot.interrupts`.
+    /// Wire the machine's hptimer manager in. The cycle-derived clock arms no
+    /// timer of its own; this is kept so a snapshot restored from an older
+    /// build can be cleaned up, and so `Machine`'s wiring stays unchanged.
     pub fn set_timer_manager(&mut self, tm: Arc<crate::hptimer::TimerManager>) {
         self.timer_mgr = Some(tm);
     }
 
     /// Re-anchor the virtual count at the current `cp0_count` value (after a
     /// Count write or a snapshot restore that set it as a raw field) and
-    /// re-arm the compare timer against it. While the CPU is stopped
-    /// (`count_paused`) the timer stays silenced — `schedule_compare_timer`
-    /// itself refuses to arm — and `on_cpu_start` re-arms.
+    /// re-arm the compare deadline against it.
     pub fn reanchor_count_and_reschedule(&mut self) {
         self.count_read_cycle = self.hot.cycles;
-        #[cfg(feature = "ci_clock")]
-        { self.count_anchor_cycle = self.hot.cycles; }
-        #[cfg(not(feature = "ci_clock"))]
-        { self.count_anchor_instant = std::time::Instant::now(); }
+        self.count_anchor_cycle = self.hot.cycles;
         self.schedule_compare_timer();
     }
 
     /// CPU thread is stopping: latch the virtual count at its current value
-    /// and silence the compare timer, so a stopped CPU (monitor `cpu stop`,
-    /// debugger stepping) sees a frozen Count and never gets IP7 raised
-    /// underneath it (use the monitor's `ip7` command to inject one
-    /// manually). Idempotent. No-op semantics under ci_clock (count follows
-    /// `hot.cycles` there, which stops advancing on its own).
+    /// and silence the compare deadline, so a stopped CPU (monitor
+    /// `cpu stop`, debugger stepping) sees a frozen Count and never gets IP7
+    /// raised underneath it (use the monitor's `ip7` command to inject one
+    /// manually). Idempotent. Count follows `hot.cycles`, which stops
+    /// advancing on its own.
     pub fn on_cpu_stop(&mut self) {
         if self.count_paused {
             return;
-        }
-        #[cfg(not(feature = "ci_clock"))]
-        {
-            // Materialize directly, bypassing count_now's cycles memo —
-            // cycles may not have moved since the last read, but real time
-            // has.
-            let elapsed_ns = self.count_anchor_instant.elapsed().as_nanos() as u64;
-            let ticks = ((elapsed_ns as u128 * self.count_hz as u128) / 1_000_000_000) as u64;
-            self.cp0_count = (self.cp0_count as u32).wrapping_add(ticks as u32) as u64;
         }
         self.count_read_cycle = self.hot.cycles;
         self.count_paused = true;
@@ -1986,11 +1872,9 @@ impl MipsCore {
                 // schedule_compare_timer arm/classify against the true
                 // current Count/Compare relationship, then arm the
                 // interrupt.
-                // Issue a new delivery ticket before anything else. Any
-                // one-shot armed for the previous Compare -- including one the
-                // timer thread has already dequeued and is about to run
-                // outside its lock, which `remove()` cannot retract -- now
-                // holds a stale ticket and can no longer assert IP7 over the
+                // Issue a new delivery ticket before anything else. Any claim
+                // still pending for the previous Compare now holds a stale
+                // ticket and can no longer assert IP7 over the
                 // acknowledgement we are about to perform.
                 let ticket = self.arm_ip7_sequence();
                 let count_before = self.materialize_count(false);
@@ -2005,7 +1889,7 @@ impl MipsCore {
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
 
                 // Now classify what the guest actually asked for. Count here
-                // is virtual and materialized in lumps from the wall clock,
+                // is virtual and materialized in lumps from retired cycles,
                 // so "Compare is behind Count" is ambiguous in a way it never
                 // is on silicon, where Count advances one tick at a time:
                 //
@@ -2629,43 +2513,42 @@ mod ip7_ticket_tests {
 
     /// A core whose Compare deadline is already behind Count, which is what a
     /// guest produces when it writes Compare from a Count it read a tick ago.
-    /// Count is materialized from the clock at ~33 MHz, so a couple of
-    /// milliseconds puts it tens of thousands of ticks past a low Compare --
-    /// the margin here is enormous, not a race.
+    /// Count is derived from retired cycles (~0.33 ticks per cycle at the
+    /// default 33 MHz), so a hundred thousand cycles puts it tens of thousands
+    /// of ticks past a low Compare -- the margin here is enormous, not a race.
     fn core_past_its_compare() -> MipsCore {
         let mut core = MipsCore::default();
         core.cp0_compare = 0x40;
-        std::thread::sleep(std::time::Duration::from_millis(3));
         // `materialize_count` memoizes per cycle count: a core that has never
         // executed has `hot.cycles == count_read_cycle == 0` and short-circuits
-        // before materializing anything, so Count would stay 0 and no crossing
-        // could ever be detected. Make it look like it has run.
-        core.hot.cycles = 1;
+        // before materializing anything, so Count would stay 0. Give it a
+        // non-zero, already-run cycle count.
+        core.hot.cycles = 100_000;
         core
     }
 
-    /// The ticket `schedule_compare_timer` arms its one-shot with is
-    /// `self.ip7_seq`. If something consumed the shared sequence in the
-    /// meantime, that one-shot can never claim: on its first fire `claim_ip7`
-    /// fails, it returns `TimerReturn::Delete`, and nothing re-arms it -- the
-    /// guest's timer is gone for the rest of the run.
+    /// The deadline ticket armed on a Compare write is `self.ip7_seq`. If
+    /// something consumed the shared sequence in the meantime, a later Count
+    /// read that crosses Compare (or this write's own missed-deadline check)
+    /// can never claim and the guest's interrupt is lost.
     ///
-    /// A crossing detected inside the Compare write used to do exactly that.
+    /// A crossing detected inside the Compare write used to consume it.
     #[test]
-    fn a_compare_write_leaves_its_one_shots_ticket_claimable() {
+    fn a_compare_write_leaves_its_deadline_ticket_claimable() {
         let mut core = core_past_its_compare();
         let before = core.cp0_count as u32;
+        // A future deadline: no classification path should claim the ticket.
         core.write_cp0(11, (before.wrapping_add(330_000)) as u64);
 
         let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
         assert_ne!(
             shared, IP7_SEQ_CONSUMED,
-            "the Compare write consumed its own ticket; the one-shot it just \
-             armed can never claim and will delete itself"
+            "the Compare write consumed its own ticket; the deadline it just \
+             armed can never be delivered"
         );
         assert_eq!(
             shared, core.ip7_seq,
-            "the armed one-shot's ticket must be the live sequence"
+            "the armed deadline's ticket must be the live sequence"
         );
     }
 
@@ -2704,7 +2587,7 @@ mod ip7_ticket_tests {
         let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
         assert_eq!(
             pending & CAUSE_IP7, 0,
-            "Compare = 0xFFFFFFFF with Count near 0 is a match about 2^32 \
+            "Compare = 0xFFFFFFFF just past Count is a match about 2^32 \
              ticks away, not a deadline missed since the last read"
         );
     }
@@ -2717,8 +2600,9 @@ mod ip7_ticket_tests {
     fn a_missed_deadline_across_a_count_wrap_still_raises_ip7() {
         let mut core = core_past_its_compare();
         core.write_cp0(9, 0xFFFF_FF00);
-        std::thread::sleep(std::time::Duration::from_millis(3));
-        core.hot.cycles += 1; // see core_past_its_compare: let Count move
+        // Retire enough cycles to carry Count through the wrap (~0.33 ticks
+        // per cycle, so ~1M ticks needs ~3M cycles).
+        core.hot.cycles += 3_000_000;
         let now = core.count_peek();
         assert!(now < 0x8000_0000, "Count should have wrapped by now: {now:#x}");
 
@@ -2727,6 +2611,83 @@ mod ip7_ticket_tests {
         assert_ne!(
             core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7, 0,
             "a deadline between the last read and Count is owed across a wrap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cycle_clock_tests {
+    use super::*;
+
+    /// Count is a pure function of `hot.cycles` at a fixed ns/cycle: two
+    /// cores at the same cycle count read the same Count no matter how much
+    /// real time passes between them. On the old host-clock model the second
+    /// read moved with wall time.
+    #[test]
+    fn count_is_a_function_of_cycles_not_host_time() {
+        fn count_after(cycles: u64, host_delay: std::time::Duration) -> u32 {
+            let mut core = MipsCore::default();
+            core.hot.cycles = cycles;
+            if !host_delay.is_zero() {
+                std::thread::sleep(host_delay);
+            }
+            core.count_now()
+        }
+
+        let quick = count_after(5_000_000, std::time::Duration::ZERO);
+        let slow = count_after(5_000_000, std::time::Duration::from_millis(5));
+        assert_eq!(
+            quick, slow,
+            "Count tracked the host clock: the same retired cycles produced \
+             different Counts"
+        );
+    }
+
+    /// Advancing retired cycles by equal amounts advances Count by equal,
+    /// strictly positive amounts: a fixed rate per cycle, monotonic.
+    #[test]
+    fn count_advances_monotonically_with_cycles_at_a_fixed_rate() {
+        let mut core = MipsCore::default();
+        let base = core.count_now();
+        core.hot.cycles = 1_000_000;
+        let a = core.count_now();
+        core.hot.cycles = 2_000_000;
+        let b = core.count_now();
+        core.hot.cycles = 3_000_000;
+        let c = core.count_now();
+
+        assert!(
+            base < a && a < b && b < c,
+            "Count must increase with retired cycles: {base} {a} {b} {c}"
+        );
+        assert_eq!(a - base, b - a, "equal cycle deltas must add equal Count");
+        assert_eq!(b - a, c - b, "equal cycle deltas must add equal Count");
+    }
+
+    /// A Count read that materializes across Compare delivers IP7 then and
+    /// there, with no host timer and no wall-clock wait.
+    #[test]
+    fn a_count_read_crossing_compare_delivers_ip7_without_wall_clock() {
+        let mut core = MipsCore::default();
+        core.cp0_compare = 1_000;
+        // A Compare write arms the delivery ticket; do the same so the
+        // crossing claim is allowed to fire.
+        let _ = core.arm_ip7_sequence();
+
+        // Below Compare: no interrupt.
+        let _ = core.count_now();
+        assert_eq!(
+            core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7, 0,
+            "no crossing yet, so no IP7"
+        );
+
+        // Enough retired cycles to carry Count past Compare.
+        core.hot.cycles = 10_000_000; // Count ~= 3_300_000 > 1_000
+        let count = core.count_now();
+        assert!(count > 1_000, "test setup: Count {count} must be past Compare");
+        assert_ne!(
+            core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7, 0,
+            "a Count read that stepped over Compare must raise IP7"
         );
     }
 }

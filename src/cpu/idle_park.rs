@@ -90,13 +90,12 @@ impl IdleParkState {
 
     /// Park in ≤1 ms slices until an interrupt is pending or the CPU stops.
     ///
-    /// The Count==Compare interrupt needs no special handling here anymore:
-    /// the compare timer fires on the hptimer thread and ORs IP7 into
-    /// `hot.interrupts` exactly like a device line, and CP0 Count itself is
-    /// virtual (materialized from the wall clock on read), so nothing has to
-    /// advance it during the sleep. Only `hot.cycles` is advanced — at a
-    /// nominal ~100 MIPS — so cross-thread cycle readers (Wd33c93a's
-    /// deferred-interrupt spin-wait, CP0 Random) keep seeing progress.
+    /// The Count==Compare deadline is a `hot.cycles` threshold, so parking
+    /// must stop once the threshold is crossed and let step()'s preamble
+    /// deliver IP7. `hot.cycles` is advanced during the sleep — at the
+    /// `NS_PER_GUEST_CYCLE` (10 ns) host-pacing rate — so the deadline still
+    /// arrives, and cross-thread cycle readers (Wd33c93a's deferred-interrupt
+    /// spin-wait, CP0 Random, CP0 Count) keep seeing progress.
     pub fn park(&self, core: &mut MipsCore, running: &AtomicBool) {
         // Only park once the guest has actually armed a Compare deadline.
         // Before that (PROM), Compare use is ad-hoc and there may be nothing
@@ -122,22 +121,22 @@ impl IdleParkState {
             if (ip & im) != 0 {
                 break;
             }
-            // ci_clock has no hptimer — the fire point is a cycles threshold
-            // checked in step()'s preamble, so stop parking once we cross it.
-            #[cfg(feature = "ci_clock")]
+            // The compare deadline is a cycles threshold checked in step()'s
+            // preamble, so stop parking once we cross it.
             if core.hot.cycles >= core.count_fire_cycle {
                 break;
             }
 
             let t0 = Instant::now();
-            // Still a bounded slice — `running` and the ci_clock threshold are
+            // Still a bounded slice — `running` and the compare threshold are
             // only polled — but an interrupt now ends it at once.
             std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
             core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
         }
-        // Every exit, including the ci_clock one, leaves the flag clear: a
-        // stale `true` would put `wake` on the mutex for a running CPU.
+        // Every exit, including the compare-deadline one, leaves the flag
+        // clear: a stale `true` would put `wake` on the mutex for a running
+        // CPU.
         PARKED.store(false, Ordering::SeqCst);
     }
 }
@@ -152,10 +151,10 @@ impl IdleParkState {
 /// so there is no `cp0_compare`-armed guard and no `running` flag to poll: it
 /// stays parked until the architectural wake condition (or the soft-reset bit,
 /// which is set by `MipsCpu::signal` and also goes through [`wake`]). Only
-/// `hot.cycles` advances — at the 10 ns/guest-cycle wall-clock rate — so
-/// cross-thread cycle readers (Wd33c93a's deferred-interrupt spin) and
-/// `ci_clock`'s virtual CP0 Count keep seeing progress exactly as the old
-/// `spin_loop` stall did.
+/// `hot.cycles` advances — at the 10 ns/guest-cycle host-pacing rate — so
+/// cross-thread cycle readers (Wd33c93a's deferred-interrupt spin) and the
+/// virtual CP0 Count keep seeing progress exactly as the old `spin_loop`
+/// stall did.
 pub fn park_wait(core: &mut MipsCore) {
     const SOFT_RESET_BIT: u64 = 1u64 << 63;
     *PARKER.lock() = Some(std::thread::current());
@@ -171,10 +170,9 @@ pub fn park_wait(core: &mut MipsCore) {
         if (ip & im) != 0 {
             break;
         }
-        // ci_clock has no hptimer — the fire point is a cycles threshold
-        // checked in step()'s preamble, so stop parking once we cross it so
-        // the next step delivers IP7 (same rule as `IdleParkState::park`).
-        #[cfg(feature = "ci_clock")]
+        // The compare deadline is a cycles threshold checked in step()'s
+        // preamble, so stop parking once we cross it so the next step
+        // delivers IP7 (same rule as `IdleParkState::park`).
         if core.hot.cycles >= core.count_fire_cycle {
             break;
         }

@@ -133,7 +133,6 @@ pub mod build_features {
             ("tlbcheck", cfg!(feature = "tlbcheck")),
             ("instr_stats", cfg!(feature = "instr_stats")),
             ("pcap", cfg!(feature = "pcap")),
-            ("ci_clock", cfg!(feature = "ci_clock")),
             ("developer", cfg!(feature = "developer")),
             ("developer_ip7", cfg!(feature = "developer_ip7")),
             ("debug_cache", cfg!(feature = "debug_cache")),

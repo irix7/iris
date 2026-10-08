@@ -188,6 +188,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **2026-10-02 — Cache control in General** (`5582e96`): persistent JIT cache
   controls remain accessible in lightning builds, which hide the Debug tab.
 
+### CPU, timing, and audio
+
+- **2026-10-08 — Cycle-derived clock is the default (#42).** CP0 Count is
+  derived from retired cycles at 10 ns per cycle, scaled to guest ticks by the
+  fixed `count_hz` (33 MHz IP22/IP24, 97.5 MHz IP28). The Count==Compare
+  interrupt fires deterministically: the step preamble raises IP7 when
+  `hot.cycles` reaches `count_fire_cycle`, and a Count read that steps over
+  Compare raises it at the crossing. The host clock is kept only for pacing
+  (idle parking) and real time; the host-`Instant` anchor is gone. There is
+  still no calibration or slow/fast-tick inference. `--features ci_clock` is a
+  retired no-op — the behaviour it gated is unconditional — and old snapshots
+  listing `ci_clock` still restore (it joins `chd`/`camera` in
+  `RETIRED_FEATURES`).
+
 ## September 2026
 
 ### Configuration and desktop usability

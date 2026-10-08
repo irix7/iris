@@ -63,8 +63,9 @@ cargo build -p iris-gui --release --features iris/jitv2
   (`iris::build_features::LIGHTNING`), since the paths it drives are compiled
   out.
 - `iris/jitv2` — the experimental MIPS JIT; nothing in the GUI needs to change.
-- `iris/idle-pause`, `iris/tlbstats`, `iris/ci_clock`, `iris/developer*`,
-  `iris/debug_cache` — various core tweaks. `iris/r5ksc` and
+- `iris/idle-pause`, `iris/tlbstats`, `iris/developer*`,
+  `iris/debug_cache` — various core tweaks. `iris/ci_clock` is a retired
+  no-op (the cycle-derived clock is the default). `iris/r5ksc` and
   `iris/r5ksc_triton` refuse to build.
 
 **Help → Diagnostics** lists what's compiled in.

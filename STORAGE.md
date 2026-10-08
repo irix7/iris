@@ -73,7 +73,7 @@ iris-ci save base/desktop
 iris-ci restore base/desktop          # full disk-backed reload (~150 ms cold)
 iris-ci rollback                      # in-memory rewind to last restore (~40 ms)
 iris-ci diff base/desktop tests/grep  # what changed: devices, RAM chunks, COW sectors
-iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check (build with --features ci_clock)
+iris-ci validate base/desktop -n 1000000  # bit-deterministic re-execution check (cycle-derived clock is the default)
 iris-ci tree                          # snapshot parent-chain hierarchy
 iris-ci gc                            # sweep CAS chunks no kept snapshot references
 iris-ci pull http://reg/snapshots/base   # fetch a snapshot from another machine

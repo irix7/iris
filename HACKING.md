@@ -159,14 +159,17 @@ points VPNs straight at TLB entries (always on; the `tlbvmap` feature name is
 vestigial). All are invalidated on ASID changes and TLB writes. `tlbcheck` and
 `tlbstats` are the diagnostic features.
 
-**Count/Compare** — CP0 Count is anchored to host wall-clock time and ticks at a
-fixed 33 MHz on IP22/IP24 or 97.5 MHz on IP28 (`[clock] fixed_mhz`
-overrides). IRIX reports twice the Count frequency as CPU MHz. The Compare interrupt (IP7) is delivered by a host timer
-(`hptimer.rs`), not by counting instructions. There is no calibration or
-slow/fast-tick inference any more — that was removed in September 2026 because
-a fixed rate is more stable, and these guests are interrupt-driven so running
-faster or slower than "real" does no harm. `--features ci_clock` instead derives
-Count from retired instructions (10ns each) for deterministic replays.
+**Count/Compare** — CP0 Count is derived from retired cycles: each retired
+instruction is `NS_PER_GUEST_CYCLE` = 10 ns of synthetic guest time, scaled to
+guest ticks by the fixed Count frequency (33 MHz on IP22/IP24, 97.5 MHz on IP28;
+`[clock] fixed_mhz` overrides). IRIX reports twice the Count frequency as CPU
+MHz. The Count==Compare interrupt (IP7) is delivered deterministically: the
+step() preamble raises it when `hot.cycles` reaches `count_fire_cycle`, and a
+Count read that steps over Compare raises it at the crossing. There is no
+calibration or slow/fast-tick inference — that was removed in September 2026,
+and the host clock is kept only for pacing (idle parking) and for real time.
+`--features ci_clock` is a retired no-op: the cycle-derived clock is the
+default, and the feature no longer changes behaviour (#42).
 
 ---
 

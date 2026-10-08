@@ -1,5 +1,11 @@
 # CP0 Count is wallclock-derived, so Count tests flake
 
+> **Superseded (issue #42).** Count is now derived from retired cycles, not a
+> host `Instant`, so the flakiness this note describes no longer occurs. The
+> retry in `cp0/count_writable` and its `diff-hw.py` exclusion are still
+> harmless; this note is kept for the history of the model. See
+> `HACKING.md` §4 and `src/cpu/mips_core.rs` (`NS_PER_GUEST_CYCLE`).
+
 IRIS derives CP0 Count from a host `Instant` anchor plus a fixed
 `count_hz` (33 MHz on IP22/IP24, 97.5 MHz on IP28), not from a guest instruction count — `src/cpu/mips_exec.rs:9686` calls
 `count_anchor_instant` a wallclock anchor and notes it is "meaningless across

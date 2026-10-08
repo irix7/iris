@@ -57,10 +57,11 @@ rexdiag = []
 # its own feature rather than part of `developer`, and like `llstats` it is kept
 # `lightning`-compatible so it can run at the speed a timing bug needs.
 fetchverify = []
-# Synthetic deterministic clock for CP0 Compare calibration: dt_ns derived from
-# (instructions executed) * 10ns instead of host Instant::now(). Required for
-# the snapshot determinism validator (Phase 3.3). Default OFF preserves the
-# wallclock-anchored timer that interactive desktop builds expect.
+# Retired no-op. The synthetic, cycle-derived CP0 Count clock (dt_ns from
+# retired cycles * 10ns instead of host Instant::now()) is now the only clock
+# and the default. The feature is kept defined so existing
+# `--features ci_clock` build commands still work; it no longer changes
+# behaviour, and is ignored when comparing snapshot provenance.
 ci_clock = []
 # MIPS opcode fusion: branch/jump+NOP delay slot, LUI+ORI/ADDIU (32-bit
 # immediate materialization), and ADDU/SUBU/ADDIU+load/store (address-calc

@@ -2487,12 +2487,12 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
 /// guarantees the compiler can't elide/hoist the write out of an unbounded
 /// loop, even though this isn't a synchronizing atomic RMW (readers only
 /// need eventual visibility of the count, not ordering against other
-/// memory). Also runs `ci_clock`'s timer-fire check, immediately after, on
-/// the freshly-bumped value — `ci_clock`'s "fire when hot.cycles >=
-/// count_fire_cycle" is a threshold test, not an edge trigger, so it stays
-/// correct (just coarser-grained, still deterministic) even when the caller
-/// only calls this once per N instructions instead of every single one —
-/// see `step_int_0cycles`'s doc comment.
+/// memory). Also runs the Compare-fire check, immediately after, on the
+/// freshly-bumped value — "fire when hot.cycles >= count_fire_cycle" is a
+/// threshold test, not an edge trigger, so it stays correct (just
+/// coarser-grained, still deterministic) even when the caller only calls
+/// this once per N instructions instead of every single one — see
+/// `step_int_0cycles`'s doc comment.
 macro_rules! step_cycles {
     ($self:ident) => {{
         unsafe {
@@ -2500,10 +2500,10 @@ macro_rules! step_cycles {
             std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
         }
 
-        // ci_clock: the compare "timer" is a deterministic hot.cycles
-        // threshold instead of an hptimer thread — check it here, before the
-        // pending load below, so the fire is delivered within this same step.
-        #[cfg(feature = "ci_clock")]
+        // The compare "timer" is a deterministic hot.cycles threshold, not a
+        // host timer thread — check it here, before the pending load below,
+        // so the fire is delivered within this same step. Count is derived
+        // from the same cycles, so this is the guest-visible Compare match.
         if $self.core.hot.cycles >= $self.core.count_fire_cycle {
             // Next architectural match is a full 32-bit Count wrap away;
             // normally a Compare write re-arms much sooner.
@@ -7488,11 +7488,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
         // The stall itself. With `idle-pause` the CPU thread parks via the
         // idle-park primitive (same Dekker wake as the run-loop idle park),
-        // advancing `hot.cycles` at the 10 ns/guest-cycle wall-clock rate so
-        // the WD33C93A deferred-interrupt spin and (under `ci_clock`) CP0
-        // Count keep seeing progress — identical pacing to the spin loop
-        // below, minus the host CPU burn. A guest that actually executes WAIT
-        // (OpenBSD/NetBSD, or an R10000 guest) then idles at ~0 host CPU.
+        // advancing `hot.cycles` at the 10 ns/guest-cycle host-pacing rate so
+        // the WD33C93A deferred-interrupt spin and CP0 Count keep seeing
+        // progress — identical pacing to the spin loop below, minus the host
+        // CPU burn. A guest that actually executes WAIT (OpenBSD/NetBSD, or
+        // an R10000 guest) then idles at ~0 host CPU.
         #[cfg(feature = "idle-pause")]
         {
             crate::cpu::idle_park::park_wait(&mut self.core);
@@ -7509,11 +7509,10 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // very interrupt that spin is about to deliver.
         //
         // Must be paced: it is also the *virtual time base*
-        // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and under `ci_clock` CP0
-        // Count derives straight from it (`count_now`). Bumping once per
-        // host iteration would run guest time at hundreds of millions of
-        // cycles per real second inside one instruction — Count would leap
-        // and timers would fire early.
+        // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and CP0 Count derives straight
+        // from it (`count_now`). Bumping once per host iteration would run
+        // guest time at hundreds of millions of cycles per real second inside
+        // one instruction — Count would leap and timers would fire early.
         //
         // So: one guest cycle per 10ns of real time, which is exactly the
         // 1:1 rate `NS_PER_GUEST_CYCLE` defines, sampled off the host
@@ -7533,11 +7532,18 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if (ip & im) != 0 {
                     break;
                 }
+                // The compare deadline is a cycles threshold; break so the
+                // next step()'s preamble delivers IP7, exactly as idle parking
+                // does. Without this a WAIT whose only wake source is the
+                // compare timer would spin forever.
+                if self.core.hot.cycles >= self.core.count_fire_cycle {
+                    break;
+                }
                 let now = std::time::Instant::now();
                 let elapsed_ns = now.duration_since(stall_start).as_nanos() as u64;
                 // 10ns/cycle — the same rate `mips_core::NS_PER_GUEST_CYCLE`
-                // defines, restated here because that constant is `ci_clock`-only
-                // while this pacing must hold in every build.
+                // defines; restated as a const so this pacing holds in every
+                // build.
                 const STALL_NS_PER_CYCLE: u64 = 10;
                 let want = elapsed_ns / STALL_NS_PER_CYCLE;
                 if want > issued {
@@ -11209,10 +11215,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         Ok(())
     }
 
-    /// Snapshot the deterministic-from-state CPU registers. Excludes host
-    /// wallclock anchors like `count_anchor_instant` (they're meaningless
-    /// across runs) but includes their calibrated equivalents (count_hz,
-    /// the fixed count_hz).
+    /// Snapshot the deterministic-from-state CPU registers. Count is derived
+    /// from retired cycles, so it is reproducible from this digest plus the
+    /// cycle count; `count_hz` (the guest-visible frequency) is included.
     ///
     /// Also drains `hw_read_fixup_recorded` (see that field's doc comment)
     /// into the returned digest's `hw_reads` and clears it — empty/no-op
@@ -14636,12 +14641,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         }
         cp0u32!(cp0_index); cp0u32!(cp0_random); cp0u32!(cp0_wired);
         cp0u64!(cp0_count); cp0u64!(cp0_compare);
-        // Timer calibration state. Without these, restore loses the kernel's
-        // inferred count frequency and runs at the default 33 MHz until IRIX
-        // touches Compare again — guest scheduler drifts noticeably for the
-        // first few seconds after every restore. count_anchor_instant is
-        // intentionally not saved: it's a host-wall anchor, not calibrated
-        // state, and must be reset on load.
+        // Count frequency. Without this, restore runs at the default 33 MHz
+        // until IRIX touches Compare again — the guest scheduler drifts
+        // noticeably for the first few seconds after every restore. The
+        // cycle anchor and memo are not saved: they are re-derived from
+        // `hot.cycles` on load by `reanchor_count_and_reschedule`.
         cp0u64!(count_hz);
         cp0u32!(cp0_status); cp0u32!(cp0_cause);
         cp0u32!(cp0_prid); cp0u32!(cp0_config); cp0u32!(cp0_lladdr);
