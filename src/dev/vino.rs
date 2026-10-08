@@ -592,6 +592,11 @@ impl Vino {
             // step so all 300 data pages land in order.
             let target = (chan.descriptors[0] as u32) & desc::PTR_MASK;
             Self::descriptor_fetch(chan, target, mem);
+            // Track the live base across the jump. MAME leaves
+            // `m_next_desc_ptr` pointing at the pre-jump group (its known
+            // bug); IRIS carries the cursor forward so `end_of_field`'s
+            // odd-advance reflects real descriptor progress (plan §3.3).
+            chan.next_desc_ptr = target.wrapping_add(16);
         }
     }
 
@@ -798,7 +803,21 @@ impl Vino {
             }
         }
 
+        // MAME `end_of_field` odd-advance (plan §3.4): once the COMPLETING
+        // (second) interlaced field has been pumped, advance the live base to
+        // the descriptor cursor the walk actually reached, so the ring
+        // progresses frame-by-frame and eventually lands on the chain's STOP.
+        // The even field's rewind for the second field is done at the top of
+        // this function (the per-parity `page_index` offset); here we only
+        // advance. `field_counter` is still the pre-increment value, so 0 is
+        // the first field of the DMA-enable cycle and != 0 is the completing
+        // one. 5.3 GATE: this is `interleave`-gated and 5.3 is EOF-driven, so
+        // its path is untouched.
         let mut st = self.state.lock();
+        if interleave && field_counter != 0 && start_desc_ptr != 0 {
+            let next = st.channels[ch].next_desc_ptr;
+            st.channels[ch].start_desc_ptr = next;
+        }
         st.channels[ch].field_counter = st.channels[ch].field_counter.wrapping_add(1);
         let isr_eof    = if ch == 0 { isr::CHA_EOF } else { isr::CHB_EOF };
         let new_status = st.int_status | isr_eof;
@@ -1036,15 +1055,20 @@ impl Vino {
             // field doesn't abort either). `field_counter` is reset to 0 per
             // DMA-enable in start_channel and reaches 2 at the 2nd field's interrupt.
             // With this, vidtomem delivers a 640x480 frame on 6.5 (verified live,
-            // cont. 15). FIELD_DESC_SPAN is the kernel's field-boundary offset for the
-            // standard IndyCam capture (= rows-per-field 240 * 8); generalizing it for
-            // other geometries is follow-up. 5.3 GATE: 5.3 capture is EOF-driven /
+            // cont. 15). The span is the kernel's field-boundary descriptor offset:
+            // half the clipped field height (rows per interlaced field) times 8
+            // bytes-per-row in the descriptor table. Deriving it from the clip
+            // geometry replaces the old hard-coded 640x480 constant (0x780) so other
+            // capture geometries scale. 5.3 GATE: 5.3 capture is EOF-driven /
             // page-steps NEXT_4_DESC and uses neither this completion check nor a 2nd
             // interlaced field, so its readback stays at the base.
             reg::CH_DESC_TABLE_PTR => {
-                const FIELD_DESC_SPAN: u32 = 0x780;
+                let y_start = (chan.clip_start >> clip::YEVEN_SHIFT) & clip::YEVEN_MASK;
+                let y_end   = (chan.clip_end   >> clip::YEVEN_SHIFT) & clip::YEVEN_MASK;
+                let rows_per_field = y_end.saturating_sub(y_start) / 2;
+                let span = rows_per_field.wrapping_mul(8);
                 if chan.field_counter >= 2 {
-                    chan.start_desc_ptr.wrapping_add(FIELD_DESC_SPAN)
+                    chan.start_desc_ptr.wrapping_add(span)
                 } else {
                     chan.start_desc_ptr
                 }
@@ -1796,6 +1820,10 @@ mod tests {
         {
             let mut st = vino.state.lock();
             st.channels[0].start_desc_ptr = 0x0861_e000;
+            // Clip geometry for a 640x480 interlaced capture: 480 lines total,
+            // so 240 rows/field -> span = 240 * 8 = 0x780.
+            st.channels[0].clip_start = 0;
+            st.channels[0].clip_end   = (480 & clip::YEVEN_MASK) << clip::YEVEN_SHIFT;
             st.channels[0].field_counter  = 1; // first field's interrupt
         }
         assert_eq!(vino.read_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR), 0x0861_e000,
@@ -1931,14 +1959,13 @@ mod tests {
     /// `shift_descriptors` / `page_index_w`), with exactly one `CHA_DESC` for
     /// the frame and `end_of_field`'s odd-advance moving `start_desc_ptr`.
     ///
-    /// It is `#[ignore]`d because it is the failing target, not a regression:
-    /// the shipped model is pixel-driven (`render_and_pump` stops at the clipped
-    /// rectangle, the cursor is rewound per field, and `CH_DESC_TABLE_PTR`
-    /// reports a hard-coded `FIELD_DESC_SPAN = 0x780`), so it cannot satisfy a
-    /// chain-walk clean frame. Run it with:
-    ///   `cargo test -p iris --lib vino_6_5_vidtomem -- --ignored --nocapture`
+    /// The descriptor engine now walks the chain to STOP (the interleaved
+    /// second field completes it), `end_of_field`'s odd-advance moves
+    /// `start_desc_ptr`, and `CH_DESC_TABLE_PTR`'s boundary span is derived
+    /// from the clip geometry rather than a hard-coded 640x480 constant, so
+    /// this passes as a regression. Run it with:
+    ///   `cargo test -p iris --lib vino_6_5_vidtomem -- --nocapture`
     #[test]
-    #[ignore = "target for #55: fails until the descriptor engine lands"]
     fn vino_6_5_vidtomem_capture_yields_clean_frame() {
         const W: u32 = 640;
         const H: u32 = 480;
