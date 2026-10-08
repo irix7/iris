@@ -162,6 +162,8 @@ pub mod prombin;
 pub mod prombini2;
 pub mod prombinip28;
 pub mod ppmem;
+#[cfg(feature = "faultmmio")]
+pub mod faultmmio;
 pub mod machine;
 pub mod platform;
 pub mod physical;
