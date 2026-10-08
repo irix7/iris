@@ -73,8 +73,8 @@ emulated CPU is not a build feature; read `MachineConfig::machine.cpu`.
 
 ## Empty-media CD-ROM
 
-`ScsiDevice.backend` is `Option<DiskBackend>`. `None` represents "drive
-present, tray empty": INQUIRY still answers, TEST UNIT READY / READ
+`ScsiDevice.backend` is `Option<Box<dyn iris::block_node::BlockNode>>`. `None`
+represents "drive present, tray empty": INQUIRY still answers, TEST UNIT READY / READ
 CAPACITY / READ / READ TOC return `CHECK CONDITION` with sense key
 `0x02` (NOT_READY) + ASC `0x3A` (MEDIUM NOT PRESENT). Construct via
 `ScsiDevice::new_empty_cdrom()`; mount/swap media with

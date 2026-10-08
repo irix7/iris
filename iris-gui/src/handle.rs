@@ -1,5 +1,6 @@
 use crate::framebuffer::{new_capture_renderer, FrameSink};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use iris::block_node::BlockNode;
 use iris::config::{MachineConfig, PortForwardConfig};
 use iris::machine::Machine;
 use iris::dev::ps2::Ps2Controller;

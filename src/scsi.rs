@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::block_node::{BlockNode, ChdCdNode, ChdNode, CowNode, RawNode};
+use crate::block_node::{BlockNode, RawNode};
 
 /// Get the standard CDB length based on the opcode's group code
 pub fn get_cdb_length(opcode: u8) -> usize {
@@ -61,101 +61,6 @@ pub struct ScsiResponse {
     pub data: Vec<u8>,   // Response data
 }
 
-/// Disk I/O backend: a node in the layered block graph (tickets #49/#50). The
-/// enum remains the compatibility façade that distinguishes the four backends
-/// for the overlay / commit / rollback operations; the byte-level I/O itself is
-/// carried by [`BlockNode`], so the call sites read and write through the trait.
-///
-/// Dirty / commit semantics (unchanged by #50; #51 folds this into the node
-/// contract and deletes the enum):
-///
-/// * **Raw COW** — dirty is the set of sectors held by the sparse `.overlay`,
-///   persisted in `<overlay>.dirty`. `cow commit` copies those sectors into the
-///   base and truncates the overlay; `cow reset` truncates the overlay and
-///   deletes the sidecar. Snapshots reflink the overlay and carry the dirty set.
-/// * **CHD** — dirty is a coarse 1/0 flag meaning "the `.diff.chd` diverges from
-///   the base". `cow commit` rebuilds the base from the merged diff view and
-///   reopens; `cow reset` deletes the diff and reopens. A clean exit auto-folds
-///   only when COW is off (`pending_sync`).
-/// * **Direct / CD CHD** — no overlay, so nothing is ever dirty.
-pub enum DiskBackend {
-    /// Direct read-write access to a single file.
-    Direct(RawNode),
-    /// Copy-on-write: base image is read-only, writes go to overlay file.
-    Cow(CowNode),
-    /// Hard-disk CHD. Writable; compressed parents get an uncompressed
-    /// `.diff.chd` sidecar (MAME-style), so the parent stays untouched.
-    ChdHd(ChdNode),
-    /// CD CHD (single-track MODE1) exposed as a 2048-byte/sector read-only
-    /// stream. Writes return an error.
-    ChdCd(ChdCdNode),
-}
-
-impl BlockNode for DiskBackend {
-    fn size(&self) -> u64 {
-        match self {
-            DiskBackend::Direct(n) => n.size(),
-            DiskBackend::Cow(n) => n.size(),
-            DiskBackend::ChdHd(n) => n.size(),
-            DiskBackend::ChdCd(n) => n.size(),
-        }
-    }
-
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        match self {
-            DiskBackend::Direct(n) => n.read(offset, buf),
-            DiskBackend::Cow(n) => n.read(offset, buf),
-            DiskBackend::ChdHd(n) => n.read(offset, buf),
-            DiskBackend::ChdCd(n) => n.read(offset, buf),
-        }
-    }
-
-    fn write(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        match self {
-            DiskBackend::Direct(n) => n.write(offset, buf),
-            DiskBackend::Cow(n) => n.write(offset, buf),
-            DiskBackend::ChdHd(n) => n.write(offset, buf),
-            DiskBackend::ChdCd(n) => n.write(offset, buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            DiskBackend::Direct(n) => n.flush(),
-            DiskBackend::Cow(n) => n.flush(),
-            DiskBackend::ChdHd(n) => n.flush(),
-            DiskBackend::ChdCd(n) => n.flush(),
-        }
-    }
-
-    fn discard(&mut self, offset: u64, len: u64) -> io::Result<()> {
-        match self {
-            DiskBackend::Direct(n) => n.discard(offset, len),
-            DiskBackend::Cow(n) => n.discard(offset, len),
-            DiskBackend::ChdHd(n) => n.discard(offset, len),
-            DiskBackend::ChdCd(n) => n.discard(offset, len),
-        }
-    }
-
-    fn block_status(&self, offset: u64, len: u64) -> io::Result<crate::block_node::BlockStatus> {
-        match self {
-            DiskBackend::Direct(n) => n.block_status(offset, len),
-            DiskBackend::Cow(n) => n.block_status(offset, len),
-            DiskBackend::ChdHd(n) => n.block_status(offset, len),
-            DiskBackend::ChdCd(n) => n.block_status(offset, len),
-        }
-    }
-
-    fn backing(&self) -> Option<&dyn BlockNode> {
-        match self {
-            DiskBackend::Direct(n) => n.backing(),
-            DiskBackend::Cow(n) => n.backing(),
-            DiskBackend::ChdHd(n) => n.backing(),
-            DiskBackend::ChdCd(n) => n.backing(),
-        }
-    }
-}
-
 /// What kind of target sits at this SCSI id.
 ///
 /// `Disk` and `Cdrom` share the storage command set below and differ only in
@@ -173,7 +78,7 @@ pub struct ScsiDevice {
     /// None = no media loaded (CD-ROM drive present but tray is empty), or a
     /// device with no storage behind it at all (DaynaPort).
     /// HDDs are never None in practice.
-    backend: Option<DiskBackend>,
+    backend: Option<Box<dyn BlockNode>>,
     /// Capacity in bytes of the loaded media. 0 when `backend` is None.
     size: u64,
     kind: DeviceKind,
@@ -197,7 +102,7 @@ pub struct ScsiDevice {
 const SCSI_BUFFER_SIZE: usize = 0x4000; // 16KB (16384 bytes)
 
 impl ScsiDevice {
-    pub fn new(backend: DiskBackend, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
+    pub fn new(backend: Box<dyn BlockNode>, size: u64, is_cdrom: bool, filename: String, discs: Vec<String>) -> Self {
         Self {
             backend: Some(backend),
             size,
@@ -281,7 +186,7 @@ impl ScsiDevice {
     pub fn insert_media(&mut self, path: &str) -> io::Result<()> {
         let node = RawNode::open_readonly(std::path::Path::new(path))?;
         let size = node.size();
-        self.backend = Some(DiskBackend::Direct(node));
+        self.backend = Some(Box::new(node));
         self.size = size;
         self.filename = path.to_string();
         self.unit_attention = true;
@@ -296,109 +201,65 @@ impl ScsiDevice {
         self.unit_attention = true;
     }
 
-    /// Commit the COW overlay into the base image ("apply the changes"). For a
-    /// raw overlay this copies the dirty sectors in place; for a CHD it rebuilds
-    /// the base from the diff (recompressing) and reopens a fresh overlay. No-op
-    /// if not overlaid. Returns a coarse count of what was committed.
+    /// Commit the divergence layer into the base image ("apply the changes").
+    /// Raw: copies the dirty sectors in place; CHD: rebuilds the base from the
+    /// diff (recompressing) and reopens a fresh overlay. No-op if not overlaid.
+    /// Returns a coarse count of what was committed. The concrete behaviour is
+    /// [`BlockNode::commit`] — including the CHD handle close/reopen.
     pub fn cow_commit(&mut self) -> io::Result<usize> {
-        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
-            return cow.commit();
+        match self.backend.as_mut() {
+            Some(node) => node.commit(),
+            None => Ok(0),
         }
-        {
-            // CHD: rebuild needs the file closed first, so extract the paths,
-            // drop the backend, flatten, then reopen with the same COW mode.
-            let info = match &self.backend {
-                Some(DiskBackend::ChdHd(hd)) if hd.diff_dirty() => {
-                    hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow()))
-                }
-                _ => None,
-            };
-            if let Some((base, diff, cow)) = info {
-                self.backend = None;
-                crate::chd_disk::flatten_diff(&base, &diff, &mut |_| {}, &|| false)?;
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = ChdNode::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
-                return Ok(1);
-            }
-        }
-        Ok(0)
     }
 
-    /// Reset the COW overlay — discard all uncommitted writes ("roll back"). For
-    /// a raw overlay this truncates it; for a CHD it deletes the `.diff.chd` and
+    /// Reset the divergence layer — discard all uncommitted writes ("roll
+    /// back"). Raw: truncates the overlay; CHD: deletes the `.diff.chd` and
     /// reopens a fresh overlay over the untouched base. No-op if not overlaid.
+    /// The concrete behaviour is [`BlockNode::rollback`].
     pub fn cow_reset(&mut self) -> io::Result<()> {
-        if let Some(DiskBackend::Cow(cow)) = &mut self.backend {
-            return cow.reset_overlay();
+        match self.backend.as_mut() {
+            Some(node) => node.rollback(),
+            None => Ok(()),
         }
-        {
-            let info = match &self.backend {
-                Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().map(|(b, d)| (b, d, hd.is_cow())),
-                _ => None,
-            };
-            if let Some((base, diff, cow)) = info {
-                self.backend = None;
-                let _ = std::fs::remove_file(&diff); // discard every overlay write
-                let base_str = base.to_str()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 CHD path"))?;
-                let reopened = ChdNode::open(base_str, cow)?;
-                self.backend = Some(DiskBackend::ChdHd(reopened));
-            }
-        }
-        Ok(())
     }
 
     /// Copy the COW overlay into `dest` and return its dirty sector set.
     /// Direct-mode / no-media devices return an empty list and create no file.
     pub fn cow_export(&mut self, dest: &std::path::Path) -> io::Result<Vec<u64>> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.export_overlay(dest),
-            _ => Ok(Vec::new()),
+        match self.backend.as_mut() {
+            Some(node) => node.export_overlay(dest),
+            None => Ok(Vec::new()),
         }
     }
 
     /// Replace the COW overlay with the contents of `source` and adopt
     /// `dirty` as the dirty sector set. No-op on non-COW / no-media devices.
     pub fn cow_import(&mut self, source: &std::path::Path, dirty: Vec<u64>) -> io::Result<()> {
-        match &mut self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.import_overlay(source, dirty),
-            _ => Ok(()),
+        match self.backend.as_mut() {
+            Some(node) => node.import_overlay(source, dirty),
+            None => Ok(()),
         }
     }
 
-    /// Number of dirty sectors in the COW overlay (raw), or for a CHD a coarse
-    /// 1/0 "has uncommitted changes" (we don't track per-sector dirt there).
-    /// 0 if direct / no media.
+    /// Size of the device's uncommitted divergence, via [`BlockNode::dirty_count`]:
+    /// exact dirty sectors for a raw overlay, a coarse 1/0 for a CHD diff. 0 if
+    /// direct / no media.
     pub fn cow_dirty_count(&self) -> usize {
-        match &self.backend {
-            Some(DiskBackend::Cow(cow)) => cow.dirty_count(),
-            Some(DiskBackend::ChdHd(hd)) => usize::from(hd.diff_dirty()),
-            _ => 0,
-        }
+        self.backend.as_ref().map_or(0, |node| node.dirty_count())
     }
 
-    /// Whether this device has a copy-on-write overlay (a raw `.overlay` or a CHD
+    /// Whether this device has a divergence layer (a raw `.overlay` or a CHD
     /// `.diff.chd`) that `cow commit` / `cow reset` can act on.
     pub fn is_cow(&self) -> bool {
-        match &self.backend {
-            Some(DiskBackend::Cow(_)) => true,
-            Some(DiskBackend::ChdHd(hd)) => hd.overlay_paths().is_some(),
-            _ => false,
-        }
+        self.backend.as_ref().is_some_and(|node| node.is_cow())
     }
 
     /// `(base, diff)` paths if this device is a CHD writing to a `.diff.chd`
     /// sidecar that holds changes worth folding back into the base on a clean
     /// shutdown. `None` for in-place / non-CHD / no-media devices.
     pub fn pending_chd_sync(&self) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        {
-            if let Some(DiskBackend::ChdHd(hd)) = &self.backend {
-                return hd.pending_sync();
-            }
-        }
-        None
+        self.backend.as_ref().and_then(|node| node.pending_sync())
     }
 
     /// Take the pending-sync paths AND release the disk backend, closing the CHD
@@ -439,7 +300,7 @@ impl ScsiDevice {
         match RawNode::open_readonly(std::path::Path::new(&next_path)) {
             Ok(node) => {
                 let size = node.size();
-                self.backend = Some(DiskBackend::Direct(node));
+                self.backend = Some(Box::new(node));
                 self.size = size;
                 // phys_block_size never changes — CD-ROM physical sectors are always 2048.
                 // Do NOT reset logical_block_size — MODE SELECT is a controller setting
@@ -490,7 +351,7 @@ impl ScsiDevice {
         let node = RawNode::open_readonly(std::path::Path::new(&path))
             .map_err(|e| format!("could not open {}: {}", path, e))?;
         let size = node.size();
-        self.backend = Some(DiskBackend::Direct(node));
+        self.backend = Some(Box::new(node));
         self.size = size;
         self.filename = path.clone();
         self.unit_attention = true;
@@ -771,7 +632,7 @@ impl ScsiDevice {
             return Ok(self.check_condition(0x05, 0x21, 0x00)); // Illegal Request: LBA Out of Range
         }
         let mut data = vec![0u8; count * self.logical_block_size as usize];
-        BlockNode::read(backend, lba * self.logical_block_size, &mut data)?;
+        backend.read(lba * self.logical_block_size, &mut data)?;
         let expected = count as u64 * self.logical_block_size;
         if data.len() as u64 != expected {
             eprintln!(
@@ -824,7 +685,7 @@ impl ScsiDevice {
         let Some(backend) = self.backend.as_mut() else {
             return Ok(self.check_condition(0x02, 0x3A, 0x00));
         };
-        BlockNode::write(backend, lba * 512, data)?;
+        backend.write(lba * 512, data)?;
 
         Ok(ScsiResponse {
             status: 0x00,
@@ -1359,7 +1220,7 @@ mod tests {
         std::fs::write(&path, vec![0u8; 4 * 512]).unwrap();
         let node = crate::block_node::RawNode::open(&path).unwrap();
         let mut dev = ScsiDevice::new(
-            DiskBackend::Direct(node),
+            Box::new(node),
             4 * 512,
             false,
             path.display().to_string(),
@@ -1399,7 +1260,7 @@ mod tests {
             .unwrap()
             .with_base_path(&base);
         let mut dev = ScsiDevice::new(
-            DiskBackend::Cow(node),
+            Box::new(node),
             2 * 512,
             false,
             base.display().to_string(),
