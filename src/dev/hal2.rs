@@ -2309,6 +2309,76 @@ mod tests {
         assert_eq!(n.underruns(), 0);
     }
 
+    /// End-to-end CI capture: `IRIS_HAL2_CAPTURE` selects the wav backend
+    /// through the same `select_backend` path `Hal2::start` uses, a short
+    /// synthetic Codec A stream is pushed through the real drain, and the
+    /// resulting file is a well-formed RIFF/WAVE with the samples intact.
+    ///
+    /// `#[ignore]`: it writes `IRIS_HAL2_CAPTURE` into the process
+    /// environment, which is global, so it must not run beside the parallel
+    /// test pool. The HAL2 audio-capture CI job runs it explicitly with
+    /// `--ignored --test-threads=1` and hands it a capture path.
+    #[test]
+    #[ignore = "environment-global; run by the HAL2 audio-capture CI job"]
+    fn capture_through_the_wav_backend_is_a_well_formed_wav() {
+        // Honour a path the caller (the CI job) already set; otherwise pick a
+        // unique temp file so a local `cargo test -- --ignored` is self-contained.
+        let path = std::env::var_os("IRIS_HAL2_CAPTURE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("iris-hal2-capture-{}.wav", std::process::id()))
+            });
+        std::env::set_var("IRIS_HAL2_CAPTURE", &path);
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = AudioConfig::default();
+        let backend = select_backend(&cfg, Arc::new(AtomicU64::new(0)));
+        let out = backend
+            .open(&cfg)
+            .expect("the wav capture backend opens with no sound card");
+
+        let source = sawtooth_capture(512);
+        let dma = Arc::new(CorpusDma { samples: source.clone(), served: AtomicU64::new(0) });
+        let client: Arc<dyn DmaClient> = dma.clone();
+
+        let mut st = CodecAState::new();
+        st.out = Some(out);
+        // prebuf_ms = 0 flushes the pre-buffer on the first frame, so one drain
+        // writes the whole capture straight to the sink.
+        let frames = source.len() as u64 / 2;
+        let moved = drain_codec_a(
+            &mut st, &client, MODE_STEREO, 48_000, 48_000, 0,
+            ResamplerKind::CatmullRom, frames,
+        );
+        assert_eq!(moved, frames, "every frame moved through the drain");
+        drop(st); // drops the WavOutput, which patches the header sizes
+
+        let b = std::fs::read(&path).expect("the capture file exists after drop");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(b.len() > 44, "capture has a header and samples");
+        assert_eq!(&b[0..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        assert_eq!(&b[12..16], b"fmt ");
+        assert_eq!(&b[36..40], b"data");
+        assert_eq!(u16::from_le_bytes([b[20], b[21]]), 1, "PCM");
+        assert_eq!(u16::from_le_bytes([b[22], b[23]]), 2, "stereo");
+        assert_eq!(u32::from_le_bytes([b[24], b[25], b[26], b[27]]), 48_000, "rate");
+        assert_eq!(u16::from_le_bytes([b[34], b[35]]), 16, "bits");
+
+        let data_bytes = b.len() as u32 - 44;
+        assert_eq!(data_bytes % 4, 0, "whole stereo 16-bit frames");
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 36 + data_bytes);
+        assert_eq!(u32::from_le_bytes([b[40], b[41], b[42], b[43]]), data_bytes);
+
+        let samples: Vec<i16> = b[44..]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(samples.iter().any(|&s| s != 0), "expected non-zero samples");
+        assert_eq!(samples, source, "capture is the codec stream, sample for sample");
+    }
+
     #[test]
     fn save_load_round_trip() {
         let src = Hal2::new(Vec::new(), AudioConfig::default());

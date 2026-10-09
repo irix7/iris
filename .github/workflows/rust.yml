@@ -27,6 +27,25 @@ jobs:
       run: cargo build --workspace --verbose
     - name: Run tests
       run: cargo test --workspace --verbose
+    # CI audio capture (#73). The resampler and the audio-backend traits have
+    # null/wav sinks, but until now nothing in CI drove them: a regression in
+    # the capture path would only show up on a developer's machine with the
+    # right env var set. This runs the `IRIS_HAL2_CAPTURE` wav backend through
+    # the same `select_backend` path `Hal2::start` uses, pushes a short
+    # synthetic Codec A stream through the real drain, then asserts the file is
+    # a well-formed RIFF/WAVE (PCM, stereo, 48 kHz, 16-bit) with non-zero
+    # samples and header sizes matching the payload.
+    #
+    # It is `--ignored` because it writes `IRIS_HAL2_CAPTURE` into the process
+    # environment, which is global and would race the parallel test pool; CI is
+    # the one place that runs it, serially. A full headless emulator boot is
+    # not used here: with no IRIX media it only ever drains silence, so the
+    # capture is driven through the library at the codec drain, where the
+    # samples are deterministic.
+    - name: HAL2 audio capture (wav backend)
+      env:
+        IRIS_HAL2_CAPTURE: ${{ runner.temp }}/hal2-capture.wav
+      run: cargo test --lib capture_through_the_wav_backend -- --ignored --nocapture --test-threads=1
     # The parallel-agent workflow: boot two isolated instances (`--instance N`)
     # and drive each over its own CI serial socket. No IRIX media needed — the
     # Indy PROM's command monitor is the serial endpoint. Catches regressions
