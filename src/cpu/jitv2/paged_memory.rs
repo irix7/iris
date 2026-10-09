@@ -427,6 +427,14 @@ pub struct SharedArena {
     /// Incremented by every provider handle built over this arena, decremented
     /// by `free_memory`; only the last one out actually frees.
     users: usize,
+    /// Generational retention pin (see `PagedArenaMemoryProvider::set_retained`).
+    /// While set, `free_memory` still decrements `users` but never releases the
+    /// mapping, so a demoted generation can outlive the worker `Codegen`s that
+    /// compiled into it — its code is still dispatchable, and freeing it would
+    /// be a use-after-free. Cleared (and the mapping released) only by an
+    /// explicit `free_retained`, once the generation has been retired wholesale
+    /// and every page pointing into it has been evicted.
+    retained: bool,
     /// The real `BranchProtection` cranelift computed and passed into the
     /// most recent real `finalize()` call (`JITModule::finalize_definitions()`
     /// derives this from the live ISA — BTI on aarch64 when the target
@@ -506,6 +514,7 @@ impl SharedArena {
             // The arena starts with no module attached; each provider handle
             // registers itself in `new_shared`/`new_with_size`.
             users: 0,
+            retained: false,
             last_branch_protection: None,
             last_sealed: Vec::new(),
             state,
@@ -843,14 +852,49 @@ impl SharedArena {
         }
         // N modules can share one arena (the compile pool's whole shape), and
         // each one's `JITModule::free_memory()` lands here. Only the last one
-        // may actually release the mapping — see `users`.
+        // may actually release the mapping — see `users` — and only when the
+        // arena isn't pinned for generational retention (see `retained`).
         self.users = self.users.saturating_sub(1);
-        if self.users > 0 {
+        if self.users > 0 || self.retained {
             return;
         }
+        self.release_mapping();
+    }
+
+    /// Actually release the reserved mapping and forget its bookkeeping. Only
+    /// ever called once `users == 0` and `retained == false` (see
+    /// `free_memory`/`free_retained`); callers must already have evicted every
+    /// page that could reach code in this arena.
+    fn release_mapping(&mut self) {
         self.seal_queue.clear();
         let _: Option<region::Allocation> = self.alloc.take();
         self.ptr = ptr::null_mut();
+    }
+
+    /// Pin this arena so `free_memory` leaves the mapping mapped even after its
+    /// last `JITModule` detaches — the generational-retention seam. The code in
+    /// it is still reachable by dispatch, so it must outlive the worker
+    /// `Codegen`s that compiled into it.
+    pub(crate) fn set_retained(&mut self, retained: bool) {
+        self.retained = retained;
+    }
+
+    /// Retire a pinned arena: clear the pin and release the mapping if nothing
+    /// still uses it. The caller must have evicted every page whose compiled
+    /// function pointed into this arena's range first; otherwise those pages
+    /// would be dispatchable into freed memory.
+    pub(crate) unsafe fn free_retained(&mut self) {
+        self.retained = false;
+        if self.ptr != ptr::null_mut() && self.users == 0 {
+            self.release_mapping();
+        }
+    }
+
+    /// `(base, len)` of this arena's reserved range — the address window every
+    /// function compiled into it falls inside. Used by generational retirement
+    /// to find the pages that point into a retiring arena.
+    pub(crate) fn range(&self) -> (usize, usize) {
+        (self.ptr as usize, self.size)
     }
 }
 
@@ -1119,6 +1163,32 @@ impl PagedArenaMemoryProvider {
         self.inner.lock().ptr
     }
 
+    /// `(base, len)` of the reserved range every function compiled into this
+    /// arena falls inside — see `SharedArena::range`. Used by generational
+    /// retirement to identify the pages that point into a retiring arena.
+    pub fn arena_span(&self) -> (usize, usize) {
+        self.inner.lock().range()
+    }
+
+    /// Pin/unpin this arena for generational retention — see
+    /// `SharedArena::set_retained`.
+    pub fn set_retained(&self, retained: bool) {
+        self.inner.lock().set_retained(retained);
+    }
+
+    /// Retire a pinned arena; see `SharedArena::free_retained`.
+    ///
+    /// # Safety
+    /// Every page whose compiled function pointed into this arena's range must
+    /// already have been evicted.
+    pub unsafe fn free_retained(&self) {
+        unsafe { self.inner.lock().free_retained() }
+    }
+
+    /// Whether the underlying mapping has been released (test/diagnostic).
+    pub fn is_released(&self) -> bool {
+        self.inner.lock().ptr.is_null()
+    }
 
     pub(crate) unsafe fn free_memory(&mut self) {
         unsafe { self.inner.lock().free_memory() }
