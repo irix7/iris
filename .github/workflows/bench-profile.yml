@@ -219,3 +219,140 @@ data = json.load(sys.stdin)
             profile-irix-boot-${{ github.sha::8 }}/collapsed.txt
             profile-irix-boot-${{ github.sha::8 }}/boot.log
           retention-days: 30
+
+  # Run IRIX benchmark suite after boot
+  bench-irix:
+    name: IRIX Benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    if: env.IRIS_IRIX_IMAGE_URL != ''
+    needs: profile
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build emulator (jitv2) + iris-bench + iris-ci
+        run: |
+          cargo build --release --bin iris --features jitv2
+          cargo build --release --bin iris-bench --features jitv2
+          cargo build --release --bin iris-ci --features jitv2
+
+      - name: Download IRIX disk image
+        env:
+          IRIS_IRIX_IMAGE_URL: ${{ secrets.IRIS_IRIX_IMAGE_URL }}
+        run: |
+          set -e
+          echo "Downloading IRIX image from Cloudflare..."
+          wget -q --show-progress -O irix-disk.chd "$IRIS_IRIX_IMAGE_URL"
+          ls -lh irix-disk.chd
+
+      - name: Start IRIX emulator with CI socket
+        run: |
+          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          mkdir -p "$OUT_DIR"
+          SOCKET="$OUT_DIR/iris.sock"
+
+          # Start emulator in background with CI socket
+          # --ci-display keeps REX3 mapped for X11
+          ./target/release/iris \
+            --cpu r4400 \
+            --disk irix-disk.chd \
+            --ci \
+            --ci-socket "$SOCKET" \
+            --ci-display \
+            2>&1 | tee "$OUT_DIR/emu.log" &
+          EMU_PID=$!
+          echo $EMU_PID > "$OUT_DIR/emu.pid"
+
+          # Wait for CI socket to appear
+          for i in {1..60}; do
+            if [ -S "$SOCKET" ]; then
+              echo "CI socket ready"
+              break
+            fi
+            sleep 2
+          done
+
+          # Wait for login prompt
+          echo "Waiting for login prompt..."
+          for i in {1..300}; do
+            if grep -q "login:" "$OUT_DIR/emu.log"; then
+              echo "Login prompt detected"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Auto-login and start X (if configured)
+        run: |
+          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          SOCKET="$OUT_DIR/iris.sock"
+
+          # Login as root (no password on fresh install)
+          # Send: root\n\n
+          ./target/release/iris-ci --socket "$SOCKET" send "root" $'\n' || true
+          sleep 2
+          ./target/release/iris-ci --socket "$SOCKET" send "" $'\n' || true
+          sleep 5
+
+          # Check if we have a shell
+          ./target/release/iris-ci --socket "$SOCKET" send "echo 'SHELL_READY'" $'\n' || true
+          sleep 2
+
+          # Try to start X if not already running
+          ./target/release/iris-ci --socket "$SOCKET" send "startx &" $'\n' || true
+          sleep 10
+
+      - name: Run IRIX benchmark suite under perf
+        run: |
+          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          mkdir -p "$OUT_DIR"
+          SOCKET="$OUT_DIR/iris.sock"
+
+          # Build host baseline for IRIX benchmarks (native)
+          make -C bench hostbench
+
+          # Run IRIX benchmarks under perf
+          # This runs the steps in bench/irix/steps.toml via iris-ci
+          perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
+            ./target/release/iris-bench irix \
+              --socket "$SOCKET" \
+              --out "$OUT_DIR" \
+              2>&1 | tee "$OUT_DIR/irix-bench.log" || true
+
+      - name: Generate IRIX bench flamegraph
+        run: |
+          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          cargo install inferno --locked 2>/dev/null || true
+          export PATH="$HOME/.cargo/bin:$PATH"
+          perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
+          inferno-flamegraph "$OUT_DIR/collapsed.txt" > "$OUT_DIR/flamegraph.svg"
+
+      - name: Upload IRIX bench results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: irix-bench-${{ github.sha::8 }}
+          path: |
+            irix-bench-${{ github.sha::8 }}/flamegraph.svg
+            irix-bench-${{ github.sha::8 }}/collapsed.txt
+            irix-bench-${{ github.sha::8 }}/irix-bench.log
+            irix-bench-${{ github.sha::8 }}/emu.log
+          retention-days: 30
+
+      - name: Stop emulator
+        if: always()
+        run: |
+          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          if [ -f "$OUT_DIR/emu.pid" ]; then
+            kill $(cat "$OUT_DIR/emu.pid") 2>/dev/null || true
+          fi
