@@ -308,7 +308,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On the AMD EPYC 9V45 host, the JIT compiler (jitv2) delivers substantial performance improvements over the interpreter, boosting MIPS from 97.9 to 616.5 for the r4400 and from 65.9 to 359.2 for the r5000. Notably, the r5000-jitv2 configuration achieves the highest overall score with 739.6 DMIPS, outperforming the r4400-jitv2's 546.9 DMIPS, while all four configurations maintain a 100.0% pass rate across the 410 recorded runs.
+On this host the JIT (jitv2) runs the R4400 guest at 632 MIPS versus 46 MIPS interpreted (13.8x speedup).
 
 ### Latest Run
 
@@ -318,10 +318,10 @@ Latest run's four cells (MIPS, DMIPS, LINPACK MFLOPS, Whetstone k passes/s):
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS | Whetstone k/s |
 |---|---|---:|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 97.9 | 125.2 | 15.8 | 4665.0 |
-| `r4400-jitv2` | R4400 | 100.0% | 616.5 | 546.9 | 48.2 | 1625.0 |
-| `r5000-interp` | R5000 | 100.0% | 65.9 | 85.6 | 10.1 | 3063.0 |
-| `r5000-jitv2` | R5000 | 100.0% | 359.2 | 739.6 | 67.7 | 4525.0 |
+| `r4400-interp` | R4400 | 100.0% | 45.9 | 66.4 | 8.2 | 2266.0 |
+| `r4400-jitv2` | R4400 | 100.0% | 632.3 | 546.7 | 47.8 | 1143.0 |
+| `r5000-interp` | R5000 | 100.0% | 45.6 | 66.6 | 8.1 | 2228.0 |
+| `r5000-jitv2` | R5000 | 100.0% | 420.8 | 1056.3 | 111.2 | 9575.0 |
 
 ### Raw Guest MIPS History
 
@@ -353,6 +353,6 @@ Latest run's four cells (MIPS, DMIPS, LINPACK MFLOPS, Whetstone k passes/s):
 
 *JIT efficiency per kernel group across recent commits. Blue→Yellow→Red = low→medium→high efficiency. Only commits with group-level data are shown.*
 
-Full history table: [data/bench_history.md](data/bench_history.md) (410 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
+Full history table: [data/bench_history.md](data/bench_history.md) (411 runs). Regenerated from `data/bench_history.json` by `tools/bench_graphs.py`.
 
 <!-- BENCHMARKS -->
