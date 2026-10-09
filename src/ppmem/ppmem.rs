@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::cell::UnsafeCell;
 
 use super::map::{granularity, AddrSpace, Prot, SharedMem};
+use crate::chunk_store::ChunkDirtyBitmap;
 use crate::traits::{
     BusDevice, BusRead16, BusRead32, BusRead64, BusRead8, Resettable, BUS_OK,
 };
@@ -179,6 +180,11 @@ pub struct PpMemory {
     addr_mask: AtomicU64,
     /// Its own private mapping, kept alive for `base`'s lifetime.
     _own: AddrSpace,
+    /// Snapshot dirty tracking: one bit per 64 KiB chunk, set on every write
+    /// that can reach this bank. `save_snapshot` clears it after a save so the
+    /// next incremental save only re-hashes chunks written since. On a fresh
+    /// bank every chunk is dirty (nothing has been saved yet).
+    dirty: ChunkDirtyBitmap,
     /// JIT v2: this bank's generation counters, one `AtomicU64` per 4KB page.
     ///
     /// A shared object exactly like the data storage, and mapped into the gen
@@ -246,6 +252,7 @@ impl PpMemory {
             size_bytes,
             addr_mask: AtomicU64::new((size_bytes - 1) as u64),
             _own: own,
+            dirty: ChunkDirtyBitmap::new(size_bytes),
             #[cfg(feature = "jitv2")]
             gen_mem,
             #[cfg(feature = "jitv2")]
@@ -275,6 +282,40 @@ impl PpMemory {
     #[inline(always)]
     fn off(&self, addr: u32) -> usize {
         (addr as usize) & self.mask()
+    }
+
+    /// Mark the snapshot chunk containing byte offset `off` dirty.
+    #[inline(always)]
+    pub fn mark_dirty_byte(&self, off: usize) {
+        self.dirty.mark(off);
+    }
+
+    /// Mark every snapshot chunk touching `[off, off+len)` dirty.
+    #[inline]
+    pub fn mark_dirty_range(&self, off: usize, len: usize) {
+        self.dirty.mark_range(off, len);
+    }
+
+    /// One flag per 64 KiB chunk, `true` where the chunk may have changed since
+    /// the last save.
+    pub fn dirty_flags(&self) -> Vec<bool> {
+        self.dirty.flags()
+    }
+
+    /// Clear the dirty bitmap after its flags have been consumed by a save.
+    pub fn clear_dirty(&self) {
+        self.dirty.clear();
+    }
+
+    /// Mark every chunk dirty — a whole-bank mutation (restore, load, power-on)
+    /// that the per-write hooks cannot attribute to individual chunks.
+    pub fn mark_all_dirty(&self) {
+        self.dirty.mark_all();
+    }
+
+    /// Number of 64 KiB snapshot chunks in this bank.
+    pub fn chunk_count(&self) -> usize {
+        self.dirty.chunks()
     }
 
     /// Set a new address mask. AND-ed with `size_bytes-1` so it can never
@@ -352,6 +393,8 @@ impl PpMemory {
             let b = &bytes[i * 4..(i + 1) * 4];
             words[i] = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
         }
+        // A whole-bank load changes chunks the per-write hooks never saw.
+        self.mark_all_dirty();
         #[cfg(feature = "jitv2")]
         self.bump_gen_all();
         Ok(())
@@ -368,6 +411,8 @@ impl PpMemory {
         let words = self.as_words_mut();
         let n = src.len().min(words.len());
         words[..n].copy_from_slice(&src[..n]);
+        // A whole-bank restore changes chunks the per-write hooks never saw.
+        self.mark_all_dirty();
         // Snapshot restore mutates RAM under any compiled artifact regardless
         // of content equality (jit-v2-design.md §7.1 channel 4, §7.6).
         #[cfg(feature = "jitv2")]
@@ -459,6 +504,7 @@ impl Resettable for PpMemory {
         if !self.mem.discard() {
             self.as_words_mut().fill(0);
         }
+        self.mark_all_dirty();
         #[cfg(feature = "jitv2")]
         self.bump_gen_all();
     }
@@ -476,7 +522,9 @@ impl BusDevice for PpMemory {
 
     #[inline(always)]
     fn write8(&self, addr: u32, val: u8) -> u32 {
-        unsafe { *self.base.add(self.off(addr) ^ 3) = val };
+        let off = self.off(addr);
+        unsafe { *self.base.add(off ^ 3) = val };
+        self.mark_dirty_byte(off);
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
@@ -492,10 +540,12 @@ impl BusDevice for PpMemory {
 
     #[inline(always)]
     fn write16(&self, addr: u32, val: u16) -> u32 {
+        let off = self.off(addr);
         unsafe {
             let p = self.base as *mut u16;
-            *p.add((self.off(addr) >> 1) ^ 1) = val;
+            *p.add((off >> 1) ^ 1) = val;
         }
+        self.mark_dirty_byte(off);
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
@@ -511,10 +561,12 @@ impl BusDevice for PpMemory {
 
     #[inline(always)]
     fn write32(&self, addr: u32, val: u32) -> u32 {
+        let off = self.off(addr);
         unsafe {
             let p = self.base as *mut u32;
-            *p.add(self.off(addr) >> 2) = val;
+            *p.add(off >> 2) = val;
         }
+        self.mark_dirty_byte(off);
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
@@ -530,10 +582,12 @@ impl BusDevice for PpMemory {
 
     #[inline(always)]
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        let off = self.off(addr);
         unsafe {
             let p = self.base as *mut u64;
-            *p.add(self.off(addr) >> 3) = val.rotate_left(32);
+            *p.add(off >> 3) = val.rotate_left(32);
         }
+        self.mark_dirty_byte(off);
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
@@ -565,6 +619,8 @@ impl BusDevice for PpMemory {
             let off = self.off(addr) >> 3;
             swap_word_halves_store(buf, p.add(off));
         }
+        // One dirty bit per 64 KiB chunk the write spans.
+        self.mark_dirty_range(self.off(addr), buf.len().max(1) * 8);
         // Per-page write cursor: bump once per page touched, not per qword
         // (jit-v2-design.md §7.2).
         #[cfg(feature = "jitv2")]
@@ -600,14 +656,16 @@ impl BusDevice for PpMemory {
 
     #[inline(always)]
     fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
+        let off = self.off(addr);
         unsafe {
-            let p = (self.base as *mut u64).add(self.off(addr) >> 3);
+            let p = (self.base as *mut u64).add(off >> 3);
             // Storage keeps qwords rotate_left(32); rotate val/mask to match.
             let old = *p;
             let v = val.rotate_left(32);
             let m = mask.rotate_left(32);
             *p = (old & !m) | (v & m);
         }
+        self.mark_dirty_byte(off);
         #[cfg(feature = "jitv2")]
         self.bump_gen(addr);
         BUS_OK
@@ -1129,6 +1187,40 @@ mod tests {
         m.power_on();
         assert_eq!(m.read32(0x1000).data, 0);
         assert_eq!(m.read32(0x20_0000).data, 0);
+    }
+
+    #[test]
+    fn writes_mark_exactly_the_touched_chunk_and_clear() {
+        use crate::chunk_store::CHUNK_SIZE;
+        let m = PpMemory::new(2); // 2 MB = 32 chunks
+        m.clear_dirty();
+        assert!(m.dirty_flags().iter().all(|&d| !d), "cleared bank reads clean");
+
+        m.write32(0x10, 0x1234_5678); // chunk 0
+        m.write64(CHUNK_SIZE as u32 + 8, 0xDEAD_BEEF); // chunk 1
+        m.write_block(2 * CHUNK_SIZE as u32, &[1, 2, 3, 4]); // chunk 2
+        let flags = m.dirty_flags();
+        assert_eq!(m.chunk_count(), 32);
+        assert!(flags[0] && flags[1] && flags[2], "touched chunks are dirty");
+        assert_eq!(flags.iter().filter(|&&d| d).count(), 3, "only touched chunks");
+
+        m.clear_dirty();
+        assert!(m.dirty_flags().iter().all(|&d| !d));
+    }
+
+    #[test]
+    fn whole_bank_mutations_mark_every_chunk() {
+        let m = PpMemory::new(1);
+        m.clear_dirty();
+        assert!(m.dirty_flags().iter().all(|&d| !d));
+        m.mark_all_dirty();
+        assert!(m.dirty_flags().iter().all(|&d| d), "restore marks the whole bank");
+
+        // restore_words is a whole-bank mutation too.
+        m.clear_dirty();
+        let snap = vec![0u32; m.chunk_count() * (crate::chunk_store::CHUNK_SIZE / 4)];
+        m.restore_words(&snap);
+        assert!(m.dirty_flags().iter().all(|&d| d));
     }
 
     #[test]
