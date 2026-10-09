@@ -1685,6 +1685,15 @@ mod tests {
         Field { parity: FieldParity::Even, width: w, height: h, pixels: Arc::from(pix) }
     }
 
+    /// `make_field` with every byte XORed by `seed`, so two fields in one test
+    /// carry distinguishable content (a misdirected DMA write is then visible).
+    fn make_field_seeded(w: u32, h: u32, seed: u8) -> Field {
+        let mut f = make_field(w, h);
+        let pix: Vec<u8> = f.pixels.iter().map(|b| b ^ seed).collect();
+        f.pixels = Arc::from(pix);
+        f
+    }
+
     /// Stand up a Vino with DMA enabled on channel A, a valid head descriptor,
     /// clip covering the full input field (even parity), and the chosen format
     /// + decimation set in CONTROL.  CHA_FIELD_INT_EN is set so EOF actually
@@ -2191,6 +2200,101 @@ mod tests {
             assert_eq!(page_hits.get(&page).copied().unwrap_or(0), 512,
                 "chain data page {:#010x} ({}/{}) must be fully written by the engine",
                 page, p + 1, data_pages);
+        }
+    }
+
+    /// IRIX 5.3-shaped capture (issue #70). The 5.3 driver is EOF-driven and
+    /// non-interleaved: it re-programs `A_NEXT_4_DESC` per field to a
+    /// page-stepped block of page descriptors, never lays down a STOP, and
+    /// expects end-of-field only (real 5.3 INTR is `0x01`, EOF — not 6.5's
+    /// `0x05`, DESC|EOF). The #71 split moved pixel production into a per-channel
+    /// FIFO drained by `do_dma_transfer`; this drives that rewritten path
+    /// end-to-end in the 5.3 shape: two fields, each a whole-page-spanning
+    /// linear run consumed from its own descriptor group, byte-for-byte correct,
+    /// with no DESC and DMA left enabled across both.
+    ///
+    /// It cannot stand in for a live 5.3 `vidtomem` run (no guest, no real
+    /// videod/kernel driver), but it pins the structural invariants the 5.3
+    /// path must keep: EOF-only, no STOP consumption, per-field re-arm honoured,
+    /// no qword lost or reordered through the producer→FIFO→engine split.
+    #[test]
+    fn vino_5_3_eof_driven_capture_multi_field_without_desc() {
+        const W: u32 = 128;
+        const H: u32 = 64;
+        const FIELD_BYTES: u32 = W * H * 2; // YUV422: 2 bytes/pixel
+        const FIELD_PAGES: u32 = FIELD_BYTES / 0x1000;
+        assert_eq!(FIELD_BYTES % 0x1000, 0, "field must span whole pages");
+
+        let table0 = 0x0862_0000u32;
+        let table1 = 0x0862_1000u32;
+        let data0  = 0x0900_0000u32;
+        let data1  = 0x0a00_0000u32;
+
+        let vino = Vino::new();
+        let mem  = FrameMem::new();
+        vino.set_phys(mem.clone());
+
+        // Two descriptor groups, one page-address word per 4 KiB page.
+        for (table, data) in [(table0, data0), (table1, data1)] {
+            for p in 0..FIELD_PAGES {
+                mem.poke(table + p * 4, data + p * 0x1000);
+            }
+        }
+
+        // Non-interleaved YUV422 on channel A; EOF *and* DESC interrupts enabled
+        // so a wrongly-raised DESC would actually surface in int_status.
+        {
+            let mut st = vino.state.lock();
+            st.control = ctrl::CHA_DMA_EN | ctrl::CHA_FIELD_INT_EN | ctrl::CHA_DESC_INT_EN;
+            let chan = &mut st.channels[0];
+            chan.decimation = 1;
+            chan.line_size  = 0;
+            chan.frame_rate = 0;
+            chan.page_index = 0;
+            chan.clip_start = 0;
+            chan.clip_end   = (W & clip::X_MASK)
+                            | ((H & clip::YEVEN_MASK) << clip::YEVEN_SHIFT)
+                            | ((H & clip::YODD_MASK)  << clip::YODD_SHIFT);
+        }
+        vino.write_reg(reg::CHA_BASE + reg::CH_DESC_TABLE_PTR, table0);
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC,   table0);
+
+        let mem_dyn: Arc<dyn BusDevice> = mem.clone();
+        let field0 = make_field_seeded(W, H, 0x00);
+        vino.pump_field(0, &field0, &mem_dyn);
+
+        // The driver page-steps A_NEXT_4_DESC to the next buffer for field 1,
+        // exactly as videod re-arms the 5.3 capture path per field.
+        vino.write_reg(reg::CHA_BASE + reg::CH_NEXT_4_DESC, table1);
+        vino.write_reg(reg::CHA_BASE + reg::CH_PAGE_INDEX,   0);
+        let field1 = make_field_seeded(W, H, 0x5A);
+        vino.pump_field(0, &field1, &mem_dyn);
+
+        // (1) EOF-only, like real 5.3: never DESC, and DMA stays armed.
+        {
+            let st = vino.state.lock();
+            assert_ne!(st.int_status & isr::CHA_EOF, 0, "5.3 path raises EOF");
+            assert_eq!(st.int_status & isr::CHA_DESC, 0,
+                "5.3's EOF-driven chain has no STOP, so it never raises DESC");
+            assert_ne!(st.control & ctrl::CHA_DMA_EN, 0,
+                "no STOP means DMA stays enabled across fields");
+            assert_eq!(st.channels[0].field_counter, 2, "two fields captured");
+        }
+
+        // (2) Each field's qwords land in its own buffer, byte-for-byte — the
+        // producer→FIFO→engine split must not lose or reorder a qword, and the
+        // per-field NEXT_4_DESC re-arm must retarget the walk.
+        for (data, field) in [(data0, &field0), (data1, &field1)] {
+            let mut w: Vec<(u32, u64)> = mem.writes().into_iter()
+                .filter(|(a, _)| *a >= data && *a < data + FIELD_BYTES)
+                .collect();
+            assert_eq!(w.len(), (FIELD_BYTES / 8) as usize,
+                "a whole field of qwords must be written to {:#010x}", data);
+            w.sort_by_key(|(a, _)| *a);
+            let mut got = Vec::with_capacity(FIELD_BYTES as usize);
+            for (_, val) in &w { got.extend_from_slice(&val.to_be_bytes()); }
+            assert_eq!(&got[..], &field.pixels[..],
+                "captured field at {:#010x} must match the input byte-for-byte", data);
         }
     }
 }
