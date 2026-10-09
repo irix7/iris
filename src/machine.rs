@@ -2916,3 +2916,132 @@ mod controller_lifetime_tests {
         assert_eq!(prepared, v);
     }
 }
+
+/// End-to-end boot-chime capture (#78).
+///
+/// The boot chime is real and the emulator can drive it all the way to the wav
+/// sink, but only on the profile whose *PROM* emits it. The embedded IP28 PROM
+/// runs `play_hello_tune` early in POST — gated on the R10000 PRId (IRIS
+/// reports `0x0925`) and on the freshly initialised motherboard EEPROM's
+/// boot-tune volume (`initialize_ip28_if_erased`) — and that tune is what this
+/// test captures.
+///
+/// The IP22 and IP24 embedded PROMs do **not** play a chime: they program the
+/// HAL2 (BRES clock, codec registers) but never enable Codec A DMA, so a
+/// headless boot to the PROM command monitor is silent with no IRIX media. The
+/// Indigo2/IP22 startup sound is an IRIX-side playback and therefore needs a
+/// guest. See `rules/irix/boot-chime.md`. The #73 capture was all-zero because
+/// it looked for a chime on a profile/config that never produces one, not
+/// because the audio path was broken.
+#[cfg(test)]
+mod boot_chime_tests {
+    use super::*;
+
+    /// Boot the IP28 profile headless with the `IRIS_HAL2_CAPTURE` wav backend
+    /// and assert the PROM's boot tune is present: a well-formed RIFF/WAVE with
+    /// non-zero samples within the first 100 ms and a plausible duration.
+    ///
+    /// `#[ignore]`: it writes `IRIS_HAL2_CAPTURE`, which is process-global, so
+    /// it must run alone. rust.yml runs it with `--ignored --test-threads=1`.
+    #[test]
+    #[ignore = "boots a full IP28 machine; run with --ignored --test-threads=1"]
+    fn ip28_prom_boot_chime_is_captured_through_the_wav_backend() {
+        let bytes = capture_ip28_boot_chime();
+        assert!(bytes.len() > 44, "the capture has a header and samples ({} bytes)", bytes.len());
+        assert_eq!(&bytes[0..4], b"RIFF", "RIFF magic");
+        assert_eq!(&bytes[8..12], b"WAVE", "WAVE magic");
+        assert_eq!(&bytes[12..16], b"fmt ", "fmt chunk");
+        assert_eq!(&bytes[36..40], b"data", "data chunk");
+        assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 1, "PCM");
+        assert_eq!(u16::from_le_bytes([bytes[22], bytes[23]]), 2, "stereo");
+        assert_eq!(u16::from_le_bytes([bytes[34], bytes[35]]), 16, "16-bit");
+        let rate = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]);
+        assert_eq!(rate, 48_000, "wav backend stream rate");
+
+        let data = &bytes[44..];
+        assert_eq!(data.len() % 4, 0, "whole stereo 16-bit frames");
+        let samples: Vec<i16> = data.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(samples.iter().any(|&s| s != 0), "the boot tune is non-silent");
+
+        // The chime begins in the first frames of captured audio; the wav sink
+        // only ever receives frames once Codec A DMA is running, which is the
+        // tune itself.
+        let first_nonzero = samples.iter().position(|&s| s != 0)
+            .expect("at least one non-zero sample");
+        let first_ms = first_nonzero as f64 * 1000.0 / rate as f64;
+        assert!(first_ms < 100.0, "tune starts within the first 100 ms (first non-zero at {first_ms:.1} ms)");
+
+        // play_hello_tune is a couple of seconds. A handful of samples would
+        // mean the drain hiccuped, and minutes would mean we captured something
+        // other than the tune.
+        let duration_s = (samples.len() / 2) as f64 / rate as f64;
+        assert!(
+            (0.5..=8.0).contains(&duration_s),
+            "boot tune duration is plausible (captured {duration_s:.2} s)"
+        );
+    }
+
+    /// Build an IP28 machine wired to the wav sink, run it until the PROM's
+    /// chime lands, then stop and return the raw capture (header + samples).
+    fn capture_ip28_boot_chime() -> Vec<u8> {
+        let dir = std::env::temp_dir();
+        let stem = format!("iris-bootchime-{}", std::process::id());
+        let wav = dir.join(format!("{stem}.wav"));
+        let nveeprom = dir.join(format!("{stem}.nveeprom"));
+        let nvram = dir.join(format!("{stem}.nvram"));
+        for p in [&wav, &nveeprom, &nvram] { let _ = std::fs::remove_file(p); }
+        // Hal2::start reads this when it opens the backend (see
+        // select_backend). Process-global, hence the ignored/serial contract.
+        std::env::set_var("IRIS_HAL2_CAPTURE", &wav);
+
+        let mut cfg = MachineConfig {
+            // 256 MB is the smallest IP28 bank the PROM accepts and is enough
+            // to reach the tune. No graphics: the chime is audio only.
+            banks: [256, 0, 0, 0],
+            headless: true,
+            no_audio: false,
+            nvram: nvram.to_string_lossy().into_owned(),
+            nveeprom: nveeprom.to_string_lossy().into_owned(),
+            ..MachineConfig::default()
+        };
+        // `MachineConfig::default` attaches `scsi1.raw`, whose absence is fatal
+        // at startup — and there is none here. Same reason as bench_config.
+        cfg.scsi.clear();
+        cfg.machine.profile = MachineProfile::Indigo2Ip28;
+        cfg.machine.cpu = crate::config::CpuModel::R10000;
+
+        // Machine::new needs more stack than a test thread has (see main.rs).
+        let mut machine = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || Box::new(Machine::new(cfg)))
+            .unwrap()
+            .join()
+            .unwrap();
+        machine.start();
+        // Machine::start autostarts the CPU only in a non-debug build; ask for
+        // it explicitly so `cargo test` boots too (same as bench_runner).
+        machine.cpu_start();
+
+        // The wav sink buffers, so wait for the capture file to grow past the
+        // header, then let the rest of the ~2 s tune land before stopping
+        // (`stop` drops the sink, which patches the header sizes).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut heard = false;
+        while std::time::Instant::now() < deadline {
+            if std::fs::metadata(&wav).map(|m| m.len() > 44).unwrap_or(false) {
+                heard = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if heard { std::thread::sleep(std::time::Duration::from_secs(6)); }
+        machine.stop();
+        drop(machine);
+
+        let bytes = std::fs::read(&wav).unwrap_or_default();
+        for p in [&wav, &nveeprom, &nvram] { let _ = std::fs::remove_file(p); }
+        bytes
+    }
+}

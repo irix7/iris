@@ -46,6 +46,22 @@ jobs:
       env:
         IRIS_HAL2_CAPTURE: ${{ runner.temp }}/hal2-capture.wav
       run: cargo test --lib capture_through_the_wav_backend -- --ignored --nocapture --test-threads=1
+    # Boot chime, end to end (#78). The step above proves the wav sink works at
+    # the codec-drain level; this one proves the whole path — embedded PROM →
+    # HAL2 Codec A DMA → resampler → wav — actually emits sound. It boots an
+    # IP28 machine headless and captures the PROM's `play_hello_tune` from
+    # power-on.
+    #
+    # The IP22/IP24 embedded PROMs only *initialise* the HAL2 and never play a
+    # chime; that startup sound is IRIX-side and needs a guest. IP28 is the
+    # profile whose PROM emits it, so that is the profile this asserts on. See
+    # rules/irix/boot-chime.md.
+    #
+    # `--ignored` for the same reason as #73: the test writes IRIS_HAL2_CAPTURE
+    # into the process environment, which is global, so it runs serially. No
+    # IRIX media needed.
+    - name: HAL2 boot chime capture (IP28 PROM, wav backend)
+      run: cargo test --lib ip28_prom_boot_chime -- --ignored --nocapture --test-threads=1
     # The parallel-agent workflow: boot two isolated instances (`--instance N`)
     # and drive each over its own CI serial socket. No IRIX media needed — the
     # Indy PROM's command monitor is the serial endpoint. Catches regressions
