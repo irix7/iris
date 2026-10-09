@@ -25,6 +25,25 @@
 //! Off unless asked for. The CPU carries no journal state by default; the
 //! driver methods take the journal by reference, so a normal run pays nothing
 //! and cannot be perturbed by a recording that was never started.
+//!
+//! The record/replay driver (`MipsExecutor::journal_record`/`journal_replay`)
+//! steps through the same dispatch the CPU thread's batch loop uses
+//! (`step_jit` when jitv2 dispatch is on, `step_int` otherwise) and drains the
+//! guest-time deadline queue, so a deadline or pending-line event that a real
+//! run produced replays at the same `hot.cycles` boundary. The CPU's snapshot
+//! now carries the externally-raised interrupt word (`hot.interrupts`) the
+//! journal observes, so a replay restored from a snapshot starts from the same
+//! pending-line state the recording did.
+//!
+//! **Remaining evidence (not yet asserted here).** The driver runs inline
+//! under the executor lock with peripheral threads stopped (the same
+//! `load_snapshot_paused` discipline as the snapshot determinism validator);
+//! it is *not* a record of a fully-threaded IRIX boot, and device-side
+//! non-CPU state (disk DMA, RTC/host-time reads, network) is not journaled.
+//! Closing that needs the journal hooks installed in `MipsCpu::start`'s live
+//! loop plus an event log for device I/O, and can only be validated against
+//! real IRIX media. `test/journal/run.sh` exercises the headless-boot → snapshot
+//! → record → replay path that is testable without media.
 
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 

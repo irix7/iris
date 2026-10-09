@@ -1,0 +1,14 @@
+# Minimal machine for the record/replay journal CI test (issue #47): RAM and the
+# SCC only, exactly like test/fleet/machine.toml. No SCSI targets — the test
+# drives the Indy PROM's command monitor over the serial console, takes a
+# snapshot there, and records/replays a guest-cycle journal from it. No IRIX
+# media needed.
+
+banks = [128, 128, 0, 0]
+headless = true
+no_audio = true
+
+[machine]
+profile = "indy_ip24"
+
+[scsi]

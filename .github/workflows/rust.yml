@@ -34,3 +34,11 @@ jobs:
     # isolation that the unit tests alone would miss.
     - name: Fleet parallel-agent test
       run: test/fleet/run.sh target/debug/iris target/debug/iris-ci
+    # Record/replay journal (#47): boot one headless instance to the PROM command
+    # monitor, snapshot it, record a guest-cycle journal from the snapshot and
+    # replay it. `iris-ci journal-replay` exits non-zero unless the replay's event
+    # stream is byte-identical to the recording, so this is the CI assertion that
+    # a replay equals a recording. It does not need IRIX media; a full threaded
+    # IRIX boot remains unverified (see test/journal/run.sh).
+    - name: Journal record/replay test
+      run: test/journal/run.sh target/debug/iris target/debug/iris-ci
