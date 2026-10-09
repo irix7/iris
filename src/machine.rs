@@ -2919,20 +2919,19 @@ mod controller_lifetime_tests {
 
 /// End-to-end boot-chime capture (#78).
 ///
-/// The boot chime is real and the emulator can drive it all the way to the wav
-/// sink, but only on the profile whose *PROM* emits it. The embedded IP28 PROM
-/// runs `play_hello_tune` early in POST — gated on the R10000 PRId (IRIS
-/// reports `0x0925`) and on the freshly initialised motherboard EEPROM's
-/// boot-tune volume (`initialize_ip28_if_erased`) — and that tune is what this
-/// test captures.
+/// The boot chime is real and the emulator drives it all the way to the wav
+/// sink. It is the PROM's power-on tune — it plays before any OS load and even
+/// with no disk — gated on the HAL2 being present (`no_audio = false`) and the
+/// PROM env `volume` being set (see `rules/irix/boot-chime.md`).
 ///
-/// The IP22 and IP24 embedded PROMs do **not** play a chime: they program the
-/// HAL2 (BRES clock, codec registers) but never enable Codec A DMA, so a
-/// headless boot to the PROM command monitor is silent with no IRIX media. The
-/// Indigo2/IP22 startup sound is an IRIX-side playback and therefore needs a
-/// guest. See `rules/irix/boot-chime.md`. The #73 capture was all-zero because
-/// it looked for a chime on a profile/config that never produces one, not
-/// because the audio path was broken.
+/// This media-free test uses the IP28 profile because `Machine::new` initialises
+/// an erased IP28 motherboard EEPROM with `volume 80`, so the chime fires with
+/// no seeded NVRAM and no disk. The embedded IP28 PROM also gates
+/// `play_hello_tune` on the R10000 PRId (IRIS reports `0x0925`). The Indy
+/// (IP22/IP24) PROM plays the same tune but needs an NVRAM that already carries
+/// `volume`, so it is validated against real media rather than here. The
+/// original all-zero capture came from a rig with `no_audio = true` on a fresh
+/// NVRAM, not from a broken audio path.
 #[cfg(test)]
 mod boot_chime_tests {
     use super::*;
