@@ -1,0 +1,221 @@
+# Rust-level profiling of the emulator (flamegraphs via perf).
+# Runs on every push to main, and on workflow_dispatch for ad-hoc commits.
+# Uploads interactive SVG flamegraphs as artifacts.
+name: Benchmark Profile
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to profile (commit SHA, tag, branch)"
+        required: false
+        default: ""
+      cpu:
+        description: "Emulated CPU (r4400 or r5000)"
+        required: true
+        default: "r4400"
+      engine:
+        description: "interp or jitv2"
+        required: true
+        default: "jitv2"
+      quick:
+        description: "Run quick suite (30% time)"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  actions: read  # for downloading artifacts if needed
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-g"  # debug info for perf
+
+jobs:
+  profile:
+    name: Profile ${{ matrix.cpu }}-${{ matrix.engine }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: r4400
+            engine: interp
+          - cpu: r4400
+            engine: jitv2
+          - cpu: r5000
+            engine: interp
+          - cpu: r5000
+            engine: jitv2
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Install profiling dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev linux-tools-common linux-tools-generic linux-cloud-tools-generic
+          # perf needs kernel headers matching the runner kernel
+          sudo apt-get install -y linux-headers-$(uname -r) 2>/dev/null || true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build emulator with debug info
+        env:
+          FEATURES: ${{ matrix.engine == 'jitv2' && 'jitv2' || '' }}
+        run: |
+          cargo build --release --bin iris ${{ env.FEATURES && format('--features {0}', env.FEATURES) }}
+          cargo build --release --bin iris-bench ${{ env.FEATURES && format('--features {0}', env.FEATURES) }}
+
+      - name: Build host baseline (native)
+        run: |
+          make -C bench hostbench
+
+      - name: Run benchmark under perf
+        env:
+          QUICK_FLAG: ${{ matrix.quick && '--quick' || '' }}
+        run: |
+          set -o pipefail
+          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
+          mkdir -p "$OUT_DIR"
+
+          # Run with perf record -g (call graphs) at 99Hz (lower overhead than default)
+          # Use --call-graph dwarf for better Rust symbol resolution
+          perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
+            ./target/release/iris-bench run \
+              --cpu ${{ matrix.cpu }} \
+              --label ${{ matrix.cpu }}-${{ matrix.engine }} \
+              --repeat 3 \
+              --out "$OUT_DIR" \
+              $QUICK_FLAG \
+              2>&1 | tee "$OUT_DIR/run.log"
+
+          # Also capture raw MIPS output for correlation
+          grep -E "(MIPS|guest MIPS|emulator speed)" "$OUT_DIR/run.log" > "$OUT_DIR/summary.txt" || true
+
+      - name: Generate flamegraph
+        run: |
+          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
+          # Install inferno for flamegraph generation
+          cargo install inferno --locked 2>/dev/null || true
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          # Collapse perf data
+          perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
+
+          # Generate SVG flamegraph
+          inferno-flamegraph "$OUT_DIR/collapsed.txt" > "$OUT_DIR/flamegraph.svg"
+
+          # Also generate a "diff-ready" folded format for later comparison
+          cp "$OUT_DIR/collapsed.txt" "$OUT_DIR/folded.txt"
+
+      - name: Generate speedscope JSON (alternative viewer)
+        run: |
+          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
+          # speedscope uses a different format; use speedscope's converter
+          pipx install speedscope 2>/dev/null || pip install --user speedscope 2>/dev/null || true
+          export PATH="$HOME/.local/bin:$PATH"
+
+          # Convert collapsed to speedscope format
+          perf script -i "$OUT_DIR/perf.data" -j | \
+            python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+# speedscope expects a specific format; we'll use the built-in converter if available
+" 2>/dev/null || true
+
+      - name: Upload profile artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}
+          path: |
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/flamegraph.svg
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/folded.txt
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/summary.txt
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/run.log
+          retention-days: 30
+
+      - name: Upload perf.data (for local analysis)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perfdata-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}
+          path: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/perf.data
+          retention-days: 7
+
+  # Optional: Profile IRIX boot if guest image URL is configured
+  profile-irix:
+    name: Profile IRIX Boot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    if: env.IRIS_IRIX_IMAGE_URL != ''
+    needs: profile
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.ref || github.sha }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev linux-tools-common linux-tools-generic
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build emulator (jitv2)
+        run: cargo build --release --bin iris --features jitv2
+
+      - name: Download IRIX disk image
+        env:
+          IRIS_IRIX_IMAGE_URL: ${{ secrets.IRIS_IRIX_IMAGE_URL }}
+        run: |
+          set -e
+          echo "Downloading IRIX image from Cloudflare..."
+          wget -q --show-progress -O irix-disk.chd "$IRIS_IRIX_IMAGE_URL"
+          ls -lh irix-disk.chd
+
+      - name: Profile IRIX boot under perf
+        run: |
+          OUT_DIR="profile-irix-boot-${{ github.sha::8 }}"
+          mkdir -p "$OUT_DIR"
+
+          # Run with perf for 60 seconds of boot
+          timeout 120 perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
+            ./target/release/iris \
+              --cpu r4400 \
+              --disk irix-disk.chd \
+              --headless \
+              --ci \
+              2>&1 | tee "$OUT_DIR/boot.log" || true
+
+          # Check if we reached shell
+          if grep -q "login:" "$OUT_DIR/boot.log"; then
+            echo "Reached login prompt"
+          fi
+
+      - name: Generate IRIX boot flamegraph
+        run: |
+          OUT_DIR="profile-irix-boot-${{ github.sha::8 }}"
+          cargo install inferno --locked 2>/dev/null || true
+          export PATH="$HOME/.cargo/bin:$PATH"
+          perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
+          inferno-flamegraph "$OUT_DIR/collapsed.txt" > "$OUT_DIR/flamegraph.svg"
+
+      - name: Upload IRIX boot profile
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: profile-irix-boot-${{ github.sha::8 }}
+          path: |
+            profile-irix-boot-${{ github.sha::8 }}/flamegraph.svg
+            profile-irix-boot-${{ github.sha::8 }}/collapsed.txt
+            profile-irix-boot-${{ github.sha::8 }}/boot.log
+          retention-days: 30

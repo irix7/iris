@@ -974,68 +974,30 @@ def readme_block(entry, entries, analysis):
         parts.append(analysis)
         parts.append("")
 
-    # Chart 1: Latest cells
-    parts.append("### Latest Run")
+    parts.append("See **[BENCHMARKS.md](BENCHMARKS.md)** for the full benchmark suite documentation: "
+                 "bare-metal kernels, IRIX workloads, CI workflows, data pipeline, and generated charts.")
     parts.append("")
+
     parts.append("![latest benchmark cells](data/bench_cells.svg)")
     parts.append("")
-    parts.append("Latest run's four cells (MIPS, DMIPS, LINPACK MFLOPS, Whetstone k passes/s):")
+    parts.append("Latest run (4 cells):")
     parts.append("")
     parts.append("| cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS | Whetstone k/s |")
     parts.append("|---|---|---:|---:|---:|---:|---:|")
     parts.append(cells_md)
     parts.append("")
 
-    # Chart 2: Raw MIPS history
-    parts.append("### Raw Guest MIPS History")
+    parts.append("Charts (auto-regenerated from CI history):")
     parts.append("")
-    parts.append("![raw MIPS history](data/bench_history.svg)")
-    parts.append("")
-    parts.append("*Logarithmic scale. Lines break where the CI host CPU changes (different runner hardware). "
-                 "Faint points = individual runs, bold lines = centred moving average.*")
-    parts.append("")
-
-    # Chart 3: Normalised efficiency
-    if has_efficiency(entries):
-        parts.append("### Normalised Efficiency (Cross-Runner Comparable)")
-        parts.append("")
-        parts.append("![normalised efficiency history](data/bench_history_eff.svg)")
-        parts.append("")
-        parts.append("*Each run divided by its own runner's native baseline, so 100% = same speed as native host code. "
-                     "This removes host hardware variance, making the trend purely about emulator changes.*")
-        parts.append("")
-
-    # Chart 4: Speedup
-    parts.append("### JIT vs Interpreter Speedup")
-    parts.append("")
-    parts.append("![JIT speedup](data/bench_speedup.svg)")
-    parts.append("")
-    parts.append("*Ratio of JIT guest MIPS to interpreter guest MIPS for each CPU. "
-                 "Values above 1.0× mean the JIT is faster; logarithmic scale.*")
+    parts.append("- [Raw MIPS history](data/bench_history.svg) — log scale, host-break lines")
+    parts.append("- [Normalised efficiency](data/bench_history_eff.svg) — % of native host speed")
+    parts.append("- [JIT speedup](data/bench_speedup.svg) — JIT/interp ratio over time")
+    parts.append("- [Efficiency by group](data/bench_groups.svg) — int/fpu/mem/img/vid/codec/sys")
+    parts.append("- [Group heatmap](data/bench_heatmap.svg) — 80 commits × 7 groups")
+    parts.append("- [Full history table](data/bench_history.md) — with inline sparklines")
     parts.append("")
 
-    # Chart 5: Groups
-    if has_groups(entries):
-        parts.append("### Efficiency by Kernel Group")
-        parts.append("")
-        parts.append("![efficiency by group](data/bench_groups.svg)")
-        parts.append("")
-        parts.append("*Per-kernel-group efficiency (fraction of native host speed) for the latest run with group data. "
-                     "Groups: **int**=integer ALU, **fpu**=floating point, **mem**=memory, **img**=imaging, "
-                     "**vid**=video, **codec**=compression, **sys**=system (TLB, exceptions, cache).*")
-        parts.append("")
-
-        parts.append("### Group Efficiency Heatmap")
-        parts.append("")
-        parts.append("![group efficiency heatmap](data/bench_heatmap.svg)")
-        parts.append("")
-        parts.append("*JIT efficiency per kernel group across recent commits. Blue→Yellow→Red = low→medium→high efficiency. "
-                     "Only commits with group-level data are shown.*")
-        parts.append("")
-
-    parts.append(f"Full history table: [data/bench_history.md](data/bench_history.md) "
-                 f"({len(entries)} runs). Regenerated from `data/bench_history.json` "
-                 f"by `tools/bench_graphs.py`.")
+    parts.append("Profile artifacts (Rust flamegraphs): see `bench-profile.yml` workflow, uploaded per commit.")
     parts.append("")
     parts.append(MARKER)
     return "\n".join(parts)

@@ -26,15 +26,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HISTORY = REPO_ROOT / "data" / "bench_history.json"
 
-# Each entry is a single CI run (one report), with its per-cell summary.
-# `cells` keeps the headline numbers; per-kernel rows are deliberately not
-# stored here (they are large and the report.md is regenerated on demand).
-# `commit` is a proxy for the guest-suite version: the bench kernels are part of
-# the same repo, so a commit pins the exact suite that was measured.
-
 
 def parse_report(md: str) -> dict:
-    """Parse the host line and the `## Cells` table out of a report.md."""
+    """Parse the host line and all tables out of a report.md."""
     host = {}
     cells = []
     in_cells = False
@@ -43,7 +37,6 @@ def parse_report(md: str) -> dict:
         m = re.match(r"^Host:\s*(.*)$", line)
         if m:
             host["raw"] = m.group(1).strip()
-            # "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores"
             parts = [p.strip() for p in m.group(1).split("/")]
             if len(parts) >= 3:
                 host["cpu"] = parts[1]
@@ -56,7 +49,6 @@ def parse_report(md: str) -> dict:
             break
         if in_cells and line.strip().startswith("|"):
             cols = [c.strip() for c in line.strip().strip("|").split("|")]
-            # Skip the markdown separator row (`|---|---|...`).
             if all(set(c) <= set("-: ") for c in cols if c):
                 continue
             if header is None:
@@ -66,11 +58,8 @@ def parse_report(md: str) -> dict:
                 continue
             row = dict(zip(header, cols))
             name = row.get("cell")
-            # Only emulated cells belong in the history; the host runs (plain or
-            # the per-cell `<cell>-host` baselines) are the normaliser, not data.
             if not name or name == "host" or name.endswith("-host"):
                 continue
-            # accuracy: "100.0% (40/40)"
             acc = re.match(r"([\d.]+)%\s*\((\d+)/(\d+)\)", row.get("accuracy", ""))
             cells.append(
                 {
@@ -82,25 +71,39 @@ def parse_report(md: str) -> dict:
                     "dmips": _f(row.get("DMIPS")),
                     "whet": _f(row.get("whet/s")),
                     "linpack": _f(row.get("LINPACK MFLOPS")),
-                    # Fraction of the same runner's native rate. Absent on
-                    # reports recorded before the per-cell host baseline existed.
                     "efficiency": _f(row.get("efficiency")),
                 }
             )
+
     if not cells:
         raise ValueError("no `## Cells` table found in report")
+
     groups = parse_groups(md)
+    kernels = parse_kernels(md)
+    time_share = parse_time_share(md)
+    least_eff = parse_least_efficient(md)
+    exceptions = parse_exceptions(md)
+    mismatches = parse_mismatches(md)
+
     for c in cells:
-        if c["name"] in groups:
-            c["groups"] = groups[c["name"]]
+        name = c["name"]
+        if name in groups:
+            c["groups"] = groups[name]
+        if name in kernels:
+            c["kernels"] = kernels[name]
+        if name in time_share:
+            c["time_share"] = time_share[name]
+        if name in least_eff:
+            c["least_efficient"] = least_eff[name]
+        if name in exceptions:
+            c["exceptions"] = exceptions[name]
+        if name in mismatches:
+            c["mismatches"] = mismatches[name]
+
     return {"host": host, "cells": cells}
 
 
 def parse_groups(md: str) -> dict:
-    """Parse the `## Efficiency by group` table into {cell: {group: efficiency}}.
-
-    Empty when the report had no host baseline (the table is only emitted then).
-    """
     lines = md.splitlines()
     start = next((i for i, l in enumerate(lines)
                   if l.startswith("## Efficiency by group")), None)
@@ -117,7 +120,7 @@ def parse_groups(md: str) -> dict:
         if all(set(c) <= set("-: ") for c in cols if c):
             continue
         if header is None:
-            header = cols  # ["group", cell, cell, ...]
+            header = cols
             continue
         if len(cols) != len(header):
             continue
@@ -126,6 +129,165 @@ def parse_groups(md: str) -> dict:
             v = _f(val)
             if v is not None:
                 out.setdefault(cell, {})[group] = v
+    return out
+
+
+def parse_kernels(md: str) -> dict:
+    """Parse `## Per-kernel throughput` table into {cell: {kernel: {rate, unit, native, vs_base}}}."""
+    lines = md.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if l.startswith("## Per-kernel throughput")), None)
+    if start is None:
+        return {}
+    header = None
+    out: dict = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.strip().startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cols if c):
+            continue
+        if header is None:
+            header = cols
+            continue
+        if len(cols) != len(header):
+            continue
+        kernel_name = cols[0]
+        unit = cols[1]
+        # Columns after unit: one per cell, then optionally "vs base", "host", "native"
+        cell_cols = header[2:]
+        for cell, val in zip(cell_cols, cols[2:]):
+            if cell in ("vs base", "host", "native"):
+                continue  # skip derived columns for now
+            v = _f(val)
+            if v is not None:
+                out.setdefault(cell, {})[kernel_name] = {
+                    "rate": v,
+                    "unit": unit,
+                }
+    return out
+
+
+def parse_time_share(md: str) -> dict:
+    """Parse `## Where <cell> spends its time` tables into {cell: {kernel: {share_pct, mips}}}."""
+    lines = md.splitlines()
+    out: dict = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^## Where\s+(.+?)\s+spends its time", line)
+        if m:
+            cell = m.group(1).strip()
+            cell_data = {}
+            i += 1
+            # Skip header lines
+            while i < len(lines) and not lines[i].strip().startswith("|"):
+                i += 1
+            if i < len(lines):
+                i += 1  # skip separator
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cols = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if len(cols) >= 3 and not all(set(c) <= set("-: ") for c in cols if c):
+                    kernel = cols[0]
+                    share = _f(cols[1].replace("%", ""))
+                    mips = _f(cols[2])
+                    if share is not None:
+                        cell_data[kernel] = {"share_pct": share, "mips": mips}
+                i += 1
+            out[cell] = cell_data
+            continue
+        i += 1
+    return out
+
+
+def parse_least_efficient(md: str) -> dict:
+    """Parse `Least efficient` tables into {cell: {kernel: {mips, vs_avg}}}."""
+    lines = md.splitlines()
+    out: dict = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "Least efficient" in line and line.startswith("##"):
+            # Find which cell this belongs to by looking backwards
+            cell = None
+            for j in range(i - 1, -1, -1):
+                m = re.match(r"^## Where\s+(.+?)\s+spends its time", lines[j])
+                if m:
+                    cell = m.group(1).strip()
+                    break
+            if not cell:
+                i += 1
+                continue
+            cell_data = {}
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("|"):
+                i += 1
+            if i < len(lines):
+                i += 1  # skip separator
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                cols = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                if len(cols) >= 3 and not all(set(c) <= set("-: ") for c in cols if c):
+                    kernel = cols[0]
+                    mips = _f(cols[1])
+                    vs_avg = _f(cols[2].replace("x", ""))
+                    if mips is not None:
+                        cell_data[kernel] = {"mips": mips, "vs_avg": vs_avg}
+                i += 1
+            out[cell] = cell_data
+            continue
+        i += 1
+    return out
+
+
+def parse_exceptions(md: str) -> dict:
+    """Parse `## Unexpected exceptions` table into {cell: {kernel: count}}."""
+    lines = md.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if l.startswith("## Unexpected exceptions")), None)
+    if start is None:
+        return {}
+    out: dict = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.strip().startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cols if c):
+            continue
+        if len(cols) >= 3 and cols[0] != "cell":
+            cell = cols[0]
+            kernel = cols[1]
+            exc = _f(cols[2])
+            if exc is not None:
+                out.setdefault(cell, {})[kernel] = int(exc)
+    return out
+
+
+def parse_mismatches(md: str) -> dict:
+    """Parse `## Checksum mismatches` table into {cell: {kernel: {got, want}}}."""
+    lines = md.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if l.startswith("## Checksum mismatches")), None)
+    if start is None:
+        return {}
+    out: dict = {}
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if not line.strip().startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip().strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cols if c):
+            continue
+        if len(cols) >= 4 and cols[0] != "cell":
+            cell = cols[0]
+            kernel = cols[1]
+            got = cols[2].strip("`")
+            want = cols[3].strip("`")
+            out.setdefault(cell, {})[kernel] = {"got": got, "want": want}
     return out
 
 
@@ -153,9 +315,6 @@ def save(data: dict, path=HISTORY) -> None:
 
 
 def entry_key(entry):
-    """Identity of a history entry: source, commit, and the set of cells it
-    measured. The cell set matters — the interpreter and jitv2 backfills measure
-    the same commits, and both must survive a merge."""
     return (entry.get("source"), entry.get("commit"),
             tuple(sorted(c.get("name") for c in entry.get("cells", []))))
 
@@ -166,7 +325,6 @@ def entry_exists(data, entry):
 
 
 def commit_seen(data, source, commit):
-    """Coarse check used only to skip re-downloading an already-recorded CI run."""
     return any(e["source"] == source and e["commit"] == commit for e in data["entries"])
 
 
@@ -218,13 +376,6 @@ def collect(repo, run_id, source, ref, date, title):
 
 
 def merge_into(into_path: Path, from_paths) -> None:
-    """Fold history fragments into one file, deduping by entry key (source,
-    commit, measured cells).
-
-    A sharded one-time backfill collects each shard into its own fragment; this
-    is how the shards are stitched back into the single history. The cell set is
-    part of the key so the interpreter and jitv2 backfills of the same commit
-    both survive."""
     into = load(into_path)
     before = len(into["entries"])
     seen = {entry_key(e) for e in into["entries"]}
