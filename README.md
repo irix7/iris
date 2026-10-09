@@ -4,7 +4,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On this host the JIT (jitv2) runs the R4400 guest at 632 MIPS versus 46 MIPS interpreted (13.8× speedup).
+On an AMD EPYC 7763 host, the JIT compiler (jitv2) delivers a substantial performance boost over the interpreter, accelerating the r4400 from 45.9 MIPS to 632.3 MIPS and the r5000 from 45.6 MIPS to 420.8 MIPS. Notably, the r5000 JIT configuration achieves the highest computational throughput at 1056.3 DMIPS, significantly outpacing the r4400 JIT's 546.7 DMIPS, while all four configurations report a 100.0% completion rate across the 411 recorded runs.
 
 See **[BENCHMARKS.md](BENCHMARKS.md)** for the full benchmark suite documentation: bare-metal kernels, IRIX workloads, CI workflows, data pipeline, and generated charts.
 
