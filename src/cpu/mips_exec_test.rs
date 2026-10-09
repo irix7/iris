@@ -1539,6 +1539,133 @@ mod tests {
         assert!(report.matches, "{}", report.summary());
     }
 
+    /// Issue #47, run-loop path: a longer run — a real countdown loop with a
+    /// branch and delay slot, plus an external IP2 line partway through — must
+    /// record and replay identically when driven through the same dispatch and
+    /// guest-timer drain the CPU thread's batch loop uses (`step_run_loop` /
+    /// `drain_guest_timers`), not just a bare `step_int` trace. This is the
+    /// regression net for "the journal runs the real run loop".
+    #[test]
+    fn journal_run_loop_replays_a_longer_run_with_a_loop_and_an_interrupt() {
+        use crate::cpu::journal::{Journal, ReplayReport};
+        use std::sync::atomic::Ordering;
+
+        // addiu $8, $8, 1   ; 0x25080001
+        // bne   $8, $9, -2  ; 0x1509FFFE  (loop on itself; $9 stays 0)
+        // nop               ; 0x00000000  (delay slot)
+        const PROG: [u32; 3] = [0x2508_0001, 0x1509_FFFE, 0x0000_0000];
+
+        let setup = |exec: &mut MipsExecutor<PassthroughTlb, PassthroughCache>, mem: &MockMemory| {
+            // kseg0 is masked by PassthroughTlb before MockMemory sees it, so
+            // write the program at the physical address (virt & 0x1FFFFFFF).
+            let phys_base = 0xFFFF_FFFF_8001_0000u64 & 0x1FFF_FFFF;
+            for (i, w) in PROG.iter().enumerate() {
+                mem.set_word(phys_base + (i as u64) * 4, *w);
+            }
+            exec.core.pc = 0xFFFF_FFFF_8001_0000;
+            // Kernel, interrupts enabled, IP2 unmasked (IM2).
+            exec.core.cp0_status =
+                crate::cpu::mips_core::STATUS_IE | crate::cpu::mips_core::CAUSE_IP2;
+            exec.core.cp0_cause = 0;
+            exec.core.gpr = [0; 32];
+            exec.core.hot.interrupts.store(0, Ordering::SeqCst);
+            exec.resync_privilege_state();
+        };
+
+        let (mut exec, mem) = create_executor();
+        setup(&mut exec, &mem);
+        let mut j = Journal::new();
+        exec.journal_checkpoint(&mut j, "snapshot");
+        let mut last = (exec.core.hot.interrupts.load(Ordering::SeqCst) as u32)
+            & crate::cpu::mips_core::CAUSE_IP_MASK;
+        // A long stretch, then raise IP2, then run on.
+        exec.journal_record(&mut j, 1_000, &mut last);
+        exec.core
+            .hot
+            .interrupts
+            .fetch_or(crate::cpu::mips_core::CAUSE_IP2 as u64, Ordering::SeqCst);
+        exec.journal_record(&mut j, 3_000, &mut last);
+
+        let record_cycles = exec.core.hot.cycles;
+        let record_pc = exec.core.pc;
+        let record_gpr = exec.core.gpr;
+        assert!(j.interrupts() >= 1, "run must observe the IP2 line: {}", j.summary());
+        assert!(j.exceptions() >= 1, "IP2 must vector as an exception: {}", j.summary());
+        assert!(j.len() > 3, "the longer run must produce a real stream: {}", j.summary());
+
+        // Replay from an identical starting state, through the same path.
+        let (mut exec2, mem2) = create_executor();
+        setup(&mut exec2, &mem2);
+        let observed = exec2.journal_replay(&j);
+        let report = ReplayReport::compare(&j, observed);
+        assert!(report.matches, "{}", report.summary());
+        assert_eq!(exec2.core.hot.cycles, record_cycles, "final cycle must match");
+        assert_eq!(exec2.core.pc, record_pc, "final PC must match");
+        assert_eq!(exec2.core.gpr, record_gpr, "final GPRs must match");
+    }
+
+    /// Issue #47: a snapshot must carry the externally-raised interrupt word the
+    /// journal observes, so a replay restored from it starts from the same
+    /// pending-line state. The soft-reset bit must not be persisted: a restored
+    /// snapshot is powered-on, not mid-reset.
+    #[test]
+    fn cpu_snapshot_round_trips_external_interrupt_word() {
+        use crate::cpu::mips_exec::MipsCpu;
+        use crate::traits::Saveable;
+        use std::sync::atomic::Ordering;
+
+        let ip2 = crate::cpu::mips_core::CAUSE_IP2 as u64;
+        let (mut exec, _mem) = create_executor();
+        exec.core.hot.interrupts.store(ip2, Ordering::SeqCst);
+        // A soft-reset request rides the same word (bit 63) and must be dropped.
+        exec.core.hot.interrupts.fetch_or(1u64 << 63, Ordering::SeqCst);
+        let cpu = MipsCpu::new(exec);
+
+        let saved = cpu.save_state();
+        let tbl = saved.as_table().expect("cpu state is a table");
+        assert_eq!(
+            tbl.get("interrupts").and_then(crate::snapshot::toml_u64),
+            Some(ip2),
+            "the external interrupt word must be recorded (and soft-reset dropped)"
+        );
+
+        // Restore into a fresh CPU and re-save: the round-trip must be exact.
+        let (mut exec2, _mem) = create_executor();
+        exec2.core.hot.interrupts.store(0, Ordering::SeqCst);
+        let cpu2 = MipsCpu::new(exec2);
+        cpu2.load_state(&saved).expect("load_state");
+        assert_eq!(cpu2.save_state(), saved, "interrupt word must round-trip");
+    }
+
+    /// Issue #47: version-1 CPU payloads predate the interrupt word; the
+    /// registered migration must default it to "none pending" so pre-#47
+    /// snapshots keep loading rather than failing the field-set check.
+    #[test]
+    fn cpu_v1_state_migrates_to_v2_with_no_pending_interrupts() {
+        use crate::cpu::mips_exec::MipsCpu;
+        use crate::traits::Saveable;
+
+        let (exec, _mem) = create_executor();
+        let cpu = MipsCpu::new(exec);
+        let mut v1 = cpu.save_state();
+        // Strip the v2-only field to synthesise a v1 payload, and lower the
+        // recorded version so the migration chain runs.
+        if let Some(t) = v1.as_table_mut() {
+            t.remove("interrupts");
+        }
+        let desc = cpu.state_desc().expect("cpu has a description");
+        assert_eq!(desc.version, 2, "adding the field bumped the CPU schema version");
+        assert_eq!(desc.minimum_version, 1, "a v1 migration is registered");
+
+        let migrated = desc.migrate_value(1, &v1).expect("v1 migrates to v2");
+        desc.verify(&migrated).expect("migrated value matches the v2 field set");
+        assert_eq!(
+            migrated.get("interrupts").and_then(|v| v.as_integer()),
+            Some(0),
+            "migration defaults the interrupt word to none pending"
+        );
+    }
+
     #[test]
     fn test_eret() {
         let (mut exec, _) = create_executor();

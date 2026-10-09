@@ -4011,9 +4011,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// between calls, so a caller can record a chunk, raise an interrupt,
     /// then record the next chunk.
     ///
-    /// Uses `step_int` (the straight interpreter path) so `hot.cycles`
-    /// advances exactly once per architectural instruction — the same
-    /// deterministic base Count and the guest-time timer queue derive from.
+    /// Drives the **real run-loop path**, not a synthetic interpreter trace:
+    /// each step goes through [`Self::step_run_loop`], which picks the same
+    /// dispatch the CPU thread's batch loop does (`step_jit` when jitv2
+    /// dispatch is enabled, `step_int` otherwise), and the guest-time deadline
+    /// queue is drained after every step (the CPU thread drains it per batch;
+    /// doing it per step here is free in this opt-in path and keeps the
+    /// record/replay drain cadence trivially identical). That is what lets a
+    /// deadline/pending-line event recorded by a real run replay at the same
+    /// `hot.cycles` boundary.
     pub fn journal_record(
         &mut self,
         j: &mut crate::cpu::journal::Journal,
@@ -4025,14 +4031,29 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         while done < n {
             self.journal_observe_pending(j, &mut acc, last_pending);
             let before = self.core.hot.cycles;
-            let status = self.step_int();
+            let status = self.step_run_loop();
             let retired = self.core.hot.cycles.wrapping_sub(before);
             let step = retired.max(1);
             acc += retired;
             done += step;
             self.journal_note_status(j, &mut acc, status);
+            self.drain_guest_timers();
         }
         j.delta(acc);
+    }
+
+    /// The CPU thread's dispatch choice, factored out so the journal runs the
+    /// same path a real run does: `step_jit` when jitv2 dispatch is enabled,
+    /// `step_int` otherwise. Mirrors `MipsCpu::start`'s batch selection.
+    #[inline]
+    fn step_run_loop(&mut self) -> ExecStatus {
+        #[cfg(feature = "jitv2")]
+        {
+            if self.jitv2_dispatch_enabled {
+                return self.step_jit();
+            }
+        }
+        self.step_int()
     }
 
     /// Re-drive a recording from the current CPU state, applying each
@@ -4065,12 +4086,13 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     while done < *cycles {
                         self.journal_observe_pending(&mut out, &mut acc, &mut last_pending);
                         let before = self.core.hot.cycles;
-                        let status = self.step_int();
+                        let status = self.step_run_loop();
                         let retired = self.core.hot.cycles.wrapping_sub(before);
                         let step = retired.max(1);
                         acc += retired;
                         done += step;
                         self.journal_note_status(&mut out, &mut acc, status);
+                        self.drain_guest_timers();
                     }
                     // Close this delta at the same boundary the recorder did,
                     // so two consecutive deltas (a record run split into
@@ -14902,7 +14924,11 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
     fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
         use crate::state_desc::{FieldKind, StateDesc};
 
-        let mut d = StateDesc::new("cpu", 1);
+        // Version 2 (#47) adds the externally-raised interrupt word the
+        // record/replay journal observes, so a replay restored from a snapshot
+        // starts from the same pending-interrupt state the recording did.
+        // Version 1 payloads migrate by defaulting it to "none pending".
+        let mut d = StateDesc::new("cpu", 2);
 
         // Guest-time timer queue (#43): named deadlines only. Transient
         // callbacks are never serialised (they are re-registered by their
@@ -15088,6 +15114,30 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
                 |t| { let exec = self.executor.lock(); t.insert("delay_slot_target".into(), hex_u64(exec.core.delay_slot_target)); },
                 |v| { let mut exec = self.executor.lock(); exec.core.delay_slot_target = toml_u64(v).unwrap_or(0); Ok(()) },
             )
+            // Externally-raised interrupt lines (Cause.IP positions, the same
+            // word the record/replay journal keys on). Without this, a replay
+            // restored from a snapshot started with whatever the process-global
+            // `hot.interrupts` word happened to hold rather than the recording's
+            // state. The soft-reset bit (bit 63) is deliberately not persisted:
+            // a snapshot is restored powered-on, not mid-reset.
+            .field(
+                "interrupts",
+                FieldKind::U64,
+                2,
+                |t| {
+                    let exec = self.executor.lock();
+                    let ip = exec.core.hot.interrupts.load(std::sync::atomic::Ordering::Relaxed)
+                        & crate::cpu::mips_core::CAUSE_IP_MASK as u64;
+                    t.insert("interrupts".into(), hex_u64(ip));
+                },
+                |v| {
+                    let exec = self.executor.lock();
+                    let ip = toml_u64(v).unwrap_or(0)
+                        & crate::cpu::mips_core::CAUSE_IP_MASK as u64;
+                    exec.core.hot.interrupts.store(ip, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
             .field(
                 "tlb",
                 FieldKind::Table,
@@ -15110,6 +15160,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
                 let mut exec = self.executor.lock();
                 exec.resync_privilege_state();
                 Ok(())
+            })
+            // #47: version-1 payloads predate the `interrupts` field. Default
+            // it to "none pending" so pre-#47 snapshots keep loading; the CPU
+            // thread re-derives any genuinely-live line from its device on the
+            // next run anyway.
+            .migrate(1, |v| {
+                let mut t = v.as_table().cloned().unwrap_or_default();
+                t.entry("interrupts".to_string())
+                    .or_insert(toml::Value::Integer(0));
+                Ok(toml::Value::Table(t))
             });
 
         Some(d)
