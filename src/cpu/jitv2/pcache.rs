@@ -359,8 +359,29 @@ pub fn lookup(
         eprintln!("{}", summary());
     }
     let dir = page_dir(fp, ph, fr1)?;
+    let best = lookup_in_dir(&dir, fp, ph, fr1, words, want);
+    if best.is_some() {
+        HITS.fetch_add(1, Relaxed);
+    }
+    best
+}
+
+/// The disk-and-decode half of [`lookup`], against an already-computed page
+/// directory. Split out so [`lookup_at`] can probe an explicit cache
+/// namespace without the process-global [`root`] (whose `OnceLock` fixes one
+/// base for the whole process). It still records the decode-level
+/// `compare_fail`/`bad_files` counters; only the `LOOKUPS`/`HITS` totals the
+/// emulator reports stay with [`lookup`].
+fn lookup_in_dir(
+    dir: &Path,
+    fp: &Fingerprint,
+    ph: &PageHash,
+    fr1: bool,
+    words: &[u32; ENTRIES_PER_PAGE],
+    want: &Entries,
+) -> Option<Blob> {
     let mut best: Option<Blob> = None;
-    for path in variant_files(&dir) {
+    for path in variant_files(dir) {
         let Ok(buf) = std::fs::read(&path) else { continue };
         // Only a covering variant is worth the full check.
         match decode_header(&buf) {
@@ -377,10 +398,25 @@ pub fn lookup(
             best = Some(blob);
         }
     }
-    if best.is_some() {
-        HITS.fetch_add(1, Relaxed);
-    }
     best
+}
+
+/// [`lookup`] against an explicit cache namespace, the read-side twin of
+/// [`fill_blob`]: `base/<build_id>/<fingerprint>/<page-hash>-<fr>/`. The
+/// runtime counter `LOOKUPS`/`HITS` are deliberately **not** touched, so an
+/// offline harness can probe a filled cache (or a test can time the real
+/// decode path) without polluting the numbers an emulator reports.
+pub fn lookup_at(
+    base: &Path,
+    build_id: &str,
+    fp: &Fingerprint,
+    ph: &PageHash,
+    fr1: bool,
+    words: &[u32; ENTRIES_PER_PAGE],
+    want: &Entries,
+) -> Option<Blob> {
+    let dir = base.join(build_id).join(hex(fp)).join(format!("{}-{}", hex(ph), fr1 as u8));
+    lookup_in_dir(&dir, fp, ph, fr1, words, want)
 }
 
 /// Every entry any stored variant of this page has, for union-on-miss. Only
@@ -571,6 +607,96 @@ mod tests {
         assert_eq!(*back.words, *b.words);
         // Wrong FR is a different directory namespace and must not decode.
         assert!(decode(&bytes, &fp, &ph, true).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A unique scratch directory, so tests can run in parallel.
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    /// Guest-free micro-benchmark of the per-lookup cost the persistent/AOT
+    /// cache trades a compile for: read one variant off disk, verify its
+    /// container, decode it and compare the full 4 KB page. No guest and no
+    /// Cranelift, so it runs anywhere; the end-to-end boot win still needs a
+    /// booted IRIX (`test/aotbench/`).
+    ///
+    /// Run it (release is the honest number — a debug build is dominated by
+    /// hashing overhead):
+    ///
+    /// ```text
+    /// cargo test --release --features jitv2 --lib lookup_cost -- --nocapture
+    /// ```
+    ///
+    /// The figure is a property of this host's filesystem and CPU; compare it
+    /// against the ~22 ms compile it replaces *on the same host*
+    /// (`docs/jitv2-persistent-cache.md`).
+    #[test]
+    fn lookup_cost_microbench() {
+        use std::time::Instant;
+
+        const PAGES: usize = 512;
+        let base = unique_tmp("iris-pcache-lookupbench");
+        let build_id = "lookupbench";
+        let fp = [0x33u8; 16];
+        // Any non-empty subset works; one entry keeps every page's blob tiny.
+        let mut want = [0u64; BITMAP_WORDS];
+        want[0] = 1;
+
+        let mut stored: Vec<(PageHash, Box<[u32; ENTRIES_PER_PAGE]>)> = Vec::with_capacity(PAGES);
+        for i in 0..PAGES {
+            let mut words = Box::new([0u32; ENTRIES_PER_PAGE]);
+            for (j, w) in words.iter_mut().enumerate() {
+                // Distinct per page so every page hash is unique.
+                *w = (i as u32).wrapping_mul(0x9e37_79b1).wrapping_add(j as u32);
+            }
+            let blob = Blob {
+                entries: want,
+                used: [!0; BITMAP_WORDS],
+                instr_count: 1,
+                align: 16,
+                words,
+                code: vec![0xcc; 64],
+            };
+            let ph = page_hash(&blob.words);
+            fill_blob(&base, build_id, &fp, &ph, false, &blob).expect("write blob");
+            stored.push((ph, blob.words));
+        }
+
+        // Warm the page cache: measure steady-state lookup, not first-touch I/O.
+        for (ph, words) in &stored {
+            assert!(lookup_at(&base, build_id, &fp, ph, false, words, &want).is_some());
+        }
+        // The explicit namespace is a real key: a different fingerprint misses.
+        assert!(
+            lookup_at(&base, build_id, &[0x44u8; 16], &stored[0].0, false, &stored[0].1, &want)
+                .is_none()
+        );
+
+        let t = Instant::now();
+        let mut hits = 0usize;
+        for (ph, words) in &stored {
+            if let Some(b) = lookup_at(&base, build_id, &fp, ph, false, words, &want) {
+                assert_eq!(*b.words, **words, "a hit must carry the same page bytes");
+                hits += 1;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        eprintln!(
+            "pcache lookup bench: {hits}/{PAGES} hits in {:.3} ms = {:.1} us/lookup ({} build)",
+            secs * 1e3,
+            secs * 1e6 / PAGES as f64,
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+        );
+        assert_eq!(hits, PAGES, "every blob written must be found");
 
         let _ = std::fs::remove_dir_all(&base);
     }
