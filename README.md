@@ -308,7 +308,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On an AMD EPYC 7763 64-Core host, the JIT-compiled implementations significantly outperform their interpreter counterparts, with r4400-jitv2 achieving 632.3 MIPS and r5000-jitv2 reaching 420.8 MIPS, compared to only 45.9 MIPS and 45.6 MIPS respectively for the interpreters. While the r4400 JIT variant delivers a higher raw MIPS score, the r5000 JIT variant stands out with a much higher DMIPS score of 1056.3, nearly double that of the r4400 JIT's 546.7 DMIPS. All four configurations recorded a 100.0% completion rate across the 411 total benchmark runs.
+On this host the JIT (jitv2) runs the R4400 guest at 576 MIPS versus 47 MIPS interpreted (12.3x speedup).
 
 See **[BENCHMARKS.md](BENCHMARKS.md)** for the full benchmark suite documentation: bare-metal kernels, IRIX workloads, CI workflows, data pipeline, and generated charts.
 
@@ -318,10 +318,10 @@ Latest run (4 cells):
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS | Whetstone k/s |
 |---|---|---:|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 45.9 | 66.4 | 8.2 | 2266.0 |
-| `r4400-jitv2` | R4400 | 100.0% | 632.3 | 546.7 | 47.8 | 1143.0 |
-| `r5000-interp` | R5000 | 100.0% | 45.6 | 66.6 | 8.1 | 2228.0 |
-| `r5000-jitv2` | R5000 | 100.0% | 420.8 | 1056.3 | 111.2 | 9575.0 |
+| `r4400-interp` | R4400 | 100.0% | 46.9 | 66.1 | 8.6 | 2358.0 |
+| `r4400-jitv2` | R4400 | 100.0% | 575.8 | 554.9 | 47.2 | 1161.0 |
+| `r5000-interp` | R5000 | 100.0% | 46.1 | 66.0 | 8.3 | 2316.0 |
+| `r5000-jitv2` | R5000 | 100.0% | 340.2 | 744.5 | 68.0 | 3654.0 |
 
 Charts (auto-regenerated from CI history):
 
