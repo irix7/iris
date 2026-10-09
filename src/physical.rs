@@ -275,6 +275,30 @@ fn plan_bank_slots(
     (plan.into_iter().collect(), outside)
 }
 
+/// Map a physical address to `(bank, in-bank byte offset)` using the bank
+/// placements captured by `remap_banks`, or `None` when no bank window covers
+/// it. The offset folds SIMM mirroring: `mask` is `period - 1`, so
+/// `rel & mask == rel % period` is the byte within the bank that `PpMemory`
+/// would have addressed.
+///
+/// Used by the snapshot dirty-tracking hook on the ppmem fast path, which
+/// writes RAM without going through `PpMemory`'s own write methods.
+#[inline(always)]
+fn attribute_ram_write(
+    bank_windows: &[Option<(u32, u32, u32)>; 4],
+    addr: u32,
+) -> Option<(usize, usize)> {
+    for (bank, window) in bank_windows.iter().enumerate() {
+        if let Some((base, mask, limit)) = *window {
+            let rel = addr.wrapping_sub(base);
+            if rel < limit {
+                return Some((bank, (rel & mask) as usize));
+            }
+        }
+    }
+    None
+}
+
 // Mystery Black Hole (64KB at 0x02080000)
 const MYSTERY_HOLE_BASE: u32 = 0x02080000;
 const MYSTERY_HOLE_END: u32  = 0x02090000;
@@ -546,6 +570,16 @@ pub struct Physical {
     /// two, and a bank parked out there has to be unmapped again when it
     /// moves — see `plan_bank_slots`.
     banks_outside_windows: Vec<u32>,
+    /// Placement of each bank (`conf_base`, period mask, `limit`) as decoded by
+    /// the last `remap_banks`, or `None` for an absent/unmapped bank. The ppmem
+    /// fast path writes RAM directly, bypassing `PpMemory`'s write methods, so
+    /// it needs this to attribute a physical write back to `(bank, in-bank
+    /// offset)` for the snapshot dirty bitmap. See `note_ram_write`.
+    bank_windows: [Option<(u32, u32, u32)>; 4],
+    /// Snapshot chunk-dirty tracking. Off until the first `save_snapshot`, so a
+    /// run that never snapshots pays only a relaxed load per RAM write rather
+    /// than the bank lookup in `note_ram_write`. Enabled after a baseline save.
+    track_chunk_dirty: AtomicBool,
     /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
     alias_offset: u32,
     /// This machine is an IP28. Only used to label the bank-map trace.
@@ -683,6 +717,8 @@ impl Physical {
             black_hole,
             device_map,
             banks_outside_windows: Vec::new(),
+            bank_windows: [None; 4],
+            track_chunk_dirty: AtomicBool::new(false),
             alias_offset: alias_offset_for(ip28),
             is_ip28: ip28,
             trace: AtomicBool::new(false),
@@ -901,9 +937,13 @@ impl Physical {
 
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
             let Some((conf_base, addr_mask, limit)) = *maybe_bank else {
+                self.bank_windows[bank_idx] = None;
                 dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} not mapped", bank_idx);
                 continue;
             };
+            // The ppmem fast path can answer for addresses inside this window;
+            // remember how to get from such an address back to the bank.
+            self.bank_windows[bank_idx] = Some((conf_base, addr_mask, limit));
 
             if self.is_ip28 {
                 eprintln!("iris: IP28 experiment: bank {bank_idx} -> base {conf_base:#010x} mask {addr_mask:#010x} limit {limit:#010x}");
@@ -1041,6 +1081,56 @@ impl Physical {
                 (*(self.ppmem_gen_base.add(page))).fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Attribute a directly-mapped RAM write at `addr` to a bank chunk and set
+    /// its snapshot dirty bit.
+    ///
+    /// The ppmem fast path stores straight into the window; it never reaches
+    /// `PpMemory::write*`, so without this an incremental save would see those
+    /// chunks as clean. The bank lookup is only paid while tracking is armed
+    /// (after the first save); before that this is one relaxed load.
+    #[inline(always)]
+    fn note_ram_write(&self, addr: u32) {
+        if !self.track_chunk_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some((bank, off)) = attribute_ram_write(&self.bank_windows, addr) {
+            self.banks[bank].mark_dirty_byte(off);
+        }
+    }
+
+    /// [`note_ram_write`](Self::note_ram_write) for a `[addr, addr+len)` block.
+    #[inline]
+    fn note_ram_write_range(&self, addr: u32, len: usize) {
+        if !self.track_chunk_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some((bank, off)) = attribute_ram_write(&self.bank_windows, addr) {
+            self.banks[bank].mark_dirty_range(off, len.max(1));
+        }
+    }
+
+    /// Arm snapshot chunk-dirty tracking. Called after the first save, once
+    /// every chunk's pristine content has been recorded.
+    pub fn enable_chunk_dirty_tracking(&self) {
+        self.track_chunk_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// One `true` per 64 KiB chunk of bank `i` that may have changed since the
+    /// last save. Also true for every chunk of a bank that has never been saved.
+    pub fn bank_dirty_flags(&self, bank: usize) -> Vec<bool> {
+        self.banks[bank].dirty_flags()
+    }
+
+    /// Clear bank `i`'s dirty bitmap after its flags have been consumed.
+    pub fn clear_bank_dirty(&self, bank: usize) {
+        self.banks[bank].clear_dirty();
+    }
+
+    /// Number of 64 KiB snapshot chunks in bank `i`.
+    pub fn bank_chunk_count(&self, bank: usize) -> usize {
+        self.banks[bank].chunk_count()
     }
 }
 
@@ -1211,6 +1301,7 @@ impl BusDevice for Physical {
         if self.ppmem_ptr(addr).is_some() {
             let off = addr as usize;
             unsafe { *self.ppmem_base.add(off ^ 3) = val };
+            self.note_ram_write(addr);
             #[cfg(feature = "jitv2")]
             self.ppmem_bump_gen_range(addr, 1);
             return BUS_OK;
@@ -1244,6 +1335,7 @@ impl BusDevice for Physical {
         if self.ppmem_ptr(addr).is_some() {
             let off = addr as usize;
             unsafe { *((self.ppmem_base as *mut u16).add((off >> 1) ^ 1)) = val };
+            self.note_ram_write(addr);
             #[cfg(feature = "jitv2")]
             self.ppmem_bump_gen_range(addr, 1);
             return BUS_OK;
@@ -1277,6 +1369,7 @@ impl BusDevice for Physical {
         if self.ppmem_ptr(addr).is_some() {
             let off = addr as usize;
             unsafe { *(self.ppmem_base.add(off) as *mut u32) = val };
+            self.note_ram_write(addr);
             #[cfg(feature = "jitv2")]
             self.ppmem_bump_gen_range(addr, 1);
             return BUS_OK;
@@ -1310,6 +1403,7 @@ impl BusDevice for Physical {
         if self.ppmem_ptr(addr).is_some() {
             let off = addr as usize;
             unsafe { *(self.ppmem_base.add(off) as *mut u64) = val.rotate_left(32) };
+            self.note_ram_write(addr);
             #[cfg(feature = "jitv2")]
             self.ppmem_bump_gen_range(addr, 1);
             return BUS_OK;
@@ -1409,6 +1503,7 @@ impl BusDevice for Physical {
     fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
         if let Some(p) = self.ppmem_ptr(addr) {
             crate::ppmem::swap_word_halves_store(buf, p);
+            self.note_ram_write_range(addr, buf.len().max(1) * 8);
             // The gen bump still has to happen: a cache writeback mutates RAM
             // under any compiled artifact for those pages.
             #[cfg(feature = "jitv2")]
@@ -1441,6 +1536,30 @@ mod ppmem_tests {
             None,
             None,
         ]
+    }
+
+    /// The ppmem fast-path write must attribute a physical address to the
+    /// right bank and in-bank offset, mirroring included, so the snapshot
+    /// dirty bitmap tracks the chunk that actually changed (#48).
+    #[test]
+    fn attribute_ram_write_finds_the_bank_and_offset() {
+        // Bank 0: 8MB SIMM repeating every 8MB across a 32MB slot at 0x08000000.
+        // Bank 1: 128MB at 0x10000000. Bank 2 absent, bank 3 128MB at 0x20000000.
+        let windows: [Option<(u32, u32, u32)>; 4] = [
+            Some((0x0800_0000, 0x007F_FFFF, 32 << 20)),
+            Some((0x1000_0000, 0x07FF_FFFF, 128 << 20)),
+            None,
+            Some((0x2000_0000, 0x07FF_FFFF, 128 << 20)),
+        ];
+        assert_eq!(attribute_ram_write(&windows, 0x0800_1000), Some((0, 0x1000)));
+        // Second mirror of the undersized bank folds back onto the same bytes.
+        assert_eq!(attribute_ram_write(&windows, 0x0800_0000 + (8 << 20) + 0x1000), Some((0, 0x1000)));
+        assert_eq!(attribute_ram_write(&windows, 0x1000_2000), Some((1, 0x2000)));
+        assert_eq!(attribute_ram_write(&windows, 0x2000_3000), Some((3, 0x3000)));
+        // Past the slot's limit (or in the gap) there is no bank to attribute.
+        assert_eq!(attribute_ram_write(&windows, 0x0800_0000 + (32 << 20)), None);
+        assert_eq!(attribute_ram_write(&windows, 0x1800_0000), None);
+        assert_eq!(attribute_ram_write(&windows, 0x0000_0000), None);
     }
 
     /// After a remap, every address the bitmap claims is directly mapped must

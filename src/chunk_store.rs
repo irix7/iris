@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Chunk size in bytes. 64 KB is the plan-cited sweet spot — small enough
 /// that a few-page write to RAM only dirties one chunk, large enough that
@@ -37,6 +38,108 @@ const CHUNK_EXT: &str = "chunk";
 
 /// 32-byte BLAKE3 digest.
 pub type ChunkHash = [u8; 32];
+
+/// Bit-per-chunk dirty map at [`CHUNK_SIZE`] granularity, covering one RAM bank
+/// (`chunks = ceil(bytes / CHUNK_SIZE)`).
+///
+/// A set bit means the chunk *may* differ from the last save; a clear bit means
+/// it is byte-identical to the last save. `save_snapshot` uses this to skip
+/// re-hashing and re-storing unchanged chunks on an incremental save.
+///
+/// Bits are atomic so the CPU thread, the MC-DMA worker and device threads can
+/// all mark a write without a lock. [`mark`](Self::mark) tests before it
+/// read-modify-writes, so once a chunk is dirty the common case is a plain load
+/// and a well-predicted branch rather than a locked OR.
+pub struct ChunkDirtyBitmap {
+    bits: Box<[AtomicU64]>,
+    chunks: usize,
+}
+
+impl ChunkDirtyBitmap {
+    /// A bitmap over `size_bytes`, with every chunk marked dirty (the state a
+    /// fresh bank is in: it has never been saved).
+    pub fn new(size_bytes: usize) -> Self {
+        let chunks = size_bytes.div_ceil(CHUNK_SIZE);
+        let words = chunks.div_ceil(64).max(1);
+        let bits: Box<[AtomicU64]> =
+            (0..words).map(|_| AtomicU64::new(u64::MAX)).collect();
+        // Mask off the tail bits past `chunks` so `flags()` and `clear()` agree.
+        if chunks % 64 != 0 {
+            let last = words - 1;
+            let keep = (1u64 << (chunks % 64)) - 1;
+            bits[last].store(keep, Ordering::Relaxed);
+        }
+        Self { bits, chunks }
+    }
+
+    pub fn chunks(&self) -> usize {
+        self.chunks
+    }
+
+    /// Mark the chunk containing byte offset `off` dirty.
+    #[inline(always)]
+    pub fn mark(&self, off: usize) {
+        let chunk = off / CHUNK_SIZE;
+        if chunk >= self.chunks {
+            return;
+        }
+        let word = &self.bits[chunk >> 6];
+        let bit = 1u64 << (chunk & 63);
+        // Test first: after the first write to a chunk this is a load + branch,
+        // not a locked read-modify-write, on every subsequent store.
+        if word.load(Ordering::Relaxed) & bit == 0 {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark every chunk touching `[off, off+len)` dirty.
+    #[inline]
+    pub fn mark_range(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let first = (off / CHUNK_SIZE).min(self.chunks);
+        let last = ((off + len - 1) / CHUNK_SIZE).min(self.chunks.saturating_sub(1));
+        for chunk in first..=last {
+            let word = &self.bits[chunk >> 6];
+            let bit = 1u64 << (chunk & 63);
+            if word.load(Ordering::Relaxed) & bit == 0 {
+                word.fetch_or(bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Mark every chunk dirty (whole-bank mutation: restore, load, power-on).
+    pub fn mark_all(&self) {
+        let mut chunk = 0usize;
+        while chunk < self.chunks {
+            let word_idx = chunk >> 6;
+            let bits_in_word = (self.chunks - chunk).min(64);
+            let mask = if bits_in_word == 64 { u64::MAX } else { (1u64 << bits_in_word) - 1 };
+            self.bits[word_idx].fetch_or(mask, Ordering::Relaxed);
+            chunk += 64;
+        }
+    }
+
+    pub fn is_dirty(&self, chunk: usize) -> bool {
+        if chunk >= self.chunks {
+            return false;
+        }
+        self.bits[chunk >> 6].load(Ordering::Relaxed) & (1u64 << (chunk & 63)) != 0
+    }
+
+    /// Snapshot the bitmap as one `bool` per chunk, in bank offset order.
+    pub fn flags(&self) -> Vec<bool> {
+        (0..self.chunks).map(|c| self.is_dirty(c)).collect()
+    }
+
+    /// Clear every bit, arming the bitmap for the next save epoch.
+    pub fn clear(&self) {
+        for word in self.bits.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 pub struct ChunkStore {
     root: PathBuf,
@@ -92,6 +195,13 @@ impl ChunkStore {
 
     pub fn has(&self, hash: &ChunkHash) -> bool {
         self.path_for(hash).exists()
+    }
+
+    /// Are all `hashes` still present? Lets an incremental save skip the RAM
+    /// clone for a bank whose chunks are all clean *and* still on disk after a
+    /// possible `gc`.
+    pub fn all_present(&self, hashes: &[ChunkHash]) -> bool {
+        hashes.iter().all(|h| self.has(h))
     }
 
     /// Remove any chunk whose hash isn't in `live`. Returns (removed_count,
@@ -186,22 +296,57 @@ pub fn put_words_as_chunks(
     store: &ChunkStore,
     words: &[u32],
 ) -> io::Result<Vec<ChunkHash>> {
+    Ok(put_words_as_chunks_selective(store, words, None, &[])?.0)
+}
+
+/// Incremental form of [`put_words_as_chunks`].
+///
+/// `dirty[c]` says whether chunk `c` may have changed since the last save; a
+/// clean chunk whose previous hash is present in `prev` is *reused* rather
+/// than re-hashed and re-put — this is what makes an incremental save cheap.
+/// `prev` is only trusted when it is exactly as long as the current chunk
+/// count, so a bank that resized (or a first save) transparently re-hashes.
+///
+/// A reused hash is only taken if its chunk is still in the store: a `gc`
+/// between saves can drop chunks no kept snapshot references, and reusing a
+/// hash whose chunk is gone would write a manifest that cannot be loaded.
+///
+/// Returns `(hashes, chunks_hashed)` — the second element is the
+/// instrumentation the incremental-save test counts against.
+pub fn put_words_as_chunks_selective(
+    store: &ChunkStore,
+    words: &[u32],
+    prev: Option<&[ChunkHash]>,
+    dirty: &[bool],
+) -> io::Result<(Vec<ChunkHash>, usize)> {
     let bytes_total = words.len() * 4;
     let chunk_words = CHUNK_SIZE / 4;
-    let mut hashes = Vec::with_capacity(bytes_total.div_ceil(CHUNK_SIZE));
+    let n_chunks = bytes_total.div_ceil(CHUNK_SIZE);
+    let prev = prev.filter(|p| p.len() == n_chunks);
+    let dirty_ok = dirty.len() == n_chunks;
+
+    let mut hashes = Vec::with_capacity(n_chunks);
     let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut hashed = 0usize;
     let mut i = 0usize;
-    while i < words.len() {
+    for c in 0..n_chunks {
         let take = (words.len() - i).min(chunk_words);
+        if let Some(prev) = prev {
+            if dirty_ok && !dirty[c] && store.has(&prev[c]) {
+                hashes.push(prev[c]);
+                i += take;
+                continue;
+            }
+        }
         let bytes_this_chunk = take * 4;
         for (k, &w) in words[i..i + take].iter().enumerate() {
             buf[k * 4..k * 4 + 4].copy_from_slice(&w.to_be_bytes());
         }
-        let chunk_slice = &buf[..bytes_this_chunk];
-        hashes.push(store.put(chunk_slice)?);
+        hashes.push(store.put(&buf[..bytes_this_chunk])?);
+        hashed += 1;
         i += take;
     }
-    Ok(hashes)
+    Ok((hashes, hashed))
 }
 
 /// Inverse of `put_words_as_chunks`. Given a hash list, fetch each chunk
@@ -316,6 +461,99 @@ mod tests {
         let (removed, _bytes) = store.gc(&live).unwrap();
         assert_eq!(removed, 1);
         assert!(store.has(&h_keep));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dirty_bitmap_marks_clears_and_snapshots() {
+        // 3.5 chunks -> 4 chunks, exercising the partial final word.
+        let bm = ChunkDirtyBitmap::new((CHUNK_SIZE * 3) + CHUNK_SIZE / 2);
+        assert_eq!(bm.chunks(), 4);
+        assert!(bm.flags().iter().all(|&d| d), "a fresh bank is all-dirty");
+
+        bm.clear();
+        assert!(bm.flags().iter().all(|&d| !d));
+        bm.mark(CHUNK_SIZE + 5);
+        bm.mark_range(CHUNK_SIZE * 2, 10);
+        assert_eq!(bm.flags(), vec![false, true, true, false]);
+
+        bm.mark_all();
+        assert!(bm.flags().iter().all(|&d| d));
+
+        // Out-of-range marks are inert rather than panicking.
+        bm.clear();
+        bm.mark(CHUNK_SIZE * 99);
+        bm.mark_range(CHUNK_SIZE * 10, 1);
+        assert!(bm.flags().iter().all(|&d| !d));
+    }
+
+    /// The headline for #48: a second selective save over a bank where exactly
+    /// one chunk changed must hash exactly one chunk, reproduce the same hash
+    /// list as a full save, and load back to the identical bytes.
+    #[test]
+    fn selective_save_hashes_only_dirty_chunks_and_loads_identically() {
+        let dir = unique_tmp_dir("selective");
+        let store = ChunkStore::new(&dir);
+        // Three chunks (192 KB) of words.
+        let words: Vec<u32> = (0..3 * (CHUNK_SIZE / 4))
+            .map(|i| 0x4000_0000u32 ^ (i as u32))
+            .collect();
+
+        // First save: no previous manifest, so every chunk is hashed.
+        let (first, hashed_all) =
+            put_words_as_chunks_selective(&store, &words, None, &[]).unwrap();
+        assert_eq!(hashed_all, 3);
+        let total_first = store.total_size().unwrap();
+
+        // Touch one word in the middle chunk only.
+        let mut words2 = words.clone();
+        words2[CHUNK_SIZE / 4 + 7] ^= 0xDEAD_BEEF;
+
+        let dirty = [false, true, false];
+        let (second, hashed) =
+            put_words_as_chunks_selective(&store, &words2, Some(&first), &dirty).unwrap();
+        assert_eq!(hashed, 1, "only the dirty chunk is re-hashed");
+        assert_eq!(second[0], first[0], "clean chunk reuses its hash");
+        assert_eq!(second[2], first[2], "clean chunk reuses its hash");
+        assert_ne!(second[1], first[1], "dirty chunk gets a fresh hash");
+
+        // A full save produces the same hash list the incremental one did.
+        let (full, _) = put_words_as_chunks_selective(&store, &words2, None, &[]).unwrap();
+        assert_eq!(second, full, "incremental manifest matches a full re-hash");
+
+        // It loads back to the identical bytes.
+        let loaded = get_chunks_as_words(&store, &second).unwrap();
+        assert_eq!(loaded, words2);
+        // Only the one changed chunk was added to the store.
+        assert_eq!(
+            store.total_size().unwrap(),
+            total_first + CHUNK_SIZE as u64,
+            "exactly one new chunk written"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A `gc` between saves can drop a chunk a clean flag would otherwise
+    /// reuse; the selective writer must notice and re-hash it rather than
+    /// emit a manifest pointing at missing bytes.
+    #[test]
+    fn selective_save_rehashes_a_chunk_gc_removed() {
+        let dir = unique_tmp_dir("selective-gc");
+        let store = ChunkStore::new(&dir);
+        let words: Vec<u32> = (0..2 * (CHUNK_SIZE / 4))
+            .map(|i| 0xA000_0000u32 ^ (i as u32))
+            .collect();
+        let (first, _) = put_words_as_chunks_selective(&store, &words, None, &[]).unwrap();
+
+        // Simulate gc sweeping the middle chunk.
+        fs::remove_file(store.path_for(&first[1])).unwrap();
+        assert!(!store.has(&first[1]));
+
+        let (second, hashed) =
+            put_words_as_chunks_selective(&store, &words, Some(&first), &[false, false]).unwrap();
+        assert_eq!(hashed, 1, "the missing chunk is re-hashed despite being clean");
+        assert_eq!(second, first, "re-hash reproduces the same manifest");
+        assert_eq!(get_chunks_as_words(&store, &second).unwrap(), words);
         let _ = fs::remove_dir_all(&dir);
     }
 }

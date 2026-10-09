@@ -40,7 +40,7 @@ use crate::monitor::Monitor;
 use crate::dev::ng1::rex3::Rex3;
 use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRef, DeviceSchema, enabled_features};
 use crate::state_desc::{value_signature, value_field_list};
-use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks};
+use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks, put_words_as_chunks_selective};
 use crate::hptimer::TimerManager;
 
 /// Which cache model `Machine::new` selects for a CPU.
@@ -120,6 +120,11 @@ pub struct Machine {
     /// bank/framebuffer buffers. Cleared on any explicit `load_snapshot`
     /// outside the CI path.
     last_restore_checkpoint: Option<RollbackCheckpoint>,
+    /// Per-bank chunk hashes from the most recent CAS save (#48). The next save
+    /// reuses these for chunks its dirty bitmap reports clean, so an unchanged
+    /// bank is neither cloned, re-hashed nor re-written. Cleared on any load,
+    /// which mutates RAM wholesale.
+    last_chunk_hashes: Option<ChunksManifest>,
     /// Path of the configured scratch SCSI volume, if any. The CI socket reads
     /// and writes this file directly (with the machine briefly stopped) to
     /// inject/exfiltrate files without going through the network. None when no
@@ -1244,6 +1249,7 @@ impl Machine {
             ci_serial,
             last_restore: None,
             last_restore_checkpoint: None,
+            last_chunk_hashes: None,
             scratch_path,
             disks: disk_provenance,
             nvram_path: nvram_provenance,
@@ -2173,13 +2179,49 @@ impl Machine {
         // shared across all snapshots in `saves/.cas/`. v2 (legacy) writes
         // raw bank{N}.bin files. Chunk hashes go in chunks.bin so load can
         // walk the right chunks back out.
+        //
+        // #48: from the second save onward, a per-bank dirty bitmap says which
+        // 64 KiB chunks were written since the last save. Clean chunks reuse
+        // the previous snapshot's hash, so an untouched bank is not cloned,
+        // re-hashed or re-written. jitv2's inline store path writes the ppmem
+        // window directly and bypasses the bitmap, so under that feature every
+        // bank is treated as dirty and correctness is preserved at the cost of
+        // the optimisation.
         if sv >= 3 {
             let store = ChunkStore::new("saves");
             let mut chunks = ChunksManifest::default();
+            let incremental = !cfg!(feature = "jitv2");
+            let prev = self.last_chunk_hashes.clone();
             for i in 0..4 {
+                let chunk_count = self._phys.bank_chunk_count(i);
+                let prev_i = prev.as_ref()
+                    .and_then(|p| p.bank_chunks.get(i))
+                    .filter(|v| v.len() == chunk_count);
+                let dirty = if incremental {
+                    self._phys.bank_dirty_flags(i)
+                } else {
+                    vec![true; chunk_count]
+                };
+                // An untouched bank with a complete, still-present previous
+                // manifest needs no RAM clone at all — the expensive part of
+                // an incremental save.
+                if incremental
+                    && prev_i.is_some()
+                    && dirty.iter().all(|&d| !d)
+                    && store.all_present(prev_i.unwrap())
+                {
+                    chunks.bank_chunks[i] = prev_i.unwrap().clone();
+                    continue;
+                }
                 let words = self._phys.snapshot_bank_inmem(i);
-                chunks.bank_chunks[i] = put_words_as_chunks(&store, &words)
-                    .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
+                let (hashes, _hashed) = put_words_as_chunks_selective(
+                    &store,
+                    &words,
+                    prev_i.map(|v| v.as_slice()),
+                    &dirty,
+                )
+                .map_err(|e| format!("CAS bank{} put: {}", i, e))?;
+                chunks.bank_chunks[i] = hashes;
             }
             if let Some(rex3) = &self._phys.rex3 {
                 let (rgb, aux) = rex3.snapshot_framebuffers_inmem();
@@ -2190,6 +2232,15 @@ impl Machine {
                 chunks.framebuffer_chunks = Some((rgb_chunks, aux_chunks));
             }
             snap.write_chunks_manifest(&chunks).map_err(|e| e.to_string())?;
+            // Only now that the manifest is safely on disk: clear the dirty
+            // bits and arm the fast path for the next save.
+            if incremental {
+                for i in 0..4 {
+                    self._phys.clear_bank_dirty(i);
+                }
+                self._phys.enable_chunk_dirty_tracking();
+            }
+            self.last_chunk_hashes = Some(chunks);
         } else {
             for i in 0..4 {
                 self._phys.save_bank(i, dir.join(format!("bank{}.bin", i))).map_err(|e| e.to_string())?;
@@ -2263,6 +2314,9 @@ impl Machine {
         // a different snapshot). ci_restore will recapture if reached via
         // that path; the monitor `load` command leaves it cleared.
         self.last_restore_checkpoint = None;
+        // The chunk-hash cache describes RAM the load is about to replace, so
+        // it can no longer be reused for incremental saves (#48).
+        self.last_chunk_hashes = None;
 
         // Reset to clean state before loading
         self.power_on_devices();
