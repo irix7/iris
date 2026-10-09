@@ -156,6 +156,17 @@ pub const ARENA_RESERVE_SIZE: usize = 512 * 1024 * 1024;
 /// primary trigger.
 pub const CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES: u64 = ARENA_RESERVE_SIZE as u64 - 16 * 1024 * 1024;
 
+/// How many *past* transient code generations are kept mapped (and their code
+/// still dispatchable) before the oldest is retired wholesale. This is the
+/// "young/old" of `rules/jitv2/jit-v2-design.md` §12.3.4 item 4: when the live
+/// arena fills, it is demoted to a retained generation and a fresh arena takes
+/// over; only once the retained count would exceed this bound is the oldest
+/// generation's pages evicted and its arena unmapped. 1 = one live, one
+/// retained (young + old). Every retained generation is a real address-space
+/// reservation, so this bounds generational memory at `(N + 1)` temporary
+/// arenas.
+pub const MAX_RETAINED_CODE_GENERATIONS: usize = 1;
+
 /// Default page-pool capacity for `Jitv2::new()` as embedded in `MipsExecutor`.
 /// Sizing is a Phase 0 measurement per the design doc (§9, "Max live entries per
 /// epoch"); `mega_flush` absorbs it being wrong in either direction. Now that
@@ -1499,6 +1510,33 @@ impl PhysicalCodePage {
         self.reset_entries_and_bitmaps();
     }
 
+    /// Generational retirement: drop this page's compiled code because its
+    /// `func` lives in an arena that is about to be unmapped. Unlike
+    /// [`Self::reset_compiled_state`], this keeps `pfn`/`gen`, `requested`,
+    /// `denied`, the FR pin and every diagnostic counter — only the things
+    /// that referenced the retiring arena are cleared. The page stays claimed
+    /// and recompiles lazily (into whatever arena is live then) at its next
+    /// arrival, exactly as a gen-drift recompile would.
+    ///
+    /// Safe to call only while the CPU is stopped and no compile worker is
+    /// mid-publish (the generational-rotation barrier guarantees both), since
+    /// it nulls `func` under `publish_lock`.
+    pub fn evict_compiled_code(&self) {
+        let _guard = self.publish_lock.lock();
+        for word in self.compiled.iter() { word.store(0, Ordering::Release); }
+        for word in self.compiled_lines.iter() { word.store(0, Ordering::Relaxed); }
+        self.smc_hit.store(0, Ordering::Relaxed);
+        self.func.store(std::ptr::null_mut(), Ordering::Release);
+        self.func_fr1.store(false, Ordering::Relaxed);
+        self.entry_gen.store(0, Ordering::Relaxed);
+        // The record describes the `func` just dropped — see
+        // `invalidate_compile_snapshot`.
+        self.invalidate_compile_snapshot();
+        // A retirement is a kill: until a real recompile re-derives coverage,
+        // the churn-avoidance skip must not re-advertise any entry here.
+        self.kills.fetch_add(1, Ordering::Release);
+    }
+
     /// Current generation count for this page.    /// Current generation count for this page. `self.gen` is never null (see
     /// its own doc comment) — a page whose backing device has no real gen
     /// tracking (MMIO, etc) reads the shared, never-bumped
@@ -2469,6 +2507,23 @@ pub type PageSlot = u32;
 const NO_SLOT: u32 = u32::MAX;
 const _: () = assert!(NO_SLOT == PFN_MAP_EMPTY);
 
+/// One demoted transient code generation, kept dispatchable across a
+/// generational rotation. See [`Jitv2::retained_generations`] and
+/// `rules/jitv2/jit-v2-design.md` §12.3.4 item 4.
+pub struct RetainedArena {
+    /// The retained shared arena. Pinned (`set_retained(true)`) so its mapping
+    /// survives the worker `Codegen`s detaching at rotation; released
+    /// wholesale (never page-by-page) by `free_retained` at retirement.
+    arena: Arc<Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+    /// The arena's `PagedArenaState`, kept for retention diagnostics.
+    state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+    /// `[base, base + len)` of the reservation — the address window every
+    /// function compiled into this arena falls inside, and so the exact test
+    /// for "which pages point into it" at retirement.
+    base: usize,
+    len: usize,
+}
+
 /// The permanent half of the code arena split (see [`Jitv2::perm_helpers`]):
 /// a `Codegen` whose only job is to emit the shared memory-access helpers, kept
 /// alive for the whole process so nothing a page flush does can invalidate the
@@ -2547,6 +2602,22 @@ pub struct Jitv2 {
     /// arena, never reset. Rebuilt (leaking the previous region, whose code
     /// live regions may still call) only if the cache geometry changes.
     pub perm_helpers: Mutex<PermHelperRegion>,
+    /// Demoted transient code generations, oldest first (see [`RetainedArena`]).
+    ///
+    /// A generational rotation — run at the same quiesce point a flush used to
+    /// occupy (`run_leader_flush`) — demotes the just-filled live arena onto
+    /// this list rather than unmapping it, so its code stays dispatchable and
+    /// the re-warm cliff a full `mega_flush` causes is avoided. When pushing
+    /// would exceed [`MAX_RETAINED_CODE_GENERATIONS`], the oldest generation is
+    /// retired: every page whose `func` lies in its range is evicted
+    /// ([`PhysicalCodePage::evict_compiled_code`]) and the arena is unmapped
+    /// wholesale. A page therefore keeps its code for at most one rotation past
+    /// the arena it was compiled into, and no sealed page is ever reused — each
+    /// generation is a fresh monotonic arena.
+    retained_generations: Vec<RetainedArena>,
+    /// Lifetime count of generations retired wholesale (diagnostic; `j2
+    /// status`).
+    retired_generations: u64,
     /// The full-capacity page pool, allocated once — see this struct's own
     /// doc comment. Indices are stable for the pool's entire lifetime,
     /// including across `mega_flush` (slots are reset/relinked in place, the
@@ -2661,6 +2732,8 @@ impl Jitv2 {
         }
         Self {
             perm_helpers: Mutex::new(PermHelperRegion::default()),
+            retained_generations: Vec::new(),
+            retired_generations: 0,
             pages,
             free_head: if capacity > 0 { 0 } else { NO_SLOT },
             pfn_to_slot: PfnMap::new(),
@@ -2918,8 +2991,84 @@ impl Jitv2 {
         } else {
             self.free_head = NO_SLOT;
         }
+        // Every page slot just went unclaimed, so no page can reach any
+        // retained generation's code anymore — those arenas are dead and are
+        // released wholesale (never page-by-page, which the seal invariant
+        // forbids anyway). Without this the retained list would leak a full
+        // arena reservation per full flush.
+        for retained in self.retained_generations.drain(..) {
+            unsafe { retained.arena.lock().free_retained(); }
+        }
         crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
         crate::cpu::jit_feedback::JIT_FEEDBACK.record_flush();
+    }
+
+    /// Evict every claimed page whose compiled `func` lies inside
+    /// `[base, base + len)` — i.e. every page still pointing into the arena
+    /// about to be retired. Keeps the page claimed (only its code coverage is
+    /// dropped), so nothing in the page pool or `pfn_to_slot` needs touching
+    /// and the page recompiles lazily on its next arrival.
+    fn evict_pages_in_arena_range(&self, base: usize, len: usize) {
+        if len == 0 { return; }
+        let end = base.saturating_add(len);
+        for page in self.pages.iter() {
+            if !page.is_claimed() { continue; }
+            let func = page.func() as usize;
+            if func != 0 && func >= base && func < end {
+                page.evict_compiled_code();
+            }
+        }
+    }
+
+    /// Demote the just-filled live transient arena to a retained generation and
+    /// retire the oldest if that would exceed [`MAX_RETAINED_CODE_GENERATIONS`].
+    ///
+    /// This is the generational replacement for a full flush on the
+    /// compile-pool arena-growth path: instead of clearing the whole page pool
+    /// (making *all* compiled code unreachable and forcing a full re-warm), it
+    /// keeps the demoted arena's code live and reclaims only the generation
+    /// that has aged out. Must run at the same quiesce point a flush did — CPU stopped,
+    /// every compile worker parked, the request queue drained — so no page is
+    /// executing and no compile is in flight while pages are evicted and an
+    /// arena is unmapped.
+    pub fn rotate_code_generation(
+        &mut self,
+        live_arena: Arc<Mutex<crate::cpu::jitv2::paged_memory::SharedArena>>,
+        live_state: Arc<crate::cpu::jitv2::paged_memory::PagedArenaState>,
+    ) {
+        let (base, len) = live_arena.lock().range();
+        // Retire oldest generations until pushing this one fits the bound.
+        // `max(1)` guards the degenerate `MAX == 0` config into "retire each
+        // demoted arena immediately" rather than an infinite loop.
+        let cap = MAX_RETAINED_CODE_GENERATIONS.max(1);
+        while self.retained_generations.len() >= cap {
+            let oldest = self.retained_generations.remove(0);
+            self.evict_pages_in_arena_range(oldest.base, oldest.len);
+            unsafe { oldest.arena.lock().free_retained(); }
+            self.retired_generations += 1;
+        }
+        // Pin before the worker `Codegen`s are rebuilt off it, so their
+        // `reset_with_shared_arena` frees the module handle but leaves the
+        // mapping mapped — the demoted arena's code is still dispatchable.
+        live_arena.lock().set_retained(true);
+        self.retained_generations.push(RetainedArena { arena: live_arena, state: live_state, base, len });
+    }
+
+    /// Number of demoted generations currently mapped and dispatchable
+    /// (diagnostic; bounded by [`MAX_RETAINED_CODE_GENERATIONS`] plus the
+    /// live arena).
+    pub fn retained_generation_count(&self) -> usize {
+        self.retained_generations.len()
+    }
+
+    /// Lifetime number of generations retired wholesale (diagnostic).
+    pub fn retired_generation_count(&self) -> u64 {
+        self.retired_generations
+    }
+
+    /// Sum of reserved bytes across every retained generation (diagnostic).
+    pub fn retained_generation_bytes(&self) -> u64 {
+        self.retained_generations.iter().map(|r| r.state.packing_stats().1).sum()
     }
 
     /// Self-contained page-pool + compiled-code-arena flush, called FROM the
@@ -2954,8 +3103,12 @@ impl Jitv2 {
         }
     }
 
-    /// Mirror image of [`Self::flush_from_cpu_thread`], called FROM the
-    /// compile thread.
+    /// Mirror image of [`Self::flush_from_cpu_thread`]: a *full* page-pool
+    /// flush, callable from the compile thread. The compile-pool arena-growth
+    /// path no longer uses this — it rotates generations instead
+    /// ([`Self::rotate_code_generation`], issue #77) — so this remains the
+    /// explicit full-flush entry point for callers that need every page
+    /// invalidated (it also releases retained generations).
     pub unsafe fn flush_from_jit_thread(&mut self, function_count: u32) {
         eprintln!(
             "jitv2: mega_flush (from jit thread) — {} / {} pages used, {} functions compiled",
@@ -3597,14 +3750,16 @@ impl CompileQueue {
     /// — if crossed, the first worker to detect it becomes leader
     /// (`quiesce_in_progress.compare_exchange`) and runs `run_leader_flush`:
     /// stops the CPU (via `cpu`, upgraded from `Weak`; skipped entirely if
-    /// unset or already gone — nothing to flush for if the machine has no
+    /// unset or already gone — nothing to rotate for if the machine has no
     /// CPU to pause), waits for every other worker to park
     /// (`park_at_barrier`, called by any worker whose own loop-top check —
     /// or its own trigger detection — sees `quiesce_in_progress` already
-    /// set), flushes the page pool (`Jitv2::flush_from_jit_thread` — NOT
-    /// `Jitv2::flush`, which would try to stop this same compile queue from
-    /// within itself), builds one fresh shared arena, rebuilds every
-    /// worker's own `Codegen` on top of it
+    /// set), then **rotates the code generation** —
+    /// `Jitv2::rotate_code_generation` demotes the just-filled live arena to a
+    /// retained generation (its code stays dispatchable) and retires only the
+    /// generation that has aged out, rather than the whole page pool a
+    /// `mega_flush` would clear (issue #77) — builds one fresh shared arena,
+    /// rebuilds every worker's own `Codegen` on top of it
     /// (`Codegen::new_with_shared_arena`/`reset_with_shared_arena`),
     /// publishes it into the barrier, and restarts the CPU. At today's
     /// `thread_count == 1` there are never any followers to wait for — the
@@ -3743,32 +3898,39 @@ impl CompileQueue {
                     abandon_quiesce(pending);
                     return;
                 }
-                // Discard, not flush: every PendingPublish::page and every
-                // not-yet-finalized FuncId this batch is holding is about to
-                // dangle (the page-pool clear below, plus every worker's
-                // Codegen getting rebuilt on a fresh arena) — see
-                // worker_loop's own doc comment for the full reasoning,
-                // same as drain_pending's existing treatment of in-flight
-                // CompileRequests below.
+                // Discard, not flush: every not-yet-finalized FuncId this
+                // batch is holding belongs to the worker `Codegen` that is
+                // about to be rebuilt on a fresh arena (`reset_with_shared_arena`
+                // below), so it would dangle — see worker_loop's own doc comment
+                // for the full reasoning, same as drain_pending's existing
+                // treatment of in-flight CompileRequests below.
                 *pending = 0;
                 // cpu.stop() must run with Jitv2's lock NOT held — it locks
                 // the executor and, through it, this same Mutex<Jitv2>
                 // again (own page-pool stats print), which would
                 // self-deadlock this thread on its own non-reentrant lock
-                // if taken here first. Lock only for the actual flush
-                // (flush_from_jit_thread's own doc comment), release before
+                // if taken here first. Lock only for the actual rotation
+                // (rotate_code_generation's own doc comment), release before
                 // cpu.start().
                 cpu.stop();
-                // Every request still sitting in the shared queue right now
-                // points into the pool flush_from_jit_thread is about to
-                // clear — drain them before the flush, not after, or the
-                // next pop() dereferences a dangling PhysicalCodePage
-                // pointer (see drain_pending's own doc comment for the
-                // crash this was confirmed to cause). Safe to drain once
-                // here even though the queue is shared with every other
-                // (already-parked, not popping) worker.
+                // Every request still sitting in the shared queue was built
+                // against the pool as it stood before this rotation. Drain and
+                // discard them before touching shared state; the pages stay
+                // claimed and re-request on their next arrival. Safe to drain
+                // once here even though the queue is shared with every other
+                // (already-parked, not popping) worker. See drain_pending's
+                // own doc comment for this call's history.
                 Self::drain_pending(&queue);
-                unsafe { jit.lock().flush_from_jit_thread(codegen.function_count()); }
+                // Generational rotation, not a full flush: demote the
+                // just-filled live arena to a retained generation (its code
+                // stays dispatchable) and retire only the generation that has
+                // aged out. This is what avoids the whole-pool re-warm cliff a
+                // `mega_flush` here used to cause. `rotate_code_generation`
+                // pins the old arena before the `reset_with_shared_arena`
+                // below detaches the worker modules, so their free does not
+                // unmap memory pages still point into.
+                let (old_arena, old_state) = codegen.shared_arena();
+                jit.lock().rotate_code_generation(old_arena, old_state);
                 // Build ONE fresh shared arena and rebuild this (leader's
                 // own) Codegen on top of it — every other, parked worker
                 // rebuilds its own once it wakes (park_at_barrier's return
@@ -3778,6 +3940,10 @@ impl CompileQueue {
                     ARENA_RESERVE_SIZE, fresh_state.clone(),
                 ).expect("run_leader_flush: failed to reserve a fresh jitv2 arena");
                 unsafe { codegen.reset_with_shared_arena(fresh_arena.clone(), fresh_state.clone()); }
+                // The fresh arena is empty; keep the status-bar gauge honest
+                // until the next compile updates it (a full flush used to do
+                // this via `mega_flush`, which a rotation no longer calls).
+                crate::cpu::jit_feedback::JIT_FEEDBACK.set_arena_fill(0, CODEGEN_ARENA_FLUSH_THRESHOLD_BYTES);
                 // Helpers are NOT rebuilt here. They live in the permanent
                 // region (`Jitv2::perm_helpers`) and were injected into this
                 // `Codegen` at worker startup; `reset_with_shared_arena`
@@ -3798,7 +3964,7 @@ impl CompileQueue {
                 }
                 quiesce_in_progress.store(false, Ordering::Release);
                 cpu.start();
-                // flush_from_jit_thread reset codegen back to 0.
+                // `reset_with_shared_arena` reset codegen back to 0.
                 function_count.store(0, Ordering::Relaxed);
             }
         };
@@ -6044,5 +6210,161 @@ mod tests {
             "the permanent arena must not grow across repeated flushes");
         assert_eq!(jit.pages_used(), 0, "a flush must recycle every page-pool slot");
         assert_eq!(jit.capacity(), JITV2_INITIAL_PAGE_CAPACITY);
+    }
+
+    /// A `(base, len)`-inside-arena compiled-function pointer for generational
+    /// tests: real `region::alloc`-backed arenas, with a synthetic `func` value
+    /// that falls inside the arena's address window. The publish/dismiss logic
+    /// only compares the pointer against the retired range, so no real codegen
+    /// is needed to exercise it.
+    fn arena_test_func(base: usize) -> *const () {
+        (base + 64) as *const ()
+    }
+
+    fn one_entry_bitmap() -> [u64; BITMAP_WORDS] {
+        let mut b = [0u64; BITMAP_WORDS];
+        b[0] = 1;
+        b
+    }
+
+    /// Issue #77 core claim: a filled transient arena is demoted to a retained
+    /// generation (its code stays dispatchable); only the generation that ages
+    /// out is evicted + unmapped wholesale, and never page-by-page.
+    #[test]
+    fn generational_rotation_retains_live_code_and_retires_the_oldest_arena() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(JITV2_INITIAL_PAGE_CAPACITY);
+        let bits = one_entry_bitmap();
+
+        // Generation A: one page compiled into arena A.
+        let state_a = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let provider_a = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(1 << 20, state_a.clone()).unwrap();
+        let (base_a, _len_a) = provider_a.arena_span();
+        let arena_a = provider_a.shared();
+        let slot_a = jit.page_for(0, 0, &dev, false).unwrap() as usize;
+        assert!(jit.pages[slot_a].publish(&bits, arena_test_func(base_a), 0, 1, 8, false));
+        assert!(jit.pages[slot_a].is_runnable(0), "sanity: generation A starts dispatchable");
+
+        // First rotation: A is demoted, nothing retired yet.
+        jit.rotate_code_generation(arena_a.clone(), state_a.clone());
+        assert_eq!(jit.retained_generation_count(), 1);
+        assert_eq!(jit.retired_generation_count(), 0);
+        assert!(jit.pages[slot_a].is_runnable(0), "a demoted generation's code must stay dispatchable");
+        assert!(!provider_a.is_released(), "a demoted generation must stay mapped");
+
+        // Generation B: a fresh page compiled into arena B.
+        let state_b = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let provider_b = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(1 << 20, state_b.clone()).unwrap();
+        let (base_b, _len_b) = provider_b.arena_span();
+        let arena_b = provider_b.shared();
+        let slot_b = jit.page_for(1, PAGE_SIZE, &dev, false).unwrap() as usize;
+        assert!(jit.pages[slot_b].publish(&bits, arena_test_func(base_b), 0, 1, 8, false));
+
+        // Second rotation: B demoted, A retired wholesale.
+        jit.rotate_code_generation(arena_b.clone(), state_b.clone());
+        assert_eq!(jit.retained_generation_count(), MAX_RETAINED_CODE_GENERATIONS, "retention is bounded");
+        assert_eq!(jit.retired_generation_count(), 1);
+
+        // A's page was evicted (its code lived in the retired arena) yet stays
+        // claimed, so it recompiles lazily rather than losing slot identity.
+        assert!(jit.pages[slot_a].is_claimed(), "a retired page stays claimed");
+        assert!(!jit.pages[slot_a].is_runnable(0), "the retired arena's code must be unreachable");
+        assert!(jit.pages[slot_a].func().is_null(), "the retired arena's func pointer must be cleared");
+        assert!(provider_a.is_released(), "the retired generation's arena must be unmapped");
+
+        // B's page survives untouched — the whole point of generations.
+        assert!(jit.pages[slot_b].is_runnable(0), "the live generation's code must survive a rotation");
+        assert!(!provider_b.is_released(), "the live generation must stay mapped");
+    }
+
+    /// Issue #77 stress/acceptance test: repeated generational rotation must
+    /// reclaim code memory with bounded growth, never churn the permanent
+    /// helper region, and keep a page dispatchable exactly until its own
+    /// generation ages out — no whole-pool re-warm per rotation.
+    #[test]
+    fn repeated_generational_rotation_reclaims_without_unbounded_growth_or_helper_churn() {
+        let mut jit = Jitv2::new(JITV2_INITIAL_PAGE_CAPACITY);
+        *jit.dc_geometry.lock() = supported_geometry_for_test();
+        let helpers = jit.ensure_perm_helpers();
+        assert!(helpers.iter().all(|a| a.is_some()), "supported geometry must build every helper");
+        let perm_baseline = jit.perm_helper_stats();
+
+        let dev = FakeDevice(AtomicU64::new(0));
+        let bits = one_entry_bitmap();
+
+        const ROTATIONS: usize = 64;
+        let mut providers = Vec::with_capacity(ROTATIONS);
+        let mut prev_slot: Option<usize> = None;
+
+        for i in 0..ROTATIONS {
+            let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+            let provider = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(1 << 20, state.clone()).unwrap();
+            let (base, _len) = provider.arena_span();
+            let arena = provider.shared();
+
+            // One fresh physical page per generation, "compiled" into this
+            // generation's arena.
+            let slot = jit.page_for(i as u32 + 1, (i as u32 + 1) * PAGE_SIZE, &dev, false).unwrap() as usize;
+            assert!(jit.pages[slot].publish(&bits, arena_test_func(base), 0, 1, 8, false));
+
+            jit.rotate_code_generation(arena, state);
+
+            // Bounded: never more than the configured retained generations.
+            assert!(jit.retained_generation_count() <= MAX_RETAINED_CODE_GENERATIONS,
+                "rotation {i}: retained generations must stay bounded");
+            // The just-demoted generation stays dispatchable — no re-warm cliff.
+            assert!(jit.pages[slot].is_runnable(0),
+                "rotation {i}: the newest generation's code must survive");
+            // The generation aged out this rotation is evicted, but its page
+            // slot is reusably retained (not reset to unclaimed).
+            if let Some(prev) = prev_slot {
+                assert!(!jit.pages[prev].is_runnable(0),
+                    "rotation {i}: the generation aged out must be evicted");
+                assert!(jit.pages[prev].is_claimed(),
+                    "rotation {i}: eviction must keep the page slot claimed");
+            }
+            prev_slot = Some(slot);
+
+            // Permanent helpers keep identical addresses every rotation.
+            assert_eq!(jit.ensure_perm_helpers(), helpers,
+                "rotation {i}: permanent helpers must survive arena retirement");
+            providers.push(provider);
+        }
+
+        assert_eq!(jit.retired_generation_count(),
+            (ROTATIONS - MAX_RETAINED_CODE_GENERATIONS) as u64,
+            "every generation past the retention bound must have been retired exactly once");
+        assert_eq!(jit.perm_helper_stats(), perm_baseline,
+            "the permanent arena must not grow across rotations");
+        // The oldest generations are unmapped; the newest is still retained.
+        assert!(providers[0].is_released(), "the oldest generation must be unmapped");
+        assert!(!providers[ROTATIONS - 1].is_released(),
+            "the newest generation must remain mapped and dispatchable");
+    }
+
+    /// A full `mega_flush` (pool exhaustion / restore / rollback / manual
+    /// `j2 flush`) invalidates every page, so it must also release every
+    /// retained generation — otherwise each full flush would leak an arena.
+    #[test]
+    fn mega_flush_releases_retained_generations() {
+        let dev = FakeDevice(AtomicU64::new(0));
+        let mut jit = Jitv2::new(4);
+        let bits = one_entry_bitmap();
+
+        let state = Arc::new(crate::cpu::jitv2::paged_memory::PagedArenaState::default());
+        let provider = crate::cpu::jitv2::paged_memory::PagedArenaMemoryProvider::new_with_size(1 << 20, state.clone()).unwrap();
+        let (base, _len) = provider.arena_span();
+        let arena = provider.shared();
+
+        let slot = jit.page_for(0, 0, &dev, false).unwrap() as usize;
+        assert!(jit.pages[slot].publish(&bits, arena_test_func(base), 0, 1, 8, false));
+        jit.rotate_code_generation(arena, state);
+        assert_eq!(jit.retained_generation_count(), 1);
+        assert!(!provider.is_released(), "sanity: generation retained");
+
+        jit.mega_flush();
+        assert_eq!(jit.retained_generation_count(), 0, "a full flush must drop the retained list");
+        assert!(provider.is_released(), "a full flush must release retained generation arenas");
+        assert_eq!(jit.pages_used(), 0);
     }
 }
