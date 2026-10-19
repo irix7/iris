@@ -674,8 +674,11 @@ fn start_transaction(&mut self) {
     }
 
     /// Bulk read: fill `dst` with the low byte of each DMA unit, walking the
-    /// descriptor chain and signalling EOP/EOX/XIE/IRQ only at descriptor
-    /// boundaries. Returns (status, writebacks, bytes filled).
+    /// descriptor chain. The channel's `cbp` advances after every unit — the
+    /// lock is held once for the whole block, but the address arithmetic is
+    /// exactly the per-unit `dma_read` path (batching the read without moving
+    /// `cbp` reads the same word repeatedly). Returns (status, writebacks,
+    /// bytes filled).
     fn dma_read_block(&mut self, dst: &mut [u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
         let mut status = DmaStatus::ok();
         let mut wb = Vec::new();
@@ -695,33 +698,29 @@ fn start_transaction(&mut self) {
                 self.fetch_descriptor();
                 continue;
             }
-            let dst_left = dst.len() - read;
-            let units = (remaining / step).min(dst_left);
-            if units == 0 { break; }
-            let mut ok = true;
-            for i in 0..units {
-                match self.read_unit() {
-                    Some(v) => dst[read + i] = v as u8,
-                    None => { ok = false; break; }
-                }
-            }
-            if !ok {
+            let Some(v) = self.read_unit() else {
                 status |= DmaStatus(DmaStatus::NOT_ACTIVE);
                 break;
-            }
-            let (st, w) = self.advance((units * step) as u32, false);
+            };
+            dst[read] = v as u8;
+            read += 1;
+            let (st, w) = self.advance(step as u32, false);
             status |= st;
             if let Some(w) = w { wb.push(w); }
-            read += units;
-            if st.eox() || st.refused() { break; }
+            // A descriptor boundary raises XIE. Return so the wrapper can
+            // release the channel lock and deliver the interrupt; the caller
+            // resumes with the next block.
+            if st.irq() || st.eox() || st.refused() { break; }
         }
 
         (status, wb, read)
     }
 
-    /// Bulk write: push `src` to the channel, walking the descriptor chain and
-    /// signalling EOP/EOX/XIE/IRQ only at descriptor boundaries. Returns
-    /// (status, writebacks, bytes written).
+    /// Bulk write: push `src` to the channel, walking the descriptor chain.
+    /// As with [`Self::dma_read_block`], `cbp` advances per unit so successive
+    /// bytes land at successive addresses. EOP is signalled on the final byte
+    /// of `src`, matching the per-unit `dma_write` call. Returns (status,
+    /// writebacks, bytes written).
     fn dma_write_block(&mut self, src: &[u8]) -> (DmaStatus, Vec<(u32, u16)>, usize) {
         let mut status = DmaStatus::ok();
         let mut wb = Vec::new();
@@ -748,21 +747,14 @@ fn start_transaction(&mut self) {
                 self.fetch_descriptor();
                 continue;
             }
-            let src_left = src.len() - written;
-            let units = (remaining / step).min(src_left);
-            if units == 0 { break; }
-            // caller EOP is signalled on the final chunk (its last byte is the
-            // last byte of `src`), matching the per-unit `eop` on the last byte.
-            let caller_eop = src_left <= units;
-            self.dev_writes += units as u64;
-            for i in 0..units {
-                self.write_unit(src[written + i] as u32);
-            }
-            let (st, w) = self.advance((units * step) as u32, caller_eop);
+            let caller_eop = written + 1 == src.len();
+            self.dev_writes += 1;
+            self.write_unit(src[written] as u32);
+            written += 1;
+            let (st, w) = self.advance(step as u32, caller_eop);
             status |= st;
             if let Some(w) = w { wb.push(w); }
-            written += units;
-            if caller_eop || st.eox() || st.refused() { break; }
+            if caller_eop || st.irq() || st.eox() || st.refused() { break; }
         }
 
         (status, wb, written)
@@ -2526,6 +2518,55 @@ mod tests {
     /// through the same record, so a group-specific field such as `even_high`
     /// still has to survive on every channel.
     const SAMPLED: [usize; 4] = [0, 8, 10, 11];
+
+    /// Bulk DMA must walk the channel's address, not read or write the same
+    /// `cbp` once per unit. The original batched implementation did the
+    /// latter, which corrupted every multi-byte SCSI transfer.
+    #[test]
+    fn bulk_dma_advances_the_channel_address_per_unit() {
+        use crate::traits::{BusDevice, BusRead8, BUS_OK};
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Mutex;
+
+        struct SeqMemory {
+            writes: Mutex<Vec<(u32, u8)>>,
+        }
+        impl BusDevice for SeqMemory {
+            fn read8(&self, addr: u32) -> BusRead8 { BusRead8::ok(addr as u8) }
+            fn write8(&self, addr: u32, val: u8) -> u32 {
+                self.writes.lock().unwrap().push((addr, val));
+                BUS_OK
+            }
+        }
+
+        let mem = Arc::new(SeqMemory { writes: Mutex::new(Vec::new()) });
+        let bus: Arc<dyn BusDevice> = mem.clone();
+
+        let mut read = PdmaChannel::new(8, Arc::new(AtomicU32::new(0)));
+        read.sys_mem = Some(bus.clone());
+        read.set_active(true);
+        read.cbp = 0x1000;
+        read.bc = 8;
+        read.eox = true;
+        let mut buf = [0u8; 8];
+        let (st, _, n) = read.dma_read_block(&mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(buf, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(read.cbp, 0x1008, "read advanced one address per unit");
+        assert!(st.eox());
+
+        let mut write = PdmaChannel::new(8, Arc::new(AtomicU32::new(0)));
+        write.sys_mem = Some(bus);
+        write.set_active(true);
+        write.cbp = 0x2000;
+        write.bc = 8;
+        write.eox = true;
+        let (st, _, n) = write.dma_write_block(&[10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(n, 8);
+        assert_eq!(*mem.writes.lock().unwrap(), (0u32..8).map(|i| (0x2000 + i, 10 + i as u8)).collect::<Vec<_>>());
+        assert_eq!(write.cbp, 0x2008, "write advanced one address per unit");
+        assert!(st.eox());
+    }
 
     fn hpc3_for_test() -> Hpc3 {
         Hpc3::with_net(
