@@ -708,7 +708,10 @@ impl Machine {
                 // keep the historical /tmp location keyed by pid.
                 let ci_overlay = match std::env::var_os("IRIS_COW_OVERLAY_DIR") {
                     Some(dir) => format!("{}/scsi{}.overlay", dir.to_string_lossy(), id),
-                    None => format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id),
+                    None => match cfg.state_dir.as_deref() {
+                        Some(state) => format!("{state}/overlays/scsi{id}.overlay"),
+                        None => format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id),
+                    },
                 };
                 hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
             } else {
@@ -1209,6 +1212,11 @@ impl Machine {
             .map(|d| std::path::Path::new(d).join("saves"))
             .unwrap_or_else(|| std::path::PathBuf::from("saves"));
         crate::snapshot::set_store_root(snapshot_root.clone());
+        if let Some(state) = cfg.state_dir.as_deref() {
+            let _ = std::fs::create_dir_all(std::path::Path::new(state).join("overlays"));
+            let _ = std::fs::create_dir_all(std::path::Path::new(state).join("diffs"));
+            crate::chd_disk::set_diff_dir(std::path::Path::new(state).join("diffs"));
+        }
 
         Self {
             cpu,
