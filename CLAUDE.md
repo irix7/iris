@@ -11,6 +11,14 @@ canonical project. The fork carries performance work and parallel per-task
 instance operation for development. Sync upstream with
 `git fetch upstream && git merge upstream/main`.
 
+## Attribution
+
+Reuse of this fork's code, tests, benchmarks, measurements, documentation or
+ideas outside this repository is allowed only with credit to **Jupiter Belic**
+and **`irix7/iris`**, naming the reused commit/file/PR. Read and follow
+[AGENTS.md](AGENTS.md) before committing, opening a pull request, publishing, or
+offering work upstream.
+
 ## Read these first
 
 - `HACKING.md` — architecture: data path/endianness, concurrency model, the

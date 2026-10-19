@@ -28,7 +28,9 @@ Prebuilt releases are available in [GitHub Releases](https://github.com/techoman
 This repository (`irix7/iris`) is a fork of
 [`techomancer/iris`](https://github.com/techomancer/iris) — the upstream SGI
 Indy / Indigo2 emulator, and the source of the prebuilt releases linked above.
-Upstream remains the canonical project.
+Upstream remains the canonical project. The fork is maintained by **Jupiter
+Belic**; anyone reusing its work elsewhere should follow the attribution rules
+in [AGENTS.md](AGENTS.md).
 
 This fork is a working tree for two things: **performance** (allocator, PGO and
 `target-cpu` build defaults; interpreter/JIT dispatch; idle-parking and
