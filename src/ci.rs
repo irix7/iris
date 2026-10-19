@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::machine::Machine;
 use crate::gfx_display::GfxDisplay;
-use crate::dev::z85c30::CiSerialBackend;
+use crate::dev::z85c30::{CiSerialBackend, WaitOutcome};
 
 /// Set at `start_server`; consulted by `quit` so the socket file is cleaned up
 /// before `std::process::exit` (which skips Drop).
@@ -289,7 +289,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "info" => cmd_info(&req.args),
         "delete" => cmd_delete(&req.args),
         "serial-send" => cmd_serial_send(server, &req.args),
-        "serial-read" => cmd_serial_read(server),
+        "serial-read" => cmd_serial_read(server, &req.args),
         "wait-serial" => cmd_wait_serial(server, &req.args),
         "screenshot" => cmd_screenshot(server, &req.args),
         "scratch-write" => cmd_scratch_write(server, &req.args),
@@ -575,8 +575,12 @@ fn cmd_serial_send(server: &CiServer, args: &Value) -> Response {
     Response::ok()
 }
 
-fn cmd_serial_read(server: &CiServer) -> Response {
-    let bytes = server.ci_serial.drain_guest();
+fn serial_consumer(args: &Value) -> String {
+    args.get("consumer").and_then(|v| v.as_str()).unwrap_or("default").to_string()
+}
+
+fn cmd_serial_read(server: &CiServer, args: &Value) -> Response {
+    let bytes = server.ci_serial.drain_for(&serial_consumer(args));
     let s = String::from_utf8_lossy(&bytes).into_owned();
     Response::data(Value::String(s))
 }
@@ -653,13 +657,15 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("wait-serial: missing 'pattern' arg"),
     };
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000);
+    let consumer = serial_consumer(args);
 
-    match server.ci_serial.wait_for(pattern.as_bytes(), Duration::from_millis(timeout_ms)) {
-        Some(consumed) => {
+    match server.ci_serial.wait_for_consumer(&consumer, pattern.as_bytes(), Duration::from_millis(timeout_ms)) {
+        WaitOutcome::Matched(consumed) => {
             let s = String::from_utf8_lossy(&consumed).into_owned();
             Response::data(Value::String(s))
         }
-        None => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
+        WaitOutcome::TimedOut => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
+        WaitOutcome::Reset => Response::err("wait-serial: console was reset"),
     }
 }
 
