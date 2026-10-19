@@ -116,9 +116,17 @@ test/fleet/run.sh target/debug/iris target/debug/iris-ci
 ```
 
 `$FLEET_N` sets the instance count (default 2); `$KEEP=1` keeps the temp dir on
-exit for inspection. The serial/session semantics that the later tickets add
-(per-connection read cursors, reset-wakes-waiters, host-speed CI pacing) will
-extend this script's checks as those tickets land.
+exit for inspection.
+
+For a development fleet, `scripts/fleet.sh -n N` derives and prints every
+instance's endpoints and starts them in the background (PIDs in
+`<state-root>/pids`). `-c` selects the base TOML, `-s` the state root and `-b`
+the first port block; `--dry-run` validates and prints without starting:
+
+```sh
+scripts/fleet.sh -n 4 -c iris.toml -s ~/iris-fleet --dry-run
+scripts/fleet.sh -n 4 -c iris.toml -s ~/iris-fleet
+```
 
 ## For agents
 
