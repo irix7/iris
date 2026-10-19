@@ -264,6 +264,15 @@ pub fn derive_instance(
     if cfg.nveeprom == default_nveeprom() {
         cfg.nveeprom = paths.nveeprom().to_string_lossy().into_owned();
     }
+    if cfg.serial_log.is_none() {
+        cfg.serial_log = paths.serial_log().map(|p| p.to_string_lossy().into_owned());
+    }
+    if cfg.test_device_dump.is_none() {
+        cfg.test_device_dump = Some(paths.test_device_dump().to_string_lossy().into_owned());
+    }
+    if cfg.jitv2.cache_dir.is_empty() {
+        cfg.jitv2.cache_dir = paths.jit_cache_dir().to_string_lossy().into_owned();
+    }
 
     if cfg.monitor_port.is_none() {
         cfg.monitor_port = Some(ident.port_base);
@@ -2569,6 +2578,12 @@ mod instance_tests {
         assert_ne!(a.serial_ports(), b.serial_ports());
         assert_ne!(a.network.mac, b.network.mac);
         assert_ne!(a.nat_subnet, b.nat_subnet);
+        assert_ne!(a.serial_log, b.serial_log);
+        assert_ne!(a.test_device_dump, b.test_device_dump);
+        assert_ne!(a.jitv2.cache_dir, b.jitv2.cache_dir);
+        assert!(a.serial_log.as_deref().unwrap().contains("iris-instance-1"));
+        assert!(a.test_device_dump.as_deref().unwrap().contains("iris-instance-1"));
+        assert!(a.jitv2.cache_dir.contains("iris-instance-1"));
     }
 
     #[test]
