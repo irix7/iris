@@ -433,6 +433,14 @@ impl SerialBackend for UnixSocketBackend {
     fn recv_byte(&self) -> io::Result<u8> {
         let mut guard = self.stream.lock();
         
+        if guard.is_some() {
+            // One console client at a time. Refuse a second connection
+            // explicitly instead of leaving it in the accept backlog, where a
+            // peer sees a completed handshake and then a silent hang.
+            if let Ok((socket, _)) = self.listener.accept() {
+                drop(socket);
+            }
+        }
         if guard.is_none() {
             match self.listener.accept() {
                 Ok((socket, _)) => {
@@ -518,9 +526,19 @@ impl SerialBackend for TcpSocketBackend {
     fn recv_byte(&self) -> io::Result<u8> {
         let mut guard = self.conn.lock();
 
+        if guard.is_some() {
+            // One console client at a time. Refuse a second connection
+            // explicitly instead of leaving it in the accept backlog, where a
+            // peer sees a completed handshake and then a silent hang.
+            if let Ok((socket, _)) = self.listener.accept() {
+                let _ = socket.set_nodelay(true);
+                drop(socket);
+            }
+        }
         if guard.is_none() {
             match self.listener.accept() {
                 Ok((socket, _)) => {
+                    let _ = socket.set_nodelay(true);
                     socket.set_nonblocking(true)?;
                     let mut c = TcpConn {
                         stream: socket,
