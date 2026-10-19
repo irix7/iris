@@ -26,6 +26,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 IRIS="${1:-${IRIS:-$REPO/target/debug/iris}}"
 IRIS_CI="${2:-${IRIS_CI:-$REPO/target/debug/iris-ci}}"
+# Each instance runs from its own state dir, so relative binary arguments
+# must be resolved against the caller's cwd first.
+IRIS="$(cd "$(dirname "$IRIS")" && pwd)/$(basename "$IRIS")"
+IRIS_CI="$(cd "$(dirname "$IRIS_CI")" && pwd)/$(basename "$IRIS_CI")"
 CONFIG="$HERE/machine.toml"
 N="${FLEET_N:-2}"
 
@@ -67,11 +71,14 @@ echo "fleet: derivation is disjoint for $N instances"
 # ── 2. boot all instances together ───────────────────────────────────────────
 for ((i=0;i<N;i++)); do
   mkdir -p "$WORK/inst$i"
-  "$IRIS" --config "$CONFIG" --instance "$i" \
+  # Run from the instance's state dir, like test/journal/run.sh: a checkout
+  # may carry an unrelated local prom.bin (the cpu-tests POST ROM), and the
+  # PROM menu this test drives must come from the embedded image.
+  ( cd "$WORK/inst$i" && exec "$IRIS" --config "$CONFIG" --instance "$i" \
           --state-dir "$WORK/inst$i" \
           --ci-socket "$WORK/inst$i/iris.sock" \
           --serial-log "$WORK/inst$i/serial.log" \
-          --ci >"$WORK/inst$i.stdout" 2>&1 &
+          --ci ) >"$WORK/inst$i.stdout" 2>&1 &
   PIDS+=("$!")
 done
 
