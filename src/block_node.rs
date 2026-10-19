@@ -226,6 +226,20 @@ impl RawNode {
     /// Open `path` read-write and use its current length as the capacity.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Advisory, non-blocking: a second read-write writer fails loudly
+            // instead of corrupting the guest filesystem. Read-only/COW bases
+            // use open_readonly and are unaffected; the lock dies with the fd.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("{} is already open read-write by another process", path.display()),
+                ));
+            }
+        }
         let size = file.metadata()?.len();
         Ok(Self { file, size })
     }
@@ -772,6 +786,22 @@ impl BlockNode for ChdCdNode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_write_base_refuses_a_second_writer() {
+        let path = tmp_path("lock");
+        std::fs::write(&path, b"disk").unwrap();
+        let first = RawNode::open(&path).expect("first writer");
+        let err = match RawNode::open(&path) {
+            Ok(_) => panic!("second writer must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        drop(first);
+        RawNode::open(&path).expect("lock released with the first handle");
+        let _ = std::fs::remove_file(path);
+    }
 
     fn tmp_path(tag: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
