@@ -410,6 +410,9 @@ impl AudioOutput for WavOutput {
     fn push_frames(&mut self, samples: &[i16]) -> usize {
         for &s in samples { let _ = self.writer.write_all(&s.to_le_bytes()); }
         self.frames += (samples.len() / 2) as u64;
+        // Keep a live capture readable while the guest runs; the header is
+        // patched again on drop.
+        let _ = self.writer.flush();
         samples.len() / 2
     }
     fn underruns(&self) -> u64 { 0 }

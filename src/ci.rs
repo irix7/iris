@@ -436,6 +436,9 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
             Err(e) => return Response::err(format!("chd sync failed: {e}")),
         }
     }
+    // Stop peripherals so HAL2/WAV and other Drop-based writers flush before
+    // process::exit skips destructors.
+    let _ = server.with_machine(|m| m.stop());
     // Schedule process exit after a brief delay so the response flushes.
     thread::spawn(|| {
         thread::sleep(Duration::from_millis(50));
