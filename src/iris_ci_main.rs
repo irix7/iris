@@ -55,6 +55,11 @@ struct Cli {
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 
+    /// Serial-session name for serial-read/wait-serial cursors. Concurrent
+    /// agents on one instance should each set a distinct name.
+    #[arg(long, global = true, default_value = "default")]
+    consumer: String,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -243,6 +248,7 @@ fn main() {
         socket,
         json: cli.json,
         quiet: cli.quiet,
+        consumer: std::env::var("IRIS_CI_CONSUMER").unwrap_or(cli.consumer),
     };
 
     let exit = match dispatch(&opts, cli.cmd) {
@@ -359,6 +365,7 @@ struct Opts {
     socket: PathBuf,
     json: bool,
     quiet: bool,
+    consumer: String,
 }
 
 // ---- socket client -----------------------------------------------------------
@@ -403,7 +410,12 @@ fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
 /// fixed client-side read timeout silently caps every command that uses it.
 /// At 300s that made any guest command over five minutes fail with EAGAIN
 /// while the guest carried on working, and `--timeout` appeared to do nothing.
-fn send_until(opts: &Opts, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
+fn send_until(opts: &Opts, cmd: &str, mut args: Value, read_timeout: Duration) -> Result<Value> {
+    if matches!(cmd, "serial-read" | "wait-serial") {
+        if let Some(o) = args.as_object_mut() {
+            o.entry("consumer").or_insert_with(|| Value::String(opts.consumer.clone()));
+        }
+    }
     let addr = opts.socket.to_string_lossy();
     if iris::config::ci_socket_is_tcp(&addr) {
         send_tcp(&iris::config::ci_socket_tcp_addr(&addr), cmd, args, read_timeout)
@@ -1124,6 +1136,7 @@ fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
             socket: opts.socket.clone(),
             json: opts.json || cli.json,
             quiet: opts.quiet || cli.quiet,
+            consumer: opts.consumer.clone(),
         };
 
         let pretty = format_step(line);

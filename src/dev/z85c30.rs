@@ -350,6 +350,9 @@ impl Channel {
 pub trait SerialBackend: Send + Sync {
     fn send_byte(&self, byte: u8);
     fn recv_byte(&self) -> io::Result<u8>;
+    /// True when this backend is the in-process CI console: emulated baud
+    /// pacing would only slow agent-driven boots and command output.
+    fn host_speed(&self) -> bool { false }
 }
 
 /// Drops TX bytes and never yields RX. Used as a placeholder when a channel
@@ -386,6 +389,7 @@ impl SerialBackend for TeeBackend {
     fn recv_byte(&self) -> io::Result<u8> {
         self.inner.recv_byte()
     }
+    fn host_speed(&self) -> bool { self.inner.host_speed() }
 }
 
 #[cfg(unix)]
@@ -905,7 +909,8 @@ impl Device for Z85c30 {
 
                     // Get pre-calculated delay
                     let delay_micros = channel.tx_delay;
-                    let char_duration = Duration::from_micros(delay_micros);
+                    let mut char_duration = Duration::from_micros(delay_micros);
+                    if tx_backend.host_speed() { char_duration = Duration::ZERO; }
 
                     // Release lock to sleep (simulate transmission time)
                     drop(channel);
@@ -987,7 +992,8 @@ impl Device for Z85c30 {
                     let wr3 = channel.regs[scc_regs::WR3 as usize];
                     let rx_enabled = (wr3 & wr3::RX_ENABLE) != 0;
                     let delay_micros = channel.tx_delay;
-                    let char_duration = Duration::from_micros(delay_micros);
+                    let mut char_duration = Duration::from_micros(delay_micros);
+                    if rx_backend.host_speed() { char_duration = Duration::ZERO; }
 
                     if !rx_enabled {
                         // RX disabled — drop the byte (matches real hw with
@@ -1150,9 +1156,61 @@ impl Saveable for Z85c30 {
 /// `host_to_guest` via `push_host`; the existing RX thread drains them into
 /// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
 /// `guest_to_host` and wakes anyone waiting in `wait_for`.
+const CI_CONSOLE_CAP: usize = 1 << 20;
+
+/// Result of a `wait-serial` on one consumer's cursor.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WaitOutcome {
+    Matched(Vec<u8>),
+    TimedOut,
+    /// The console was cleared by restore/rollback while waiting.
+    Reset,
+}
+
+struct ConsoleRing {
+    /// Append-only bytes since `base`; the front is dropped beyond the cap.
+    data: Vec<u8>,
+    /// Absolute stream offset of `data[0]`.
+    base: u64,
+    generation: u64,
+    cursors: std::collections::HashMap<String, u64>,
+}
+
+impl ConsoleRing {
+    fn new() -> Self {
+        Self { data: Vec::new(), base: 0, generation: 0, cursors: std::collections::HashMap::new() }
+    }
+    fn end(&self) -> u64 { self.base + self.data.len() as u64 }
+    fn cursor(&self, consumer: &str) -> u64 {
+        self.cursors.get(consumer).copied().unwrap_or(self.base).max(self.base)
+    }
+    fn advance(&mut self, consumer: &str, absolute: u64) {
+        self.cursors.insert(consumer.to_string(), absolute);
+    }
+    fn push(&mut self, byte: u8) {
+        self.data.push(byte);
+        if self.data.len() > CI_CONSOLE_CAP {
+            let drop = self.data.len() - CI_CONSOLE_CAP;
+            self.data.drain(..drop);
+            self.base += drop as u64;
+        }
+    }
+    fn read(&mut self, consumer: &str) -> Vec<u8> {
+        let start = (self.cursor(consumer) - self.base) as usize;
+        let out = self.data[start..].to_vec();
+        self.advance(consumer, self.end());
+        out
+    }
+}
+
+/// Serial backend that the CI control socket reads from and writes to. The
+/// guest sees this as channel A (the IRIX console). Host pushes bytes into
+/// `host_to_guest` via `push_host`; the existing RX thread drains them into
+/// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
+/// the append-only console ring and wakes waiters.
 pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
-    guest_to_host: Mutex<Vec<u8>>,
+    console: Mutex<ConsoleRing>,
     cv: Condvar,
     /// Optional file mirror: every byte that flows through ttyd1 in either
     /// direction is appended here. Host-injected bytes are echoed by IRIX
@@ -1165,7 +1223,7 @@ impl CiSerialBackend {
     pub fn new() -> Self {
         Self {
             host_to_guest: Mutex::new(VecDeque::new()),
-            guest_to_host: Mutex::new(Vec::new()),
+            console: Mutex::new(ConsoleRing::new()),
             cv: Condvar::new(),
             log: Mutex::new(None),
         }
@@ -1183,54 +1241,96 @@ impl CiSerialBackend {
         q.extend(data.iter().copied());
     }
 
-    /// Drain everything the guest has produced since the last call. Empties
-    /// the buffer; the returned Vec is the guest output as raw bytes.
-    pub fn drain_guest(&self) -> Vec<u8> {
-        let mut q = self.guest_to_host.lock();
-        std::mem::take(&mut *q)
+    /// Read bytes after one consumer's cursor and advance it to the end.
+    /// Consumers are independent: another reader's cursor is untouched.
+    pub fn drain_for(&self, consumer: &str) -> Vec<u8> {
+        self.console.lock().read(consumer)
     }
 
-    /// Block until `needle` is seen in guest output, or `timeout` expires.
-    /// On success returns the consumed bytes up to and including the match;
-    /// bytes that arrived after the match stay in the buffer for the next
-    /// `serial-read`. On timeout returns `None` without consuming anything.
-    pub fn wait_for(&self, needle: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+    /// Block until `needle` is seen after `consumer`'s cursor, or `timeout`
+    /// expires. Only bytes after that cursor are scanned, so a waiter never
+    /// consumes another consumer's pending output. A console reset wakes the
+    /// waiter immediately with [`WaitOutcome::Reset`].
+    pub fn wait_for_consumer(
+        &self,
+        consumer: &str,
+        needle: &[u8],
+        timeout: Duration,
+    ) -> WaitOutcome {
         if needle.is_empty() {
-            return Some(Vec::new());
+            return WaitOutcome::Matched(Vec::new());
         }
         let deadline = Instant::now() + timeout;
-        let mut q = self.guest_to_host.lock();
+        let mut ring = self.console.lock();
+        let generation = ring.generation;
+        let mut scan = (ring.cursor(consumer) - ring.base) as usize;
         loop {
-            if let Some(pos) = find_subseq(&q, needle) {
-                let end = pos + needle.len();
-                let consumed: Vec<u8> = q.drain(..end).collect();
-                return Some(consumed);
+            if ring.generation != generation {
+                return WaitOutcome::Reset;
             }
+            let cursor = (ring.cursor(consumer) - ring.base) as usize;
+            if scan < cursor {
+                scan = cursor;
+            }
+            if scan > ring.data.len() {
+                scan = ring.data.len().saturating_sub(needle.len().saturating_sub(1));
+            }
+            if let Some(pos) = find_subseq(&ring.data[scan..], needle) {
+                let end = scan + pos + needle.len();
+                let consumed = ring.data[cursor..end].to_vec();
+                let absolute = ring.base + end as u64;
+                ring.advance(consumer, absolute);
+                return WaitOutcome::Matched(consumed);
+            }
+            // A later scan only needs the possible partial match at the tail.
+            scan = ring.data.len().saturating_sub(needle.len().saturating_sub(1));
             let now = Instant::now();
             if now >= deadline {
-                return None;
+                return WaitOutcome::TimedOut;
             }
-            if self.cv.wait_until(&mut q, deadline).timed_out() {
-                // One more scan in case bytes arrived between the last check
-                // and the timeout.
-                if let Some(pos) = find_subseq(&q, needle) {
-                    let end = pos + needle.len();
-                    let consumed: Vec<u8> = q.drain(..end).collect();
-                    return Some(consumed);
+            if self.cv.wait_until(&mut ring, deadline).timed_out() {
+                if ring.generation != generation {
+                    return WaitOutcome::Reset;
                 }
-                return None;
+                // Re-scan once in case bytes arrived between the last check
+                // and the timeout, then give up.
+                let cursor = (ring.cursor(consumer) - ring.base) as usize;
+                if let Some(pos) = find_subseq(&ring.data[cursor..], needle) {
+                    let end = cursor + pos + needle.len();
+                    let consumed = ring.data[cursor..end].to_vec();
+                    let absolute = ring.base + end as u64;
+                    ring.advance(consumer, absolute);
+                    return WaitOutcome::Matched(consumed);
+                }
+                return WaitOutcome::TimedOut;
             }
         }
     }
 
-    /// Clear both queues. Called on `restore`/`rollback` so stale serial
-    /// output from the previous run doesn't leak into the next test.
-    pub fn reset(&self) {
-        self.host_to_guest.lock().clear();
-        self.guest_to_host.lock().clear();
-        if let Some(f) = self.log.lock().as_mut() {
-            let _ = f.flush();
+    /// Drain the default consumer (the pre-cursor API).
+    pub fn drain_guest(&self) -> Vec<u8> { self.drain_for("default") }
+
+    /// Wait on the default consumer (the pre-cursor API).
+    pub fn wait_for(&self, needle: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+        match self.wait_for_consumer("default", needle, timeout) {
+            WaitOutcome::Matched(v) => Some(v),
+            WaitOutcome::TimedOut | WaitOutcome::Reset => None,
         }
+    }
+
+    /// Clear the console and wake every waiter. Called on restore/rollback.
+    pub fn reset(&self) {
+        {
+            let mut ring = self.console.lock();
+            ring.base = ring.end();
+            ring.data.clear();
+            ring.generation = ring.generation.wrapping_add(1);
+            ring.cursors.clear();
+        }
+        if let Some(log) = self.log.lock().as_ref() {
+            log.flush();
+        }
+        self.cv.notify_all();
     }
 }
 
@@ -1242,8 +1342,9 @@ fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 impl SerialBackend for CiSerialBackend {
+    fn host_speed(&self) -> bool { true }
     fn send_byte(&self, byte: u8) {
-        self.guest_to_host.lock().push(byte);
+        self.console.lock().push(byte);
         if let Some(log) = self.log.lock().as_ref() {
             log.write(&[byte]);
         }
@@ -1505,6 +1606,35 @@ mod tests {
         dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
         assert_eq!(dst.read_a_control() & (1 << 1), 1 << 1,
             "B's Tx IP occupies bits 2..0 of A's RR3");
+    }
+
+    #[test]
+    fn serial_consumers_have_independent_cursors() {
+        let b = CiSerialBackend::new();
+        for byte in b"hello" { b.send_byte(*byte); }
+        assert_eq!(b.drain_for("a"), b"hello");
+        assert_eq!(b.drain_for("a"), b"", "a's cursor stayed at the end");
+        assert_eq!(
+            b.wait_for_consumer("b", b"hello", Duration::from_millis(10)),
+            WaitOutcome::Matched(b"hello".to_vec()),
+            "b still sees the bytes a already read",
+        );
+        assert_eq!(b.drain_for("b"), b"", "b's wait advanced b's cursor");
+        assert_eq!(b.drain_for("a"), b"", "b's wait did not consume a's cursor");
+    }
+
+    #[test]
+    fn a_console_reset_wakes_waiters() {
+        let b = Arc::new(CiSerialBackend::new());
+        let waiter = b.clone();
+        let t = thread::spawn(move || {
+            waiter.wait_for_consumer("w", b"never", Duration::from_secs(5))
+        });
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        b.reset();
+        assert_eq!(t.join().unwrap(), WaitOutcome::Reset);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
