@@ -22,6 +22,12 @@ a ~5% compile-time win with up to ~35% RSS increase (rust PR #92249). A/B time
 *and* RSS; if memory balloons, `tikv-jemallocator` (jemalloc) is the fallback (and
 what rustc ships with on Linux, with THP tuning available).
 
+**Measured (2026-10-08, commit `9d1988a`):** mimalloc against the system
+allocator cut peak RSS by about **35%** with **no wall-clock regression**. Kept:
+the RSS win is the larger effect here, and the multi-threaded device/JIT
+allocation pattern is mimalloc's target. `iris-bench` rates and the boot smoke
+were unchanged.
+
 ## 2. `-C target-cpu=native` — opt-in, not a magic number
 
 The Rust Performance Book: "can improve runtime speed, especially if the compiler
