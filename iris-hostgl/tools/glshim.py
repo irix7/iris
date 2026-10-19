@@ -103,7 +103,80 @@ INDEX_HOOKS = {
     "glEnable": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
     "glDisable": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
     "glIsEnabled": "if (hgl_index_mode && cap == GL_LOGIC_OP) cap = GL_COLOR_LOGIC_OP;",
+    # GL_TEXTURE_MULTI_BUFFER_HINT_SGIX (GL_SGIX_texture_multi_buffer): a
+    # hint about IMPACT's texture memory, which the host has no use for and
+    # would refuse; taken here.
+    "glHint": "if (target == 0x812E) return;",
+    # Drawing indices: the host's RGBA GL turns them into colours through its
+    # pixel maps (all 0), so they are encoded here as an index context draws.
+    "glDrawPixels": "if (hgl_index_mode && format == GL_COLOR_INDEX) { hgl_draw_index(width, height, type, pixels); return; }",
+    # Reading indices back: the host has only the RGBA they were drawn as.
+    "glReadPixels": "if (hgl_index_mode && format == GL_COLOR_INDEX) { hgl_read_index(x, y, width, height, type, pixels); return; }",
 }
+
+# lmcolor(LMC_COLOR) for SGI's IRIS GL (hgl_lmc in the guest's glshim_rt.c):
+# the program's GL_LIGHTING, and a glBegin held until its first vertex while
+# the mode is on. Which of a colour and a normal came last, IGLOO says itself.
+GUEST_HOOKS.update({
+    **{f"glVertex{n}{t}{v}": "if (hgl_lmc_pending) hgl_lmc_vertex();"
+       for n in ("2", "3", "4") for t in ("d", "f", "i", "s") for v in ("", "v")},
+    "glBegin": "if (hgl_lmc && hgl_lmc_begin(mode)) return;",
+    "glEnd": "if (hgl_lmc_pending && hgl_lmc_end()) return;",
+    "glEnable": "hgl_lmc_lighting(cap, 1);",
+    "glDisable": "hgl_lmc_lighting(cap, 0);",
+})
+
+# swaptmesh for SGI's IRIS GL (hgl_tm in the guest's glshim_rt.c): inside one
+# of its triangle meshes, each vertex and the normal, colour and texture
+# coordinate it was sent with are kept, so that a swap can send the older of
+# the last two again. Values as floats: an integer colour or normal is
+# normalized as OpenGL does it.
+_TM_NORM = {"b": "127.0", "s": "32767.0", "i": "2147483647.0"}
+_TM_UNORM = {"ub": "255.0", "us": "65535.0", "ui": "4294967295.0"}
+
+
+def _tm_args(names, n, t, v, norm):
+    """C expressions for n values of type t, scalar names or v[i], as doubles."""
+    vals = [f"v[{i}]" if v else names[i] for i in range(n)]
+    if norm and t in _TM_NORM:
+        # OpenGL 1.1: (2c + 1) / (2^b - 1)
+        return [f"(2.0 * {x} + 1.0) / (2.0 * {_TM_NORM[t]} + 1.0)" for x in vals]
+    if norm and t in _TM_UNORM:
+        return [f"{x} / {_TM_UNORM[t]}" for x in vals]
+    return [f"(double){x}" for x in vals]
+
+
+def _tm_hook(kind, names, n, t, v, norm, fill):
+    a = _tm_args(names, n, t, v, norm) + fill[n:]
+    return f"if (hgl_tm && !hgl_tm_internal) hgl_tm_attr({kind}, {', '.join(a)});"
+
+
+def _add_hook(name, code, first=False):
+    old = GUEST_HOOKS.get(name)
+    GUEST_HOOKS[name] = code if old is None else (f"{code} {old}" if first else f"{old} {code}")
+
+
+for n in ("3", "4"):
+    for t in ("b", "d", "f", "i", "s", "ub", "ui", "us"):
+        for v in ("", "v"):
+            _add_hook(f"glColor{n}{t}{v}", _tm_hook("HGL_TM_COLOUR", ["red", "green", "blue", "alpha"], int(n), t, v, True,
+                                                   ["0", "0", "0", "1.0"]))
+for t in ("b", "d", "f", "i", "s"):
+    for v in ("", "v"):
+        _add_hook(f"glNormal3{t}{v}", _tm_hook("HGL_TM_NORMAL", ["nx", "ny", "nz"], 3, t, v, True, ["0", "0", "0", "0"]))
+for n in ("1", "2", "3", "4"):
+    for t in ("d", "f", "i", "s"):
+        for v in ("", "v"):
+            _add_hook(f"glTexCoord{n}{t}{v}", _tm_hook("HGL_TM_TEXCOORD", ["s", "t", "r", "q"], int(n), t, v, False,
+                                                      ["0", "0", "0", "1.0"]))
+for n in ("2", "3", "4"):
+    for t in ("d", "f", "i", "s"):
+        for v in ("", "v"):
+            # After lmcolor's: the vertex is sent after its held glBegin.
+            _add_hook(f"glVertex{n}{t}{v}", _tm_hook("HGL_TM_VERTEX", ["x", "y", "z", "w"], int(n), t, v, False,
+                                                    ["0", "0", "0", "1.0"]))
+# Before lmcolor's, which may return: a new strip starts with no vertices kept.
+_add_hook("glBegin", "if (hgl_tm) hgl_tm_begin();", first=True)
 
 # ... and these after a state query has its answer: an index context answers
 # for its index state, which the host does not have.
@@ -112,6 +185,8 @@ GUEST_AFTER = {
     "glGetIntegerv": "if (hgl_index_mode) hgl_index_geti(pname, data);",
     "glGetFloatv": "if (hgl_index_mode) hgl_index_getf(pname, data);",
     "glGetDoublev": "if (hgl_index_mode) hgl_index_getd(pname, data);",
+    # The program's lighting back on after a primitive drawn unlit (hgl_lmc).
+    "glEnd": "if (hgl_lmc_off) hgl_lmc_after_end();",
 }
 
 # The encoders also report what memory the host will read: hgl_ref for a
@@ -503,6 +578,16 @@ def gen_rust(api):
                 lines.append(f"g({', '.join(call_args)});")
                 if guard:
                     lines.append("}")
+                # The internal format a texture image was given, as the
+                # program named it, for glGetTexLevelParameter to answer
+                # with (Exec::texture_internal_answer).
+                if internal_params and "target" in local and "level" in local:
+                    ik = next(k for k, p in enumerate(params) if p["name"] in internal_params)
+                    lines.append(f"x.note_internal({local['target']} as u32, {local['level']} as i32, a{ik} as i32);")
+                if name == "glGetTexLevelParameteriv":
+                    lines.append("x.texture_internal_answer(a0, a1, a2, &mut o3);")
+                if name == "glGetTexLevelParameterfv":
+                    lines.append("x.texture_internal_answer_f(a0, a1, a2, &mut o3);")
                 # The state queries go past the executor on the way back, so
                 # that a limit the host reports but this library cannot stand
                 # behind is answered with one it can (Exec::get_limit).
@@ -543,6 +628,13 @@ GUARDED = {
     "glFogf": "x.fog(a0, &[a1])",
     "glFogi": "x.fog(a0, &[a1 as f32])",
     "glFogfv": "x.fog(a0, &v1)",
+    # SGI_color_matrix's state on a host without a colour matrix (Mesa's
+    # compatibility profile has no ARB_imaging): answered here, as IMPACT
+    # answers it, rather than refused (Exec::color_matrix_query).
+    "glGetBooleanv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetIntegerv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetFloatv": "x.color_matrix_query(a0, &mut o1)",
+    "glGetDoublev": "x.color_matrix_query(a0, &mut o1)",
 }
 
 # Calls that read the framebuffer: a multisampled drawable is resolved first.

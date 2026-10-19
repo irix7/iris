@@ -1,3 +1,4 @@
+use crate::i18n::subtitle;
 use eframe::egui::{self, Color32, Grid, RichText, Slider, TextEdit};
 use std::path::PathBuf;
 
@@ -25,8 +26,7 @@ impl Default for CreateDiskDialog {
 impl CreateDiskDialog {
     pub fn open_for(&mut self, scsi_id: u8) {
         self.scsi_id = scsi_id;
-        // Absolute, app-managed default location (writable in the App Store
-        // sandbox too) so a new disk never lands in the working dir.
+        // Relative to the selected machine folder, writable in the sandbox.
         self.filename = crate::settings::GuiSettings::default_disk_path(scsi_id);
         self.size_mb = 1024.0;
         self.overwrite = false;
@@ -38,14 +38,14 @@ impl CreateDiskDialog {
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.open { return; }
         let mut close = false;
-        egui::Window::new(format!("Create blank HDD image for SCSI #{}", self.scsi_id))
+        egui::Window::new(t!("dialog-create-disk-title", id = self.scsi_id))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 Grid::new("create_disk_grid").num_columns(2).striped(true).show(ui, |ui| {
-                    ui.label("Filename");
+                    ui.label(t!("dialog-create-disk-file"));
                     ui.horizontal(|ui| {
                         ui.add(TextEdit::singleline(&mut self.filename).desired_width(220.0));
                         if ui.button("📁").clicked() {
@@ -53,24 +53,22 @@ impl CreateDiskDialog {
                             // to the nearest folder that exists rather than
                             // creating one the user has not asked for yet.
                             let dlg = crate::filedialog::dialog_with(
-                                "New disk image", &self.filename,
+                                &t!("dialog-create-disk-picker-title"), &self.filename,
                                 crate::filedialog::Anchor::Disks,
                                 crate::filedialog::Purpose::Save,
-                                &[("Disk image", &["raw", "img"])]);
+                                &[(t!("dialog-create-disk-filter").as_str(), &["raw", "img"])]);
                             if let Some(p) = dlg.save_file() {
-                                self.filename = p.to_string_lossy().into_owned();
+                                self.filename = crate::picked_path(&p);
                             }
                         }
                     });
                     ui.end_row();
-                    ui.label("Size (MB)");
+                    ui.label(t!("dialog-create-disk-size"));
                     ui.add(Slider::new(&mut self.size_mb, 8.0..=16384.0).step_by(8.0).logarithmic(true));
                     ui.end_row();
                 });
                 ui.add_space(4.0);
-                ui.label(RichText::new("The image will be created as a zero-filled file. \
-                    Reset the machine after attaching new drives.")
-                    .color(Color32::GRAY).small());
+                subtitle(ui, t!("dialog-create-disk-subtitle"));
                 // File::create truncates: without this gate, Create silently wipes an
                 // existing image (the default filename is the disk already at this ID).
                 let exists = std::path::Path::new(&self.filename).is_file();
@@ -78,21 +76,21 @@ impl CreateDiskDialog {
                     let mb = std::fs::metadata(&self.filename).map(|m| m.len()).unwrap_or(0) as f64
                         / (1024.0 * 1024.0);
                     ui.add_space(4.0);
-                    ui.label(RichText::new(format!(
-                        "⚠ {} already exists ({mb:.0} MB). Creating will erase it.", self.filename))
+                    ui.label(RichText::new(t!("dialog-create-disk-exists",
+                        file = &self.filename, size = format!("{mb:.0}")))
                         .color(Color32::from_rgb(230, 140, 70)));
-                    ui.checkbox(&mut self.overwrite, "Erase the existing image");
+                    ui.checkbox(&mut self.overwrite, t!("dialog-create-disk-overwrite"));
                 } else {
                     self.overwrite = false;
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() { close = true; }
-                    if ui.add_enabled(!exists || self.overwrite, egui::Button::new("Create")
+                    if ui.button(t!("common-cancel")).clicked() { close = true; }
+                    if ui.add_enabled(!exists || self.overwrite, egui::Button::new(t!("dialog-create-disk-create"))
                         .fill(Color32::from_rgb(60, 110, 60))).clicked()
                     {
                         // Create file on disk now (making the parent dir first,
-                        // e.g. the managed <data_dir>/disks on first use).
+                        // e.g. the managed <machine dir>/disks on first use).
                         let path = PathBuf::from(&self.filename);
                         if let Some(parent) = path.parent() {
                             let _ = std::fs::create_dir_all(parent);

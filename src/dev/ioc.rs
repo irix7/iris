@@ -179,6 +179,9 @@ pub mod ext_io_regs {
 /// PIO6 — one chip, two address windows, per `ioc2_device`'s single
 /// `m_pit` in MAME).
 pub const INT2_REG_COUNT: u32 = 16;
+
+/// Perfetto: the interrupt lines as last traced (one IOC per process).
+static IOC_PF_LINES: crate::PfBits = crate::PfBits::new();
 const INT2_TMR_CLR_IDX: u32 = 8;
 const INT2_PIT_BASE_IDX: u32 = 12;
 
@@ -316,6 +319,50 @@ pub fn profile_idx(guinness: bool) -> usize {
     if guinness { 0 } else { 1 }
 }
 
+/// How the guest keeps up with one 8254 timer: ticks fired, ticks it
+/// acknowledged (TMR_CLR on a set bit), ticks that landed on a still-pending
+/// one (merged, so the guest never saw them), and how long each wait from
+/// fire to acknowledgement was. `ioc ticks` reports and restarts a window.
+/// IRIX refills its audio rings from the 1 kHz fast clock (timer 1), so a
+/// host too busy to service it shows up here before it is heard.
+#[derive(Clone, Default)]
+struct TimerTicks {
+    fired: u64,
+    acked: u64,
+    merged: u64,
+    /// When the pending tick fired; `None` once acknowledged.
+    pending_since: Option<std::time::Instant>,
+    lat_sum_ns: u64,
+    lat_max_ns: u64,
+    /// Fire-to-acknowledge waits: <250 us, <500 us, <1 ms, <2 ms, <5 ms, longer.
+    lat_hist: [u64; 6],
+}
+
+impl TimerTicks {
+    const BUCKETS_US: [u64; 5] = [250, 500, 1_000, 2_000, 5_000];
+
+    fn fire(&mut self) {
+        self.fired += 1;
+        if self.pending_since.is_some() {
+            self.merged += 1;
+        } else {
+            self.pending_since = Some(std::time::Instant::now());
+        }
+    }
+
+    fn ack(&mut self) {
+        if let Some(t) = self.pending_since.take() {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.acked += 1;
+            self.lat_sum_ns += ns;
+            self.lat_max_ns = self.lat_max_ns.max(ns);
+            let us = ns / 1_000;
+            let b = Self::BUCKETS_US.iter().position(|&lim| us < lim).unwrap_or(5);
+            self.lat_hist[b] += 1;
+        }
+    }
+}
+
 struct IocState {
     sys_id: u8,
     
@@ -325,6 +372,9 @@ struct IocState {
     l1_stat: u8,
     l1_mask: u8,
     map_stat: u8,
+    /// Timer 0/1 service statistics (`ioc ticks`), and when the window began.
+    ticks: [TimerTicks; 2],
+    ticks_since: std::time::Instant,
     map_mask0: u8,
     map_mask1: u8,
     map_pol: u8,
@@ -390,13 +440,17 @@ struct IocTimerCallback {
 
 impl TimerCallback for IocTimerCallback {
     fn callback(&self) {
-        if let Some(t) = self.ticks.get() {
-            t.fetch_add(1, Ordering::Relaxed);
+        // Only timer 1, the fast clock: timer 0's 100 Hz system clock on top
+        // of it read as 1100 Hz.
+        if self.source == IocInterrupt::Mappable1 {
+            if let Some(t) = self.ticks.get() {
+                t.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let mut state = self.state.lock();
         match self.source {
-            IocInterrupt::Mappable0 => state.map_stat |= 1 << 0,
-            IocInterrupt::Mappable1 => state.map_stat |= 1 << 1,
+            IocInterrupt::Mappable0 => { state.ticks[0].fire(); state.map_stat |= 1 << 0 }
+            IocInterrupt::Mappable1 => { state.ticks[1].fire(); state.map_stat |= 1 << 1 }
             _ => {}
         }
         state.update_interrupts();
@@ -482,6 +536,8 @@ impl Ioc {
             l1_stat: 0,
             l1_mask: 0,
             map_stat: 0,
+            ticks: Default::default(),
+            ticks_since: std::time::Instant::now(),
             map_mask0: 0,
             map_mask1: 0,
             map_pol: 0,
@@ -553,11 +609,12 @@ impl Ioc {
         let _ = self.event_tx.set(tx);
     }
 
-    /// Count the kernel's clock ticks into the status bar's Hz counter. IRIX
-    /// keeps time with the 8254 (timer 0 is the system clock, timer 1 the
-    /// profiling clock) unless the IOC's 8254 is known broken, in which case
-    /// it uses CP0 Compare, which the CPU already counts. Either way the
-    /// counter shows the kernel's tick rate, and never both at once.
+    /// Count the kernel's fast clock into the status bar's Hz counter. IRIX
+    /// keeps time with the 8254 (timer 0 is the 100 Hz system clock, timer 1
+    /// the 1000 Hz fast clock, parked when nothing needs it) unless the IOC's
+    /// 8254 is known broken, in which case the fast clock is CP0 Compare,
+    /// which the CPU already counts. Only timer 1 is counted here, so either
+    /// way the counter shows the fast clock, and never both at once.
     pub fn set_clock_ticks(&self, ticks: Arc<AtomicU64>) {
         let _ = self.clock_ticks.set(ticks);
     }
@@ -712,7 +769,7 @@ impl Device for Ioc {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        let mut cmds = vec![("ioc".to_string(), "IOC commands: ioc status".to_string())];
+        let mut cmds = vec![("ioc".to_string(), "IOC commands: ioc status | ioc ticks (8254 timer service: fired/acked/merged, fire-to-ack waits; each call starts a new window)".to_string())];
         cmds.extend(self.scc.register_commands());
         cmds.extend(self.pit.register_commands());
         cmds.extend(self.ps2.register_commands());
@@ -721,8 +778,29 @@ impl Device for Ioc {
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
         if cmd == "ioc" {
+            if args.first().copied() == Some("ticks") {
+                let mut s = self.state.lock();
+                let secs = s.ticks_since.elapsed().as_secs_f64().max(1e-9);
+                let _ = writeln!(writer, "8254 ticks over the last {:.1} s (since the previous `ioc ticks`):", secs);
+                for (t, name) in [(0, "timer 0, system clock"), (1, "timer 1, fast clock  ")] {
+                    let k = &s.ticks[t];
+                    let avg_us = if k.acked > 0 { k.lat_sum_ns as f64 / k.acked as f64 / 1e3 } else { 0.0 };
+                    let _ = writeln!(writer, "  {}: fired {} ({:.1}/s)  acked {} ({:.1}/s)  merged {}  wait avg {:.0} us  max {:.2} ms",
+                        name, k.fired, k.fired as f64 / secs, k.acked, k.acked as f64 / secs, k.merged,
+                        avg_us, k.lat_max_ns as f64 / 1e6);
+                    let h = k.lat_hist;
+                    let _ = writeln!(writer, "      waits: <250us {}  <500us {}  <1ms {}  <2ms {}  <5ms {}  >=5ms {}",
+                        h[0], h[1], h[2], h[3], h[4], h[5]);
+                }
+                // A new window; a tick pending now keeps its fire time.
+                for k in s.ticks.iter_mut() {
+                    *k = TimerTicks { pending_since: k.pending_since, ..Default::default() };
+                }
+                s.ticks_since = std::time::Instant::now();
+                return Ok(());
+            }
             if args.first().copied() != Some("status") {
-                return Err("Usage: ioc status".to_string());
+                return Err("Usage: ioc status | ioc ticks".to_string());
             }
             let s = self.state.lock();
             fn bits8(v: u8, names: &[(u8, &str)]) -> String {
@@ -932,7 +1010,7 @@ impl BusDevice for Ioc {
             IOC_INT3_MAP_POL  => { dlog_dev!(LogModule::Ioc, "IOC: MAP_POL   = {:#04x}", val); state.map_pol  = val; }
             IOC_INT3_TMR_CLR => {
                 dlog_dev!(LogModule::Ioc, "IOC: Timer Clear val {:02x}", val);
-                state.map_stat &= !(val & 0x3);
+                state.clear_timers(val);
             }
 
             IOC_GC_SELECT => state.gc_select = val,
@@ -1106,7 +1184,7 @@ impl Ioc {
             }
             idx if idx == INT2_TMR_CLR_IDX => {
                 dlog_dev!(LogModule::Ioc, "INT2: Timer Clear val {:02x}", val);
-                state.map_stat &= !(val & 0x3);
+                state.clear_timers(val);
             }
             _ => dlog_dev!(LogModule::Ioc, "INT2: Write8 idx {} val {:02x} (RO or unmapped)", idx, val),
         }
@@ -1117,6 +1195,16 @@ impl Ioc {
 }
 
 impl IocState {
+    /// TMR_CLR: acknowledge timer 0 (bit 0) and/or timer 1 (bit 1).
+    fn clear_timers(&mut self, val: u8) {
+        for t in 0..2 {
+            if val & (1 << t) != 0 && self.map_stat & (1 << t) != 0 {
+                self.ticks[t].ack();
+            }
+        }
+        self.map_stat &= !(val & 0x3);
+    }
+
     fn update_interrupts(&mut self) {
         // 1. Update Mappable Interrupts (MAP_INT0, MAP_INT1)
         let map_int0 = (self.map_stat & self.map_mask0) != 0;
@@ -1152,6 +1240,10 @@ impl IocState {
 
         // Level 4: Bus Error -> IP6
         let ip6 = self.err_stat != 0;
+
+        crate::pf_bits!(IOC_PF_LINES, crate::perfetto::events::IOC_LINES,
+            self.l0_stat as u32 | (self.l1_stat as u32) << 8 | (self.map_stat as u32) << 16
+            | (ip2 as u32 | (ip3 as u32) << 1 | (ip4 as u32) << 2 | (ip5 as u32) << 3 | (ip6 as u32) << 4) << 24);
 
         // 3. Signal CPU
         // Safety: interrupts points into the CPU executor's MipsCore, which
@@ -1197,6 +1289,7 @@ impl Resettable for Ioc {
         state.l1_stat = 0;
         state.l1_mask = 0;
         state.map_stat = 0;
+        for t in state.ticks.iter_mut() { t.pending_since = None; }
         state.map_mask0 = 0;
         state.map_mask1 = 0;
         state.map_pol = 0;
@@ -1268,6 +1361,57 @@ impl Saveable for Ioc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Timer 1 feeds the status bar's Hz, timer 0 does not; a tick landing on
+    /// a pending one is merged; TMR_CLR on a set bit is an acknowledgement and
+    /// on a clear bit is not.
+    #[test]
+    fn timer_ticks_count_fast_clock_and_acknowledgements() {
+        let ioc = Ioc::new_ci(false);
+        let hz = Arc::new(AtomicU64::new(0));
+        ioc.set_clock_ticks(hz.clone());
+        let cb = |source| IocTimerCallback { state: ioc.state.clone(), source, ticks: ioc.clock_ticks.clone() };
+        let (t0, t1) = (cb(IocInterrupt::Mappable0), cb(IocInterrupt::Mappable1));
+
+        t0.callback();
+        t1.callback();
+        t1.callback(); // lands on the pending one
+        assert_eq!(hz.load(Ordering::Relaxed), 2, "only timer 1 counts toward Hz");
+
+        let mut s = ioc.state.lock();
+        s.clear_timers(0x2);
+        s.clear_timers(0x2); // already clear: not an acknowledgement
+        assert_eq!((s.ticks[1].fired, s.ticks[1].merged, s.ticks[1].acked), (2, 1, 1));
+        assert_eq!(s.ticks[1].lat_hist.iter().sum::<u64>(), 1);
+        assert_eq!((s.ticks[0].fired, s.ticks[0].acked), (1, 0));
+        s.clear_timers(0x1);
+        assert_eq!(s.ticks[0].acked, 1);
+        assert_eq!(s.map_stat & 0x3, 0);
+    }
+
+    /// `ioc ticks` reports the window and starts a new one.
+    #[test]
+    fn ioc_ticks_reports_and_resets_the_window() {
+        #[derive(Clone)]
+        struct Buf(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let ioc = Ioc::new_ci(false);
+        {
+            let mut s = ioc.state.lock();
+            s.ticks[1].fire();
+            s.map_stat |= 0x2;
+            s.clear_timers(0x2);
+        }
+        let out = Buf(Arc::new(parking_lot::Mutex::new(Vec::new())));
+        ioc.execute_command("ioc", &["ticks"], Box::new(out.clone())).unwrap();
+        let text = String::from_utf8(out.0.lock().clone()).unwrap();
+        assert!(text.contains("fast clock") && text.contains("fired 1 ") && text.contains("acked 1 "), "{text}");
+        let s = ioc.state.lock();
+        assert_eq!((s.ticks[1].fired, s.ticks[1].acked), (0, 0), "a new window starts empty");
+    }
 
     /// Phase 1.7 round-trip: a fresh IOC loaded from a captured save_state must
     /// re-serialize byte-identically. Catches load_state forgetting any of the

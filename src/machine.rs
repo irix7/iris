@@ -30,10 +30,8 @@ const IP28_COUNT_HZ: u64 = 97_500_000;
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::cpu::mips_exec::{MipsExecutor, MipsCpu, MipsCpuConfig, MipsCpuDebugAdapter};
 use crate::gdb_stub::CpuDebug;
-use crate::cpu::mips_cache_v2::{CpuModel as CacheCpuModel, MipsCache};
-#[cfg(feature = "accurate-cache")]
-use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
-use crate::cpu::mips_cache_shadow::{R4400ShadowCache, R5000ShadowCache, R10000ShadowCache};
+use crate::cpu::mips_cache_v2::{MipsCache, R4400Cache, R5000Cache};
+use crate::cpu::mips_cache_shadow::{R10000ShadowCache, R4400ShadowCache, R5000ShadowCache};
 use crate::dev::hpc3::Hpc3;
 use crate::dev::ioc::{Ioc, GioSlot, GIO_SLOT_MAP, profile_idx};
 use crate::monitor::Monitor;
@@ -42,35 +40,6 @@ use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRe
 use crate::state_desc::{value_signature, value_field_list};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks, put_words_as_chunks_selective};
 use crate::hptimer::TimerManager;
-
-/// Which cache model `Machine::new` selects for a CPU.
-///
-/// The `build_cpu!` match further down names these same types; this function is
-/// the one place the *choice* lives, so it can be asserted in a unit test
-/// without building a `Machine` (the process is allowed only one).
-///
-/// Default: every CPU runs the observation-only shadow. Under the opt-in
-/// `accurate-cache` feature (#35) the R4400 and R5000 run the functional
-/// `mips_cache_v2` model instead; the R10000 keeps its shadow — it has no
-/// functional data path and is out of scope for the feature.
-pub(crate) fn selected_cache_model(cpu: crate::config::CpuModel) -> &'static str {
-    #[cfg(feature = "accurate-cache")]
-    {
-        match cpu {
-            crate::config::CpuModel::R4400 => <R4400Cache as CacheCpuModel>::CACHE_MODEL,
-            crate::config::CpuModel::R5000 => <R5000Cache as CacheCpuModel>::CACHE_MODEL,
-            crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
-        }
-    }
-    #[cfg(not(feature = "accurate-cache"))]
-    {
-        match cpu {
-            crate::config::CpuModel::R4400 => <R4400ShadowCache as CacheCpuModel>::CACHE_MODEL,
-            crate::config::CpuModel::R5000 => <R5000ShadowCache as CacheCpuModel>::CACHE_MODEL,
-            crate::config::CpuModel::R10000 => <R10000ShadowCache as CacheCpuModel>::CACHE_MODEL,
-        }
-    }
-}
 
 pub fn emulator_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -787,6 +756,7 @@ impl Machine {
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
+                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
                 ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
@@ -803,6 +773,7 @@ impl Machine {
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
             let ioc_clone = ioc.clone();
             r.set_vblank_callback(Arc::new(move |active| {
+                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
                 ioc_clone.set_interrupt(wiring.retrace, active);
             }));
             let ioc_ff = ioc.clone();
@@ -837,6 +808,7 @@ impl Machine {
                 // EXTIO SG_STAT_0 is the board's vertical status level (low in
                 // blank); the PROM and the kernel retrace handler poll it.
                 g.set_retrace_callback(Arc::new(move |vblank| {
+                    if vblank { crate::pf_instant!(crate::perfetto::events::GR2_VBLANK); }
                     if vblank { ioc_r.set_interrupt(line, true); }
                     if !guinness { ioc_r.set_ext_io_level(crate::dev::ioc::ext_io_regs::SG_STAT_0, !vblank); }
                 }));
@@ -1002,12 +974,6 @@ impl Machine {
         //    arm below monomorphises its own CPU — no per-model branch on the hot path.
         let sysad: Arc<dyn BusDevice> = phys.clone();
         macro_rules! build_cpu { ($cache:ty) => {{
-        debug_assert_eq!(
-            <$cache as CacheCpuModel>::CACHE_MODEL,
-            selected_cache_model(cfg_cpu_model),
-            "the CPU selector and the cache-model choice disagree for {:?}",
-            cfg_cpu_model,
-        );
         let cfg = MipsCpuConfig::for_model::<$cache>();
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut executor: MipsExecutor<MipsTlb, $cache> = MipsExecutor::new(sysad.clone(), tlb, &cfg);
@@ -1054,24 +1020,14 @@ impl Machine {
         Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
 
-        // Default: every CPU runs the observation-only shadow cache — out of
-        // the data path entirely, with tag and data arrays that exist only to
-        // answer CACHE ops and the PROM's diagnostics. See mips_cache_shadow.rs.
-        // Under the opt-in `accurate-cache` feature (#35) the R4400 and R5000
-        // run the functional `mips_cache_v2` model instead, which raises VCE.
-        #[cfg(feature = "accurate-cache")]
+        let shadow = cfg.machine.cache.is_shadow(cfg_cpu_model);
         let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
+            // R4400/R5000: the functional caches, or the shadow ones that
+            // keep only what CACHE instructions observe — see CacheModel.
+            crate::config::CpuModel::R4400 if shadow => build_cpu!(R4400ShadowCache),
+            crate::config::CpuModel::R5000 if shadow => build_cpu!(R5000ShadowCache),
             crate::config::CpuModel::R4400 => build_cpu!(R4400Cache),
             crate::config::CpuModel::R5000 => build_cpu!(R5000Cache),
-            crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
-        };
-        #[cfg(not(feature = "accurate-cache"))]
-        let cpu: Arc<dyn crate::cpu::mips_exec::CpuDevice> = match cfg_cpu_model {
-            crate::config::CpuModel::R4400 => build_cpu!(R4400ShadowCache),
-            crate::config::CpuModel::R5000 => build_cpu!(R5000ShadowCache),
-            // IP28 uses the shadow cache: out of the data path entirely, with
-            // tag and data arrays that exist only to answer CACHE ops and the
-            // PROM's diagnostics. See mips_cache_shadow.rs.
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
         };
 
@@ -1104,15 +1060,20 @@ impl Machine {
                 let phys_ptr = Arc::as_ptr(&phys) as *mut Physical;
                 (*phys_ptr).resync_ppmem_bitmap();
             }
-            // tcache: the cache reads RAM straight out of the same window.
-            // Must come after set_bitmap_sink, so it captures the CPU's inline
-            // field rather than the sink the space just abandoned.
-            #[cfg(feature = "tcache")]
+            // The cache reads RAM straight out of the same window: the full
+            // cache under tcache, the shadow cache always. A cache that does
+            // not (the full cache without tcache) has no bitmap field and
+            // returns null. Must come after set_bitmap_sink, so it captures
+            // the CPU's inline field rather than the sink the space just
+            // abandoned.
             if let Some(sp) = phys.ppmem_space() {
                 unsafe { cpu.set_tcache_window(sp.window_base()) };
                 // The cache keeps the bitmap inline; ppmem publishes into it
                 // directly on every remap, so the hot path needs no indirection.
-                unsafe { sp.set_bitmap_sink2(cpu.tcache_bitmap_ptr()) };
+                let bitmap = cpu.tcache_bitmap_ptr();
+                if !bitmap.is_null() {
+                    unsafe { sp.set_bitmap_sink2(bitmap) };
+                }
                 // Window writes bypass BusDevice, so the cache needs the gen
                 // window to bump page counters itself — otherwise jitv2 keeps
                 // running compiled code for pages the guest has modified.
@@ -1203,6 +1164,11 @@ impl Machine {
         if let Some(mgras) = &phys.mgras { monitor.register_device(mgras.clone()); }
         if let Some(u64) = &phys.ultra64 { monitor.register_device(u64.clone()); }
         monitor.register_device(Arc::new(phys.vino.clone()));
+        #[cfg(feature = "perfetto")]
+        {
+            crate::perfetto::set_guest_cycles(Some(cpu.cycles_ptr()));
+            monitor.register_device(Arc::new(crate::perfetto::PerfettoMonitor));
+        }
         monitor.register_device(crate::perf_monitor::PerfMonitor::new(
             cpu.running_flag(),
             cpu.cycles_ptr(),
@@ -1221,6 +1187,7 @@ impl Machine {
             hpc3.register_locks();
             if let Some(rex3) = &phys.rex3 { rex3.register_locks(); }
             if let Some(rex3) = &phys.rex3_head1 { rex3.register_locks(); }
+            if let Some(mgras) = &phys.mgras { mgras.register_locks(); }
             cpu.register_locks();
         }
         {
@@ -2154,6 +2121,7 @@ impl Machine {
         // The CPU is a runtime choice now, so it is state the restore must match.
         manifest.cpu_model = Some(self.cpu.model_name().to_string());
         manifest.state = schemas;
+        manifest.cpu_cache = Some(self.cpu.cache_kind().to_string());
         snap.write_manifest(&manifest).map_err(|e| e.to_string())?;
         let sv = manifest.schema_version;
 
@@ -2382,6 +2350,8 @@ impl Machine {
                     // no longer a build flag, so a mismatch is as fatal as a feature one.
                     if let Some(e) = crate::snapshot::cpu_model_mismatch(
                         m.cpu_model.as_deref(), self.cpu.model_name()) { fatal.push(e); }
+                    if let Some(e) = crate::snapshot::cache_model_mismatch(
+                        m.cpu_cache.as_deref(), m.cpu_model.as_deref(), self.cpu.cache_kind()) { fatal.push(e); }
                     // Every recorded disk must still be configured at the same SCSI
                     // id with the same size. The host *path* is only where the file
                     // happens to live (it moves when disks are relocated, e.g. into a
@@ -2575,6 +2545,9 @@ impl Drop for Machine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = std::ptr::null_mut();
         }
+        // The guest clock points into this Machine's CPU core.
+        #[cfg(feature = "perfetto")]
+        crate::perfetto::set_guest_cycles(None);
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();
@@ -2688,21 +2661,20 @@ mod controller_lifetime_tests {
     use super::*;
 
     /// Issue #34/#35: the CPU selector picks the observation-only shadow by
-    /// default and the functional cache under `accurate-cache`, for the R4400
-    /// and R5000. The R10000 keeps its shadow either way. Geometry is asserted
-    /// against the functional models in `mips_cache_shadow`'s own tests.
+    /// default and the functional cache with `[machine] cache = "full"`, for
+    /// the R4400 and R5000. The R10000 keeps its shadow either way. Geometry
+    /// is asserted against the functional models in `mips_cache_shadow`'s own
+    /// tests.
     #[test]
-    fn the_cpu_selector_matches_the_cache_feature() {
-        use crate::config::CpuModel;
+    fn cache_model_selects_the_shadow_or_full_cpu() {
+        use crate::config::{CacheModel, CpuModel};
 
-        #[cfg(feature = "accurate-cache")]
-        let (r4400, r5000) = ("functional", "functional");
-        #[cfg(not(feature = "accurate-cache"))]
-        let (r4400, r5000) = ("shadow", "shadow");
-
-        assert_eq!(selected_cache_model(CpuModel::R4400), r4400);
-        assert_eq!(selected_cache_model(CpuModel::R5000), r5000);
-        assert_eq!(selected_cache_model(CpuModel::R10000), "shadow");
+        assert!(CacheModel::Shadow.is_shadow(CpuModel::R4400));
+        assert!(CacheModel::Shadow.is_shadow(CpuModel::R5000));
+        assert!(!CacheModel::Full.is_shadow(CpuModel::R4400));
+        assert!(!CacheModel::Full.is_shadow(CpuModel::R5000));
+        assert!(CacheModel::Full.is_shadow(CpuModel::R10000));
+        assert_eq!(CacheModel::Auto.is_shadow(CpuModel::R4400), cfg!(feature = "jitv2"));
     }
 
     fn build_machine() -> Box<Machine> {

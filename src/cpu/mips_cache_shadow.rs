@@ -33,11 +33,10 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use crate::cpu::mips_cache_v2::{
-    cache_op_name, CpuModel, FetchInstrResult, MipsCache, C_ILT, C_IST, C_R10K_CBARRIER,
-    C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
+    cache_op_name, model, r4k_load_taglo, r4k_store_taglo, CpuModel, FetchInstrResult, MipsCache,
+    C_ILT, C_IST, C_R10K_CBARRIER, C_R10K_ILD, C_R10K_ISD, CACH_PD, CACH_PI, CACH_SD, CACH_SI,
 };
-use crate::cpu::mips_exec::{DecodedInstr, FLAG_NOT_DECODED};
-use crate::traits::{BusDevice, BusRead64};
+use crate::traits::{BusDevice, BusRead64, BUS_OK};
 use crate::devlog::{LogModule, CACHE_LOG_HIT, CACHE_LOG_OP, devlog_is_active, devlog_mask};
 
 /// Shadow tag and data arrays for one cache.
@@ -86,8 +85,9 @@ impl Shadow {
 /// nothing, because the way that is read is never the way that was written.
 const MRU_BIT: u64 = 1 << 63;
 
-/// Ways per set, as CACHE index operations address them. Bit 0 of the index
-/// selects the way on an R10000; the set starts above the line offset.
+/// R10000 only: ways per set, as CACHE index operations address them. Bit 0
+/// of the index selects the way; the set starts above the line offset. The
+/// R4400 and R5000 index differently — see `tag_slot`.
 const WAYS: usize = 2;
 
 /// Bits a secondary-cache tag retains.
@@ -122,6 +122,10 @@ fn l2_op_log(bit: u32) -> bool {
 ///
 /// Const parameters carry the geometry that software can read back, and the
 /// processor identity. Nothing here affects the speed of a load.
+///
+/// `MODEL` is `mips_cache_v2::model`, as for `CpuCache`, and decides
+/// everything shape cannot: how a CACHE index op picks its line and way, what
+/// a tag keeps, and the R10000's MRU bit, data arrays and op encodings.
 pub struct ShadowCache<
     const IC_SIZE: usize,
     const IC_LINE: usize,
@@ -133,13 +137,11 @@ pub struct ShadowCache<
     const PRID: u32,
     const FIR: u32,
     const TLB_ENTRIES: usize,
-    const R10K_OPS: bool,
+    const MODEL: u8,
 > {
     downstream: Arc<dyn BusDevice>,
     llbit: UnsafeCell<bool>,
     lladdr: UnsafeCell<u32>,
-    /// Somewhere to decode into. Not a cache line — there is no caching.
-    fetch_scratch: UnsafeCell<DecodedInstr>,
     /// CP0 ECC on the way in to a store, and on the way out of a load.
     ecc_in: UnsafeCell<u32>,
     ecc_out: UnsafeCell<u32>,
@@ -151,12 +153,13 @@ pub struct ShadowCache<
     /// reads nothing through them — `read`/`write` go to `downstream`, whose
     /// ppmem path uses the same window — they are here only so jitv2's inline
     /// tcache path can serve this model too (`jit_dc_geometry`).
-    #[cfg(feature = "tcache")]
     tc_base: UnsafeCell<*mut u8>,
-    #[cfg(feature = "tcache")]
     tc_bitmap: UnsafeCell<u64>,
     #[cfg(feature = "jitv2")]
     tc_gen: UnsafeCell<*mut std::sync::atomic::AtomicU64>,
+    /// Decoded instructions, by physical page. Never touches the shadow
+    /// arrays above — see `decode_cache`.
+    decode: UnsafeCell<crate::cpu::decode_cache::DecodeCache>,
 }
 
 // Safety: the CPU thread is the only accessor, as for every other cache model
@@ -164,26 +167,28 @@ pub struct ShadowCache<
 unsafe impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > Send
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
 }
 unsafe impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > Sync
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
 }
 
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
-    > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
+    > ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
+    const R10K: bool = MODEL == model::R10000;
+    const R5K: bool = MODEL == model::R5000;
     const IC_LINES: usize = if IC_LINE == 0 { 0 } else { IC_SIZE / IC_LINE };
     const DC_LINES: usize = if DC_LINE == 0 { 0 } else { DC_SIZE / DC_LINE };
     const L2_LINES: usize = if L2_LINE == 0 { 0 } else { L2_SIZE / L2_LINE };
@@ -193,20 +198,45 @@ impl<
             downstream,
             llbit: UnsafeCell::new(false),
             lladdr: UnsafeCell::new(0),
-            fetch_scratch: UnsafeCell::new(DecodedInstr::default()),
             ecc_in: UnsafeCell::new(0),
             ecc_out: UnsafeCell::new(0),
             ic: UnsafeCell::new(Shadow::new(Self::IC_LINES, 0)),
             dc: UnsafeCell::new(Shadow::new(Self::DC_LINES, 0)),
-            // Only the secondary keeps a data shadow: it is the one a PROM
-            // walks with Index_Store_Data, and a 1 MB array is cheap once.
-            l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, L2_SIZE / 8)),
-            #[cfg(feature = "tcache")]
+            // Only the R10000 secondary keeps a data shadow: it is the one
+            // the IP28 PROM walks with Index_Store_Data, and a 1 MB array is
+            // cheap once. The R4000 family has no index data ops.
+            l2: UnsafeCell::new(Shadow::new(Self::L2_LINES, if Self::R10K { L2_SIZE / 8 } else { 0 })),
             tc_base: UnsafeCell::new(std::ptr::null_mut()),
-            #[cfg(feature = "tcache")]
             tc_bitmap: UnsafeCell::new(0),
             #[cfg(feature = "jitv2")]
             tc_gen: UnsafeCell::new(std::ptr::null_mut()),
+            decode: UnsafeCell::new(crate::cpu::decode_cache::DecodeCache::new()),
+        }
+    }
+
+    /// ppmem's window base if `phys` is RAM the window maps, as the region
+    /// bitmap says; `None` for the PROM, MMIO and the low-512KB alias, which go
+    /// through the bus. The bitmap stays zero until the window is wired, so a
+    /// set bit also means the base is valid.
+    #[inline(always)]
+    fn ram(&self, phys: u64) -> Option<*mut u8> {
+        if unsafe { *self.tc_bitmap.get() } & (1u64 << (phys >> crate::ppmem::BITMAP_SHIFT)) != 0 {
+            Some(unsafe { *self.tc_base.get() })
+        } else {
+            None
+        }
+    }
+
+    /// A window store skips `BusDevice`, so it bumps the page's jitv2
+    /// generation counter itself, as `PpMemory`'s writes do.
+    #[inline(always)]
+    fn bump_gen(&self, _phys: u64) {
+        #[cfg(feature = "jitv2")]
+        {
+            let g = unsafe { *self.tc_gen.get() };
+            if !g.is_null() {
+                unsafe { (*g.add((_phys >> 12) as usize)).fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
+            }
         }
     }
 
@@ -232,6 +262,10 @@ impl<
     /// line granularity — made the two ways of a set alias onto one slot, so
     /// a tag written to way 1 overwrote way 0 and the PROM read back the
     /// wrong one. That is the whole of the "TAG walking 1s" failure.
+    ///
+    /// That is the R10000. The R4400 is direct-mapped throughout: the index
+    /// is the set. The R5000's 2-way primaries take the way from VA[14], above
+    /// the 16 KB a way spans (VR5000 UM 3.4), as `CpuCache` does.
     fn tag_slot(&self, sel: u32, virt_addr: u64) -> usize {
         let (line, lines) = match sel {
             CACH_PI => (IC_LINE, Self::IC_LINES),
@@ -240,6 +274,14 @@ impl<
         };
         if line == 0 || lines == 0 {
             return 0;
+        }
+        if !Self::R10K {
+            let va = virt_addr as usize;
+            if Self::R5K && matches!(sel, CACH_PI | CACH_PD) {
+                let sets = lines / 2;
+                return ((va >> 14) & 1) * sets + (va / line) % sets;
+            }
+            return (va / line) % lines;
         }
         let way = (virt_addr as usize) & (WAYS - 1);
         let set = ((virt_addr as usize) / line) % (lines / WAYS).max(1);
@@ -264,9 +306,9 @@ impl<
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > From<Arc<dyn BusDevice>>
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     fn from(downstream: Arc<dyn BusDevice>) -> Self {
         Self::new(downstream)
@@ -276,38 +318,37 @@ impl<
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > CpuModel
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     const MIPS4: bool = MIPS4;
     const PRID: u32 = PRID;
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     // The R10000 implements 44 virtual address bits where the R4x00 implements
-    // 40; key this off the same flag that selects its cache encodings rather
-    // than asserting it unconditionally.
-    const VA_BITS: u32 = if R10K_OPS { 44 } else { 40 };
-    // Snapshot identity. It must be distinct per CPU even though all three now
-    // share this type: a single "shadow" would let an R5000 restore accept an
-    // R4400 snapshot, because `cpu_model_mismatch` compares this string alone.
-    // The R10000 shadow keeps the historical "shadow" so existing IP28
-    // snapshots still load.
-    const NAME: &'static str = match PRID {
-        0x0000_0440 => "R4400",
-        0x0000_2321 => "R5000",
+    // 40; the shadow cache is only used for it, but key this off the same flag
+    // that selects its cache encodings rather than asserting it unconditionally.
+    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
+    // The CPU's name, which snapshots check: the same as the full model's, so
+    // a mismatch reads as a cache-kind difference rather than a different CPU.
+    // The R10000 keeps its historical "shadow", which existing IP28
+    // snapshots carry.
+    const NAME: &'static str = match MODEL {
+        model::R4400 => "R4400",
+        model::R5000 => "R5000",
         _ => "shadow",
     };
-    const R10K_CACHE_OPS: bool = R10K_OPS;
-    const CACHE_MODEL: &'static str = "shadow";
+    const CACHE_KIND: &'static str = "shadow";
+    const R10K_CACHE_OPS: bool = MODEL == model::R10000;
 }
 
 impl<
         const IC_SIZE: usize, const IC_LINE: usize, const DC_SIZE: usize, const DC_LINE: usize,
         const L2_SIZE: usize, const L2_LINE: usize, const MIPS4: bool, const PRID: u32,
-        const FIR: u32, const TLB_ENTRIES: usize, const R10K_OPS: bool,
+        const FIR: u32, const TLB_ENTRIES: usize, const MODEL: u8,
     > MipsCache
-    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, R10K_OPS>
+    for ShadowCache<IC_SIZE, IC_LINE, DC_SIZE, DC_LINE, L2_SIZE, L2_LINE, MIPS4, PRID, FIR, TLB_ENTRIES, MODEL>
 {
     const IC_SIZE: usize = IC_SIZE;
     const IC_LINE: usize = IC_LINE;
@@ -318,15 +359,14 @@ impl<
     const L2_SIZE: usize = L2_SIZE;
     const L2_LINE: usize = L2_LINE;
 
-    #[cfg(feature = "tcache")]
+    // ppmem's window, in every build: memory is this cache's only store, and
+    // reading RAM through the window is one host load instead of a bus call.
     unsafe fn set_tcache_window(&self, base: *mut u8) {
         unsafe { *self.tc_base.get() = base };
     }
 
-    #[cfg(feature = "tcache")]
     fn tcache_bitmap_ptr(&self) -> *mut u64 { self.tc_bitmap.get() }
 
-    #[cfg(feature = "tcache")]
     fn tcache_base_ptr(&self) -> *mut u8 { unsafe { *self.tc_base.get() } }
 
     #[cfg(feature = "jitv2")]
@@ -353,15 +393,18 @@ impl<
         crate::cpu::mips_cache_v2::JitDcGeometry::unsupported()
     }
 
+    #[inline(always)]
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
-        let r = self.downstream.read32(phys_addr as u32);
-        if r.is_ok() {
-            let slot = unsafe { &mut *self.fetch_scratch.get() };
-            slot.flags = FLAG_NOT_DECODED;
-            slot.raw = r.data;
-            FetchInstrResult::hit(slot as *const DecodedInstr)
-        } else {
-            FetchInstrResult::exception(r.status)
+        // Decoded instructions by physical page — see `decode_cache`.
+        let dc = unsafe { &mut *self.decode.get() };
+        let word = |a: u32| {
+            let r = self.downstream.read32(a);
+            if r.is_ok() { Ok(r.data) } else { Err(r.status) }
+        };
+        let (window, bitmap) = unsafe { (*self.tc_base.get() as *const u8, *self.tc_bitmap.get()) };
+        match dc.fetch(phys_addr, window, bitmap, IC_LINE, word) {
+            Ok(p) => FetchInstrResult::hit(p),
+            Err(status) => FetchInstrResult::exception(status),
         }
     }
 
@@ -369,6 +412,24 @@ impl<
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        // RAM: one load out of ppmem's window. Its layout is u32 words in
+        // native order — byte at `off ^ 3`, halfword at `(off >> 1) ^ 1`,
+        // u64 as rotate_left(32) — the same as CpuCache::tc_read.
+        if let Some(base) = self.ram(phys_addr) {
+            let off = phys_addr as usize;
+            let data = unsafe {
+                if SIZE == 8 {
+                    (*(base.add(off) as *const u64)).rotate_left(32)
+                } else if SIZE == 4 {
+                    *(base.add(off) as *const u32) as u64
+                } else if SIZE == 2 {
+                    *((base as *const u16).add((off >> 1) ^ 1)) as u64
+                } else {
+                    *base.add(off ^ 3) as u64
+                }
+            };
+            return BusRead64::ok(data);
+        }
         let a = phys_addr as u32;
         if SIZE == 1 {
             let r = self.downstream.read8(a);
@@ -388,6 +449,22 @@ impl<
         const {
             assert!(SIZE == 1 || SIZE == 2 || SIZE == 4 || SIZE == 8, "invalid memory access SIZE")
         };
+        if let Some(base) = self.ram(phys_addr) {
+            let off = phys_addr as usize;
+            unsafe {
+                if SIZE == 8 {
+                    *(base.add(off) as *mut u64) = val.rotate_left(32);
+                } else if SIZE == 4 {
+                    *(base.add(off) as *mut u32) = val as u32;
+                } else if SIZE == 2 {
+                    *((base as *mut u16).add((off >> 1) ^ 1)) = val as u16;
+                } else {
+                    *base.add(off ^ 3) = val as u8;
+                }
+            }
+            self.bump_gen(phys_addr);
+            return BUS_OK;
+        }
         let a = phys_addr as u32;
         if SIZE == 1 {
             self.downstream.write8(a, val as u8)
@@ -401,6 +478,15 @@ impl<
     }
 
     fn write64_masked(&self, _virt_addr: u64, phys_addr: u64, val: u64, mask: u64) -> u32 {
+        if let Some(base) = self.ram(phys_addr) {
+            let p = unsafe { base.add((phys_addr & !7) as usize) as *mut u64 };
+            unsafe {
+                let cur = (*p).rotate_left(32);
+                *p = ((cur & !mask) | (val & mask)).rotate_left(32);
+            }
+            self.bump_gen(phys_addr);
+            return BUS_OK;
+        }
         let aligned = (phys_addr & !7) as u32;
         let r = self.downstream.read64(aligned);
         if !r.is_ok() {
@@ -426,6 +512,22 @@ impl<
             crate::dlog!(LogModule::L2c,
                 "shadow: {:<22} raw={cache_op:#04x} va={virt_addr:#018x} arg={phys_addr:#018x}",
                 cache_op_name(cache_op));
+        }
+
+        // R4400/R5000: a tag keeps only its fields, and reads back with
+        // generated check bits — exactly what the full model returns.
+        if !Self::R10K && matches!(op, C_IST | C_ILT) {
+            let lines = match sel { CACH_PI => Self::IC_LINES, CACH_PD => Self::DC_LINES, _ => Self::L2_LINES };
+            if lines == 0 {
+                return 0; // no secondary on the R5000
+            }
+            let idx = self.tag_slot(sel, virt_addr);
+            let s = self.shadow(sel);
+            if op == C_IST {
+                s.tags[idx] = r4k_store_taglo(Self::R5K, sel, phys_addr as u32) as u64;
+                return 0;
+            }
+            return r4k_load_taglo(Self::R5K, sel, s.tags[idx] as u32) as u64;
         }
 
         match op {
@@ -471,8 +573,8 @@ impl<
             }
 
             // R10000 reassigns 5/6/7, scoped to particular cache selects.
-            C_R10K_CBARRIER if R10K_OPS && sel == CACH_PI => 0,
-            C_R10K_ILD if R10K_OPS && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
+            C_R10K_CBARRIER if Self::R10K && sel == CACH_PI => 0,
+            C_R10K_ILD if Self::R10K && matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
                 if s.data.is_empty() {
@@ -486,7 +588,7 @@ impl<
                     s.data[slot]
                 }
             }
-            C_R10K_ISD if R10K_OPS && matches!(sel, CACH_SI | CACH_SD) => {
+            C_R10K_ISD if Self::R10K && matches!(sel, CACH_SI | CACH_SD) => {
                 let s = self.shadow(sel);
                 let slot = self.data_slot(s.data.len(), virt_addr);
                 if !s.data.is_empty() {
@@ -504,6 +606,24 @@ impl<
             // no-ops: there is nothing held that could be stale or dirty.
             _ => 0,
         }
+    }
+
+    /// Power-on: tags read back invalid, and nothing decoded survives — RAM
+    /// may be reloaded without a write counter moving.
+    fn power_on(&self) {
+        for sel in [CACH_PI, CACH_PD, CACH_SD] {
+            let s = self.shadow(sel);
+            s.tags.fill(0);
+            s.mru.fill(false);
+        }
+        unsafe { (*self.decode.get()).flush() };
+    }
+
+    /// A restore replaces RAM wholesale; drop every decoded instruction. The
+    /// shadow arrays are not snapshotted (nothing reads them but diagnostics).
+    fn load_cache_state(&self, _v: &toml::Value) -> Result<(), String> {
+        unsafe { (*self.decode.get()).flush() };
+        Ok(())
     }
 
     fn get_config(&self, cache_target: u32) -> (usize, usize) {
@@ -553,26 +673,19 @@ impl<
 /// Nothing of the microarchitecture: no ways, no LRU, no out-of-order.
 /// Reports revision 2.5, matching R10000Cache and enabling the IP28 boot tune.
 pub type R10000ShadowCache =
-    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, true>;
+    ShadowCache<32768, 64, 32768, 32, 1048576, 128, true, 0x0000_0925, 0x0000_0900, 64, { model::R10000 }>;
 
-/// SGI Indy IP24 R4400 (IP22's CPU too).
-///
-/// Geometry identical to `R4400Cache` — 16 KB direct-mapped L1s with 16-byte
-/// lines, an inclusive 1 MB secondary with 128-byte lines — so CP0 Config and
-/// a PROM's cache sizing are unchanged. The functional model's L2 owns the
-/// decoded-instruction slots; the shadow holds none, so instruction fetch goes
-/// straight to memory.
+/// SGI Indy / Indigo2 R4400: the full model's geometry and identity — 16 KB
+/// direct-mapped primaries with 16-byte lines, a 1 MB secondary with 128-byte
+/// lines, PRId/FIR, 48 TLB entries, MIPS III — so CP0 Config and a PROM's
+/// cache sizing see the same part. `shadow_matches_the_full_models` pins it.
 pub type R4400ShadowCache =
-    ShadowCache<16384, 16, 16384, 16, 1048576, 128, false, 0x0000_0440, 0x0000_0500, 48, false>;
+    ShadowCache<16384, 16, 16384, 16, 1048576, 128, false, 0x0000_0440, 0x0000_0500, 48, { model::R4400 }>;
 
-/// SGI Indy IP24 R5000.
-///
-/// Geometry identical to `R5000Cache` — 2-way 32 KB L1s with 32-byte lines and
-/// no secondary cache. The functional R5000 keeps its decoded instructions in
-/// L1I; the shadow bypasses the data path entirely, which also sidesteps the
-/// L1I model's coherence bugs.
+/// SGI Indy R5000: 2-way 32 KB primaries with 32-byte lines, no secondary,
+/// MIPS IV, the full model's PRId/FIR and TLB.
 pub type R5000ShadowCache =
-    ShadowCache<32768, 32, 32768, 32, 0, 128, true, 0x0000_2321, 0x0000_2300, 48, false>;
+    ShadowCache<32768, 32, 32768, 32, 0, 128, true, 0x0000_2321, 0x0000_2300, 48, { model::R5000 }>;
 
 #[cfg(test)]
 mod tests {
@@ -760,40 +873,52 @@ mod tests {
         assert_eq!(c.get_config(CACH_SD), (1048576, 128));
     }
 
-    /// The R4400 and R5000 shadows are the same type with new geometry, and
-    /// the geometry the guest reads back — through `MipsCache`'s consts and
-    /// `get_config`, which is what CP0 Config and the cache cpu-tests size from
-    /// — must be exactly what the functional models reported.
+    /// The R4400 and R5000 shadows stand in for the full models, so everything
+    /// software can read — CP0 Config geometry, PRId/FIR, ISA level, TLB size,
+    /// the name snapshots check — must be the full model's.
     #[test]
-    fn r4400_and_r5000_shadows_report_the_functional_geometry() {
+    fn shadow_matches_the_full_models() {
         use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
-
-        fn same<S: MipsCache, F: MipsCache>() {
-            assert_eq!(S::IC_SIZE, F::IC_SIZE, "I-cache size");
-            assert_eq!(S::IC_LINE, F::IC_LINE, "I-cache line");
-            assert_eq!(S::DC_SIZE, F::DC_SIZE, "D-cache size");
-            assert_eq!(S::DC_LINE, F::DC_LINE, "D-cache line");
-            assert_eq!(S::L2_SIZE, F::L2_SIZE, "secondary size");
-            assert_eq!(S::L2_LINE, F::L2_LINE, "secondary line");
+        fn same<S: CpuModel, F: CpuModel>() {
+            assert_eq!((S::IC_SIZE, S::IC_LINE, S::DC_SIZE, S::DC_LINE, S::L2_SIZE, S::L2_LINE),
+                       (F::IC_SIZE, F::IC_LINE, F::DC_SIZE, F::DC_LINE, F::L2_SIZE, F::L2_LINE), "geometry");
+            assert_eq!((S::PRID, S::FIR, S::MIPS4, S::TLB_ENTRIES, S::VA_BITS, S::R10K_CACHE_OPS),
+                       (F::PRID, F::FIR, F::MIPS4, F::TLB_ENTRIES, F::VA_BITS, F::R10K_CACHE_OPS), "identity");
+            assert_eq!(S::NAME, F::NAME, "snapshot name");
+            assert_eq!((S::CACHE_KIND, F::CACHE_KIND), ("shadow", "full"));
         }
         same::<R4400ShadowCache, R4400Cache>();
         same::<R5000ShadowCache, R5000Cache>();
+        assert_eq!(<R10000ShadowCache as CpuModel>::NAME, "shadow", "existing IP28 snapshots");
+    }
 
-        // Identity the guest and the restore guard read: PRId/FIR, ISA level,
-        // TLB size, and the cache-model marker the selector is asserted on.
-        fn same_model<S: CpuModel, F: CpuModel>() {
-            assert_eq!(S::PRID, F::PRID, "PRId");
-            assert_eq!(S::FIR, F::FIR, "FIR");
-            assert_eq!(S::MIPS4, F::MIPS4, "ISA level");
-            assert_eq!(S::TLB_ENTRIES, F::TLB_ENTRIES, "TLB entries");
+    /// Index_Store_Tag then Index_Load_Tag returns exactly what the full model
+    /// returns, for random TagLo words at random indexes: the shadow must not
+    /// be observably different to a PROM, IDE or IRIX reading tags. Both
+    /// caches start with every tag invalid, so a store followed by a load is
+    /// the whole of what software can see.
+    #[test]
+    fn tags_read_back_as_the_full_model_does() {
+        use crate::cpu::mips_cache_v2::{R4400Cache, R5000Cache};
+        fn check<S: MipsCache + From<Arc<dyn BusDevice>>, F: MipsCache + From<Arc<dyn BusDevice>>>(
+            name: &str, sels: &[u32]) {
+            let mem = || -> Arc<dyn BusDevice> { Arc::new(Memory::new(1)) };
+            let (shadow, full) = (S::from(mem()), F::from(mem()));
+            let mut x = 0x9e37_79b9_7f4a_7c15u64;
+            for _ in 0..20_000 {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                let sel = sels[(x >> 60) as usize % sels.len()];
+                let index = 0x8000_0000 | (x >> 20 & 0xF_FFF8);
+                let taglo = x as u32 as u64;
+                shadow.cache_op(C_IST | sel, index, taglo);
+                full.cache_op(C_IST | sel, index, taglo);
+                let probe = 0x8000_0000 | (x >> 40 & 0xF_FFF8);
+                assert_eq!(shadow.cache_op(C_ILT | sel, probe, probe), full.cache_op(C_ILT | sel, probe, probe),
+                           "{name}: sel {sel} TagLo {taglo:#x} stored at {index:#x}, loaded at {probe:#x}");
+            }
         }
-        same_model::<R4400ShadowCache, R4400Cache>();
-        same_model::<R5000ShadowCache, R5000Cache>();
-
-        assert_eq!(<R4400ShadowCache as CpuModel>::CACHE_MODEL, "shadow");
-        assert_eq!(<R5000ShadowCache as CpuModel>::CACHE_MODEL, "shadow");
-        assert!(!<R4400ShadowCache as CpuModel>::R10K_CACHE_OPS);
-        assert!(!<R5000ShadowCache as CpuModel>::R10K_CACHE_OPS);
+        check::<R4400ShadowCache, R4400Cache>("R4400", &[CACH_PI, CACH_PD, CACH_SD]);
+        check::<R5000ShadowCache, R5000Cache>("R5000", &[CACH_PI, CACH_PD]);
     }
 
     /// Under tcache the JIT serves this model through the window alone, and

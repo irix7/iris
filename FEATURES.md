@@ -17,10 +17,12 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | Feature | Purpose | Enables |
 |---|---|---|
 | `debug_cache` | Track a selected cache line through cache operations. | — |
-| `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | — |
+| `developer` | Undo/trace buffers and developer monitor tools; CPU starts paused. | `gputrace` |
+| `gputrace` | REX3 bus taps: annotated trace (`rex trace`) and replayable recording (`rex rec`); see [rules/rex3/trace-and-recording.md](rules/rex3/trace-and-recording.md). GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). Off: no per-access check at all. Lightning-compatible. | — |
 | `developer_ip7` | CP0 Compare/timer calibration statistics and debug prints. | — |
 | `developerx` | Extended exception diagnostics; break on IBE/DBE/ADEL/ADES/TLB errors. | — |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible. | — |
+| `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
 | `ci_clock` | Retired no-op. The synthetic, cycle-derived Count clock it gated is now the default. | — |
@@ -40,6 +42,8 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gr2-jit` | Cranelift compiler for GR2 (XZ / Extreme) RE3 span pipelines (SHADED / FLAT shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
+| `gpujit` | Every graphics JIT; the recommended build. Hosts that forbid JIT code (the Mac App Store sandbox) set `IRIS_NO_JIT` at run time. | `rex-jit`, `gr4-jit`, `gr2-jit` |
 | `jitv2` | Experimental whole-page MIPS compiler; implies transparent caching. | `tcache`, `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `target-lexicon`, `region`, `wasmtime-jit-icache-coherence` |
 | `jitv2_opcodefusion` | Optional JIT fusion, off by default after live delay-slot failures. | `jitv2` |
 | `j2wp` | Compatibility alias for `jitv2`; no separate compiler mode. | `jitv2` |
@@ -47,24 +51,24 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `jitv2_smc_check` | Report writes to the executing code page; disable inline memory to observe all stores. | `jitv2` |
 | `pcap` | Raw Ethernet bridge backend; needs host capture library/driver and capture permissions. | `dep:pcap` |
 | `hostcall` | Private user-mode guest syscall services 3000–3009; IRIX handles other calls. | `dep:iris-hostcall` |
-| `hostgl` | Guest replacement-libGL command replay; macOS CGL backend only. | `hostcall`, `dep:iris-hostgl` |
+| `hostgl` | Guest replacement-libGL command replay; macOS (CGL) and Linux (EGL) backends. | `hostcall`, `dep:iris-hostgl` |
 
 Cargo also exposes these **implicit optional-dependency features**:
 `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native`, `region`, `target-lexicon`, `wasmtime-jit-icache-coherence`. They enable library dependencies,
-not complete emulator capabilities; use `jitv2` or `rex-jit` for a working
+not complete emulator capabilities; use `jitv2` or `gpujit` for a working
 compiler configuration. `dep:` entries above suppress implicit feature names
 for PCAP/host-service dependencies.
 
 ### iris-gui
 
 Source: [iris-gui/Cargo.toml](iris-gui/Cargo.toml). There is no GUI-specific
-default feature bundle. Its `iris` dependency always enables `rex-jit` and
-retains the core default features. GUI `--no-default-features` alone does not
+default feature bundle. Its `iris` dependency always enables `gpujit` (the
+App Store build turns the JITs off at run time with `IRIS_NO_JIT`) and retains the core default features. GUI `--no-default-features` alone does not
 turn off those dependency defaults.
 
 | GUI feature | Purpose | Enables |
 |---|---|---|
-| `bundled` | Distribution UI: hides TOML import/export; named machines remain in gui.json. | — |
+| `bundled` | Distribution UI: hides source-checkout tools; machine TOML storage is shared by all builds. | — |
 | `appstore` | Mac App Store UI, sandbox bookmarks, private-API patch, CHD diff redirection, and REX3 JIT disabled at startup; hides CI/Ultra64 controls. | `bundled` |
 | `pcap` | Expose PCAP NIC selection and bridge support in the embedded core. | `iris/pcap` |
 | `premiere` | Performance bundle for the embedded core; lightning plus idle parking. | `iris/lightning`, `iris/idle-pause` |
@@ -118,11 +122,11 @@ separate from the runtime environment inventory below.
 ## Shared machine configuration inventory
 
 Source: [src/config.rs](src/config.rs), `MachineConfig` and nested structs.
-The CLI reads `iris.toml` (or `--config FILE`); iris-gui stores the same schema
-inside its named machines in `<config dir>/iris/gui.json`. TOML import/export
-is available in GUI source builds. Relative core paths resolve from the process
-working directory; the GUI anchors its default battery-backed paths in its
-user config directory.
+The CLI reads `iris.toml` (or `--config FILE`); iris-gui reads and saves the same
+TOML schema in `<config dir>/iris/machines/<name>/<name>.toml`. `gui.json` holds
+GUI preferences. The GUI uses the selected machine folder as the working
+directory, stores config paths as relative paths, and defaults to `disks/` for
+disk images and `nvram.bin`/`nveeprom.bin` for private battery-backed state.
 
 Defaults below are **core schema/runtime defaults**, not this checkout's
 sample iris.toml or the GUI New Machine dialog. GUI IP28 creation selects
@@ -235,8 +239,9 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. |
-| `audio.cpal_buffer_frames` | `host default when unset` | Requested host cpal buffer size in frames. |
+| `audio.host` | `"default"` | Host audio system: `"default"` (CoreAudio on macOS, WASAPI on Windows, ALSA on Linux), `"alsa"`, or `"pulseaudio"` (Linux: a PulseAudio server or PipeWire's pipewire-pulse, through cpal's own client; ALSA if none answers). `--audio-host` overrides. |
+| `audio.prebuf_ms` | `20` | HAL2 prebuffer duration in milliseconds. Not used yet: HAL2 prebuffers 20 ms. |
+| `audio.cpal_buffer_frames` | `host default when unset` | Host buffer size in frames (a period; PulseAudio buffers two). Unset: the host's default, except PulseAudio's (about 2 s), which gets 512. A size the device refuses falls back to the default. |
 
 ### [jitv2]
 
@@ -336,6 +341,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--2x` | 2× window scaling for HiDPI/4K monitors |
 | `--headless` | Run headless: no window, no REX3 graphics (audio unaffected; use --noaudio to disable) |
 | `--noaudio` | Disable audio emulation (no HAL2); graphics still works |
+| `--audio-host <HOST>` | Host audio system for HAL2: `default`, `alsa` or `pulseaudio` (overrides `[audio] host`) |
 | `--nfs-dir` | Enable NFS share: path to the directory to export (enables NFS) |
 | `--nat-subnet` | NAT subnet in CIDR notation (e.g. 192.168.5.0/24). Gateway gets .1, guest (IRIX) gets .2. Default: 192.168.0.0/24. |
 | `--net-mode` | Networking backend: "nat" (default, software gateway) or "pcap" (bridge onto a real host interface; requires --features pcap). |
@@ -352,6 +358,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--test-device-dump` | Where the test device writes its machine-state dump. |
 | `--cheritest-dump-hook` | cheritest convention: a guest write to CP0 register 26 dumps machine state. Needs --test-device. Never enable for a normal boot — CP0 26 is ECC on a real R4400 and the PROM writes it during cache init. |
 | `--tftp-dir` | Serve this directory read-only over TFTP at the gateway address, so the PROM can network-boot from it: `boot -f bootp()<file>`. Off when unset. |
+| `--perfetto FILE` | Record a Perfetto trace from startup (`perfetto` builds). `--perfetto-cats LIST` (default `all`) and `--perfetto-clock host\|guest` (default `host`) select what and on which timeline. See [docs/perfetto.md](docs/perfetto.md). |
 | `--load-elf` | Load a static ELF32 MSB (big-endian MIPS) binary into RAM before the CPU starts and set PC to its entry point, instead of booting the PROM. For bare-metal test binaries; see also the monitor's `loadelf`. |
 | `--ci` | CI mode: enable the control socket and apply speed-favoring fidelity shortcuts. Hides the window unless --ci-display is set; offscreen graphics remain active unless --headless is explicitly set. |
 | `--ci-socket` | Override the default control-socket path (/tmp/iris.sock). |
@@ -375,17 +382,16 @@ not Cargo build features.
 ## iris-gui persisted settings inventory
 
 Source: [iris-gui/src/settings.rs](iris-gui/src/settings.rs). These keys belong
-to GUI JSON rather than iris.toml. View controls update the scales; the GUI
-writes machine configs and sandbox access state for you.
+to GUI JSON rather than machine TOML files. View controls update the scales;
+the GUI saves machine TOMLs and sandbox access state for you.
 
 | GUI JSON key | Normal load default | Purpose |
 |---|---|---|
 | `ui_scale` | `1.25` | egui controls scale; sanitized to supported range. |
 | `vm_scale` | `0.75` | Maximum framebuffer magnification, independent of UI scale. |
-| `machines` | empty map | Named shared MachineConfig objects. |
-| `active_machine` | unset | Selected key in machines. |
-| `recent_configs` | empty list | Recent TOML imports. |
-| `last_config` | unset | Legacy one-shot TOML migration source. |
+| `active_machine` | unset | Selected machine folder name. |
+| `recent_configs` | empty list | Legacy recent TOML paths; retained for compatibility. |
+| `last_config` | unset | Legacy TOML migration source; cleared after conversion. |
 | `bookmarks` | empty map | macOS sandbox security-scoped bookmarks by absolute path. |
 | `disk_folders` | empty list | Granted recursive sandbox disk-folder access. |
 
@@ -419,6 +425,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_GUI_GL` | 1 selects the GUI GL capture path. | [iris-gui/src/framebuffer.rs](iris-gui/src/framebuffer.rs) |
 | `IRIS_HAL2_CAPTURE` | HAL2 host audio capture output path. | [src/dev/hal2.rs](src/dev/hal2.rs) |
 | `IRIS_HOSTGL_CALLS` | Substring filter for HostGL call logging (bounded log). | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
+| `IRIS_HOSTGL_INLINE` | 1 runs the HostGL service on the CPU thread instead of its own (for comparison; the CPU stalls while a buffer replays). | [iris-hostgl/src/lib.rs](iris-hostgl/src/lib.rs) |
 | `IRIS_HOSTGL_NOSURFACE` | 1 disables CGL IOSurface presentation. | [iris-hostgl/src/backend/cgl.rs](iris-hostgl/src/backend/cgl.rs) |
 | `IRIS_HOSTGL_QOS` | default disables HostGL thread QoS adjustment. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
 | `IRIS_HOSTGL_STRINGS` | host passes through host GL strings instead of compatibility strings. | [iris-hostgl/src/service.rs](iris-hostgl/src/service.rs) |
@@ -438,12 +445,14 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_JIT_PIC` | Any presence disables core-address constants for JIT code. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
-| `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
+| `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
 | `IRIS_NO_FETCH_VERIFY` | 1 suppresses fetchverify checks in a fetchverify build. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_NO_IDLE` | Any presence disables idle parking. | [src/cpu/idle_park.rs](src/cpu/idle_park.rs) |
 | `IRIS_NO_INLINE_MEM` | Any presence disables JIT inline memory emission. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
-| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
+| `IRIS_NO_JIT` | Any presence disables the REX3 shader JIT and the IMPACT raster JIT; does not select the MIPS engine. | [src/dev/ng1/rex3.rs](src/dev/ng1/rex3.rs) |
 | `IRIS_OPT_SPEED` | Presence selects speed optimization in offline PCP/corpus measurements. | [src/bin/jitv2_pcp_dump.rs](src/bin/jitv2_pcp_dump.rs) |
 | `IRIS_PRINT_OFFSETS` | Presence runs the opt-in layout-offset print test. | [src/cpu/jitv2/mod.rs](src/cpu/jitv2/mod.rs) |
 | `IRIS_QOS` | HostGL QoS: default/off disables promotion; quiet suppresses logging. | [iris-hostgl/src/qos.rs](iris-hostgl/src/qos.rs) |
@@ -453,7 +462,7 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_SOCKET` | iris-ci default socket override (Unix path or TCP address). | [src/iris_ci_main.rs](src/iris_ci_main.rs) |
 | `MGRAS_REPLAY` | Replay input path for opt-in IMPACT golden tests. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_REPLAY_OUT` | Optional IMPACT replay image output path. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
-| `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector. | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
+| `MGRAS_REPLAY_TRACE` | IMPACT replay tracing selector (`gputrace` builds). | [src/dev/mgras/record.rs](src/dev/mgras/record.rs) |
 | `MGRAS_SIZE_PROBE` | Input for the opt-in IMPACT size/probe test. | [src/dev/mgras/mgras_tests.rs](src/dev/mgras/mgras_tests.rs) |
 
 `RUST_LOG` configures the host Rust logger; `IRIS_DEBUG_LOG` configures device
@@ -471,10 +480,10 @@ both crates; these examples and implementation notes explain the tradeoffs.
 
 Build variants:
 ```
-cargo run --release --features lightning,rex-jit     # recommended for best speed
+cargo run --release --features lightning,gpujit      # recommended for best speed
 cargo run --release --features lightning             # disable emulator breakpoints for a little bit more speed
-cargo run --release --features rex-jit               # enable REX3 graphics JIT compiler
-cargo run --release --features jitv2,rex-jit         # MIPS JIT v2 (experimental; see "JIT compilers")
+cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit + gr2-jit)
+cargo run --release --features jitv2,gpujit          # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
 cargo run --release --features accurate-cache        # functional R4400/R5000 cache that raises VCE (slower; default is the observation-only shadow)
 cargo run --release --features ci_clock              # no-op: the cycle-derived CP0 Count clock is the default now
@@ -500,7 +509,9 @@ both the interpreter and jitv2.
 | `developer_ip7` | CP0 Compare / timer delivery stats and debug prints |
 | `developerx` | Break into the monitor on IBE/DBE/ADEL/ADES/TLB errors |
 | `rexdiag` | REX3 per-GO activity bits and dispatch counters. **On by default**; drop with `--no-default-features` to measure their cost |
+| `gputrace` | REX3 annotated trace (`rex trace`) and replayable bus recording (`rex rec`); GR2 and IMPACT annotated traces (`gr2 trace`, `mgras trace`). On with `developer`; opt in for plain and `lightning` builds |
 | `llstats` | Per-address LL/SC reservation histogram (`ll stats`); lightning-compatible |
+| `perfetto` | Record Perfetto traces for ui.perfetto.dev: per-thread event rings, a writer thread, host or guest timeline. See [docs/perfetto.md](docs/perfetto.md) |
 | `fetchverify` | Check every executed instruction word against memory (stale-code detector); lightning-compatible |
 | `opcodefusion` | Interpreter branch+NOP, LUI+ORI/ADDIU and address-calc+load/store fusion. Breakpoints on a fused second instruction never fire |
 | `tlbstats` / `tlbcheck` | TLB translation counters / full JTLB consistency check after every TLB write |
@@ -512,7 +523,7 @@ both the interpreter and jitv2.
 | `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
 | `j2wp` | Compatibility alias for `jitv2`; whole-page compilation is the only implementation |
-| `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has a macOS CGL backend |
+| `hostcall` / `hostgl` | Private host-service syscalls / host OpenGL for IRIX programs; `hostgl` has macOS (CGL) and Linux (EGL) backends |
 | `debug_cache` | Track one cache line across all operations |
 | `tlbvmap` | Vestigial; the vmap TLB fast path is always on |
 | `r5ksc`, `r5ksc_triton` | Refuse to build: no working R5000 secondary-cache model yet (`rules/testing/r5k-l1i-cache-bugs.md`) |
@@ -581,7 +592,7 @@ JIT v2 section for tuning. (The original speculative, tiered MIPS JIT was
 removed in August 2026; jitv2 replaces it.)
 
 ```
-cargo run --release --features jitv2,rex-jit
+cargo run --release --features jitv2,gpujit
 ```
 
 What it does today: compiles on a pool of background threads (`[jitv2]
@@ -684,6 +695,32 @@ triangles 2.5x.
 - `mgras jit [on|off|sync|list]` in the monitor shows and changes it.
 - `GR4_JIT_DISASM=1` prints each shader's machine code as it compiles.
 
+### GR2 span JIT (`--features gr2-jit`)
+
+`gr2-jit` compiles GR2's RE3 span pipelines (`src/dev/gr2/re3_jit`), on the
+pattern of `gr4-jit`. On GR2 the HQ2/GE7 side walks primitives and RE3 draws
+spans, so the unit is an RE3 instruction: SHADED (every iterator steps per
+pixel, with depth, stencil and blending) and FLAT / FLAT4. The state that
+shapes a span's pipeline reduces to a key: the instruction, frame-buffer
+pixel format and dither, raster op, pattern mode, window-ID test, depth and
+stencil tests and blend factors. Masks, scissor, colours and steps, stencil
+references and pattern bits are read from the RE3 registers as the shader
+starts. Row spans (DX = 1, DY = 0, what GL fills send) and FLAT spans are
+clipped to the scissor once, not per pixel.
+
+Shaders compile on a background thread; until a span's shader is ready the
+interpreter draws it. They are bit-exact with the interpreter:
+`src/dev/gr2/re3_jit_tests.rs` sweeps the keys and compares whole boards
+(`GR2_JIT_SWEEP=<factor>`, `GR2_JIT_SEED=<n>`). Fills run about 3x faster
+(a 24-bit quad fill went from 78 to 245 Mpx/s in IRIX, Z-buffered from 58
+to 115), smooth shading 2-3x. Small triangles gain nothing: the HQ2 side
+(edge walking and span setup) bounds them, not RE3.
+
+- `IRIS_GR2_JIT=off|on|sync` sets the starting mode. `sync` compiles on
+  first use and waits.
+- `gr2 jit [on|off|sync|list]` in the monitor shows and changes it.
+- `GR2_JIT_DISASM=1` prints each shader's machine code as it compiles.
+
 ```
-cargo run --release --features lightning,rex-jit,gr4-jit
+cargo run --release --features lightning,gpujit   # = lightning,rex-jit,gr4-jit,gr2-jit
 ```

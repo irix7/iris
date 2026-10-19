@@ -25,7 +25,7 @@ fn setup(r: &mut Re3) {
 
 fn flat(r: &mut Re3, x: u32, y: u32, n: u32, ci: u32) {
     r.write_reg(REG_R, ci << 11);
-    r.write_reg(REG_X, (x));
+    r.write_reg(REG_X, x);
     r.write_reg(REG_Y, y);
     r.write_reg(REG_NUMPIX, n);
     r.write_reg(REG_IR, IR_FLAT);
@@ -51,8 +51,8 @@ fn flat_span_draws_numpix_pixels() {
 fn scissor_clips_span() {
     let mut r = bare_re3();
     setup(&mut r);
-    r.write_reg(REG_XMIN, (10));
-    r.write_reg(REG_XMAX, (12));
+    r.write_reg(REG_XMIN, 10);
+    r.write_reg(REG_XMAX, 12);
     flat(&mut r, 5, 0, 20, 1);
     let drawn: Vec<usize> = (0..30).filter(|&x| px(&r, x, 0) != 0).collect();
     assert_eq!(drawn, vec![10, 11, 12]);
@@ -117,7 +117,7 @@ fn wid_test_rejects_other_windows() {
 fn shaded_span_steps_colour() {
     let mut r = bare_re3();
     setup(&mut r);
-    r.write_reg(REG_X, (0));
+    r.write_reg(REG_X, 0);
     r.write_reg(REG_Y, 0);
     r.write_reg(REG_DX, 1 << 14);
     r.write_reg(REG_R, 10 << 11);
@@ -149,7 +149,7 @@ fn copy_rect_handles_overlap_both_ways() {
 fn writebuf_then_readbuf_stream() {
     let mut r = bare_re3();
     setup(&mut r);
-    r.write_reg(REG_X, (4));
+    r.write_reg(REG_X, 4);
     r.write_reg(REG_Y, 3);
     r.write_reg(REG_DX, 1 << 14);
     r.write_reg(REG_NUMPIX, 3);
@@ -160,7 +160,7 @@ fn writebuf_then_readbuf_stream() {
     assert_eq!((px(&r, 4, 3), px(&r, 5, 3), px(&r, 6, 3)), (0x11, 0x22, 0x33));
     assert_eq!(r.ctx.stream, STREAM_IDLE);
 
-    r.write_reg(REG_X, (4));
+    r.write_reg(REG_X, 4);
     r.write_reg(REG_NUMPIX, 3);
     r.write_reg(REG_IR, IR_READBUF);
     let mut got = vec![];
@@ -174,12 +174,14 @@ fn writebuf_then_readbuf_stream() {
 
 // ── Through the bus: CPU register window -> RE3 FIFO -> RE3 thread ─────────
 
-pub(super) fn live_gr2(variant: Gr2Variant) -> &'static Gr2 {
+/// A started board, stopped and freed when the test ends. Bind it with
+/// `let g = &live_gr2(..);` so helpers taking `&Gr2` coerce.
+pub(super) fn live_gr2(variant: Gr2Variant) -> crate::test_board::TestBoard<Gr2> {
     let g = Gr2::new(variant, Gr2Stats {
         heartbeat: Arc::new(AtomicU64::new(0)),
         fasttick: Arc::new(AtomicU64::new(0)),
     });
-    let g: &'static Gr2 = Box::leak(Box::new(g));
+    let g = crate::test_board::TestBoard::new(g);
     g.start();
     g
 }
@@ -206,10 +208,10 @@ fn re3_reg(reg: usize) -> u32 {
 
 #[test]
 fn cpu_register_window_draws_and_reads_back() {
-    let g = live_gr2(Gr2Variant::Xz);
+    let g = &live_gr2(Gr2Variant::Xz);
     w32(g, re3_reg(REG_FUNC), ROP_COPY);
     w32(g, re3_reg(REG_PIXMASK), 0xffffff);
-    w32(g, re3_reg(REG_XMAX), (1279));
+    w32(g, re3_reg(REG_XMAX), 1279);
     w32(g, re3_reg(REG_YMAX), 1023);
     w32(g, re3_reg(REG_R), 0x5 << 11);
     w32(g, re3_reg(REG_YX), (20 << 12) | (30));

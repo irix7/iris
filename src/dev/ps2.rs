@@ -30,6 +30,7 @@ enum CommandState {
     SetTypematic,
     MouseData,  // consuming one data byte for a mouse command (e.g. F3 sample rate, E8 resolution)
     AuxLoop,    // 0xD3: next data-port byte is echoed back as an AUX (mouse-source) byte
+    SetKeyMode(u8), // set-3 per-key typematic/break mode
 }
 
 struct Ps2State {
@@ -47,6 +48,9 @@ struct Ps2State {
     mouse_id: u8,
     // Last two sample rates written, to detect knock sequences
     sample_rate_history: [u8; 2],
+    /// Set-3 key modes: bit 0 permits typematic makes, bit 1 permits breaks.
+    key_modes: [u8; 256],
+    held_keys: [bool; 256],
 }
 
 /// Combined PS/2 Keyboard and Mouse Controller
@@ -76,6 +80,8 @@ impl Ps2Controller {
                 last_read: 0xAA, // pretend we finished BAT at startup
                 mouse_id: 0,
                 sample_rate_history: [0, 0],
+                key_modes: [3; 256],
+                held_keys: [false; 256],
             }),
             callback,
             running: AtomicBool::new(false),
@@ -204,6 +210,18 @@ impl Ps2Controller {
                 }
             }
         } else {
+            // Set-3 per-key mode commands accept scan codes until the next
+            // command. IRIX exempts Caps Lock and Num Lock from typematic.
+            if let CommandState::SetKeyMode(mode) = state.command_state {
+                if val < 0xED {
+                    state.key_modes[val as usize] = mode;
+                    state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
+                    drop(state);
+                    self.update_interrupt();
+                    return;
+                }
+                state.command_state = CommandState::Idle;
+            }
             match state.command_state {
                 CommandState::Idle => match val {
                     0xFF => {
@@ -211,6 +229,8 @@ impl Ps2Controller {
                         state.rx_queue.clear(); state.mouse_queue_bytes = 0;
                         state.led_state = 0;
                         state.scancode_set = 2;
+                        state.key_modes = [3; 256];
+                        state.held_keys = [false; 256];
                         state.scanning_enabled = false; // reset leaves scanning disabled; PROM enables via F4
                         state.command_state = CommandState::Idle;
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard)); // ACK
@@ -236,7 +256,7 @@ impl Ps2Controller {
                         state.scanning_enabled = false;
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
                     }
-                    0x14 => {
+                    0xF3 | 0x14 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Set Typematic Rate/Delay <- {:02x}", val); }
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
                         state.command_state = CommandState::SetTypematic;
@@ -253,19 +273,23 @@ impl Ps2Controller {
                     }
                     0xF6 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Reset to Defaults <- {:02x}", val); }
+                        state.key_modes = [3; 256];
+                        state.held_keys = [false; 256];
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
                     }
-                    0xFC => {
-                        if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Reset and Disable <- {:02x}", val); }
-                        state.scanning_enabled = false;
+                    0xF7..=0xFA => {
+                        let mode = match val { 0xF7 => 1, 0xF8 => 2, 0xF9 => 0, _ => 3 };
+                        state.key_modes.fill(mode);
+                        state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
+                    }
+                    0xFB..=0xFD => {
+                        let mode = match val { 0xFB => 1, 0xFC => 2, _ => 0 };
+                        state.command_state = CommandState::SetKeyMode(mode);
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
                     }
                     0x76 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard Reset to Defaults <- {:02x}", val); }
                         state.rx_queue.push_back((0xFA, Ps2Source::Keyboard));
-                    }
-                    0xFA => {
-                        // ACK echoed back by PROM — ignore silently
                     }
                     _ => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Keyboard unsupported <- {:02x}", val); }
@@ -307,6 +331,7 @@ impl Ps2Controller {
                     state.command_state = CommandState::Idle;
                 }
                 CommandState::AuxLoop => unreachable!("handled earlier in write_data"),
+                CommandState::SetKeyMode(_) => unreachable!("handled before keyboard commands"),
             }
         }
         drop(state);
@@ -471,6 +496,15 @@ impl Ps2Controller {
             3 => {
                 if let Some(scancode) = self.map_keycode_set3(key) {
                     let val = scancode as u8;
+                    let mode = state.key_modes[val as usize];
+                    let held = state.held_keys[val as usize];
+                    state.held_keys[val as usize] = pressed;
+                    // The host supplies typematic makes. X disables them
+                    // with F8 and manages repeat itself, including keys
+                    // whose repeat applications disable during a drag.
+                    if (pressed && held && mode & 1 == 0) || (!pressed && mode & 2 == 0) {
+                        return;
+                    }
                     if !pressed {
                         state.rx_queue.push_back((0xF0, Ps2Source::Keyboard));
                         if crate::devlog::devlog_is_active(LogModule::Ps2) {
@@ -948,7 +982,7 @@ impl Device for Ps2Controller {
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
-        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
+        vec![("ps2".to_string(), "PS/2 commands: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn Write + Send>) -> Result<(), String> {
@@ -984,14 +1018,55 @@ impl Device for Ps2Controller {
                 writeln!(writer, "PS/2: pressed Enter").unwrap();
                 return Ok(());
             }
+            // Esc during "Starting up the system..." stops the PROM's autoboot.
+            if !args.is_empty() && args[0] == "esc" {
+                self.push_kb(KeyCode::Escape, true);
+                self.push_kb(KeyCode::Escape, false);
+                writeln!(writer, "PS/2: pressed Esc").unwrap();
+                return Ok(());
+            }
+            // Hold a modifier across other input: programs that read the
+            // modifier's state when they handle a key (IRIS GL getbutton)
+            // miss the quick press / release `type` sends around a capital.
+            if !args.is_empty() && args[0] == "key" {
+                let key = match args.get(1).copied() {
+                    Some("shift") => KeyCode::ShiftLeft,
+                    Some("ctrl") => KeyCode::ControlLeft,
+                    Some("alt") => KeyCode::AltLeft,
+                    _ => return Err("Usage: ps2 key <shift|ctrl|alt> <down|up>".to_string()),
+                };
+                let down = match args.get(2).copied() {
+                    Some("down") => true,
+                    Some("up") => false,
+                    _ => return Err("Usage: ps2 key <shift|ctrl|alt> <down|up>".to_string()),
+                };
+                self.push_kb(key, down);
+                writeln!(writer, "PS/2: {} {}", args[1], if down { "down" } else { "up" }).unwrap();
+                return Ok(());
+            }
             if !args.is_empty() && args[0] == "mouse" {
                 let n = |i: usize| args.get(i).and_then(|v| v.parse::<i32>().ok());
                 let (Some(dx), Some(dy)) = (n(1), n(2)) else {
                     return Err("Usage: ps2 mouse <dx> <dy> [buttons: 1 left, 2 right, 4 middle]".to_string());
                 };
                 let buttons = n(3).unwrap_or(0) as u8;
-                self.push_mouse_input(buttons, dx, dy, 0);
-                writeln!(writer, "PS/2: mouse {} {} buttons {}", dx, dy, buttons).unwrap();
+                // A PS/2 packet carries at most 9-bit deltas, and the guest
+                // accelerates fast motion: send the move as packets of at
+                // most MOUSE_STEP mickeys an axis, one a millisecond (a hand
+                // moving fast, well under 100 mickeys / ms), the last one
+                // with what is left so the path stays straight.
+                const MOUSE_STEP: i32 = 50;
+                let steps = ((dx.abs().max(dy.abs()) + MOUSE_STEP - 1) / MOUSE_STEP).max(1);
+                let (mut sent_x, mut sent_y) = (0, 0);
+                for i in 1..=steps {
+                    let (tx, ty) = (dx * i / steps, dy * i / steps);
+                    self.push_mouse_input(buttons, tx - sent_x, ty - sent_y, 0);
+                    (sent_x, sent_y) = (tx, ty);
+                    if i < steps {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                writeln!(writer, "PS/2: mouse {} {} buttons {} ({} packets)", dx, dy, buttons, steps).unwrap();
                 return Ok(());
             }
             if !args.is_empty() && args[0] == "status" {
@@ -1002,7 +1077,7 @@ impl Device for Ps2Controller {
                     s.mouse_queue_bytes, s.scancode_set, s.config, s.last_read).unwrap();
                 return Ok(());
             }
-            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
+            return Err("Usage: ps2 debug <on|off> | ps2 type <ascii> | ps2 enter | ps2 esc | ps2 key <shift|ctrl|alt> <down|up> | ps2 mouse <dx> <dy> [buttons] | ps2 status".to_string());
         }
         Err("Command not found".to_string())
     }
@@ -1059,6 +1134,8 @@ impl Resettable for Ps2Controller {
         state.last_read = 0xAA;
         state.mouse_id = 0;
         state.sample_rate_history = [0, 0];
+        state.key_modes = [3; 256];
+        state.held_keys = [false; 256];
     }
 }
 
@@ -1066,7 +1143,23 @@ impl Saveable for Ps2Controller {
     fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
         use crate::state_desc::{FieldKind, StateDesc};
         Some(
-            StateDesc::new("ps2", 1)
+            StateDesc::new("ps2", 2)
+                // Version 2 adds the set-3 per-key modes and held-key state.
+                // A version-1 payload predates them, so restore the reset
+                // defaults; every key was typematic-and-break before.
+                .migrate(1, |v| {
+                    let mut t = v
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| "ps2: state is not a table".to_string())?;
+                    t.insert("key_mode".into(), hex_u8(3));
+                    t.insert("key_modes".into(), toml::Value::Array(vec![hex_u8(3); 256]));
+                    t.insert(
+                        "held_keys".into(),
+                        toml::Value::Array(vec![toml::Value::Boolean(false); 256]),
+                    );
+                    Ok(toml::Value::Table(t))
+                })
                 .field(
                     "rx_queue",
                     FieldKind::Array,
@@ -1148,19 +1241,87 @@ impl Saveable for Ps2Controller {
                             CommandState::SetTypematic => 4,
                             CommandState::MouseData => 5,
                             CommandState::AuxLoop => 6,
+                            CommandState::SetKeyMode(_) => 7,
                         };
                         t.insert("command_state".into(), toml::Value::Integer(cmd_state));
                     },
                     |v| {
-                        self.state.lock().command_state = match v.as_integer().unwrap_or(0) {
+                        let mut state = self.state.lock();
+                        state.command_state = match v.as_integer().unwrap_or(0) {
                             1 => CommandState::SetLeds,
                             2 => CommandState::SetScancodeSet,
                             3 => CommandState::WriteConfig,
                             4 => CommandState::SetTypematic,
                             5 => CommandState::MouseData,
                             6 => CommandState::AuxLoop,
+                            7 => CommandState::SetKeyMode(3), // mode patched from key_mode
                             _ => CommandState::Idle,
                         };
+                        Ok(())
+                    },
+                )
+                .field(
+                    "key_mode",
+                    FieldKind::U8,
+                    2,
+                    |t| {
+                        let mode = match self.state.lock().command_state {
+                            CommandState::SetKeyMode(mode) => mode,
+                            _ => 3,
+                        };
+                        t.insert("key_mode".into(), hex_u8(mode));
+                    },
+                    |v| {
+                        let mut state = self.state.lock();
+                        if let CommandState::SetKeyMode(_) = state.command_state {
+                            state.command_state = CommandState::SetKeyMode(toml_u8(v).unwrap_or(3) & 3);
+                        }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "key_modes",
+                    FieldKind::U8Array,
+                    2,
+                    |t| {
+                        let state = self.state.lock();
+                        t.insert(
+                            "key_modes".into(),
+                            toml::Value::Array(state.key_modes.iter().map(|v| hex_u8(*v)).collect()),
+                        );
+                    },
+                    |v| {
+                        let mut state = self.state.lock();
+                        state.key_modes = [3; 256];
+                        if let Some(arr) = v.as_array() {
+                            for (dst, src) in state.key_modes.iter_mut().zip(arr) {
+                                *dst = toml_u8(src).unwrap_or(3) & 3;
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .field(
+                    "held_keys",
+                    FieldKind::Array,
+                    2,
+                    |t| {
+                        let state = self.state.lock();
+                        t.insert(
+                            "held_keys".into(),
+                            toml::Value::Array(
+                                state.held_keys.iter().map(|v| toml::Value::Boolean(*v)).collect(),
+                            ),
+                        );
+                    },
+                    |v| {
+                        let mut state = self.state.lock();
+                        state.held_keys = [false; 256];
+                        if let Some(arr) = v.as_array() {
+                            for (dst, src) in state.held_keys.iter_mut().zip(arr) {
+                                *dst = toml_bool(src).unwrap_or(false);
+                            }
+                        }
                         Ok(())
                     },
                 )
@@ -1229,6 +1390,51 @@ impl Saveable for Ps2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set3_make_break_suppresses_host_repeat_and_preserves_release() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        for b in [0xF0, 3, 0xF4, 0xF8] {
+            ps2.write_data(b);
+            assert_eq!(ps2.read_data(), 0xFA);
+        }
+        let scan = ps2.map_keycode_set3(KeyCode::Space).unwrap() as u8;
+        ps2.push_kb(KeyCode::Space, true);
+        for _ in 0..10 { ps2.push_kb(KeyCode::Space, true); }
+        ps2.push_kb(KeyCode::Space, false);
+        assert_eq!(ps2.state.lock().rx_queue.len(), 3);
+        assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [scan, 0xF0, scan]);
+        ps2.push_kb(KeyCode::Space, true);
+        assert_eq!(ps2.read_data(), scan, "press again after release");
+    }
+
+    #[test]
+    fn set3_per_key_modes_and_snapshot_preserve_console_repeat() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        let space = ps2.map_keycode_set3(KeyCode::Space).unwrap() as u8;
+        for b in [0xF0, 3, 0xFA, 0xFC, space, 0xF4] {
+            ps2.write_data(b);
+            assert_eq!(ps2.read_data(), 0xFA);
+        }
+        ps2.push_kb(KeyCode::Space, true);
+        let saved = ps2.save_state();
+        let dst = Ps2Controller::new(None);
+        dst.start();
+        dst.load_state(&saved).unwrap();
+        assert_eq!(saved, dst.save_state());
+        dst.push_kb(KeyCode::Space, true);
+        dst.push_kb(KeyCode::Space, false);
+        assert_eq!(dst.state.lock().rx_queue.len(), 3, "a key in make/break mode does not repeat");
+        assert!(dst.state.lock().scanning_enabled, "FC sets a key mode; it does not disable scanning");
+        while dst.read_status() & 1 != 0 { dst.read_data(); }
+        let a = dst.map_keycode_set3(KeyCode::KeyA).unwrap() as u8;
+        dst.push_kb(KeyCode::KeyA, true);
+        dst.push_kb(KeyCode::KeyA, true);
+        dst.push_kb(KeyCode::KeyA, false);
+        assert_eq!([dst.read_data(), dst.read_data(), dst.read_data(), dst.read_data()], [a, a, 0xF0, a], "console typematic remains enabled");
+    }
 
     /// Phase 1.7 round-trip: a fresh PS/2 controller loaded from a captured
     /// save_state must re-serialize byte-identically. Mutates rx_queue,

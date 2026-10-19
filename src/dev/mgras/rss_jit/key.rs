@@ -20,6 +20,9 @@
 
 use std::fmt;
 
+/// Packed blend states: off, or 15 x 15 factors x 5 equations.
+const BLEND_RADIX: u64 = 1 + 15 * 15 * 5;
+
 /// The primitive whose pixel loop the shader runs.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -66,9 +69,11 @@ impl Draw {
 }
 
 /// How a 36-bit buffer write treats the value (PP1 pixel type): kept as is,
-/// replicated as 4/4/4 (`Rgb12`: type 0, 12-bit), merged under the
-/// RGBA8888 plane masks (`Rgba8`: type 2), or under the 12-bit colour-index
-/// mask (`Ci12`: type 6).
+/// merged under the RGBA8888 plane masks (`Rgba8`: type 2), under the
+/// 12-bit colour-index mask (`Ci12`: type 6), or as a pixel pair
+/// (`rss::Pair`: type 0 4:4:4 `Rgb12..`, type 1 5:5:5 `Rgb15..`) whose
+/// blending reads buffer A's half or B's (`..B`, draw field 2), each also
+/// dithered (`..D`).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Pix {
@@ -77,10 +82,68 @@ pub enum Pix {
     Rgb12 = 1,
     Rgba8 = 2,
     Ci12 = 3,
+    Rgb12B = 4,
+    Rgb12D = 5,
+    Rgb12BD = 6,
+    Rgb15 = 7,
+    Rgb15B = 8,
+    Rgb15D = 9,
+    Rgb15BD = 10,
 }
 
 impl Pix {
-    pub const ALL: [Pix; 4] = [Pix::Plain, Pix::Rgb12, Pix::Rgba8, Pix::Ci12];
+    pub const ALL: [Pix; 11] = [
+        Pix::Plain,
+        Pix::Rgb12,
+        Pix::Rgba8,
+        Pix::Ci12,
+        Pix::Rgb12B,
+        Pix::Rgb12D,
+        Pix::Rgb12BD,
+        Pix::Rgb15,
+        Pix::Rgb15B,
+        Pix::Rgb15D,
+        Pix::Rgb15BD,
+    ];
+
+    /// The pixel pair layout written, if any.
+    pub fn pair_layout(self) -> Option<crate::dev::mgras::rss::Pair> {
+        use crate::dev::mgras::rss::Pair;
+        match self {
+            Pix::Rgb12 | Pix::Rgb12B | Pix::Rgb12D | Pix::Rgb12BD => Some(Pair::P444),
+            Pix::Rgb15 | Pix::Rgb15B | Pix::Rgb15D | Pix::Rgb15BD => Some(Pair::P555),
+            _ => None,
+        }
+    }
+
+    /// A pixel pair write.
+    pub fn pair(self) -> bool {
+        self.pair_layout().is_some()
+    }
+
+    /// Blending reads buffer B's half.
+    pub fn pair_b(self) -> bool {
+        matches!(self, Pix::Rgb12B | Pix::Rgb12BD | Pix::Rgb15B | Pix::Rgb15BD)
+    }
+
+    pub fn dither(self) -> bool {
+        matches!(self, Pix::Rgb12D | Pix::Rgb12BD | Pix::Rgb15D | Pix::Rgb15BD)
+    }
+
+    /// The pair variant for a layout, half B or A, dithered or not.
+    pub fn of_pair(layout: crate::dev::mgras::rss::Pair, b: bool, dither: bool) -> Pix {
+        use crate::dev::mgras::rss::Pair;
+        match (layout, b, dither) {
+            (Pair::P444, false, false) => Pix::Rgb12,
+            (Pair::P444, true, false) => Pix::Rgb12B,
+            (Pair::P444, false, true) => Pix::Rgb12D,
+            (Pair::P444, true, true) => Pix::Rgb12BD,
+            (Pair::P555, false, false) => Pix::Rgb15,
+            (Pair::P555, true, false) => Pix::Rgb15B,
+            (Pair::P555, false, true) => Pix::Rgb15D,
+            (Pair::P555, true, true) => Pix::Rgb15BD,
+        }
+    }
 }
 
 /// Host transfer pixel formats (`rss::from_host`), by (PixelFormat,
@@ -133,12 +196,14 @@ pub struct Stencil {
     pub zpass: u8,
 }
 
-/// Blend factors, 0..=10 in BlendFactor's order (codes above 10 act as
-/// ONE and are folded into 1).
+/// Blend factors, 0..=14 in BlendFactor's order (`rss::blend_rgba`; 15
+/// acts as ONE and is folded into 1), and the equation (`rss::BLEND_EQ_*`,
+/// 0..=4; MIN and MAX ignore the factors, which fold to 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Blend {
     pub src: u8,
     pub dst: u8,
+    pub eq: u8,
 }
 
 /// Texturing: the environment (TEXMODE1 bits 2:1), components (1..=4),
@@ -375,8 +440,9 @@ impl PipeKey {
                 self.blend = None;
             }
             if let Some(b) = self.blend.as_mut() {
-                let f = |c: u8| if c > 10 { 1 } else { c };
-                *b = Blend { src: f(b.src), dst: f(b.dst) };
+                let f = |c: u8| if c > 14 { 1 } else { c };
+                let eq = if b.eq > 4 { 0 } else { b.eq };
+                *b = if matches!(eq, 3 | 4) { Blend { src: 0, dst: 0, eq } } else { Blend { src: f(b.src), dst: f(b.dst), eq } };
             }
             self.tex = self.tex.map(Tex::normalized);
         } else {
@@ -399,7 +465,7 @@ impl PipeKey {
         e.put(k.cid_test as u64, 2);
         e.put(k.nclip as u64, 5);
         e.put(k.draw as u64, 4);
-        e.put(k.pix as u64, 4);
+        e.put(k.pix as u64, Pix::ALL.len() as u64);
         e.put(k.logic.map_or(0, |op| op as u64 + 1), 17);
         e.put(k.stipple as u64, 2);
         if k.prim.is_gl() {
@@ -412,7 +478,7 @@ impl PipeKey {
                 1 + 8 * 216,
             );
             e.put(k.z.map_or(0, |f| f as u64 + 1), 9);
-            e.put(k.blend.map_or(0, |b| 1 + b.src as u64 + 11 * b.dst as u64), 1 + 121);
+            e.put(k.blend.map_or(0, |b| 1 + b.src as u64 + 15 * (b.dst as u64 + 15 * b.eq as u64)), BLEND_RADIX);
             e.put(k.tex.map_or(0, |t| 1 + t.code()), 1 + Tex::RADIX);
             e.put(k.fog as u64, 2);
         } else {
@@ -432,7 +498,7 @@ impl PipeKey {
             cid_test: d.get(2) != 0,
             nclip: d.get(5) as u8,
             draw: Draw::ALL[d.get(4) as usize],
-            pix: Pix::ALL[d.get(4) as usize],
+            pix: Pix::ALL[d.get(Pix::ALL.len() as u64) as usize],
             logic: match d.get(17) {
                 0 => None,
                 n => Some(n as u8 - 1),
@@ -459,9 +525,9 @@ impl PipeKey {
                 0 => None,
                 n => Some(n as u8 - 1),
             };
-            k.blend = match d.get(122) {
+            k.blend = match d.get(BLEND_RADIX) {
                 0 => None,
-                n => Some(Blend { src: ((n - 1) % 11) as u8, dst: ((n - 1) / 11) as u8 }),
+                n => Some(Blend { src: ((n - 1) % 15) as u8, dst: ((n - 1) / 15 % 15) as u8, eq: ((n - 1) / 225) as u8 }),
             };
             k.tex = match d.get(1 + Tex::RADIX) {
                 0 => None,
@@ -480,8 +546,8 @@ impl PipeKey {
     /// The radix product of the largest key (a GL key with every optional
     /// group on): the packed form must stay below it.
     pub fn max_packed() -> u128 {
-        let common: u128 = 6 * 2 * 5 * 4 * 4 * 17 * 2;
-        let gl: u128 = 2 * 9 * (1 + 8 * 216) * 9 * 122 * (1 + Tex::RADIX as u128) * 2;
+        let common: u128 = 6 * 2 * 5 * 4 * Pix::ALL.len() as u128 * 17 * 2;
+        let gl: u128 = 2 * 9 * (1 + 8 * 216) * 9 * BLEND_RADIX as u128 * (1 + Tex::RADIX as u128) * 2;
         let d2: u128 = 2 * 2 * 8 * 6;
         common * gl.max(d2)
     }
@@ -524,7 +590,7 @@ impl fmt::Display for PipeKey {
                 write!(f, " z={z}")?;
             }
             if let Some(b) = k.blend {
-                write!(f, " blend={}/{}", b.src, b.dst)?;
+                write!(f, " blend={}/{}/eq{}", b.src, b.dst, b.eq)?;
             }
             if let Some(t) = k.tex {
                 write!(
@@ -591,7 +657,7 @@ mod tests {
             alpha: Some(6),
             stencil: Some(Stencil { func: 7, fail: 5, zfail: 4, zpass: 3 }),
             z: Some(7),
-            blend: Some(Blend { src: 10, dst: 9 }),
+            blend: Some(Blend { src: 10, dst: 9, eq: 2 }),
             tex: Some(tex),
             fog: true,
             ..PipeKey::default()
@@ -603,7 +669,7 @@ mod tests {
 
     #[test]
     fn normalisation_folds_what_draws_alike() {
-        let a = PipeKey { prim: Prim::Tri, rgb: false, blend: Some(Blend { src: 4, dst: 5 }), ..PipeKey::default() };
+        let a = PipeKey { prim: Prim::Tri, rgb: false, blend: Some(Blend { src: 4, dst: 5, eq: 0 }), ..PipeKey::default() };
         assert_eq!(a.pack(), PipeKey { prim: Prim::Tri, ..PipeKey::default() }.pack());
         let s = PipeKey { prim: Prim::Fill, tex: Some(Tex::default()), alpha: Some(1), ..PipeKey::default() };
         assert_eq!(s.pack(), PipeKey::default().pack());

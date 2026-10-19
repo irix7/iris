@@ -19,7 +19,7 @@
 //! Run with `cargo test --release --features gr4-jit --lib rss_jit_tests`.
 
 use super::rss::{self, reg, Rss, TriSetup};
-use super::rss_jit::{self, key::XBPP, Draw, PipeKey, Prim, MODE_OFF, MODE_SYNC};
+use super::rss_jit::{self, key::XBPP, Draw, PipeKey, Pix, Prim, MODE_OFF, MODE_SYNC};
 use super::te1::reg as te;
 use std::collections::{HashMap, HashSet};
 
@@ -106,10 +106,13 @@ impl Pair {
     /// New random pixels and clip IDs where the tests draw (both boards).
     fn refresh(&mut self) {
         let n = LIVE_PAGES * super::pixmem::PAGE_WORDS;
-        for w in self.interp.mem.words[..n].iter_mut() {
-            *w = self.rng.next() & super::pixmem::WORD_MASK;
+        for re in 0..super::pixmem::RES {
+            let live = re * super::pixmem::RE_WORDS..re * super::pixmem::RE_WORDS + n;
+            for w in self.interp.mem.words[live.clone()].iter_mut() {
+                *w = self.rng.next() & super::pixmem::WORD_MASK;
+            }
+            self.jit.mem.words[live.clone()].copy_from_slice(&self.interp.mem.words[live]);
         }
-        self.jit.mem.words[..n].copy_from_slice(&self.interp.mem.words[..n]);
         for y in 0..512 {
             for x in 0..1024 {
                 // Mostly one ID per 16-pixel run, so CID tests pass some.
@@ -117,7 +120,7 @@ impl Pair {
                 self.interp.cid[y * rss::WIDTH + x] = v;
             }
         }
-        self.jit.cid.copy_from_slice(&self.interp.cid);
+        self.jit.cid.copy_from_slice(&self.interp.cid[..]);
     }
 
     fn write(&mut self, r: u32, v: u32) {
@@ -217,7 +220,8 @@ fn common_regs(rng: &mut Rng, regs: &mut Regs, gl: bool) {
     }
     regs.push((reg::PP1FILLMODE, pp1));
     regs.push((reg::DRBPOINTERS, drb));
-    regs.push((reg::DRBSIZE, (rng.range(1, 3) as u32) << 2 | rng.range(1, 2) as u32));
+    // Tiles per row, and sometimes two raster engines (Maximum Impact).
+    regs.push((reg::DRBSIZE, (rng.chance(0.3) as u32) << 6 | (rng.range(1, 3) as u32) << 2 | rng.range(1, 2) as u32));
     let mask = |rng: &mut Rng| {
         let r = rng.u32();
         rng.pick(&[0xFF_FFFFu32, u32::MAX, 0xFFF, 0xFF, 0, r])
@@ -261,7 +265,7 @@ fn common_regs(rng: &mut Rng, regs: &mut Regs, gl: bool) {
 
 /// Colours, whichever the primitive uses (data: not in the key).
 fn colour_regs(rng: &mut Rng, regs: &mut Regs) {
-    for r in [reg::FILL_COLOR_R, reg::FILL_COLOR_G, reg::FILL_COLOR_B, reg::FILL_COLOR_B + 1, reg::RED, reg::PACKEDCOLOR, reg::BG_COLOR, reg::BG_COLOR_RED] {
+    for r in [reg::FILL_COLOR_R, reg::FILL_COLOR_G, reg::FILL_COLOR_B, reg::FILL_COLOR_B + 1, reg::RED, reg::PACKEDCOLOR, reg::BG_COLOR, reg::BG_COLOR_BLUE] {
         regs.push((r, rng.u32()));
     }
 }
@@ -275,8 +279,13 @@ fn gl_regs(rng: &mut Rng, regs: &mut Regs, tex_bias: f64) {
     regs.push((reg::STENCILMASK, { let opts = [0xFFFFu32, rng.u32() & 0xFFFF, 0xFF0F]; rng.pick(&opts) }));
     let zmask = { let opts = [0xFF_FFFFu32, rng.u32() & 0xFF_FFFF, 0]; rng.pick(&opts) };
     regs.push((reg::ZMODE, te(rng.chance(0.6), rng.below(8) as u32 | zmask << 4)));
-    let blend = (rng.below(16) as u32) | (rng.below(16) as u32) << 4 | if rng.chance(0.5) { rss_blend_enable() } else { 0 };
+    let blend = (rng.below(16) as u32)
+        | (rng.below(16) as u32) << 4
+        | (rng.below(6) as u32) << rss::BLEND_EQ_SHIFT
+        | if rng.chance(0.5) { rss_blend_enable() } else { 0 };
     regs.push((reg::BLENDFACTOR, blend));
+    regs.push((reg::BLENDCOLOR_RG, rng.u32() & 0x0FFF_0FFF));
+    regs.push((reg::BLENDCOLOR_BA, rng.u32() & 0x0FFF_0FFF));
     let tex_on = rng.chance(tex_bias);
     let m1 = (rng.u32() & 0xFFE) | tex_on as u32;
     regs.push((te::TEXMODE1, m1));
@@ -403,9 +412,10 @@ fn key_of(rss: &mut Rss, prim: Prim) -> Option<PipeKey> {
         pio_read: false,
         width: 1,
         bpp: rss::bytes_per_pixel(mode),
-        format: ((mode >> 4) & 0xF, mode & 0xF),
+        format: rss::xfer_format(mode),
         begin_skip: 0,
         stride_skip: 0,
+        pio_dma_order: false,
         line: 0,
         line_begin: 0,
         pending: 0,
@@ -456,6 +466,7 @@ fn digits(k: &PipeKey) -> Vec<(u8, u32)> {
             (16, opt(k.z)),
             (17, opt(b.map(|b| b.src))),
             (18, opt(b.map(|b| b.dst))),
+            (34, opt(b.map(|b| b.eq))),
             (19, k.fog as u32),
             (20, k.tex.is_some() as u32),
         ]);
@@ -496,12 +507,13 @@ fn domain(prim: Prim, field: u8) -> Vec<u32> {
                 r(4)
             }
         }
-        4 => r(4),
+        4 => r(Pix::ALL.len() as u32),
         5 => r(17),
         11 => r(8),
         12 | 16 => r(9),
         13..=15 => r(7),
-        17 | 18 => r(12),
+        17 | 18 => r(16),
+        34 => r(6),
         21 => r(4),
         22 => vec![1, 2, 3, 4],
         23 => r(4),
@@ -599,7 +611,9 @@ fn mode_regs(rng: &mut Rng, prim: Prim, tex_bias: f64) -> Regs {
         Prim::Stipple => (rng.u32() & !(7 << 22) & !(1 << 20)) | 1 << 22 | 1 << 3,
         Prim::Xfer => {
             let (f, c) = rng.pick(&[(0u32, 0u32), (0, 1), (8, 8), (8, 10), (8, 0), (2, 3), (7, 0), (8, 1), (7, 1), (5, 5)]);
-            regs.push((reg::XFRMODE, (rng.u32() & 0x7FF00) | f << 4 | c));
+            // RGBA16 red first (RGBorder, bit 22), as the JIT keys it.
+            let order = if (f, c) == (8, 1) { 1 << 22 } else { 0 };
+            regs.push((reg::XFRMODE, (rng.u32() & 0x7FF00) | f << 4 | c | order));
             (rng.u32() & !(7 << 22) & !(1 << 20)) | 5 << 22
         }
         Prim::Tri => {
@@ -661,11 +675,16 @@ fn candidate(p: &mut Pair, prim: Prim, tex_bias: f64) -> Option<Candidate> {
 fn draw(p: &mut Pair, prim: Prim, c: &Candidate, step: usize) {
     p.apply(&c.mode);
     p.apply(&c.data);
+    // Sometimes draw as one of Maximum Impact's two raster engines, which
+    // takes only its own (even or odd) scanlines.
+    let (engine, own_mask) = if p.rng.chance(0.3) { (p.rng.below(2) as u32, 1) } else { (0, 0) };
+    p.interp.set_engine(engine, own_mask);
+    p.jit.set_engine(engine, own_mask);
     p.snapshot();
     let hits0 = p.jit.jit.hits;
     let what = |extra: &str| {
         let regs: Vec<String> = c.mode.iter().chain(&c.data).map(|(r, v)| format!("{r:#05x}={v:#x}")).collect();
-        format!("step {step}, key {} ({:#x}){extra}\nregisters: {}", c.key, c.key.pack(), regs.join(" "))
+        format!("step {step}, key {} ({:#x}), engine {engine} mask {own_mask}{extra}\nregisters: {}", c.key, c.key.pack(), regs.join(" "))
     };
     match prim {
         Prim::Fill | Prim::Line | Prim::Tri | Prim::GlLine => {

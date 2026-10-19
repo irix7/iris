@@ -17,9 +17,14 @@ use std::sync::Mutex;
 
 use iris_hostcall::{Fault, GuestMemory, PageAccess, Reply, Service, PAGE};
 
-use crate::backend::cgl::Cgl;
+use crate::backend::Backend;
 use crate::calls;
 use crate::service::*;
+
+/// This host's backend; the tests need one.
+fn backend() -> Box<dyn Backend> {
+    crate::backend::native().expect("this host makes OpenGL contexts")
+}
 
 const GL_COLOR_BUFFER_BIT: i32 = 0x4000;
 const GL_TRIANGLES: i32 = 0x0004;
@@ -231,7 +236,7 @@ pub(crate) struct Guest {
 
 impl Guest {
     pub(crate) fn new(pages: usize) -> Guest {
-        Guest::on(Rc::new(RefCell::new(GlService::new(Box::new(Cgl::new())))), pages)
+        Guest::on(Rc::new(RefCell::new(GlService::new(backend()))), pages)
     }
 
     /// Another process of the same service.
@@ -523,11 +528,11 @@ fn addresses_above_4gb_arrive_whole() {
     let out = mem.alloc(8, 0);
     cmd[16..24].copy_from_slice(&out.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     assert_eq!(x.addr(&cmd, 16), out);
     assert_eq!(x.arr::<f32>(&cmd, 4).expect("decoded"), vec![1.5, -2.0, 3.25, 8.0]);
     x.put::<u32>(x.addr(&cmd, 16), &[0xdead_beef, 7]).expect("queued");
@@ -549,17 +554,17 @@ fn by_reference_array_decodes_across_a_page_boundary() {
     cmd[4..8].copy_from_slice(&(n as u32 | 0x8000_0000).to_be_bytes());
     cmd[8..16].copy_from_slice(&at.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
     {
-        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+        let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
         assert!(x.arr::<f64>(&cmd, 4).is_none());
         assert_eq!(x.fault, Some(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false }));
     }
     mem.touch(Fault { page: (at & !(PAGE - 1)) + PAGE, write: false });
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     let v = x.arr::<f64>(&cmd, 4).expect("decoded");
     assert_eq!(x.fault, None);
     assert_eq!(v.len(), n);
@@ -590,11 +595,11 @@ fn array_arguments_hold_what_the_call_reads() {
     cmd[8..16].copy_from_slice(&16u64.to_be_bytes());
     cmd[16..20].copy_from_slice(&2.5f32.to_be_bytes());
 
-    let backend = Cgl::new();
+    let backend = backend();
     let (mut writes, mut funcs, mut reported) = (Vec::new(), Vec::new(), HashSet::new());
     let mut client = crate::exec::ClientSide::default();
     let draws = std::collections::HashMap::new();
-    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &backend, &mut client, &draws, 0, 0);
+    let mut x = crate::exec::Exec::new(&mut mem, &mut writes, &mut funcs, &mut reported, &*backend, &mut client, &draws, 0, 0);
     let slack = crate::exec::ARRAY_SLACK;
     let short = x.arr_padded::<f32>(&cmd, 4, 16).expect("decoded");
     assert_eq!(short.len(), 16 + slack);
@@ -666,6 +671,74 @@ fn swap_hands_the_frame_back() {
     assert_eq!(pixel(&f, 120, 5, 5)[1..], [255, 0, 0]);
     assert_eq!(pixel(&f, 120, 99, 49)[1..], [51, 102, 153]);
     assert_eq!(pixel(&f, 120, 110, 55)[1..], [0, 0, 0], "outside the old drawable nothing is read");
+}
+
+/// A library that keeps the front buffer apart (OP_FRONT_BUFFERS), drawn as
+/// mview's IRIS GL panel draws it: a frame shown, the back cleared, a button
+/// drawn into front and back (glDrawBuffer(GL_FRONT_AND_BACK)), then the
+/// front shown. The screen keeps the frame with the button on it; with the
+/// one buffer it showed the cleared back (iris#227).
+#[test]
+fn front_buffer_drawing_keeps_the_frame_on_the_screen() {
+    let mut g = Guest::new(512);
+    assert_eq!(g.call(OP_FRONT_BUFFERS, &[0]), Reply::Ok(1, 0));
+    let window = 0x0040_0007;
+    g.context(window, 100, 50);
+    let mut e = Enc::default();
+    ortho(&mut e, 100, 50);
+    e.cmd("glClearColor", &[V::F(0.2), V::F(0.4), V::F(0.6), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let frame = |g: &mut Guest, place: u64| {
+        let buf = g.mem.alloc(100 * 50 * 4, 0);
+        assert!(matches!(g.call(OP_SWAP, &[buf, 100, 50, 0, 0, 0, place]), Reply::Ok(0, _)));
+        g.mem.get(buf, 100 * 50 * 4).to_vec()
+    };
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [51, 102, 153], "the first frame");
+
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glDrawBuffer", &[V::I(0x0408)]) // GL_FRONT_AND_BACK
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glColor3ub", &[V::I(255), V::I(0), V::I(0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(40.0)])
+        .cmd("glVertex2f", &[V::F(10.0), V::F(40.0)])
+        .cmd("glVertex2f", &[V::F(10.0), V::F(50.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(50.0)])
+        .cmd("glEnd", &[])
+        .cmd("glDrawBuffer", &[V::I(0x0405)]); // GL_BACK
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+
+    // The front, shown as it is: the first frame, with the button.
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the button, in the front buffer");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [51, 102, 153], "the rest is still the first frame");
+    // A swap shows the back: cleared, with the button.
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the button, in the back buffer too");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the cleared back");
+    // ... which is the front from then on.
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the swap made it the front");
+    // GL_FRONT alone: the front buffer, and not the back.
+    e.cmd("glDrawBuffer", &[V::I(0x0404)]) // GL_FRONT
+        .cmd("glClearColor", &[V::F(0.0), V::F(1.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glDrawBuffer", &[V::I(0x0405)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let f = frame(&mut g, 2);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 255, 0], "drawn into the front alone");
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "the back did not see it");
+
+    // Showing the front of a window grown since is a flush, not a swap: the
+    // drawable keeps its size and its pixels.
+    let big = g.mem.alloc(120 * 60 * 4, 0);
+    assert!(matches!(g.call(OP_SWAP, &[big, 120, 60, 0, 0, 0, 2]), Reply::Ok(0, _)));
+    let f = frame(&mut g, 0);
+    assert_eq!(pixel(&f, 100, 5, 5)[1..], [255, 0, 0], "the back kept its button");
+    assert_eq!(pixel(&f, 100, 50, 25)[1..], [0, 0, 0], "and its clear");
 }
 
 /// What a program reads from glGetString is IRIS's answer, not the Mac's: a
@@ -997,7 +1070,7 @@ fn inline_and_by_reference_arrays_and_results() {
 
 #[test]
 fn hello_and_unknown_clients() {
-    let mut svc = GlService::new(Box::new(Cgl::new()));
+    let mut svc = GlService::new(backend());
     let mut mem = Proc::new(4);
     assert_eq!(svc.call(&mut mem, &[OP_HELLO, PROTOCOL + 1, 0, 0, 0, 0, 0, 0]), Reply::Ok(0, PROTOCOL), "a mismatch gets no client");
     assert_eq!(svc.call(&mut mem, &[OP_FINISH, 0, 99, 1, 0, 0, 0, 0]), Reply::Err(22));
@@ -1205,7 +1278,7 @@ impl Tlb {
 /// each far more pages than the TLB holds.
 #[test]
 fn through_the_framework_with_a_48_entry_tlb() {
-    iris_hostcall::register(iris_hostcall::GL, Box::new(GlService::new(Box::new(Cgl::new()))));
+    iris_hostcall::register(iris_hostcall::GL, Box::new(GlService::new(backend())));
     let mut t = Tlb { proc_: Proc::new(2048), entries: VecDeque::new() };
     let slots = t.proc_.alloc(64, 0);
     let (r, _) = t.call([OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]);
@@ -1440,4 +1513,315 @@ fn accumulation_buffer_operations() {
     assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
     assert_eq!(u32::from_be_bytes(g.mem.get(bits, 4).try_into().unwrap()), 16, "GL_ACCUM_RED_BITS");
     near(pixel(g.mem.get(px, 32 * 32 * 4), 32, 2, 2), [0, 255, 0], "the program's colour after a pass");
+}
+
+// ---- the GL thread (threaded.rs) ----
+
+/// One call through a service other than a bare GlService, need-page and
+/// not-yet retries done the library's way.
+fn call_on(svc: &mut dyn Service, mem: &mut Proc, args: [u64; 8]) -> Reply {
+    for _ in 0..1_000_000 {
+        match svc.call(mem, &args) {
+            Reply::NeedPage(f) => mem.touch(f),
+            Reply::Err(iris_hostcall::ENOTYET) => std::thread::yield_now(),
+            r => return r,
+        }
+    }
+    panic!("no progress");
+}
+
+/// A process talking to the GL thread: hello, a context on a 64 x 64 window.
+struct Threads {
+    svc: crate::threaded::Threaded,
+    mem: Proc,
+    client: u64,
+    serial: u64,
+    slots: u64,
+}
+
+impl Threads {
+    fn new() -> Threads {
+        let mut svc = crate::threaded::Threaded::spawn(GlService::new(backend()));
+        let mut mem = Proc::new(512);
+        let slots = mem.alloc(64, 0);
+        let Reply::Ok(client, PROTOCOL) = call_on(&mut svc, &mut mem, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else {
+            panic!("hello")
+        };
+        let mut t = Threads { svc, mem, client, serial: 0, slots };
+        let Reply::Ok(ctx, _) = t.call(OP_CREATE, &[0]) else { panic!("create") };
+        assert_eq!(t.call(OP_MAKECURRENT, &[ctx, 0x0040_0002, 0x0040_0002, 64, 64]), Reply::Ok(0, 0));
+        t
+    }
+
+    fn call(&mut self, op: u64, slots: &[u64]) -> Reply {
+        let s: Vec<u8> = slots.iter().flat_map(|v| v.to_be_bytes()).collect();
+        self.mem.put(self.slots, &s);
+        self.serial += 1;
+        call_on(&mut self.svc, &mut self.mem, [op, self.slots, self.client, self.serial, 0, 0, 0, 0])
+    }
+
+    /// `cmds` in fresh memory, every page of it paged out, sent as `op`.
+    fn batch(&mut self, op: u64, cmds: &[u8]) -> Reply {
+        let at = self.mem.alloc(cmds.len(), 0x40);
+        self.mem.put(at, cmds);
+        self.mem.page_out(at, cmds.len());
+        self.call(op, &[at, cmds.len() as u64])
+    }
+}
+
+/// Buffers sent without waiting run on the GL thread, in order, before a
+/// call that waits: the readback sees both draws, the later one on top.
+#[test]
+fn batches_sent_without_waiting_run_in_order_before_a_waiting_call() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(1.0), V::F(0.0), V::F(0.0), V::F(1.0)]).cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    let first = e.take();
+    let mut e = Enc::default();
+    e.cmd("glColor3ub", &[V::I(0), V::I(255), V::I(0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(64.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(64.0)])
+        .cmd("glEnd", &[]);
+    let second = e.take();
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &first), Reply::Ok(0, 0));
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &second), Reply::Ok(0, 0));
+
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let read = e.take();
+    assert_eq!(t.batch(OP_BATCH, &read), Reply::Ok(0, 0));
+    let out = t.mem.get(px, 64 * 64 * 4).to_vec();
+    assert_eq!(pixel(&out, 64, 8, 32), [0, 255, 0, 255], "the second buffer's quad");
+    assert_eq!(t.mem.get(px, 4), &pixel(&out, 64, 0, 0), "read back once, whole");
+    assert_eq!(pixel(&out, 64, 56, 32), [255, 0, 0, 255], "the first buffer's clear");
+}
+
+/// A buffer sent without waiting cannot read or write the program's memory:
+/// the program has moved on. One that tries is cut short there, writes
+/// nothing, and the next call is answered as usual.
+#[test]
+fn a_batch_sent_without_waiting_that_reaches_for_memory_is_cut_short() {
+    let mut t = Threads::new();
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let cmds = e.take();
+    assert_eq!(t.batch(OP_BATCH_ASYNC, &cmds), Reply::Ok(0, 0));
+    let mut e = Enc::default();
+    e.cmd("glGetError", &[]);
+    let cmds = e.take();
+    assert_eq!(t.batch(OP_BATCH, &cmds), Reply::Ok(0, 0), "the GL thread still answers");
+    assert!(t.mem.get(px, 64 * 64 * 4).iter().all(|&b| b == 0), "nothing was written");
+}
+
+/// Without the GL thread, OP_BATCH_ASYNC is an ordinary batch.
+#[test]
+fn on_the_cpu_thread_a_batch_sent_without_waiting_is_a_batch() {
+    let mut g = Guest::new(256);
+    g.context(0x0040_0003, 64, 64);
+    let px = g.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glClearColor", &[V::F(0.0), V::F(1.0), V::F(0.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    let cmds = e.take();
+    let at = g.mem.alloc(cmds.len(), 0);
+    g.mem.put(at, &cmds);
+    assert_eq!(g.call(OP_BATCH_ASYNC, &[at, cmds.len() as u64]), Reply::Ok(0, 0));
+    assert_eq!(pixel(g.mem.get(px, 64 * 64 * 4), 64, 10, 10), [0, 255, 0, 255]);
+}
+
+/// While a client's buffers are queued, its next call is not held behind
+/// them -- the emulated CPU would stand still -- but answered ENOTYET; once
+/// they have run, the same call is answered as usual. Another client is
+/// never told ENOTYET for this one's buffers.
+#[test]
+fn a_call_behind_queued_buffers_is_told_to_come_back() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glBegin", &[V::I(GL_QUADS)]);
+    while e.buf.len() < 120 << 10 {
+        e.cmd("glVertex2f", &[V::F(1.0), V::F(1.0)]);
+    }
+    e.cmd("glEnd", &[]);
+    let big = e.take();
+    for _ in 0..4 {
+        assert_eq!(t.batch(OP_BATCH_ASYNC, &big), Reply::Ok(0, 0));
+    }
+    t.serial += 1;
+    let args = [OP_FINISH, t.slots, t.client, t.serial, 0, 0, 0, 0];
+    assert_eq!(t.svc.call(&mut t.mem, &args), Reply::Err(iris_hostcall::ENOTYET), "four big buffers cannot have run yet");
+    assert_eq!(call_on(&mut t.svc, &mut t.mem, args), Reply::Ok(0, 0), "answered once they have");
+
+    let mut other = Proc::new(16);
+    let Reply::Ok(_, PROTOCOL) = call_on(&mut t.svc, &mut other, [OP_HELLO, PROTOCOL, 0, 0, 0, 0, 0, 0]) else { panic!("hello") };
+}
+
+/// macOS's OpenGL drew nothing lit after a clip plane was switched off, until
+/// lighting was switched (see exec.rs's relight_after_clip_plane): UroMan's
+/// organs, drawn after its cutting plane went off, were not there.
+#[test]
+fn lit_drawing_after_a_clip_plane_goes_off_is_drawn() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000b, 32, 32);
+    let px = g.mem.alloc(4, 0);
+    let plane: Vec<u8> = [0.0f64, 0.0, -1.0, 0.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+    let light: Vec<u8> = [0.0f32, 0.0, 1.0, 0.0].iter().flat_map(|v| v.to_be_bytes()).collect();
+    let mut e = Enc::default();
+    ortho(&mut e, 32, 32);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)])
+        .cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)])
+        .cmd("glEnable", &[V::I(0x0B50)]) // GL_LIGHTING
+        .cmd("glEnable", &[V::I(0x4000)]) // GL_LIGHT0
+        .cmd("glLightfv", &[V::I(0x4000), V::I(0x1203), V::Inline(4, light)]) // GL_POSITION
+        .cmd("glColorMaterial", &[V::I(0x0408), V::I(0x1201)]) // GL_FRONT_AND_BACK, GL_DIFFUSE
+        .cmd("glEnable", &[V::I(0x0B57)]) // GL_COLOR_MATERIAL
+        .cmd("glClipPlane", &[V::I(0x3000), V::Inline(4, plane)])
+        .cmd("glEnable", &[V::I(0x3000)])
+        // Something drawn while it is on: the driver settles its state at a draw.
+        .cmd("glColor3f", &[V::F(1.0), V::F(0.0), V::F(0.0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(4.0), V::F(4.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(4.0)])
+        .cmd("glEnd", &[])
+        .cmd("glDisable", &[V::I(0x3000)])
+        .cmd("glColor3f", &[V::F(0.0), V::F(1.0), V::F(0.0)])
+        .cmd("glNormal3f", &[V::F(0.0), V::F(0.0), V::F(1.0)])
+        .cmd("glBegin", &[V::I(GL_QUADS)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(0.0)])
+        .cmd("glVertex2f", &[V::F(32.0), V::F(32.0)])
+        .cmd("glVertex2f", &[V::F(0.0), V::F(32.0)])
+        .cmd("glEnd", &[])
+        .cmd("glReadPixels", &[V::I(16), V::I(16), V::I(1), V::I(1), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let p = g.mem.get(px, 4).to_vec();
+    assert!(p[1] > 200 && p[2] < 50, "the quad drawn lit after the plane went off: {p:?}");
+}
+
+/// glGetTexLevelParameteriv(GL_TEXTURE_INTERNAL_FORMAT) answers with the
+/// internal format the program gave, as IRIX's libGL does, not the sized one
+/// the host chose: Cosmo Player compares a proxy's answer with what it asked
+/// for, and on GL_RGBA8 for GL_RGBA shrank every texture to 1x1 (LivingO2).
+#[test]
+fn texture_internal_format_is_answered_as_the_program_gave_it() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000d, 16, 16);
+    let out = g.mem.alloc(16, 0);
+    let px = g.mem.alloc(4 * 4 * 4, 0);
+    g.mem.put(px, &[0x80u8; 4 * 4 * 4]);
+    let mut e = Enc::default();
+    // A proxy, as Cosmo probes: GL_PROXY_TEXTURE_2D, GL_RGBA.
+    e.cmd("glTexImage2D", &[V::I(0x8064), V::I(0), V::I(0x1908), V::I(64), V::I(64), V::I(0), V::I(0x1908), V::I(0x1401), V::A(0)])
+        .cmd("glGetTexLevelParameteriv", &[V::I(0x8064), V::I(0), V::I(0x1003), V::A(out)])
+        // A real texture with GL 1.0's "3 components".
+        .cmd("glBindTexture", &[V::I(0x0DE1), V::I(5)])
+        .cmd("glTexImage2D", &[V::I(0x0DE1), V::I(0), V::I(3), V::I(4), V::I(4), V::I(0), V::I(0x1908), V::I(0x1401), V::A(px)])
+        .cmd("glGetTexLevelParameteriv", &[V::I(0x0DE1), V::I(0), V::I(0x1003), V::A(out + 4)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    let v = |i: u64| u32::from_be_bytes(g.mem.get(out + i, 4).try_into().unwrap());
+    assert_eq!(v(0), 0x1908, "the proxy: GL_RGBA, as asked");
+    assert_eq!(v(4), 3, "the texture: 3, as given");
+}
+
+/// SGI_color_matrix's limits answer as IMPACT's do on any host, and asking
+/// raises no error: on a host without a colour matrix (Mesa) the answer was
+/// 0 with GL_INVALID_ENUM, and SGI's IRIS GL crashed sizing its stack from it.
+#[test]
+fn color_matrix_limits_are_answered_and_raise_no_error() {
+    let mut g = Guest::new(512);
+    g.context(0x0040_000f, 16, 16);
+    let out = g.mem.alloc(16 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glGetIntegerv", &[V::I(0x80B3), V::A(out)]) // GL_MAX_COLOR_MATRIX_STACK_DEPTH
+        .cmd("glGetIntegerv", &[V::I(0x80B2), V::A(out + 4)]) // GL_COLOR_MATRIX_STACK_DEPTH
+        .cmd("glGetError", &[]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0), "no GL error from the queries");
+    let v = |i: u64| i32::from_be_bytes(g.mem.get(out + i, 4).try_into().unwrap());
+    assert!(v(0) >= 2, "a colour matrix stack of at least 2, as IMPACT's: {}", v(0));
+    assert_eq!(v(4), 1, "one deep");
+}
+
+/// A library asks before it sends a colour-index frame as indices: a host
+/// that cannot take them answers EINVAL (see OP_INDEX_FRAMES).
+#[test]
+fn index_frames_are_asked_for() {
+    let mut g = Guest::new(64);
+    assert_eq!(g.call(OP_INDEX_FRAMES, &[0]), Reply::Ok(1, 0));
+}
+
+/// OP_PRESENT_LATER shows a client's flushes at most once a FLUSH_GAP: the
+/// first at once, a second inside the gap waits -- for the gap to be up, or
+/// for the client's next call that is not a buffer, whichever comes first.
+#[test]
+fn flush_presents_wait_out_the_gap() {
+    let mut g = Guest::new(512);
+    assert_eq!(g.call(OP_FRONT_BUFFERS, &[0]), Reply::Ok(1, 0));
+    g.context(0x0040_0009, 40, 30);
+    let client = g.client as u32;
+    let slots = [0, 40, 30, 0, 0, 0, 2];
+    // A gap far longer than a present takes, however slow the host's GL: a
+    // virtual machine's took longer than a real frame, and the second
+    // present came after the gap.
+    let gap = std::time::Duration::from_secs(60);
+    g.svc.borrow_mut().flush_gap = gap;
+    g.svc.borrow_mut().present_later(client, slots);
+    assert_eq!(g.svc.borrow().next_due(), None, "the first is shown at once");
+    g.svc.borrow_mut().present_later(client, slots);
+    let due = g.svc.borrow().next_due().expect("the second waits");
+    assert!(due > std::time::Instant::now() && due <= std::time::Instant::now() + gap);
+    // A buffer does not change what the client draws to: it still waits.
+    let mut e = Enc::default();
+    e.cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    assert_eq!(g.batch(&e.take()), Reply::Ok(0, 0));
+    assert!(g.svc.borrow().next_due().is_some(), "still waiting after a buffer");
+    // Any other call shows it first.
+    assert_eq!(g.call(OP_FINISH, &[0]), Reply::Ok(0, 0));
+    assert_eq!(g.svc.borrow().next_due(), None, "shown before the call");
+    // And with nothing else to do, the gap -- a short one, still well over
+    // what the last present took.
+    let gap = std::time::Duration::from_millis(200);
+    g.svc.borrow_mut().flush_gap = gap;
+    g.svc.borrow_mut().present_later(client, slots);
+    assert!(g.svc.borrow().next_due().is_some());
+    g.svc.borrow_mut().show_due();
+    assert!(g.svc.borrow().next_due().is_some(), "not due yet");
+    std::thread::sleep(gap);
+    g.svc.borrow_mut().show_due();
+    assert_eq!(g.svc.borrow().next_due(), None, "shown when the gap was up");
+}
+
+/// On the GL thread OP_PRESENT_LATER is answered at once, even with the
+/// client's buffers still queued, and runs in order with them.
+#[test]
+fn present_later_is_answered_at_once_and_runs_in_order() {
+    let mut t = Threads::new();
+    let mut e = Enc::default();
+    ortho(&mut e, 64, 64);
+    e.cmd("glClearColor", &[V::F(0.0), V::F(0.0), V::F(1.0), V::F(1.0)]).cmd("glClear", &[V::I(GL_COLOR_BUFFER_BIT)]);
+    let clear = e.take();
+    for _ in 0..4 {
+        assert_eq!(t.batch(OP_BATCH_ASYNC, &clear), Reply::Ok(0, 0));
+        let s: Vec<u8> = [0u64, 64, 64, 0, 0, 0, 0].iter().flat_map(|v| v.to_be_bytes()).collect();
+        t.mem.put(t.slots, &s);
+        t.serial += 1;
+        let r = t.svc.call(&mut t.mem, &[OP_PRESENT_LATER, t.slots, t.client, t.serial, 0, 0, 0, 0]);
+        assert_eq!(r, Reply::Ok(1, 0), "answered without waiting for the buffers");
+    }
+    let px = t.mem.alloc(64 * 64 * 4, 0);
+    let mut e = Enc::default();
+    e.cmd("glReadPixels", &[V::I(0), V::I(0), V::I(64), V::I(64), V::I(GL_RGBA), V::I(GL_UNSIGNED_BYTE), V::A(px)]);
+    assert_eq!(t.batch(OP_BATCH, &e.take()), Reply::Ok(0, 0));
+    assert_eq!(pixel(t.mem.get(px, 64 * 64 * 4), 64, 8, 8), [0, 0, 255, 255], "the buffers ran");
 }

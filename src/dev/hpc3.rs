@@ -414,15 +414,25 @@ fn start_transaction(&mut self) {
         if active {
             if !self.is_active() {
                 self.start_transaction();
+                crate::pf_begin!(crate::perfetto::events::PDMA_ACTIVE[self.id], self.nbdp);
             }
             self.ctrl |= self.active_mask;
         } else {
-            if self.is_active() && self.log_active() {
-                dlog_dev!(LogModule::Pdma, "PDMA[{}]: Channel Deactivated. Transferred {:x} bytes. CTRL={:08x}",
-                    self.id, self.bytes_transferred, self.ctrl);
+            if self.is_active() {
+                if self.log_active() {
+                    dlog_dev!(LogModule::Pdma, "PDMA[{}]: Channel Deactivated. Transferred {:x} bytes. CTRL={:08x}",
+                        self.id, self.bytes_transferred, self.ctrl);
+                }
+                crate::pf_end!(crate::perfetto::events::PDMA_ACTIVE[self.id]);
             }
             self.ctrl &= !self.active_mask;
         }
+    }
+
+    /// Perfetto: this channel raised its completion interrupt.
+    #[inline]
+    fn trace_int(&self) {
+        crate::pf_instant!(crate::perfetto::events::PDMA_INT[self.id]);
     }
 
     fn fetch_descriptor(&mut self) {
@@ -468,6 +478,7 @@ fn start_transaction(&mut self) {
                         if self.xie {
                             if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: Transfer Complete (EOX), Interrupting", self.id); }
                             self.ctrl |= PDMA_CTRL_INT; // Set interrupt pending
+                            self.trace_int();
                             if self.callback.is_some() {
                                 self.irq_pending = true;
                             }
@@ -479,6 +490,7 @@ fn start_transaction(&mut self) {
                         continue;
                     }
                 }
+                crate::pf_instant!(crate::perfetto::events::PDMA_DESC[self.id], self.bc);
                 break; // Valid data descriptor loaded
             } else {
                 break; // No memory attached
@@ -651,7 +663,7 @@ fn start_transaction(&mut self) {
                 // we cannot deliver. A bulk transfer wedges a few MB in and the
                 // interface stays mute until reboot.
                 if self.log_active() { dlog_dev!(LogModule::Pdma, "PDMA[{}]: receive chain exhausted at EOX — stopping channel", self.id); }
-                self.ctrl &= !self.active_mask;
+                self.set_active(false);
             }
             return (DmaStatus(DmaStatus::ROWN), None);
         }
@@ -820,6 +832,7 @@ fn start_transaction(&mut self) {
         }
 
         if irq {
+            self.trace_int();
             status |= DmaStatus(DmaStatus::IRQ);
             // For SCSI/PBUS channels (callback installed): set ctrl INT flag and
             // defer the callback. For enet channels (no callback): the IRQ bit in
@@ -1352,7 +1365,7 @@ impl Hpc3 {
             None
         };
 
-        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::new(dma_clients[0..8].to_vec(), audio))) };
+        let hal2 = if no_audio { None } else { Some(Arc::new(Hal2::with_audio(dma_clients[0..8].to_vec(), audio))) };
 
         Self {
             state,

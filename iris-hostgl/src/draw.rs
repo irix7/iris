@@ -26,6 +26,15 @@ pub struct Draw {
     flips: Vec<Flip>,
     /// The flip target the next swap tries first.
     next_flip: AtomicUsize,
+    /// A window's front buffer, for a program whose library said it knows
+    /// the front from the back (OP_FRONT_BUFFERS): what the last swap showed,
+    /// drawn into by glDrawBuffer(GL_FRONT) and GL_FRONT_AND_BACK as colour
+    /// attachment 1 of `fbo`, and copied and presented through `front_fbo`,
+    /// which has it as attachment 0 (a blit between two attachments of one
+    /// framebuffer object is undefined). Zero for pbuffers and multisampled
+    /// drawables, which keep the one buffer.
+    front: u32,
+    front_fbo: u32,
     /// A multisampled drawable cannot be read: its samples are resolved into
     /// this one first (GLX_SGIS_multisample).
     resolve_fbo: u32,
@@ -134,6 +143,52 @@ pub fn bind(draws: &HashMap<u32, Draw>, draw: u32, read: u32) {
     }
 }
 
+/// `bind`, then the colour buffers the context named (see `apply_buffers`).
+pub fn bind_with(draws: &HashMap<u32, Draw>, draw: u32, read: u32, fronts: bool, draw_mode: Option<u32>, read_mode: Option<u32>) {
+    bind(draws, draw, read);
+    apply_buffers(draws.get(&draw), draws.get(&read), fronts, draw_mode, read_mode);
+}
+
+/// The colour buffers glDrawBuffer and glReadBuffer name, for a drawable
+/// bound for drawing and one bound for reading. `fronts`: the program's
+/// library keeps front and back apart (OP_FRONT_BUFFERS), so a window's
+/// front is its own buffer; otherwise, and for drawables with one buffer,
+/// every name of a window's buffers is attachment 0, the back buffer, which
+/// the swap shows. `None` is the default, the back buffer.
+pub fn apply_buffers(draw: Option<&Draw>, read: Option<&Draw>, fronts: bool, draw_mode: Option<u32>, read_mode: Option<u32>) {
+    // SAFETY: plain state of the bound framebuffers.
+    unsafe {
+        if let Some(d) = draw {
+            let mode = draw_mode.unwrap_or(GL_BACK);
+            if fronts && d.front != 0 {
+                match mode {
+                    GL_FRONT_LEFT | GL_FRONT_RIGHT | GL_FRONT => glDrawBuffer(GL_COLOR_ATTACHMENT1),
+                    GL_BACK_LEFT | GL_BACK_RIGHT | GL_BACK => glDrawBuffer(GL_COLOR_ATTACHMENT0),
+                    GL_LEFT | GL_RIGHT | GL_FRONT_AND_BACK => {
+                        let both = [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1];
+                        glDrawBuffers(2, both.as_ptr());
+                    }
+                    other => glDrawBuffer(other),
+                }
+            } else {
+                glDrawBuffer(if (GL_FRONT_LEFT..=GL_FRONT_AND_BACK).contains(&mode) { GL_COLOR_ATTACHMENT0 } else { mode });
+            }
+        }
+        if let Some(r) = read {
+            let mode = read_mode.unwrap_or(GL_BACK);
+            if fronts && r.front != 0 {
+                match mode {
+                    GL_FRONT_LEFT | GL_FRONT_RIGHT | GL_FRONT | GL_LEFT | GL_RIGHT => glReadBuffer(GL_COLOR_ATTACHMENT1),
+                    GL_BACK_LEFT | GL_BACK_RIGHT | GL_BACK => glReadBuffer(GL_COLOR_ATTACHMENT0),
+                    other => glReadBuffer(other),
+                }
+            } else if r.samples <= 1 {
+                glReadBuffer(if (GL_FRONT_LEFT..=GL_FRONT_AND_BACK).contains(&mode) { GL_COLOR_ATTACHMENT0 } else { mode });
+            }
+        }
+    }
+}
+
 /// Delete a drawable's objects. A context of its share group must be current.
 pub fn delete(mut d: Draw) {
     // The presenting thread may still be reading one of its surfaces.
@@ -143,12 +198,12 @@ pub fn delete(mut d: Draw) {
         for f in std::mem::take(&mut d.flips) {
             f.delete();
         }
-        for rb in [d.color, d.depth, d.resolve_color] {
+        for rb in [d.color, d.depth, d.resolve_color, d.front] {
             if rb != 0 {
                 glDeleteRenderbuffersEXT(1, &rb);
             }
         }
-        for fb in [d.fbo, d.resolve_fbo] {
+        for fb in [d.fbo, d.resolve_fbo, d.front_fbo] {
             if fb != 0 {
                 glDeleteFramebuffersEXT(1, &fb);
             }
@@ -166,6 +221,8 @@ pub fn ensure(draws: &mut HashMap<u32, Draw>, backend: &mut dyn Backend, id: u32
         depth: 0,
         flips: Vec::new(),
         next_flip: AtomicUsize::new(0),
+        front: 0,
+        front_fbo: 0,
         resolve_fbo: 0,
         resolve_color: 0,
         samples: 0,
@@ -188,7 +245,7 @@ pub fn ensure(draws: &mut HashMap<u32, Draw>, backend: &mut dyn Backend, id: u32
                 f.delete();
             }
         }
-        for rb in [&mut d.color, &mut d.depth, &mut d.resolve_color] {
+        for rb in [&mut d.color, &mut d.depth, &mut d.resolve_color, &mut d.front] {
             if *rb != 0 {
                 glDeleteRenderbuffersEXT(1, rb);
                 *rb = 0;
@@ -225,6 +282,20 @@ pub fn ensure(draws: &mut HashMap<u32, Draw>, backend: &mut dyn Backend, id: u32
         glBindRenderbufferEXT(GL_RENDERBUFFER, d.color);
         storage(GL_RGBA8);
         glFramebufferRenderbufferEXT(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d.color);
+        if samples <= 1 && id & crate::service::PBUFFER_ID == 0 {
+            glGenRenderbuffersEXT(1, &mut d.front);
+            glBindRenderbufferEXT(GL_RENDERBUFFER, d.front);
+            glRenderbufferStorageEXT(GL_RENDERBUFFER, GL_RGBA8, w, h);
+            glFramebufferRenderbufferEXT(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, d.front);
+            if d.front_fbo == 0 {
+                glGenFramebuffersEXT(1, &mut d.front_fbo);
+            }
+            glBindFramebufferEXT(GL_FRAMEBUFFER, d.front_fbo);
+            glFramebufferRenderbufferEXT(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, d.front);
+            glBindFramebufferEXT(GL_FRAMEBUFFER, d.fbo);
+        } else {
+            glFramebufferRenderbufferEXT(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_RENDERBUFFER, 0);
+        }
         // GLX says every visual has an 8-bit stencil buffer (glXGetConfig in
         // the shim), so there is one: packed with the depth buffer.
         glGenRenderbuffersEXT(1, &mut d.depth);
@@ -294,7 +365,10 @@ pub enum Sink {
     Queued,
 }
 
-/// Hand a frame to `d`: at a screen position when the program gave one.
+/// Hand a frame to `d`: at a screen position when the program gave one. A
+/// colour-index window's frame (`index`: Some(overlay)) goes as indices, and
+/// only with a position (see iris_hostcall::Display::present_index_at).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn present_to(
     d: &dyn iris_hostcall::Display,
     window: u32,
@@ -303,27 +377,31 @@ pub(crate) fn present_to(
     stride: usize,
     w: usize,
     h: usize,
+    index: Option<bool>,
 ) -> bool {
-    match at {
-        Some((x, y)) => d.present_at(window, x, y, bgra, stride, w, h),
-        None => d.present(window, bgra, stride, w, h),
+    match (index, at) {
+        (Some(overlay), Some((x, y))) => d.present_index_at(window, x, y, bgra, stride, w, h, overlay),
+        (Some(_), None) => false,
+        (None, Some((x, y))) => d.present_at(window, x, y, bgra, stride, w, h),
+        (None, None) => d.present(window, bgra, stride, w, h),
     }
 }
 
 impl Sink {
     /// True if the frame has been dealt with and the program needs no pixels.
-    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(self, window: u32, at: Option<(i32, i32)>, bgra: &[u8], stride: usize, w: usize, h: usize, index: Option<bool>, flush: bool) -> bool {
         match self {
             Sink::Now => {
                 let ok = match iris_hostcall::display() {
-                    Some(d) => present_to(d.as_ref(), window, at, bgra, stride, w, h),
+                    Some(d) => present_to(d.as_ref(), window, at, bgra, stride, w, h, index),
                     None => false,
                 };
                 crate::present::note(window, ok);
                 ok
             }
             Sink::Queued if crate::present::presents(window) => {
-                crate::present::queue(window, at, bgra, stride, w, h);
+                crate::present::queue(window, at, bgra, stride, w, h, index, flush);
                 true
             }
             // Not a drawable we have seen present. Whether presenting works is
@@ -332,12 +410,20 @@ impl Sink {
             // let the next swap of this drawable be the fast one. A drawable
             // that cannot be presented into stays here for ever and behaves
             // exactly as it did before any of this.
-            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h),
+            Sink::Queued => Sink::Now.deliver(window, at, bgra, stride, w, h, index, flush),
         }
     }
 }
 
-pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool) -> Option<Vec<u8>> {
+/// `front`: show the front buffer as it is (glFlush after drawing into it)
+/// rather than swap. `keep_front`: the front buffer is kept, so a swap copies
+/// the back into it.
+#[allow(clippy::too_many_arguments)]
+/// `flush`: the frame is shown because the program flushed, not swapped (a
+/// front buffer, a colour-index window): it never waits for the presenter,
+/// and replaces a frame still waiting (see present::queue).
+#[allow(clippy::too_many_arguments)]
+pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink: Sink, abgr: bool, front: bool, keep_front: bool, index: Option<bool>, flush: bool) -> Option<Vec<u8>> {
     let (w, h) = (w.max(0), h.max(0));
     let (rw, rh) = (w.min(d.w), h.min(d.h));
     let mut frame = vec![0u8; w as usize * h as usize * 4];
@@ -380,9 +466,25 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
         };
         let flip = &d.flips[idx];
         d.next_flip.store((idx + 1) % n, Ordering::Relaxed);
-        glBindFramebufferEXT(GL_READ_FRAMEBUFFER, read_source(d));
+        let show_front = front && d.front_fbo != 0;
+        if show_front {
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER, d.front_fbo);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+        } else {
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER, read_source(d));
+            // The back buffer, whatever the program reads from.
+            if d.front != 0 {
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+            }
+        }
         glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER, flip.fbo);
         glBlitFramebufferEXT(0, 0, rw as i32, rh as i32, 0, rh as i32, rw as i32, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        if keep_front && !show_front && d.front_fbo != 0 {
+            // A swap: the frame shown is the front buffer now.
+            glBindFramebufferEXT(GL_READ_FRAMEBUFFER, d.fbo);
+            glBindFramebufferEXT(GL_DRAW_FRAMEBUFFER, d.front_fbo);
+            glBlitFramebufferEXT(0, 0, d.w, d.h, 0, 0, d.w, d.h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
 
         // Queued: the presenting thread maps the surface -- which waits for
         // the GPU to finish the frame -- and presents it, and the swap
@@ -393,7 +495,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
             if crate::present::presents(window) {
                 glFlush();
                 flip.busy.store(true, Ordering::Release);
-                crate::present::queue_surface(window, at, sf.clone(), flip.busy.clone(), rw, rh);
+                crate::present::queue_surface(window, at, sf.clone(), flip.busy.clone(), rw, rh, index, flush);
                 for (&n, &v) in names.iter().zip(pack.iter()) {
                     glPixelStorei(n, v);
                 }
@@ -432,7 +534,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glFlush();
                 let mut done = false;
                 let mapped = sf.with_pixels(&mut |px, stride| {
-                    presented = sink.deliver(window, at, px, stride, rw, rh);
+                    presented = sink.deliver(window, at, px, stride, rw, rh, index, flush);
                     if !presented && px.len() >= stride * rh && stride >= rw * 4 {
                         hand_back(px, stride);
                     }
@@ -447,7 +549,7 @@ pub fn swap(d: &Draw, window: u32, at: Option<(i32, i32)>, w: i32, h: i32, sink:
                 glReadBuffer(GL_COLOR_ATTACHMENT0);
                 let mut bgra = vec![0u8; rw * rh * 4];
                 glReadPixels(0, 0, rw as i32, rh as i32, GL_BGRA, GL_UNSIGNED_BYTE, bgra.as_mut_ptr() as *mut c_void);
-                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh);
+                presented = sink.deliver(window, at, &bgra, rw * 4, rw, rh, index, flush);
                 if !presented {
                     hand_back(&bgra, rw * 4);
                 }

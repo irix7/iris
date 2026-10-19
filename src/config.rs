@@ -828,6 +828,40 @@ impl CpuModel {
     }
 }
 
+/// How the CPU's caches are modelled. A runtime choice: each is its own
+/// monomorphisation, picked when the machine is built.
+///
+/// - `full`: the functional caches (`mips_cache_v2`): tags, line data, LRU,
+///   write-back, VCE. What the interpreter is fastest with, since its decoded
+///   instructions live in the cache lines.
+/// - `shadow`: memory is the only store; tag arrays exist only to answer
+///   CACHE instructions (`mips_cache_shadow`). jitv2's inline loads and stores
+///   need no tag check against it.
+/// - `auto`: `shadow` in a `jitv2` build, `full` otherwise.
+///
+/// The R10000 (IP28) only has the shadow model.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "lower")]
+pub enum CacheModel {
+    #[default]
+    Auto,
+    Full,
+    Shadow,
+}
+
+impl CacheModel {
+    /// Whether `cpu` runs the shadow cache under this setting.
+    pub fn is_shadow(self, cpu: CpuModel) -> bool {
+        match (cpu, self) {
+            (CpuModel::R10000, _) => true,
+            (_, Self::Full) => false,
+            (_, Self::Shadow) => true,
+            (_, Self::Auto) => cfg!(feature = "jitv2"),
+        }
+    }
+}
+
 /// `[machine]` section — platform identity (not performance knobs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -836,11 +870,13 @@ pub struct MachineSection {
     pub profile: MachineProfile,
     #[serde(default)]
     pub cpu: CpuModel,
+    #[serde(default)]
+    pub cache: CacheModel,
 }
 
 impl Default for MachineSection {
     fn default() -> Self {
-        Self { profile: MachineProfile::default(), cpu: CpuModel::default() }
+        Self { profile: MachineProfile::default(), cpu: CpuModel::default(), cache: CacheModel::default() }
     }
 }
 
@@ -1155,9 +1191,27 @@ pub enum AudioBackendKind {
     Null,
 }
 
+/// Which host audio system HAL2 plays through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioHost {
+    /// The platform's usual one: CoreAudio on macOS, WASAPI on Windows, ALSA
+    /// on Linux.
+    #[default]
+    Default,
+    /// ALSA (Linux).
+    Alsa,
+    /// A PulseAudio server, or PipeWire's pipewire-pulse (Linux). Falls back
+    /// to ALSA when none answers.
+    Pulseaudio,
+}
+
 /// HAL2 audio output tuning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// Host audio system to play through. Default: the platform's usual one.
+    #[serde(default)]
+    pub host: AudioHost,
     /// Pre-buffer duration (ms) before feeding the cpal ring. Default 20.
     #[serde(default = "default_audio_prebuf_ms")]
     pub prebuf_ms: u64,
@@ -1177,6 +1231,7 @@ fn default_audio_prebuf_ms() -> u64 { 20 }
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
+            host: AudioHost::Default,
             prebuf_ms: default_audio_prebuf_ms(),
             cpal_buffer_frames: None,
             resampler: ResamplerKind::default(),
@@ -1319,6 +1374,16 @@ pub struct MachineConfig {
     /// set PC to its entry point (bare-metal test binaries; see --load-elf).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_elf: Option<String>,
+
+    /// Start a Perfetto trace into this file at startup (`--perfetto`;
+    /// needs the `perfetto` feature). Categories and clock as for the
+    /// monitor's `perfetto start`.
+    #[serde(skip)]
+    pub perfetto: Option<String>,
+    #[serde(skip)]
+    pub perfetto_cats: Option<String>,
+    #[serde(skip)]
+    pub perfetto_clock: Option<String>,
 
     /// Map the bare-metal test device (guest console, machine-state dump, exit
     /// code) into GIO expansion slot 0. Off by default; see src/dev/testdev.rs.
@@ -1531,6 +1596,9 @@ impl Default for MachineConfig {
             serial_port_b: None,
             keyboard: KeyboardLayout::default(),
             load_elf: None,
+            perfetto: None,
+            perfetto_cats: None,
+            perfetto_clock: None,
             test_device: false,
             test_device_dump: None,
             cheritest_dump_hook: false,
@@ -1844,6 +1912,10 @@ pub struct Cli {
     #[arg(long = "noaudio", default_value_t = false)]
     pub no_audio: bool,
 
+    /// Host audio system for HAL2: default, alsa or pulseaudio (overrides [audio] host)
+    #[arg(long = "audio-host", value_enum, value_name = "HOST")]
+    pub audio_host: Option<AudioHost>,
+
     /// Enable NFS share: path to the directory to export (enables NFS)
     #[arg(long = "nfs-dir", value_name = "DIR")]
     pub nfs_dir: Option<String>,
@@ -1879,6 +1951,12 @@ pub struct Cli {
     /// picks between them at construction. The `r5k` Cargo feature is removed.
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<CpuModel>,
+
+    /// Cache model: `auto` (default: `shadow` in a jitv2 build, else `full`),
+    /// `full` or `shadow`. Overrides `[machine] cache`. The R10000 is always
+    /// `shadow`.
+    #[arg(long = "cache", value_name = "MODEL")]
+    pub cache: Option<CacheModel>,
 
     /// Graphics board: `newport` (default), `xz`, `extreme`, `solidimpact`, `highimpact`, `maximpact` (or `impact:solid`, `impact:high`, `impact:max`).
     #[arg(long = "graphics", visible_alias = "board", visible_alias = "graphics-board", value_name = "BOARD")]
@@ -1933,6 +2011,19 @@ pub struct Cli {
     /// For bare-metal test binaries; see also the monitor's `loadelf`.
     #[arg(long = "load-elf", value_name = "FILE")]
     pub load_elf: Option<String>,
+
+    /// Record a Perfetto trace into FILE from startup (build with
+    /// `--features perfetto`). Open it at ui.perfetto.dev.
+    #[arg(long, value_name = "FILE")]
+    pub perfetto: Option<String>,
+
+    /// Perfetto categories, e.g. `irq,gfx` or `all,-jit` [default: all]
+    #[arg(long = "perfetto-cats", value_name = "LIST")]
+    pub perfetto_cats: Option<String>,
+
+    /// Perfetto timeline: `host` (ns) or `guest` (instructions) [default: host]
+    #[arg(long = "perfetto-clock", value_name = "CLOCK")]
+    pub perfetto_clock: Option<String>,
 
     /// CI mode: enable the control socket and apply speed-favoring fidelity
     /// shortcuts. Hides the window unless --ci-display is set; offscreen
@@ -2018,10 +2109,12 @@ impl Cli {
         if let Some(p) = self.scsi7.clone()  { apply_scsi(&mut cfg.scsi, 7, p, false, vec![]); }
 
         if let Some(cpu) = self.cpu { cfg.machine.cpu = cpu; }
+        if let Some(cache) = self.cache { cfg.machine.cache = cache; }
         if let Some(b) = self.graphics { cfg.graphics.board = b; }
         if self.scale2x { cfg.scale = 2; }
         if self.headless  { cfg.headless  = true; }
         if self.no_audio  { cfg.no_audio  = true; }
+        if let Some(h) = self.audio_host { cfg.audio.host = h; }
 
         if self.no_scsi_deferred_int { cfg.scsi_deferred_int = false; }
         if self.ci         { cfg.ci         = true; }
@@ -2047,6 +2140,9 @@ impl Cli {
         if let Some(p) = self.serial_port_b { cfg.serial_port_b = Some(p); }
         if let Some(k) = self.keyboard { cfg.keyboard = k; }
         if let Some(ref p) = self.load_elf { cfg.load_elf = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto { cfg.perfetto = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto_cats { cfg.perfetto_cats = Some(p.clone()); }
+        if let Some(ref p) = self.perfetto_clock { cfg.perfetto_clock = Some(p.clone()); }
         if let Some(ref d) = self.tftp_dir { cfg.network.tftp_dir = Some(d.clone()); }
         if self.test_device { cfg.test_device = true; }
         if let Some(ref p) = self.test_device_dump { cfg.test_device_dump = Some(p.clone()); }
@@ -2180,6 +2276,22 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn audio_host_parses_and_defaults() {
+        let cfg: MachineConfig = toml::from_str("").expect("parse");
+        assert_eq!(cfg.audio.host, AudioHost::Default);
+        let cfg: MachineConfig = toml::from_str(r#"
+            [audio]
+            host = "pulseaudio"
+            cpal_buffer_frames = 256
+        "#).expect("parse");
+        assert_eq!(cfg.audio.host, AudioHost::Pulseaudio);
+        assert_eq!(cfg.audio.cpal_buffer_frames, Some(256));
+        let back: MachineConfig = toml::from_str(&toml::to_string_pretty(&cfg).expect("serialize")).expect("deserialize");
+        assert_eq!(back.audio.host, AudioHost::Pulseaudio);
+        assert!(toml::from_str::<MachineConfig>("[audio]\nhost = \"oss\"").is_err());
     }
 
     #[test]

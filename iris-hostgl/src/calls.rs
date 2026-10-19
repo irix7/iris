@@ -1779,6 +1779,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(87)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, a4, a5, a6);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -1794,6 +1795,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(88)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, a4, a5, a6);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -1810,6 +1812,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(89)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32, i32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, a4, a5, a6, a7);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -1826,6 +1829,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(90)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32, i32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, a4, a5, a6, a7);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -2412,9 +2416,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as u8; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(151)?;
             let g: extern "C" fn(u32, *mut u8) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<u8>(a1, &o1[..n1])?;
             x.image_done();
@@ -2616,9 +2622,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as f64; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(166)?;
             let g: extern "C" fn(u32, *mut f64) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<f64>(a1, &o1[..n1])?;
             x.image_done();
@@ -2633,9 +2641,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as f32; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(168)?;
             let g: extern "C" fn(u32, *mut f32) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<f32>(a1, &o1[..n1])?;
             x.image_done();
@@ -2738,9 +2748,11 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let c1 = get_count(a0 as u32);
             let n1 = x.count(c1)?;
             let mut o1 = vec![0 as i32; n1.max(1) + 16];
+            if !x.color_matrix_query(a0, &mut o1) {
             let f = x.func(176)?;
             let g: extern "C" fn(u32, *mut i32) = unsafe { std::mem::transmute(f) };
             g(a0, o1.as_mut_ptr());
+            }
             x.get_limit(a0, &mut o1);
             x.put::<i32>(a1, &o1[..n1])?;
             x.image_done();
@@ -3164,6 +3176,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(209)?;
             let g: extern "C" fn(u32, i32, u32, *mut f32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, a2, o3.as_mut_ptr());
+            x.texture_internal_answer_f(a0, a1, a2, &mut o3);
             x.put::<f32>(a3, &o3[..n3])?;
             x.image_done();
             Some(0)
@@ -3179,6 +3192,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(210)?;
             let g: extern "C" fn(u32, i32, u32, *mut i32) = unsafe { std::mem::transmute(f) };
             g(a0, a1, a2, o3.as_mut_ptr());
+            x.texture_internal_answer(a0, a1, a2, &mut o3);
             x.put::<i32>(a3, &o3[..n3])?;
             x.image_done();
             Some(0)
@@ -5336,6 +5350,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(424)?;
             let g: extern "C" fn(u32, i32, i32, i32, i32, u32, u32, *const c_void) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as i32, a3, a4, x.gl_format(a5), x.gl_type(a5, a6), p7 as *const c_void);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -5355,6 +5370,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let g: extern "C" fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as i32, a3, x.gl_height(a4 as i32) as i32, a5, x.gl_format(a6), x.gl_type(a6, a7), p8 as *const c_void);
             }
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -5373,6 +5389,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(426)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32, u32, u32, *const c_void) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, x.gl_height(a4 as i32) as i32, a5, a6, x.gl_format(a7), x.gl_type(a7, a8), p9 as *const c_void);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }
@@ -5391,6 +5408,7 @@ pub fn run(x: &mut Exec, op: usize, c: &[u8]) -> Option<u64> {
             let f = x.func(427)?;
             let g: extern "C" fn(u32, i32, u32, i32, i32, i32, i32, u32, u32, *const c_void) = unsafe { std::mem::transmute(f) };
             g(a0, a1, x.gl_internal(a2 as i32) as u32, a3, x.gl_height(a4 as i32) as i32, a5, a6, x.gl_format(a7), x.gl_type(a7, a8), p9 as *const c_void);
+            x.note_internal(a0 as u32, a1 as i32, a2 as i32);
             x.image_done();
             Some(0)
         }

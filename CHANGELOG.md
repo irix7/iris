@@ -2,8 +2,9 @@
 
 All notable user-facing and developer-facing changes to iris.
 
-IRIS has no numbered releases. Binary builds are tagged `v<YYYY-MM-DD-HH-MM>` by
-the Release workflow when someone publishes one. This file is grouped by month,
+Binary builds are published as a daily `nightly` pre-release
+(`nightly.YYYY.MM.DD`) and as releases for `vX.Y.Z` tags. Builds before
+October 2026 were tagged `v<YYYY-MM-DD-HH-MM>`. This file is grouped by month,
 newest first, and within a month by area. Dates use the Git committer date
 (`git show -s --format=%cs`), which records when a change landed in this
 history; author dates can differ after rebases or cherry-picks. Historical
@@ -37,8 +38,78 @@ hashes are given where a change is easiest to understand by reading the commit.
   MACs. It needs no IRIX media: the Indy PROM command monitor is the serial
   endpoint.
 
+### iris-gui text and languages
+
+- **GUI text was rewritten, and moved into translatable catalogs.** Labels,
+  menus, tooltips and messages are shorter and consistent (sentence case, no
+  register names or config keys in labels), and the explanatory captions
+  under most controls are gone. Every string now lives in Fluent files under
+  `iris-gui/locales/en/`; editing text no longer means editing code. A
+  caption or tooltip left empty in the catalog isn't drawn, so one can be
+  brought back by filling in its value. English is the only language so far:
+  adding one is adding a `locales/<lang>/` folder (`iris-gui/locales/README.md`),
+  and View → Language switches between installed languages, defaulting to the
+  system's.
+
+### Releases and packaging
+
+- **Nightly and tagged releases, built by scripts.** A nightly build of `main`
+  replaces the single `nightly` pre-release every day, versioned
+  `nightly.YYYY.MM.DD`; pushing a `vX.Y.Z` tag publishes release `X.Y.Z`. The
+  version shows in the About window, `iris-ci --version`, the macOS app and
+  every file name. Both ship iris-gui with
+  `iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl` and the CLI
+  with `lightning,jitv2,gpujit,idle-pause,hostgl`. All building and packaging
+  lives in `scripts/dist/`, which the workflows call and you can run locally.
+- **macOS ships one universal app** (`IRIS-gui-macos-universal-*.dmg` and
+  `.zip`) and a universal CLI tarball, signed and notarized when the
+  repository has Apple credentials. The bundle ID is now
+  `io.techomancer.iris`; the App Store app keeps its own.
+- The App Store build takes its version from the newest `vX.Y.Z` tag.
+
+### Networking
+
+- **The NAT stack was rebuilt, and is faster and no longer stalls.** Through
+  a port forward, host → guest TCP went from about 1 to 6 MB/s and guest →
+  host from 2.7 to 7 MB/s; FTP to a LAN server from 1 to 7 MB/s; a large
+  UDP round trip from 48 to 5 ms. A connect to an unreachable host no longer
+  freezes all guest networking for up to 5 s (nor does each DNS lookup for
+  up to 2 s), established connections are no longer dropped after 5 minutes
+  idle, and the NAT thread idles at 0.1% of a core instead of 3.7%. Causes:
+  no MSS option in our SYN-ACK (IRIX used 512-byte segments off-subnet),
+  seeq-enet pacing bursts at one frame per millisecond after a lost wake-up,
+  blocking connect and DNS on the NAT thread, and 1 ms polling. The code is
+  split into modules over typed packets (`net/packet.rs`), a real
+  guest-facing TCP endpoint (`net/tcp.rs`) and socket-like in-core services;
+  UDP replies now keep their real source port (TFTP to an outside server),
+  and portmap answers only at the gateway. Tests: `net::testnet` (directed,
+  frames in and out against real host sockets) and `test/net` (guest and
+  host, with `nettest.c`). Design and numbers: `docs/net-stack.md`.
+- **TFTP works for PROM network boot and for guest clients.** `boot -f
+  bootp()/unix` failed in two places. The BOOTP reply left the boot file
+  empty, which the PROM treats as "File not found on server". Its second
+  BOOTP, sent when the ELF loader seeks backwards and reopens the file, was
+  answered by broadcast, which the PROM drops once it has an address. BOOTP
+  now names the file and replies to the client's address, as bootpd does.
+  The TFTP server also refused absolute names (`/unix`) and netascii, the
+  default mode of IRIX's `/usr/bsd/tftp`. It now takes names relative to
+  the root, as `tftpd -s` does, and serves netascii. `test/tftp/` has a
+  portable client (`tftpget.c`) and a guest test script. The monitor's
+  `ps2 esc` presses Esc, which stops the PROM's autoboot.
+
 ### UI / input
 
+- **`--2x` and `scale = 2` survive boot.** The window opened at 2× but
+  snapped back to 1× as soon as the PROM or IRIX set a video mode. Every
+  guest mode change now sizes the window to the new resolution times the
+  configured scale. Right Ctrl + 1/2 still resize on demand, until the next
+  mode change.
+- **The status bar's Hz is the fast clock again on Indigo2 and IP28.** It
+  counted both 8254 timers, timer 0 (the 100 Hz system clock) and timer 1
+  (the 1000 Hz fast clock), so a healthy IP28 read 1100 Hz and looked like a
+  mis-calibrated CPU. It now counts timer 1 only, the clock Indy's figure
+  (CP0 Compare) has always shown. IRIX's own calibration was right all along:
+  `timer_freq` is 97500000 (195 MHz) on a live IP28 kernel.
 - **The `iris` window lets go of held keys and buttons when it loses
   focus.** Cmd-Tab or Alt-Tab is pressed in the window and released in the
   next one, so the guest kept those keys (and any held mouse button) down: a
@@ -61,6 +132,53 @@ hashes are given where a change is easiest to understand by reading the commit.
   dev shell supplies the native ALSA/X11/GL/v4l/libclang libraries and pins the
   host's shared rig Rust toolchain. `CLAUDE.md` records the invocation and the
   GC'd-toolchain remedy.
+
+- **`[audio] host` picks the host audio system; on Linux, PulseAudio on
+  request.** `host = "pulseaudio"` (or `--audio-host pulseaudio`) plays
+  through cpal's own PulseAudio client, which PipeWire answers too through
+  pipewire-pulse; the client is pure Rust, so the build links nothing new.
+  The default is unchanged: ALSA on Linux. On some setups cpal's ALSA
+  backend spins a whole core (a Debian 12 arm64 VM, through PipeWire's ALSA
+  plugin and the card's own device alike: the poll descriptor stays ready
+  while there is no room to write), starving the emulator into a stream of
+  underruns, while the PulseAudio client used 0.01 s of CPU in 5 s. See
+  `rules/testing/cpal-alsa-busy-poll.md`. `[audio] cpal_buffer_frames`,
+  which was parsed but never reached HAL2, now sets the host buffer size; a
+  size the device refuses falls back to the host's default. Unset,
+  PulseAudio gets 512 frames (two of them, ~21 ms at 48 kHz) instead of its
+  own default target of about two seconds, which made IRIX's sound arrive
+  that late.
+- **`gpujit` turns on every graphics JIT** (`rex-jit` and `gr4-jit`) and is
+  the recommended build: `--features lightning,gpujit`. The GUI and the
+  release binaries now carry it, so IMPACT gets its raster JIT out of the
+  box. `IRIS_NO_JIT` now turns the IMPACT JIT off too (and `mgras jit on`
+  refuses), which keeps the Mac App Store build interpreter-only.
+- **`gr2 trace` and `mgras trace` need `gputrace`, like `rex trace`.** On with
+  `developer`; plain and `lightning` builds add `--features gputrace`.
+  Without it the per-access trace check on GR2 and IMPACT register reads
+  and writes, and on every HQ2/RE3 and HQ3/RSS FIFO entry, is compiled out,
+  formatting and all, and the commands (and `IRIS_MGRAS_TRACE`) say the
+  build lacks the feature. `mgras rec` stays in every build.
+- **Perfetto tracing (`--features perfetto`).** `--perfetto FILE` or the
+  monitor's `perfetto start FILE` records a trace that opens in
+  ui.perfetto.dev. Events go into per-thread rings and a writer thread
+  encodes them, so an event costs about 20 ns recorded and under 1 ns when
+  its category is off. The timeline is host time, aligned with system
+  traces on Linux, or guest instructions (`clock=guest`). Traced:
+  - every IOC interrupt line and the CPU's IP2-IP7 pins, including the
+    8254 slow and fast ticks and Count/Compare
+  - interrupts taken
+  - HPC3 PDMA channels (HAL2, SCSI, ethernet): activity, descriptors and
+    completion interrupts
+  - VDMA
+  - WD33C93A commands, CDBs and interrupts
+  - ethernet frames
+  - HAL2 pacing and host underruns
+  - REX3, GR2 and IMPACT vblank, flips, busy-waits and FIFO-full stalls
+  - IMPACT engine busy and host DMA
+  - jitv2 compile requests, compiles and compile-queue-full stretches
+
+  See `docs/perfetto.md`.
 - **IMPACT colour pipeline in 12.16 fixed point.** Colour iterators,
   texel filtering (texels widened to 12 bits, 8-bit bilinear and mip
   weights), the texture environment, fog and blending now compute in
@@ -98,19 +216,45 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### iris-gui
 
+- **GUI settings for this month's core changes.** The Networking tab sets the
+  TFTP boot folder (`[network] tftp_dir`; NAT mode, with the `boot -f
+  bootp()/unix` line to use) and shows and edits the Ethernet address
+  (`eaddr`) in whichever chip the profile boots from: NVRAM on Indy, the
+  NVRAM EEPROM on Indigo2/IP28. The General tab sets the monitor and serial
+  ports (`monitor_port`, `serial_port_a`, `serial_port_b`) and the cache model
+  (`[machine] cache`: auto, full, shadow; fixed to shadow on the R10000), and
+  the help text that named 8888 and 8881 now shows the configured ports. The
+  Debug tab lists the GR2 and IMPACT graphics JITs and jitv2 next to the REX3
+  JIT, and a `perfetto` iris-gui feature adds Start/Stop for a Perfetto trace
+  (file, categories, host or guest clock). Network tab text says "guest"
+  rather than "Indy", since Indigo2s use it too. jitv2 builds also set the
+  compile thread count (`[jitv2] threads`), an August setting with no control.
+- **Machine TOML files and private machine folders.** The GUI discovers and
+  saves `machines/<name>/<name>.toml` using the standalone emulator's schema.
+  `gui.json` retains GUI preferences and the active machine name. Each machine
+  runs from its own folder, with relative config paths, default disks under
+  `disks/`, and private `nvram.bin`/`nveeprom.bin` files. Existing JSON machines
+  migrate with a preferences backup; external disks stay in place. App Store
+  storage uses the container home, bookmarks cover external relative paths,
+  and CHD diffs migrate to each machine's folder. Renaming moves the folder and
+  TOML together. Import/export menu actions are removed. Directory changes wait
+  for emulator teardown and queued file operations, and startup seeds NVRAM
+  before machine construction.
 - **NVRAM EEPROM gets the same stable-path treatment as NVRAM.** `nveeprom`
   (Indigo2/IP28's motherboard EEPROM — where `eaddr` and PROM env actually live
   on those profiles, not in the NVRAM file) used to default to a bare
   `"nveeprom.bin"` with no anchoring, no migration, and no config-editor field,
-  unlike `nvram`. Since iris-gui never changes its working directory, that bare
-  default resolved against whatever CWD the OS happened to launch it with —
-  often not the same place twice between `cargo run` and a bundled `.app` — so
-  a machine could silently load a different (usually blank) EEPROM each
-  launch, and "Reset NVRAM"'s MAC write (which only ever touched `nvram`) had
-  no effect on Indigo2/IP28's actual `eaddr`. Now: a stable
-  `<config dir>/iris/nveeprom.bin` default (`GuiSettings::default_nveeprom_path`),
-  the same relative-path migration `nvram` gets on load, and a "NVRAM EEPROM
-  file" row on the General tab right below NVRAM file.
+  unlike `nvram`. At the time iris-gui never changed its working directory, so
+  that bare default resolved against whatever CWD the OS happened to launch it
+  with — often not the same place twice between `cargo run` and a bundled
+  `.app` — so a machine could silently load a different (usually blank)
+  EEPROM each launch, and "Reset NVRAM"'s MAC write (which only ever touched
+  `nvram`) had no effect on Indigo2/IP28's actual `eaddr`. Fixed first with a
+  stable `<config dir>/iris/nveeprom.bin` default and the same relative-path
+  migration `nvram` gets on load; machine folders (above) later superseded
+  that fixed path, so `nveeprom.bin` now resolves next to each machine's own
+  `nvram.bin`. Either way there's a "NVRAM EEPROM file" row on the General tab
+  right below NVRAM file.
 - **"Reset NVRAM" and the no-MAC-yet pre-flight now also patch the NVRAM
   EEPROM.** Both only ever touched the DS1386 `nvram` file — on Indigo2/IP28,
   which read `eaddr` from `nveeprom` instead (see above), this had no effect
@@ -123,6 +267,103 @@ hashes are given where a change is easiest to understand by reading the commit.
   `nvram` ones, so both chips get a real MAC regardless of machine profile.
 ### Graphics and host OpenGL
 
+- **GR2 span JIT (`gr2-jit`, part of `gpujit`).** RE3's SHADED and FLAT spans
+  compile to native code per pipeline key (pixel format and dither, raster
+  op, pattern, WID test, depth and stencil tests, blend), the way `gr4-jit`
+  compiles IMPACT primitives: background compiler thread, interpreter until
+  a shader is ready, `IRIS_GR2_JIT=off|on|sync`, `gr2 jit` in the monitor.
+  Bit-exact with the interpreter (`re3_jit_tests.rs`). IRIX fill rate on XZ
+  about 3x (78 to 245 Mpx/s), Z-buffered 2x; small triangles are bound by
+  the HQ2 side and unchanged.
+- **GR2 OpenGL accuracy against the IMPACT test suites.** pixtest (RGBA,
+  `--ci 8`, `--ci 12`), blendtest, glstate and vissweep run clean on XZ.
+  New: glCopyPixels (0x0BA) with zoom, glDrawPixels x zoom, the 0x0A7 pixel
+  packing for colour-index reads and draws, colour-index clears with depth
+  (0x30A0 / 0x70A0), colour-index software fragments, the 4-bit 1:2:1 RGB
+  visual, mailbox reads bottom row first, 3:3:2 widening by bit
+  replication, and depth reads of z20 s4 visuals with the stencil above Z.
+  The suites flag libGLcore EXPRESS's own bugs as GR2 XFAILs
+  (rules/gr2/gl-test-suites.md).
+
+- **Host GL on Linux.** `--features hostgl` now has an EGL backend
+  (`iris-hostgl/src/backend/egl.rs`): headless contexts in the compatibility
+  profile with no surface at all (every drawable was already a framebuffer
+  object), on Mesa's surfaceless platform, so no X or Wayland session is
+  involved. libEGL is opened at run time; building links libGL (glvnd):
+  `libgl-dev` on Debian/Ubuntu, `libglvnd-devel` on Fedora, `libglvnd` on
+  Arch. Running needs libEGL and Mesa's EGL and DRI drivers: `libegl1
+  libegl-mesa0 libgl1-mesa-dri` on Debian/Ubuntu (`libegl-mesa0` alone does
+  not bring libEGL), `mesa-libEGL mesa-dri-drivers` on Fedora, `mesa` on
+  Arch. glvnd and Mesa hand
+  out a stub for any `gl*` name, so entry points are looked up only when the
+  context's version or extensions provide them (`src/avail.rs`, generated
+  from the pinned registry by `tools/gl_avail.py`). The service's own texture
+  names now count down from the top, out of the way of Mesa's, which come
+  from the bottom whatever the program asked for. Debian 12 arm64 (Mesa
+  22.3, virgl, GL 4.0 compatibility): hostgl tests 31/31, gltest 167/167 n32
+  and o32, glcheck with the reference checksum, irisgltest, Quake 3. Fedora
+  44, Arch and Ubuntu 24.04 (x86_64, Mesa's software renderer, no GPU):
+  builds, hostgl tests 31/31. See
+  `rules/hostgl/linux-egl-and-mesa.md`.
+- **Host GL no longer stops the machine while it draws.** A host call is
+  answered on the emulated CPU's thread, so while host GL replayed a
+  command buffer (2-5 ms for a big one) no instruction ran and no interrupt
+  was taken: IRIX acknowledged its 1 kHz clock late ~15 times a second, its
+  audio driver refilled HAL2's ring late, and sound crackled under any busy
+  GL program. The service now runs on a thread of its own (`threaded.rs`).
+  A new op, `OP_BATCH_ASYNC`, queues a self-contained buffer and answers at
+  once; a call from a program with buffers still queued is answered with
+  the new `ENOTYET` (0x3001) and the library yields and asks again, so IRIX
+  keeps running. Against this tree without it (IP28, Max IMPACT, macOS): a
+  GL demo with synthesized sound went from 19.7 to 3.7 dropouts a second
+  (31 to 4 ms of sound lost a second) and Quake 3's timedemo from 30.4 to
+  33.9 fps; boot, idle CPU, sound without GL and SGI's own libGL on the
+  emulated board are unchanged. Libraries without `OP_BATCH_ASYNC` work
+  unchanged. `IRIS_HOSTGL_INLINE=1` keeps the service on the CPU thread.
+  See `rules/hostgl/host-calls-hold-the-cpu-thread.md`.
+- **Maximum Impact draws correctly, on two raster engines.** Its two RE4s
+  each own every other scanline in their own 12MB, so a buffer takes half
+  the pages per engine. The model assumed one engine; buffers overlapped,
+  and the desktop came up in 16-row bands. Pixel memory now has room for
+  both engines and follows the RSS count in DRBsize. Each engine also runs
+  on its own thread, like Voodoo2 SLI. Both take every raster command from
+  a broadcast FIFO (`GFifo<DEPTH, HEADS>`), each keeps its own TRAM as the
+  board does, and each draws only its scanlines (triangle and fill loops
+  step by two). Replays come out identical to one engine, desktop2.rec
+  passes every checkpoint, and a recorded gltest fill/triangle session
+  replays 1.75x faster. `IRIS_MGRAS_ENGINES=1` keeps one RSS thread. See
+  `rules/mgras/DESIGN.md`.
+- **IMPACT locks show in `locks`, with their holders.** The board's locks
+  are now light spinlocks (`locks::SpinLock`) that record the holding thread
+  and call site. A thread stuck waiting 5 s prints both sides, so a deadlock
+  names itself instead of just hanging.
+
+- **Newport glReadPixels from a double-buffered window reads the right
+  buffer with the REX JIT.** The compiled READ shader ignored DBLSRC (and the
+  bit offsets of the overlay, popup and CID planes), so once a 12-bit
+  double-buffered readback shape was compiled, every read after the first
+  returned the other buffer's pixels. Its screen-to-screen copy had the same
+  gap for RGB. Both now take the plane's bits as the interpreter does. See
+  `rules/rex3/jit-reads-take-the-plane-bits.md`.
+- **Newport (REX3) honours STEPZ.** A GO on STEPZ fails the Z pattern test
+  for its one pixel (rex3.pdf): the iteration advances but the pixel is not
+  written (COLORBACK under ZPOPAQUE). IRIX's software rasteriser draws
+  textured, alpha-tested spans one GO per pixel and skips rejected texels
+  this way; the emulator drew them, so `blast -T`'s billboards showed their
+  transparent corners as smeared rows and solid white triangles. See
+  `rules/rex3/stepz-steps-over-one-pixel.md`.
+- **2026-10-09 — Newport (REX3) blends again under IRIX OpenGL.**
+  DRAWMODE1's BLENDALPHA bit was applied to every channel, so with it clear
+  `BF_SA` was 1.0 for red, green and blue too and nothing was ever
+  attenuated. It only changes how the alpha component is blended (rex3.pdf
+  §3.8). IRIX's GL draws `GL_SRC_ALPHA`/`GL_ONE_MINUS_SRC_ALPHA` with it
+  clear, so every blend came out opaque: half-transparent quads, antialiased
+  text, and the dark halo around `blast`'s nebula billboard. Two things the
+  old reading hid are fixed with it: with ALPHAHOST and 8-bit host fields the
+  field is now the alpha (it was unpacked as a 4-bit colour, so IRIX's smooth
+  points, `blast`'s stars among them, had alpha 0), and A_LINE pixels take
+  full coverage as their alpha instead of a stale COLORALPHA (IRIX's
+  GL_LINE_SMOOTH lines faded to nearly nothing; coverage is not modelled yet).
 - **2026-10-06 — IMPACT OpenGL and texture pipeline** (`862d0fe`): GE11
   command HLE, shared matrix/clipping/lighting routines in `src/dev/gl/`,
   triangle rasterization, context storage and eviction through ERAM, and
@@ -171,6 +412,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Monitor and serial ports
 
+- **`rex jit disable` works again.** Since prebuilt and Cranelift shaders
+  share one dispatch map, disabling a shape only changed the JIT's own record
+  and the shader went on drawing. It now takes the shape out of dispatch
+  (whichever engine built it), keeps it from being compiled again, and
+  `rex jit enable` puts the same shader back.
+- **`ioc ticks`**: how the guest keeps up with the 8254 timers. Per timer:
+  ticks fired, ticks the guest acknowledged, ticks that landed on a still
+  pending one (merged, never seen by the guest) and a histogram of
+  fire-to-acknowledge waits, for the window since the previous call. IRIX
+  refills its audio rings from the 1 kHz fast clock, so a host too busy to
+  service it shows here as merged ticks and long waits before it is heard.
 - **2026-10-04 — Configurable monitor port** (`d8b8131`): top-level
   `monitor_port` / `--monitor-port`, default `8888`. The terminal connects
   only to its own machine's bound listener; a failed bind no longer attaches

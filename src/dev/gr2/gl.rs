@@ -15,12 +15,20 @@
 //! libglcore rasterizes alpha-tested primitives on the CPU and sends the
 //! surviving fragments (T_FRAGMENT). See GR2.h "BLENDING AND ALPHA TEST".
 //!
-//! Current scope: RGB windows, no lighting (colours from glColor), no
-//! clipping beyond the window/scissor rectangle (vertices behind the eye
-//! reject the whole primitive), lines and points without Z.
+//! Transform, view-volume and user clipping, the viewport mapping, lighting
+//! and fog use the board-independent GL core (`crate::dev::gl`); this file
+//! and gl_light.rs decode the GR2 token protocol into it and keep what is
+//! GR2's own: primitive assembly, polygon clipping on vertex-buffer indices
+//! (with GL_LINE edge flags), window clipping (0x1E5) and RE3 rasterization.
 
 use super::re3;
 use super::{Hq2Engine, Re3Sink, SCREEN_H};
+use crate::dev::gl::math::{self, Mat4};
+use crate::dev::gl::light::Lighting;
+use crate::dev::gl::vertex::{self, clip_cross, Clip, Viewport, CLIP_PLANES};
+
+/// GR2 vertices: no texture, fog applied per vertex.
+pub type Wv = vertex::Wv<0, 0>;
 
 #[path = "gl_light.rs"]
 mod light;
@@ -43,6 +51,11 @@ pub const T_CLEAR_COLOR_DEPTH: u32 = 0x0a0;
 /// Colour-index clear (libglcore clear_ci, C1|0x104): index (f32); DATA
 /// 0, 0, 0. gr_osview clears its window with index 46 this way.
 pub const T_CLEAR_CI: u32 = 0x3104;
+/// Colour-index clear with depth (CZClear on a CI visual): index, f32 on
+/// C1|0x0A0 or an integer on ITOF|C1|0x0A0 (pixtest, IRIX 6.5.22); DATA 0,
+/// 0, 0, depth, 0xFFFFFFFF as for 0x0A0.
+pub const T_CLEAR_CI_DEPTH: u32 = 0x30a0;
+pub const T_CLEAR_CI_DEPTH_I: u32 = 0x70a0;
 /// Window rectangle, sent by the kernel at context restore: x0; DATA y0 (GL,
 /// bottom-up), w, h, 0x10, 0, 1, (x1 << 11) | x0, (y1 << 10) | y0, 0 x 6.
 pub const T_WINDOW: u32 = 0x1e5;
@@ -114,6 +127,11 @@ pub const T_IRIS_SETCPOS: u32 = 0x0d0;
 /// setcpos use the same screen space: writepixels places its row at
 /// getcpos - getorigin.
 pub const T_GET_ORIGIN: u32 = 0x0cd;
+/// Current colour readback (IRIS GL gRGBcolor, getcolor; blast per frame):
+/// token 0; Finish; the mailbox holds R, G, B as the RE3's 8.11 iterator
+/// values (libgl takes (w >> 11) & 0xff of each; getcolor masks R with the
+/// write mask, the colour index in CI mode).
+pub const T_IRIS_GET_COLOR: u32 = 0x0cf;
 /// FIFO pixel writes (IRIS GL writepixels / writeRGB via rectwrite; OpenGL
 /// glDrawPixels, __glExpDrawPixelsUnpack*), per chunk of <= 48 pixels:
 ///   0x0B1 = 0                    start (the chunk's data follows)
@@ -168,17 +186,43 @@ pub const T_CLIP_PLANE: u32 = 0x02f;
 /// sends all three to the token; IRIS GL rectzoom sends the first to the
 /// token and the zooms on DATA (snoop: 0, 6.0, 6.0).
 pub const T_PIXEL_ZOOM: u32 = 0x0bb;
-/// Pixel read through the mailbox (IRIS GL readpixels / rectread, OpenGL
-/// ReadColor, Fetch, Pack1): x on the token; DATA y, width, height, then
-/// three words (1, 0, 0 seen; meaning unknown). Window-relative, GL y up,
-/// y = the bottom row. The microcode puts the pixels in shram from the
-/// mailbox word 0x4022, one per word (as the 0x0AC DMA read decodes them,
-/// rows top first), and raises FIN3 itself: libgl polls version bit 0
-/// without sending a Finish, then copies the words, acks FIN3 at 0x6B000
-/// and sends READ_DONE. Unimplemented, snoop spun on FIN3 for its whole
-/// time slice.
+/// glCopyPixels of colour (__glExpFastCopyPixels, after 0x0A7 / 0x0A8 = 0
+/// and 0x0BB = 0.0, |zoom x|, |zoom y| as whole numbers): token 0; DATA
+/// source y, destination y, height, source x, destination x, width (window
+/// coordinates, GL y up). libglcore takes its slow path (DrawPixels of a
+/// ReadPixels) for pixel transfer, zoom below 1 or negative, and blending
+/// or logic op with different read and draw buffers.
+pub const T_COPY_PIXELS: u32 = 0x0ba;
+
+/// Which pixel zoom (0x0BB) a pixel row applies.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PixZoom {
+    None,
+    /// x only: OpenGL rows (0x0B2), libglcore repeats rows for y.
+    X,
+    /// Both, rows in 0x0B8's bottom-first order.
+    Both,
+}
+/// Pixel read through the mailbox (IRIS GL readpixels / lrectread, OpenGL
+/// ReadColor, Fetch, Pack1): x on the token; DATA y, width, height, words
+/// a row, 0, 0 (IRIS GL sends 1 for the words, one pixel a word).
+/// Window-relative, GL y up, y = the bottom row. The microcode puts the
+/// pixels in shram from the mailbox word 0x4022 at 0x0A7's packing (as the
+/// 0x0AC DMA read decodes them), rows BOTTOM first (libglcore Pack1 of a
+/// 13x5 colour-index image; IRIS GL lrectread walks its chunks upwards
+/// too), and raises FIN3 itself: libgl polls version bit 0 without sending
+/// a Finish, then copies the words, acks FIN3 at 0x6B000 and sends
+/// READ_DONE. Unimplemented, snoop spun on FIN3 for its whole time slice.
 pub const T_READ_RECT: u32 = 0x0ad;
 pub const T_IRIS_SBOXF: u32 = 0x053;
+/// sbox / sboxi / sboxs (gl_i_sbox*): a screen-aligned box outline, the
+/// corners as for 0x053 (f32; integers on ITOF|0x052). Blender draws its
+/// interface lines as degenerate ones.
+pub const T_IRIS_SBOX: u32 = 0x052;
+pub const T_IRIS_SBOXI: u32 = 0x4052;
+/// Aux (overlay / popup) plane write mask (__glExpSetPixWritemask; IRIS GL
+/// drawmode): the aux bits drawing may change, 0 in normal drawing.
+pub const T_AUX_WRITEMASK: u32 = 0x003;
 /// swaptmesh (gl_i_swaptmesh): swap the two vertices a tmesh (bgntmesh =
 /// 0x046, LOADV|0x047) keeps; the next vertex makes a triangle with them.
 pub const T_IRIS_SWAPTMESH: u32 = 0x04b;
@@ -186,8 +230,10 @@ pub const T_IRIS_SBOXFI: u32 = 0x4053;
 pub const T_IRIS_CHAR16: u32 = 0x069;
 pub const T_IRIS_CHAR16_TALL: u32 = 0x06a;
 pub const T_IRIS_CHAR32: u32 = 0x06d;
-/// Frame setup: 0x008 = 0, back buffer (0/1); 0x005 = colour write mask
-/// for it (0x000FFF / 0xFFF000 for 12-bit double buffering).
+/// readsource (gl_setreadsource): 0x008 = plane (0 colour, 1 overlay /
+/// popup, 2 and up other planes), then the absolute bank (0/1). 0x005 is
+/// the colour write mask, also absolute (0x000FFF / 0xFFF000 for 12-bit
+/// double buffering).
 pub const T_IRIS_BUFFER: u32 = 0x008;
 pub const T_IRIS_WRITEMASK: u32 = 0x005;
 /// clear() with the current colour; zclear(value).
@@ -248,9 +294,12 @@ pub const T_BITMAP: u32 = 0x18c;
 pub const T_BITMAP_TALL: u32 = 0x18d;
 pub const T_BITMAP_HUGE: u32 = 0x18e;
 const BITMAP_HDR: usize = 6;
-/// Pixel read setup (__glExpReadPixelsKDMA, Fetch, ReadColor): read setup
-/// 0x0A7 / 0x0A8 = 0 and read mode 0x0BC (1 before a pixel DMA read, 0
-/// before READ_RECT). Meaning unknown; the HLE ignores them.
+/// Pixel setup before pixel reads and draws (__glExpReadPixelsKDMA, Fetch,
+/// ReadColor, DrawPixels): 0x0A7 = the packing of the pixel words that
+/// follow (0 = one 32-bit pixel a word, 1 = two 16-bit, 2 = four 8-bit,
+/// first pixel in the MSB; colour-index UNSIGNED_BYTE / SHORT images,
+/// pixtest), 0x0A8 = 0 (meaning unknown), read mode 0x0BC (1 before a pixel
+/// DMA read, 0 before READ_RECT).
 pub const T_READ_SETUP_A: u32 = 0x0a7;
 pub const T_READ_SETUP_B: u32 = 0x0a8;
 pub const T_READ_MODE: u32 = 0x0bc;
@@ -281,33 +330,10 @@ const USEV: u32 = 0x200;
 const LOADV: u32 = 0x400;
 const ITOF: u32 = 0x4000;
 
-/// A vertex after transform: window coordinates (GL: y up), colour 0..1.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct Wv {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub c: [f32; 4],
-    /// Back-face colour (two-sided lighting; = c otherwise).
-    pub cb: [f32; 4],
-    /// 0 when the vertex is behind the eye (w <= 0): it has no window
-    /// position and its primitive must be clipped (gl_poly / gl_line).
-    pub ok: u32,
-    /// Clip planes the vertex is outside of (bit i = plane i), computed once
-    /// at transform; 0 for vertices made by clipping or in window space.
-    pub oc: u32,
-    /// Clip-space position (frustum clipping) and eye-space position (user
-    /// clip planes). Both are linear in the object position, so clipping
-    /// interpolates them along an edge exactly.
-    pub h: [f32; 4],
-    pub e: [f32; 4],
-}
-
-/// Clip planes: 0..5 the view volume -w <= x, y, z <= w (GL and IRIS GL
-/// alike; their different Z ranges come after clipping, in the viewport
-/// transform), 6..11 the user planes (0x02E / 0x02F, eye space).
-const CLIP_PLANES: usize = 12;
+// Clip planes (vertex::CLIP_PLANES): 0..5 the view volume -w <= x, y, z
+// <= w (GL and IRIS GL alike; their different Z ranges come after
+// clipping, in the viewport transform), 6..11 the user planes (0x02E /
+// 0x02F, eye space).
 
 /// Most visible rectangles a 0x1E5 clip decomposes into (visible_rects).
 const MAX_VIS: usize = 32;
@@ -324,23 +350,6 @@ const RING: usize = 8;
 const MAXP: usize = VB + CLIP_PLANES;
 const SCRATCH: usize = 2 * CLIP_PLANES;
 const ALL_EDGES: u64 = u64::MAX;
-
-/// Point on a-b at the crossing of a plane where the signed distances are
-/// da and db: positions and colours interpolated, window position still to
-/// be computed (GlState::project).
-fn clip_cross(a: &Wv, b: &Wv, da: f32, db: f32) -> Wv {
-    let t = da / (da - db);
-    let l = |x: f32, y: f32| x + (y - x) * t;
-    let mut v = *a;
-    v.oc = 0;
-    for k in 0..4 {
-        v.h[k] = l(a.h[k], b.h[k]);
-        v.e[k] = l(a.e[k], b.e[k]);
-        v.c[k] = l(a.c[k], b.c[k]);
-        v.cb[k] = l(a.cb[k], b.cb[k]);
-    }
-    v
-}
 
 /// GL state held by the HQ2/GE7. Plain data, valid when zeroed.
 #[derive(Clone, Copy)]
@@ -363,11 +372,11 @@ pub struct GlState {
     wid_sent: u32,
     /// Window: x0, y0 (screen, GL y up), w, h.
     win: [i32; 4],
-    /// Viewport (window relative): x0, x1, y0, y1, zscale, zcenter.
-    vp: [f32; 6],
-    mv: [f32; 16],
-    proj: [f32; 16],
-    mvp: [f32; 16],
+    /// Viewport (window relative); 0x03B carries its fields in order.
+    vp: Viewport,
+    mv: Mat4,
+    proj: Mat4,
+    mvp: Mat4,
     mvp_dirty: u32,
     smooth: u32,
     color: [f32; 4],
@@ -404,8 +413,9 @@ pub struct GlState {
     blend_fast: u32,
     logic_op: u32,
     normal: [f32; 3],
-    /// Lighting and fog (gl_light.rs).
-    lt: light::Lighting,
+    /// Lighting and fog (shared core), and where gl_light.rs's loads go.
+    lt: Lighting,
+    ltl: light::Loader,
     front_ccw: u32,
     polymode: u32,
     /// Self-streaming port being assembled.
@@ -440,22 +450,47 @@ pub struct GlState {
     /// Pixel zoom (0x0BB): x, y; 0 = 1.
     pzoom: [f32; 2],
     /// User clip planes (eye space) and their enable bits.
-    uclip: [[f32; 4]; 6],
-    uclip_on: u32,
+    clip: Clip,
     /// Read source from 0x10A: kind, buffer (0, 0 = front).
     read_src: [u32; 2],
     /// IRIS GL lmcolor(LMC_COLOR) rule: an IRIS GL colour command after the
     /// last IRIS GL normal leaves what follows unlit (see T_IRIS_COLOR).
     /// [0] = set, [1] spare (keeps GlState free of padding).
     iris_unlit: [u32; 2],
+    /// Stencil planes of the window's visual (0x00E: 0, or 4 on XZ's z20
+    /// s4 visuals). GlState is 8-byte aligned (`span`), so its 4-byte fields
+    /// must add up to an even count or the struct gets tail padding
+    /// (asserted below): add a spare word when adding or dropping one.
+    st_bits: u32,
+    /// Pixel word packing (0x0A7): 0 = 32-bit, 1 = 2 x 16, 2 = 4 x 8.
+    pix_pack: u32,
+    /// Drawing into the overlay / popup planes (IRIS GL drawmode OVERDRAW /
+    /// PUPDRAW): the MakeCurrent mode (8 = 4-bit overlay, 11 = 2-bit
+    /// overlay or popup, as the X server's 2D MODE numbers them), else 0;
+    /// and the aux plane write mask (0x003).
+    aux_draw: u32,
+    aux_wmask: u32,
+    /// Spare (keeps the count of 4-byte fields even, see st_bits).
+    pad: u32,
     /// Vertices drawn / primitives emitted since the last trace note.
     pub stats_vertices: u32,
 }
 
-const IDENT: [f32; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
-
 impl GlState {
     /// Range of the R channel in GL colour units (see to_fixed).
+    /// UAUXDATA for colour index `idx` in overlay / popup drawing: 4-bit
+    /// overlay takes it as is; the 2-bit planes take it shifted up when the
+    /// mask names aux bits 3:2 (popup), as the 2D path's value2d does.
+    fn aux_value(&self, idx: u32) -> u32 {
+        if self.aux_draw == 8 {
+            idx & 0xf
+        } else if self.aux_wmask & 0xc != 0 {
+            (idx << 2) & 0xc
+        } else {
+            idx & 3
+        }
+    }
+
     fn cmax(&self) -> f32 {
         if self.pixfmt == re3::PIXFMT_CI12 { 4095.0 / 255.0 } else { 1.0 }
     }
@@ -463,22 +498,23 @@ impl GlState {
     fn ensure_init(&mut self) {
         if self.inited == 0 {
             self.inited = 1;
-            self.mv = IDENT;
-            self.proj = IDENT;
-            self.mvp = IDENT;
+            self.mv = math::IDENT;
+            self.proj = math::IDENT;
+            self.mvp = math::IDENT;
             self.color = [1.0; 4];
             self.smooth = 1;
             self.colormask = 0x00ff_ffff;
             self.masks = [0x00ff_ffff; 2];
             self.logic_op = 3;
             self.lt.init();
+            self.ltl.init(&mut self.lt);
             self.blend_src = 1;
             self.normal = [0.0, 0.0, 1.0];
             self.front_ccw = 1;
             self.polymode = 1;
             self.scissor = [0, 0, 0x7ff, 0x7ff];
             self.win = [0, 0, re3::FB_W as i32, SCREEN_H];
-            self.vp = [0.0, re3::FB_W as f32 - 1.0, 0.0, SCREEN_H as f32 - 1.0, 1.0, 0.0];
+            self.vp = Viewport { x0: 0.0, x1: re3::FB_W as f32 - 1.0, y0: 0.0, y1: SCREEN_H as f32 - 1.0, zscale: 1.0, zcenter: 0.0 };
         }
     }
 
@@ -497,28 +533,17 @@ impl GlState {
         if self.mvp_dirty != 0 {
             self.mvp_dirty = 0;
             // Column-major (glLoadMatrix order): clip = P * MV * v.
-            let (a, b) = (&self.proj, &self.mv);
-            let mut m = [0.0f32; 16];
-            for c in 0..4 {
-                for r in 0..4 {
-                    m[c * 4 + r] = (0..4).map(|k| a[k * 4 + r] * b[c * 4 + k]).sum();
-                }
-            }
-            self.mvp = m;
+            self.mvp = math::mul(&self.proj, &self.mv);
         }
     }
 
     /// Object coordinates -> window vertex (screen pixels, GL y up).
     fn transform(&mut self, v: [f32; 4]) -> Wv {
         self.update_mvp();
-        let m = &self.mvp;
-        let clip = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-        let h = [clip(0), clip(1), clip(2), clip(3)];
-        let m = &self.mv;
-        let eye = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-        let e = [eye(0), eye(1), eye(2), eye(3)];
+        let h = math::xform(&self.mvp, v);
+        let e = math::xform(&self.mv, v);
         let mut out = Wv { c: self.color, cb: self.color, h, e, ..Default::default() };
-        out.oc = self.outcode(&out);
+        out.oc = self.clip.outcode(&out);
         self.project(out)
     }
 
@@ -535,52 +560,11 @@ impl GlState {
         0
     }
 
-    /// Signed distance of `v` to clip plane `i` (>= 0 inside).
-    fn clip_dist(&self, v: &Wv, i: usize) -> f32 {
-        let h = &v.h;
-        match i {
-            0 => h[3] + h[0],
-            1 => h[3] - h[0],
-            2 => h[3] + h[1],
-            3 => h[3] - h[1],
-            4 => h[3] + h[2],
-            5 => h[3] - h[2],
-            _ => {
-                let p = &self.uclip[i - 6];
-                p[0] * v.e[0] + p[1] * v.e[1] + p[2] * v.e[2] + p[3] * v.e[3]
-            }
-        }
-    }
-
-    /// Planes in use: the view volume plus the enabled user planes.
-    fn clip_mask(&self) -> u32 {
-        0x3f | ((self.uclip_on & 0x3f) << 6)
-    }
-
-    /// Bit i set when `v` is outside plane i.
-    fn outcode(&self, v: &Wv) -> u32 {
-        let mask = self.clip_mask();
-        (0..CLIP_PLANES).filter(|&i| mask & (1 << i) != 0 && self.clip_dist(v, i) < 0.0)
-            .fold(0, |o, i| o | (1 << i))
-    }
-
-    /// Window position of `v` from its clip position (`ok` = 0 if w <= 0).
-    fn project(&self, mut out: Wv) -> Wv {
-        let [cx, cy, cz, cw] = out.h;
-        out.ok = 0;
-        if cw <= 1e-6 {
-            return out;
-        }
-        let (nx, ny, nz) = (cx / cw, cy / cw, cz / cw);
-        let [vx0, vx1, vy0, vy1, zs, zc] = self.vp;
-        // Snap to 1/16 pixel, like the hardware's fixed-point subpixel
-        // coordinates (removes float noise such as 319.99998 on edges).
-        let snap = |v: f32| (v * 16.0).round() / 16.0;
-        out.x = snap(self.win[0] as f32 + vx0 + (nx + 1.0) * 0.5 * (vx1 - vx0 + 1.0));
-        out.y = snap(self.win[1] as f32 + vy0 + (ny + 1.0) * 0.5 * (vy1 - vy0 + 1.0));
-        out.z = zc + nz * zs;
-        out.ok = 1;
-        out
+    /// Window position of `v` from its clip position (`ok` = 0 if w <= 0),
+    /// snapped to 1/16 pixel like the hardware's fixed-point subpixel
+    /// coordinates.
+    fn project(&self, v: Wv) -> Wv {
+        self.vp.project(v, [self.win[0] as f32, self.win[1] as f32], 16.0)
     }
 
     /// Window clipping by the RE3 WID test: more visible pieces than the 4
@@ -741,7 +725,7 @@ fn port_words(index: u32) -> Option<u32> {
         T_NORMAL | T_IRIS_NORMAL => Some(3),
         T_COLOR_WRITEMASK | T_READ_BUFFER => Some(2),
         T_BLEND_FACTOR => Some(3),
-        t => light::Lighting::port_words(t),
+        t => light::port_words(t),
     }
 }
 
@@ -811,7 +795,7 @@ impl Hq2Engine {
         use super::ReadDecode;
         let g = &self.gl;
         if g.read_src[0] == 2 {
-            return ReadDecode::Depth;
+            return ReadDecode::Depth { sbits: g.st_bits.min(8) };
         }
         let bank = (g.swap ^ (g.read_src[1] & 1)) & 1;
         match g.pixfmt {
@@ -819,6 +803,7 @@ impl Hq2Engine {
             re3::PIXFMT_CI12 => ReadDecode::Ci12 { bank },
             re3::PIXFMT_CI8 => ReadDecode::Ci8 { bank },
             re3::PIXFMT_RGB8 => ReadDecode::Rgb8 { bank },
+            re3::PIXFMT_RGB4 => ReadDecode::Rgb4 { bank },
             _ => ReadDecode::Rgb24,
         }
     }
@@ -833,19 +818,25 @@ impl Hq2Engine {
         use super::{ReadDest, ReadImage};
         self.gl.ensure_init();
         // Room in shram above the mailbox.
+        // DATA y, width, height, words a row, 0, 0 (libglcore Pack1 and
+        // its span reads); packing from 0x0A7. IRIS GL sends 1 for the
+        // words (2x2 readpixels) with a pixel a word: trust the count only
+        // for packed pixels, where OpenGL is the only sender.
         let (w, rows) = (a[2].min(2048), a[3].min(4096));
-        let rows = rows.min((0x8000 - READBACK_SHRAM as u32) / w.max(1));
+        let wpr = if self.gl.pix_pack != 0 && a[4] != 0 { a[4].min(2048) } else { w };
+        let rows = rows.min((0x8000 - READBACK_SHRAM as u32) / wpr.max(1));
         let mut s2d = self.s2d;
-        s2d.buf_select = 0;
+        s2d.buf_select = self.gl.pix_pack;
         s2d.buf_offset = 0;
         let req = ReadImage {
             x: self.gl.win[0] + a[0] as i32,
             top: self.gl.win[1] + a[1] as i32 + rows as i32 - 1,
             w,
             rows,
-            words_per_row: w,
+            words_per_row: wpr,
             s2d,
             decode: self.gl_read_decode(),
+            bottom_up: true,
         };
         out.read_image(&req, ReadDest::Shram(READBACK_SHRAM));
     }
@@ -859,7 +850,13 @@ impl Hq2Engine {
         self.gl.ensure_init();
         let (w, rows, wpr) = (a[2], a[3], a[4].max(1));
         let mut s2d = self.s2d;
-        s2d.buf_select = match (w + wpr - 1) / wpr { 4 => 2, 2 => 1, _ => 0 };
+        // OpenGL says the packing on 0x0A7; IRIS GL lrectread does not
+        // send it: pixels per word from the width and words a row.
+        s2d.buf_select = if self.gl.pix_pack != 0 {
+            self.gl.pix_pack
+        } else {
+            match w.div_ceil(wpr) { 4 => 2, 2 => 1, _ => 0 }
+        };
         s2d.buf_offset = 0;
         let req = ReadImage {
             x: self.gl.win[0] + a[0] as i32,
@@ -869,6 +866,7 @@ impl Hq2Engine {
             words_per_row: wpr,
             s2d,
             decode: self.gl_read_decode(),
+            bottom_up: false,
         };
         out.read_image(&req, ReadDest::Gedma);
     }
@@ -984,7 +982,7 @@ impl Hq2Engine {
             T_VIEWPORT => 7,
             T_SCISSOR => 4,
             T_CLEAR_COLOR | T_CLEAR_CI => 4,
-            T_CLEAR_COLOR_DEPTH => 6,
+            T_CLEAR_COLOR_DEPTH | T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => 6,
             T_WINDOW => 15,
             light::T_LIGHTING | light::T_TWO_SIDED => 2,
             light::T_NORMALIZE | light::T_NORMALIZE_B | light::T_FOG_ON | light::T_MATERIAL_COMMIT => 1,
@@ -1000,13 +998,15 @@ impl Hq2Engine {
             T_DEPTH_CLEAR => 3,
             T_IRIS_SETCPOS | T_PIXEL_ZOOM => 3,
             T_READ_RECT => 7,
-            T_GET_ORIGIN | T_PIX_START | T_PIX_END => 1,
+            T_GET_ORIGIN | T_IRIS_GET_COLOR | T_PIX_START | T_PIX_END => 1,
             T_PIX_RECT => 5,
+            T_COPY_PIXELS => 7,
             T_RASTER_POS => 4,
             T_BITMAP => (BITMAP_HDR + 9) as u32,
             T_BITMAP_TALL => (BITMAP_HDR + 17) as u32,
             T_BITMAP_HUGE => (BITMAP_HDR + 33) as u32,
-            T_IRIS_SBOXF | T_IRIS_SBOXFI => 4,
+            T_IRIS_SBOXF | T_IRIS_SBOXFI | T_IRIS_SBOX | T_IRIS_SBOXI => 4,
+            T_AUX_WRITEMASK => 1,
             T_IRIS_SWAPTMESH => 1,
             T_CLIP_PLANE_ENABLE => 2,
             T_CLIP_PLANE => 5,
@@ -1159,9 +1159,7 @@ impl Hq2Engine {
                 let lit = g.lt.on != 0 && g.iris_unlit[0] == 0;
                 if lit || g.lt.fog_on != 0 {
                     // Eye-space position for lighting and fog.
-                    let m = &g.mv;
-                    let e = |r: usize| m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3];
-                    let eye = [e(0), e(1), e(2), e(3)];
+                    let eye = math::xform(&g.mv, v);
                     if lit {
                         let (fc, bc) = g.lt.light_vertex(eye, g.normal, g.color);
                         wv.c = fc;
@@ -1236,7 +1234,7 @@ impl Hq2Engine {
             }
             T_TEXTURE_MATRIX => {}
             t => {
-                g.lt.port(t, &b[..n as usize]);
+                g.ltl.port(&mut g.lt, t, &b[..n as usize]);
                 // Turning colour material on takes the current colour.
                 if t == light::T_COLOR_MATERIAL {
                     let c = g.color;
@@ -1277,7 +1275,9 @@ impl Hq2Engine {
                                        ((w0 >> 11) & 0x7ff) as i32 + 1, ((w1 >> 10) & 0x3ff) as i32 + 1];
                 }
             }
-            T_VIEWPORT => g.vp = [f(a[1]), f(a[2]), f(a[3]), f(a[4]), f(a[5]), f(a[6])],
+            T_VIEWPORT => {
+                g.vp = Viewport { x0: f(a[1]), x1: f(a[2]), y0: f(a[3]), y1: f(a[4]), zscale: f(a[5]), zcenter: f(a[6]) };
+            }
             T_SCISSOR => g.scissor = [a[0] as i32, a[1] as i32, a[2] as i32, a[3] as i32],
             T_SHADE_MODEL => g.smooth = a[0] & 1,
             T_FRONT_FACE => g.front_ccw = a[0] & 1,
@@ -1298,7 +1298,10 @@ impl Hq2Engine {
             T_STIPPLE_OFF => g.stipple_on = 0,
             T_BLEND_MODE => g.blend_fast = a[0] & 1,
             T_IRIS_DB => g.lt.on = a[1] & 1,
-            T_IRIS_BUFFER | T_IRIS_BGNPOLYGON | T_IRIS_PMV => {}
+            // readsource (gl_setreadsource): plane, then the absolute bank
+            // (libgl tracks swaps itself and sends no 0x1E7, so swap stays 0).
+            T_IRIS_BUFFER => g.read_src = [a[0], a[1]],
+            T_IRIS_BGNPOLYGON | T_IRIS_PMV => {}
             T_IRIS_WRITEMASK => g.masks = [a[0] & 0x00ff_ffff; 2],
             T_IRIS_CLEAR => {
                 let c = g.color;
@@ -1312,10 +1315,11 @@ impl Hq2Engine {
             T_IRIS_ENDPOLYGON | T_IRIS_PCLOS => {}
             light::T_LIGHTING | light::T_TWO_SIDED | light::T_NORMALIZE | light::T_NORMALIZE_B
             | light::T_FOG_ON | light::T_MATERIAL_COMMIT => {
-                g.lt.command(cmd, &a[..]);
+                light::command(&mut g.lt, cmd, &a[..]);
             }
             T_LOGIC_OP => g.logic_op = a[0] & 0xf,
-            T_READ_DONE | T_READ_SETUP_A | T_READ_SETUP_B | T_READ_MODE => {}
+            T_READ_SETUP_A => g.pix_pack = a[0] & 3,
+            T_READ_DONE | T_READ_SETUP_B | T_READ_MODE => {}
             T_GET_COLOR => {
                 let c = g.color;
                 for (k, v) in c.iter().enumerate() {
@@ -1331,15 +1335,17 @@ impl Hq2Engine {
             T_IRIS_MOVE => g.pen = 0,
             T_CLIP_PLANE_ENABLE => if a[1] < 6 {
                 let bit = 1 << a[1];
-                g.uclip_on = if a[0] & 1 != 0 { g.uclip_on | bit } else { g.uclip_on & !bit };
+                g.clip.user_on = if a[0] & 1 != 0 { g.clip.user_on | bit } else { g.clip.user_on & !bit };
             },
             T_CLIP_PLANE => if a[0] < 6 {
-                g.uclip[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
+                g.clip.user[a[0] as usize] = [f(a[1]), f(a[2]), f(a[3]), f(a[4])];
             },
             T_IRIS_SWAPTMESH => {
                 g.pv.swap(0, 1);
                 g.tflip ^= 1;
             }
+            T_AUX_WRITEMASK => g.aux_wmask = a[0] & 0xf,
+            T_IRIS_SBOX | T_IRIS_SBOXI => self.gl_sbox(cmd == T_IRIS_SBOXI, &a, out),
             T_IRIS_SBOXF | T_IRIS_SBOXFI => {
                 let num = |w: u32| if cmd == T_IRIS_SBOXFI { w as i32 as f32 } else { f(w) };
                 let p = g.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
@@ -1361,6 +1367,7 @@ impl Hq2Engine {
                 }
             }
             T_PIXEL_ZOOM => g.pzoom = [f(a[1]), f(a[2])],
+            T_COPY_PIXELS => self.gl_copy_pixels(&a, out),
             T_READ_RECT => self.gl_mailbox_read(&a, out),
             T_IRIS_SETCPOS => {
                 // Screen coordinates (getcpos x + count).
@@ -1371,6 +1378,11 @@ impl Hq2Engine {
             T_GET_ORIGIN => {
                 out.shram(READBACK_SHRAM, g.win[0] as u32);
                 out.shram(READBACK_SHRAM + 1, g.win[1] as u32);
+            }
+            T_IRIS_GET_COLOR => {
+                for (k, w) in to_fixed(g.color, g.cmax()).into_iter().enumerate() {
+                    out.shram(READBACK_SHRAM + k, w);
+                }
             }
             T_PIX_START | T_PIX_END => self.pix_n = 0,
             T_PIX_DATA => {
@@ -1383,13 +1395,23 @@ impl Hq2Engine {
                 }
             }
             T_PIX_RECT => {
-                let w = (a[2] as usize).min(self.pix_n as usize);
-                let mut words = [0u32; super::PIX_WORDS];
-                words[..w].copy_from_slice(&self.pix[..w]);
+                // DATA y, pixels, words, flag: the words hold the pixels at
+                // 0x0A7's packing, first pixel in the MSB.
+                let per = match g.pix_pack { 2 => 4usize, 1 => 2, _ => 1 };
+                let bits = 32 / per as u32;
+                let nw = (self.pix_n as usize).min(super::PIX_WORDS);
+                let w = (a[2] as usize).min(nw * per);
+                let mut words = [0u32; super::PIX_WORDS * 4];
+                for (n, p) in words[..w].iter_mut().enumerate() {
+                    let v = self.pix[n / per];
+                    *p = if per == 1 { v } else { (v >> (32 - bits * (1 + (n % per) as u32))) & ((1 << bits) - 1) };
+                }
                 if a[4] != 0 {
                     words[..w].reverse();
                 }
-                self.gl_pixel_row(a[0] as i32, a[1] as i32, 0, w as u32, 1, 0, &words[..w], false, out);
+                // libglcore repeats rows itself and sends the x zoom as a
+                // whole number (__glExpFastDrawPixels): replicate in x.
+                self.gl_pixel_row(a[0] as i32, a[1] as i32, 0, w as u32, 1, 0, &words[..w], PixZoom::X, out);
                 self.pix_n = 0;
             }
             T_IRIS_GETCPOS => {
@@ -1428,7 +1450,7 @@ impl Hq2Engine {
             T_DEPTH_MASK => g.zmask = a[0] & 0x00ff_ffff,
             T_STENCIL_MODE => g.st.copy_from_slice(&a[..7]),
             T_STENCIL_WMASK => g.st_wmask = a[0] & 0xff,
-            T_STENCIL_CONFIG => {}
+            T_STENCIL_CONFIG => g.st_bits = a[0] & 0xff,
             T_STENCIL_CLEAR => {
                 let (v, m) = ((a[0] & 0xff) << re3::ZBUF_STENCIL_SHIFT, (a[1] & 0xff) << re3::ZBUF_STENCIL_SHIFT);
                 self.gl_zfill(v, m, out);
@@ -1451,18 +1473,33 @@ impl Hq2Engine {
             }
             // Visual of the window being bound: 4 = 24-bit RGB, 2 = 12-bit
             // RGB, 10 = 12-bit colour index (showmap) (inferred from traces).
-            // Visual code from the kernel (inferred from 1, 2, 4, 9, 10 in
+            // Visual code from the kernel (inferred from 0, 1, 2, 4, 9, 10 in
             // traces and the DDX's matching 2D MODE numbers): bit 3 = colour
-            // index, low bits = depth (1 = 8, 2 = 12, 4 = 24 bits).
-            T_MAKECURRENT => match a[0] {
-                4 => g.pixfmt = 0,
-                2 => g.pixfmt = re3::PIXFMT_RGB12,
-                1 => g.pixfmt = re3::PIXFMT_RGB8,
-                10 => g.pixfmt = re3::PIXFMT_CI12,
-                9 => g.pixfmt = re3::PIXFMT_CI8,
-                _ => {}
-            },
+            // index, low bits = depth (0 = 4, 1 = 8, 2 = 12, 4 = 24 bits).
+            T_MAKECURRENT => {
+                g.aux_draw = 0;
+                match a[0] {
+                    // Overlay / popup planes: the colour index goes to the aux
+                    // bits (gl_setup), the colour planes are left alone.
+                    8 | 11 => {
+                        g.aux_draw = a[0];
+                        g.pixfmt = re3::PIXFMT_CI8;
+                    }
+                    0 => g.pixfmt = re3::PIXFMT_RGB4,
+                    4 => g.pixfmt = 0,
+                    2 => g.pixfmt = re3::PIXFMT_RGB12,
+                    1 => g.pixfmt = re3::PIXFMT_RGB8,
+                    10 => g.pixfmt = re3::PIXFMT_CI12,
+                    9 => g.pixfmt = re3::PIXFMT_CI8,
+                    _ => {}
+                }
+            }
             T_CLEAR_CI => self.gl_clear([f(a[0]) / 255.0, 0.0, 0.0, 1.0], out),
+            T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => {
+                let i = if cmd == T_CLEAR_CI_DEPTH_I { a[0] as i32 as f32 } else { f(a[0]) };
+                self.gl_clear([i / 255.0, 0.0, 0.0, 1.0], out);
+                self.gl_zfill(a[4] & 0x00ff_ffff, 0x00ff_ffff, out);
+            }
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => {
                 let c = [f(a[0]), f(a[1]), f(a[2]), 1.0];
                 self.gl_clear(c, out);
@@ -1503,10 +1540,12 @@ impl Hq2Engine {
         let g = &self.gl;
         Some(match cmd {
             T_WINDOW => format!("GL_WINDOW origin ({}, {}) {}x{}", g.win[0], g.win[1], g.win[2], g.win[3]),
-            T_VIEWPORT => format!("GL_VIEWPORT x {}..{} y {}..{} zscale {} zcenter {}", g.vp[0], g.vp[1], g.vp[2], g.vp[3], g.vp[4], g.vp[5]),
+            T_VIEWPORT => format!("GL_VIEWPORT x {}..{} y {}..{} zscale {} zcenter {}", g.vp.x0, g.vp.x1, g.vp.y0, g.vp.y1, g.vp.zscale, g.vp.zcenter),
             T_SCISSOR => format!("GL_SCISSOR ({}, {})-({}, {})", g.scissor[0], g.scissor[1], g.scissor[2], g.scissor[3]),
             T_SHADE_MODEL => format!("GL_SHADE_MODEL {}", if g.smooth != 0 { "smooth" } else { "flat" }),
             T_CLEAR_CI => format!("GL_CLEAR index {} rect {:?}", f(a[0]), g.clip_rect()),
+            T_CLEAR_CI_DEPTH | T_CLEAR_CI_DEPTH_I => format!("GL_CLEAR index {} depth {:#x} rect {:?}",
+                if cmd == T_CLEAR_CI_DEPTH_I { a[0] as i32 as f32 } else { f(a[0]) }, a[4], g.clip_rect()),
             T_CLEAR_COLOR | T_CLEAR_COLOR_DEPTH => format!("GL_CLEAR rgb ({}, {}, {}) rect {:?}", f(a[0]), f(a[1]), f(a[2]), g.clip_rect()),
             c if c & LOADV != 0 => format!("GL vertex routine {:#x}", c & 0x1ff),
             c if BEGIN_TOKENS.contains(&c) || END_TOKENS.contains(&c) => super::index_label(c),
@@ -1521,6 +1560,10 @@ impl Hq2Engine {
                 a[0] as i32 - FRAGMENT_BIAS, a[1] as i32 - FRAGMENT_BIAS, a[2], f(a[3]), f(a[4]), f(a[5]), f(a[6])),
             T_IRIS_MOVE => "IRISGL_MOVE".to_string(),
             T_GET_ORIGIN => format!("GL_GET_ORIGIN -> ({}, {})", g.win[0], g.win[1]),
+            T_IRIS_GET_COLOR => {
+                let c = to_fixed(g.color, g.cmax());
+                format!("IRISGL_GET_COLOR -> ({}, {}, {})", c[0] >> 11, c[1] >> 11, c[2] >> 11)
+            }
             T_PIX_START => "GL_PIXELS_START".to_string(),
             T_PIX_END => "GL_PIXELS_END".to_string(),
             T_PIX_DATA => format!("GL_PIXEL_DATA {} words (chunk {})", self.last_nargs, self.pix_n),
@@ -1530,6 +1573,9 @@ impl Hq2Engine {
                 if g.cpos[2] != 0 { " invalid" } else { "" }),
             T_GET_COLOR | T_GET_NORMAL | T_GET_RASTERPOS => format!("{} -> shram[{:#x}]", super::index_label(cmd), READBACK_SHRAM),
             T_READ_DONE => "GL_READ_DONE".to_string(),
+            T_COPY_PIXELS => format!("GL_COPY_PIXELS ({}, {}) {}x{} -> ({}, {}) zoom {} x {} from bank {}",
+                a[4] as i32, a[1] as i32, a[6], a[3], a[5] as i32, a[2] as i32, g.pzoom[0], g.pzoom[1],
+                (g.swap ^ (g.read_src[1] & 1)) & 1),
             T_PIXEL_ZOOM => format!("GL_PIXEL_ZOOM {} x {} ({})", f(a[1]), f(a[2]), f(a[0])),
             T_READ_RECT => format!("GL_READ_RECT ({}, {}) {}x{} [{:#x} {:#x} {:#x}] {} -> shram[{:#x}], FIN3",
                 a[0] as i32, a[1] as i32, a[2], a[3], a[4], a[5], a[6], self.gl_read_desc(), READBACK_SHRAM),
@@ -1547,7 +1593,13 @@ impl Hq2Engine {
             light::T_FOG_ON => format!("GL_FOG {}", if g.lt.fog_on != 0 { "on" } else { "off" }),
             light::T_MATERIAL_COMMIT => "GL_MATERIAL_COMMIT".to_string(),
             T_BLEND_MODE => format!("GL_BLEND_MODE {}", a[0]),
-            T_IRIS_BUFFER => format!("IRISGL_BUFFER {} {}", a[0], a[1]),
+            T_IRIS_BUFFER => format!("IRISGL_READSOURCE plane {} bank {}", a[0], a[1]),
+            T_AUX_WRITEMASK => format!("GL_AUX_WRITEMASK {:#x}", a[0]),
+            T_IRIS_SBOX | T_IRIS_SBOXI | T_IRIS_SBOXF | T_IRIS_SBOXFI => {
+                let num = |w: u32| if cmd & 0x4000 != 0 { w as i32 as f32 } else { f(w) };
+                format!("IRISGL_{} ({}, {})-({}, {})", if cmd & 0xff == T_IRIS_SBOX { "SBOX" } else { "SBOXF" },
+                    num(a[0]), num(a[1]), num(a[2]), num(a[3]))
+            }
             T_IRIS_WRITEMASK => format!("IRISGL_WRITEMASK {:#08x}", a[0]),
             T_IRIS_CLEAR => format!("IRISGL_CLEAR rgb ({:.3}, {:.3}, {:.3}) rect {:?}", g.color[0], g.color[1], g.color[2], g.clip_rect()),
             T_IRIS_ZCLEAR => format!("IRISGL_ZCLEAR {:#x}", a[0]),
@@ -1567,6 +1619,7 @@ impl Hq2Engine {
                 re3::PIXFMT_CI12 => "CI12",
                 re3::PIXFMT_CI8 => "CI8",
                 re3::PIXFMT_RGB8 => "RGB8",
+                re3::PIXFMT_RGB4 => "RGB4",
                 _ => "RGB24",
             }),
             _ => return None,
@@ -1658,8 +1711,16 @@ impl Hq2Engine {
             self.gl.blend_sent = 1;
         }
         out.reg(re3::REG_NOPUP, 1);
-        out.reg(re3::REG_UAUXDATA, 0);
-        out.reg(re3::REG_AUXMASK, 0);
+        if self.gl.aux_draw != 0 {
+            // Overlay / popup drawing: only the aux planes 0x003 names, the
+            // index as the X server's 2D path writes it (value2d).
+            out.reg(re3::REG_AUXMASK, self.gl.aux_wmask);
+            let idx = (self.gl.color[0] * 255.0).round() as u32;
+            out.reg(re3::REG_UAUXDATA, self.gl.aux_value(idx));
+        } else {
+            out.reg(re3::REG_UAUXDATA, 0);
+            out.reg(re3::REG_AUXMASK, 0);
+        }
         if self.gl.wid_clip() {
             // More visible pieces than 0x1E5 carries: draw only where the
             // CID planes (painted by Xsgi, 2D_CID_WRITE) hold this window's
@@ -1672,7 +1733,7 @@ impl Hq2Engine {
         }
         // Stipple patterns are span-relative (see gl_stipple_pattern).
         out.reg(re3::REG_ALIGNPAT, 0);
-        let mask = self.gl.masks[self.gl.swap as usize & 1] & self.gl.colormask;
+        let mask = if self.gl.aux_draw != 0 { 0 } else { self.gl.masks[self.gl.swap as usize & 1] & self.gl.colormask };
         out.reg(re3::REG_PIXMASK, mask & 0x00ff_ffff);
         // Always: a 2D 12-bit draw (MODE 2) may have left RGB12 behind.
         out.op(re3::RE3_OP_PIXFMT, self.gl.pixfmt as u64);
@@ -1700,6 +1761,11 @@ impl Hq2Engine {
 
     /// Undo GL-only RE3 state so 2D drawing sees what it expects.
     fn gl_done(&mut self, out: &mut dyn Re3Sink) {
+        if self.gl.aux_draw != 0 {
+            // 2D drawing keeps AUXMASK only for its own aux modes.
+            out.reg(re3::REG_AUXMASK, 0);
+            out.reg(re3::REG_UAUXDATA, 0);
+        }
         if self.gl.pixfmt != 0 {
             out.op(re3::RE3_OP_PIXFMT, 0);
             out.reg(re3::REG_ENABDITH, 0);
@@ -1732,6 +1798,14 @@ impl Hq2Engine {
         }
         self.gl_setup(out);
         let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32) << 11;
+        // Colour index: the first word is the index itself (libglcore adds
+        // 0.5 to round), wrapped to the visual's bits.
+        let mask = match self.gl.pixfmt {
+            re3::PIXFMT_CI12 => 0xfff,
+            re3::PIXFMT_CI8 => 0xff,
+            _ => 0,
+        };
+        let c = if mask != 0 { [((c[0].floor() as i64) & mask) as f32 / 255.0, 0.0, 0.0, 1.0] } else { c };
         let rgb = to_fixed(c, self.gl.cmax());
         self.gl_color_regs(rgb, out);
         out.reg(re3::REG_DR, 0);
@@ -1763,6 +1837,9 @@ impl Hq2Engine {
     }
 
     fn gl_color_regs(&mut self, c: [u32; 3], out: &mut dyn Re3Sink) {
+        if self.gl.aux_draw != 0 {
+            out.reg(re3::REG_UAUXDATA, self.gl.aux_value(c[0] >> 11));
+        }
         out.reg(re3::REG_R, c[0]);
         out.reg(re3::REG_G, c[1]);
         out.reg(re3::REG_B, c[2]);
@@ -1862,7 +1939,7 @@ impl Hq2Engine {
     /// 0xAABBGGRR (cpack order). Drawn as runs of equal pixels, clipped to
     /// the window, with integer pixel zoom for 0x0B8.
     pub(super) fn gl_pixel_row(&mut self, x: i32, y: i32, row: u32, w: u32, h: u32, fmt: u32, words: &[u32],
-                               zoomed: bool, out: &mut dyn Re3Sink) {
+                               zoom: PixZoom, out: &mut dyn Re3Sink) {
         let g = &self.gl;
         let (per_word, bits) = match fmt { 2 => (4usize, 8u32), 1 => (2, 16), _ => (1, 32) };
         let px = |n: usize| -> u32 {
@@ -1881,9 +1958,13 @@ impl Hq2Engine {
                 [u(0), u(8), u(16), u(24)]
             }
         };
-        let z = |v: f32| if zoomed && v >= 1.0 { v.round() as i32 } else { 1 };
-        let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
-        let from_bottom = if zoomed { row as i32 } else { h.saturating_sub(1 + row) as i32 };
+        let z = |v: f32| if v >= 1.0 { v.round() as i32 } else { 1 };
+        let (zx, zy) = match zoom {
+            PixZoom::None => (1, 1),
+            PixZoom::X => (z(g.pzoom[0]), 1),
+            PixZoom::Both => (z(g.pzoom[0]), z(g.pzoom[1])),
+        };
+        let from_bottom = if zoom == PixZoom::Both { row as i32 } else { h.saturating_sub(1 + row) as i32 };
         let (wx, wy) = (g.win[0] + x, g.win[1] + y + from_bottom * zy);
         let cmax = g.cmax();
         self.gl_setup(out);
@@ -1907,6 +1988,37 @@ impl Hq2Engine {
         self.gl_done(out);
     }
 
+    /// 0x0BA: copy a rectangle of the read buffer to the draw buffer, each
+    /// visible piece of the destination on its own (RE3 scissor = the piece).
+    fn gl_copy_pixels(&mut self, a: &[u32], out: &mut dyn Re3Sink) {
+        let g = &self.gl;
+        let (sy, dy, h, sx, dx, w) = (a[1] as i32, a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32);
+        let z = |v: f32| if v >= 1.0 { v.round() as u32 } else { 1 };
+        let (zx, zy) = (z(g.pzoom[0]), z(g.pzoom[1]));
+        let bits = match g.pixfmt {
+            re3::PIXFMT_RGB12 | re3::PIXFMT_CI12 => 12,
+            re3::PIXFMT_RGB8 | re3::PIXFMT_CI8 => 8,
+            re3::PIXFMT_RGB4 => 4,
+            _ => 0,
+        };
+        let mode = re3::copy_mode(zx, zy, bits, (g.swap ^ (g.read_src[1] & 1)) & 1);
+        let (wx, wy) = (g.win[0], g.win[1]);
+        let (rects, n) = g.visible_rects();
+        self.gl_setup(out);
+        for r in &rects[..n] {
+            out.reg(re3::REG_XMIN, r[0] as u32);
+            out.reg(re3::REG_XMAX, (r[2] - 1) as u32);
+            out.reg(re3::REG_YMIN, r[1] as u32);
+            out.reg(re3::REG_YMAX, (r[3] - 1) as u32);
+            out.copy(wx + sx, wy + sy, w, h, wx + dx, wy + dy, mode);
+        }
+        out.reg(re3::REG_XMIN, 0);
+        out.reg(re3::REG_XMAX, re3::FB_W as u32 - 1);
+        out.reg(re3::REG_YMIN, 0);
+        out.reg(re3::REG_YMAX, re3::FB_H as u32 - 1);
+        self.gl_done(out);
+    }
+
     fn gl_clear(&mut self, c: [f32; 4], out: &mut dyn Re3Sink) {
         let (rects, n) = self.gl.visible_rects();
         if n == 0 {
@@ -1917,6 +2029,40 @@ impl Hq2Engine {
         for r in &rects[..n] {
             for y in r[1]..r[3] {
                 self.span(r[0], y, (r[2] - r[0]) as u32, None, out);
+            }
+        }
+        self.gl_done(out);
+    }
+
+    /// 0x052 sbox: the outline of the screen-aligned box between two
+    /// transformed corners, in the current colour, each pixel once (top
+    /// and bottom rows, then the sides between them).
+    fn gl_sbox(&mut self, ints: bool, a: &[u32], out: &mut dyn Re3Sink) {
+        let num = |w: u32| if ints { w as i32 as f32 } else { f(w) };
+        let p = self.gl.transform([num(a[0]), num(a[1]), 0.0, 1.0]);
+        let q = self.gl.transform([num(a[2]), num(a[3]), 0.0, 1.0]);
+        if p.ok == 0 || q.ok == 0 {
+            return;
+        }
+        let (x0, x1) = (p.x.min(q.x).floor() as i32, p.x.max(q.x).floor() as i32);
+        let (y0, y1) = (p.y.min(q.y).floor() as i32, p.y.max(q.y).floor() as i32);
+        self.gl_setup(out);
+        let c = self.gl.color;
+        self.gl_color_regs(to_fixed(c, self.gl.cmax()), out);
+        let mut run = |e: &mut Self, xa: i32, xb: i32, y: i32| {
+            let (pieces, np) = e.gl.span_pieces(y, xa, xb + 1);
+            for &(s, t) in &pieces[..np] {
+                e.span(s, y, (t - s) as u32, None, out);
+            }
+        };
+        run(self, x0, x1, y0);
+        if y1 > y0 {
+            run(self, x0, x1, y1);
+        }
+        for y in y0 + 1..y1 {
+            run(self, x0, x0, y);
+            if x1 > x0 {
+                run(self, x1, x1, y);
             }
         }
         self.gl_done(out);
@@ -1950,7 +2096,7 @@ impl Hq2Engine {
                 if (oa | ob) & (1 << plane) == 0 {
                     continue;
                 }
-                let (da, db) = (self.gl.clip_dist(&a, plane), self.gl.clip_dist(&b, plane));
+                let (da, db) = (self.gl.clip.dist(&a, plane), self.gl.clip.dist(&b, plane));
                 let t = da / (da - db);
                 if da < 0.0 { t0 = t0.max(t) } else { t1 = t1.min(t) }
             }
@@ -2152,7 +2298,7 @@ impl Hq2Engine {
                 for i in 0..cn {
                     let (ia, ib) = (cur[i], cur[(i + 1) % cn]);
                     let (a, b) = (vtx(&scratch, ia), vtx(&scratch, ib));
-                    let (da, db) = (g.clip_dist(&a, plane), g.clip_dist(&b, plane));
+                    let (da, db) = (g.clip.dist(&a, plane), g.clip.dist(&b, plane));
                     let e = redges >> i & 1;
                     if da >= 0.0 && m < MAXP {
                         // The edge from an inside vertex is (part of) edge i.

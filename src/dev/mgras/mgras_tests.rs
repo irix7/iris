@@ -61,8 +61,10 @@ fn x_server(m: &Mgras) {
     // The PROM's 1280x1024 layout: draw into the main buffer at page 0x240.
     direct_rss(m, DRBSIZE, 0x31E, false);
     direct_rss(m, DRBPOINTERS, 0x240, false);
-    // All planes writable, as the X server sets them.
-    direct_rss(m, 0x163, u32::MAX, false);
+    // A colour-index window's buffer A, planes 11:0 (the X server's CI8
+    // windows write through 0xFF; colour index takes no other planes, see
+    // `rss::ci_pixtype`).
+    direct_rss(m, 0x163, 0xFFF, false);
     direct_rss(m, PP1FILLMODE, 0x0C00_4504, false);
 }
 
@@ -136,7 +138,7 @@ fn pio_read_through_the_bus() {
     direct_rss(&m, XFRMODE, 2 << 8, false);
     direct_rss(&m, XFRSIZE, 2 << 16 | 3, false);
     block(&m, 100, 50, 102, 51);
-    let mut dw = || (read(&m, 32, 0x7D1C0) << 32) | read(&m, 32, 0x7C1C4);
+    let dw = || (read(&m, 32, 0x7D1C0) << 32) | read(&m, 32, 0x7C1C4);
     assert_eq!(dw(), 0x0000_0102_0300_0000);
     assert_eq!(dw(), 0x0000_0000_0004_0506);
     assert_eq!(dw(), 0);
@@ -188,6 +190,32 @@ fn dma_write_from_host_memory() {
     let got: Vec<u32> = [(10, 10), (11, 10), (12, 10), (10, 11), (11, 11), (12, 11)].iter().map(|&(x, y)| m.fb_pixel(x, y)).collect();
     assert_eq!(got, [1, 2, 3, 4, 5, 6]);
     m.stop_engines();
+}
+
+/// PowerAnimator's front-to-back copy on both boards: 16-bit indices by
+/// DMA into buffer B (draw field 2, planes 23:12) of a CI12 window.
+#[test]
+fn ci_dma_write_into_buffer_b() {
+    for kind in [crate::config::GraphicsBoard::HighImpact, crate::config::GraphicsBoard::MaxImpact] {
+        let m = super::record::tests::live_board_of(kind);
+        x_server(&m);
+        let mem = dma_setup(&m);
+        fifo_dma(&m, 0x08, 2); // bytes a line
+        for (a, b) in [(0x2000, 0x08u8), (0x2001, 0x06), (0x2004, 0x08), (0x2005, 0x02)] {
+            mem.bytes.lock().insert(a, b);
+        }
+        direct_rss(&m, PP1FILLMODE, 0x0C00_8404, false);
+        direct_rss(&m, 0x163, 0xFFF000, false); // ColorMaskLSBsA
+        direct_rss(&m, 0x164, 0xFFF000, false); // ColorMaskLSBsB
+        direct_rss(&m, FILLMODE, 0x1140_0000, false);
+        direct_rss(&m, XFRMODE, 0xC0_8001, false);
+        direct_rss(&m, XFRSIZE, 2 << 16 | 1, false);
+        block(&m, 10, 10, 10, 11);
+        fifo_dma(&m, 0x0B, 1); // start: run, pool 0, host to board
+        let got = [m.fb_pixel(10, 10) & 0xFFF000, m.fb_pixel(10, 11) & 0xFFF000];
+        assert_eq!(got, [0x806_000, 0x802_000], "{kind:?}");
+        m.stop_engines();
+    }
 }
 
 #[test]
@@ -273,7 +301,7 @@ fn text_recording_replays() {
          W 32 7c584 c004504
          W 32 7c5b8 31e
          W 32 7c5b4 240
-         W 32 7c58c ffffffff
+         W 32 7c58c fff
          W 32 7c440 100000
          W 32 7c5d8 44
          W 32 7c114 18
@@ -308,6 +336,32 @@ fn xsetroot_red_trace() {
     m.stop_engines();
 }
 
+/// Maximum Impact's two raster engines each draw half the scanlines of
+/// one picture: the captures come out the same as on one engine, word for
+/// word (the state hash covers all pixel memory and the clip IDs).
+#[test]
+fn two_raster_engines_draw_what_one_does() {
+    use crate::config::GraphicsBoard;
+    for text in [include_str!("testdata/xsetroot_red.txt")] {
+        let recs = load_text(text).unwrap();
+        let hashes: Vec<[u8; 32]> = [GraphicsBoard::HighImpact, GraphicsBoard::MaxImpact]
+            .into_iter()
+            .map(|kind| {
+                let m = super::record::tests::live_board_of(kind);
+                let rep = replay_recs(&m, &recs, false).unwrap();
+                assert!(!rep.diverged(), "{kind:?}: {rep:?}");
+                // Maximum Impact's two and the others' one, or what
+                // IRIS_MGRAS_ENGINES asks for.
+                assert_eq!(m.nrss, super::Mgras::engines_for(kind));
+                let h = m.state_hash();
+                m.stop_engines();
+                h
+            })
+            .collect();
+        assert_eq!(hashes[0], hashes[1]);
+    }
+}
+
 /// Window-ID runs: no run at x = 0 starts in ID 0; each run lasts to the
 /// next one; the overlay ID picks the overlay mode.
 #[test]
@@ -320,8 +374,8 @@ fn frame_composes_runs_overlay_and_cursor() {
     }
     f.cmap[0x100 + 5] = 0x11_2233;
     f.cmap[0x200 + 7] = 0x44_5566;
-    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100 };
-    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0 };
+    f.main_mode[3] = MainMode { rgb: false, cmap_base: 0x100, index_mask: 0xFFF, pair: None };
+    f.main_mode[4] = MainMode { rgb: true, cmap_base: 0, index_mask: 0xFFF, pair: None };
     f.overlay_mode[2] = OverlayMode { on: true, cmap_base: 0x200 };
     f.did_main[10] = 3;
     f.main[10] = 5;
@@ -336,6 +390,28 @@ fn frame_composes_runs_overlay_and_cursor() {
     assert_eq!(out[10], 0xFF33_2211, "CI through cmap block, red in the low byte");
     assert_eq!(out[11], 0xFF80_4020 & 0xFFFF_FFFF, "RGB as stored");
     assert_eq!(out[12], 0xFF66_5544, "overlay over the main planes");
+}
+
+/// A CI8 window ID (XMAP format 1) shows planes 7:0 only: the X server
+/// draws it through mask 0xFF, so the planes above keep what an earlier
+/// window left there (a 24-bit login screen, a 12-bit pair window).
+#[test]
+fn ci8_window_shows_eight_planes() {
+    use super::frame::{Frame, H, OUT_STRIDE, W};
+    let mut f = super::plain::boxed_zeroed::<Frame>();
+    (f.width, f.height) = (W, H);
+    for (i, g) in f.gamma.iter_mut().enumerate() {
+        *g = [i as u8; 3];
+    }
+    f.cmap[0x23] = 0x56_5656;
+    // The desktop's mode word from an IRIX 6.5.22 boot (format 1, block 0).
+    f.main_mode[1] = super::frame::MainMode::of(0x601 & !(0x1F << 5));
+    assert_eq!(super::frame::MainMode::of(0x403).index_mask, 0xFFF, "format 3: 12 planes");
+    f.did_main[10] = 1;
+    f.main[10] = 0x00A0_8523;
+    let mut out = vec![0u32; OUT_STRIDE * H];
+    f.compose(&mut out);
+    assert_eq!(out[10], 0xFF56_5656, "index 0x23, stale planes 23:8 ignored");
 }
 
 /// Probe: the display size a recording's final state programs into the VC3.
@@ -468,6 +544,10 @@ fn switch_to_gl_context(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32) {
 
 /// The same, the window's PP1 window mode (image word 4) `pp1winmode`.
 fn switch_to_gl_context_cid(m: &Mgras, id: u32, x: u32, y: u32, w: u32, h: u32, pp1winmode: u32) {
+    // Clear the switch-done flag first: left set by the last switch, the
+    // wait below would return before this one ran (and a test's next
+    // register write would race the HQ thread; seen on CI).
+    write(m, 32, 0x7000C, 1 << 6);
     write(m, 32, 0x50050, 0x4FC);
     let mut img = [0u32; 63];
     img[0] = id;
@@ -563,7 +643,7 @@ fn gl_draws_only_where_the_clip_id_matches() {
     fifo_rss(&m, FILLMODE, FILL_FAST, false);
     fifo_rss(&m, FILL_COLOR_R, 0x2A, false);
     block(&m, 60, 1000, 60, 1000);
-    assert_eq!(m.fb_pixel(60, 1000), 0x2A);
+    assert_eq!(m.fb_pixel(60, 1000) & 0xFFF, 0x2A, "buffer A's index");
     m.stop_engines();
 }
 
@@ -612,6 +692,43 @@ fn gl_depth_test_hides_the_farther_triangle() {
     let at = |x: usize, y_gl: usize| m.fb_pixel(x, 1023 - y_gl);
     assert_eq!(at(150, 100), 0xFF_0000, "near blue wins where they overlap");
     assert_eq!(at(320, 60), 0x00_00FF, "far red where it is alone");
+    m.stop_engines();
+}
+
+/// A window reaching past the screen's edge has a negative origin half
+/// (traced: Quake III at 1280x1024, its window taller than the screen with
+/// the title bar, origin 0xffe00008: x 8, y -32). Its clears must land in
+/// the visible part. Read unsigned, y was 65504 and the clear was dropped,
+/// so the depth buffer kept the previous window's values and the 3D view
+/// showed only inside that window's old rectangle.
+#[test]
+fn gl_clear_in_a_window_with_a_negative_origin() {
+    let m = live_board();
+    x_server(&m);
+    // 400x300 at (8, -32): its bottom 32 rows are off screen, the screen
+    // mask covers the visible rows 0..267.
+    write(&m, 32, 0x50050, 0x4FC);
+    let mut img = [0u32; 63];
+    img[0] = SLOT_C;
+    img[2] = 8 | (-32i32 as u32 & 0xFFFF) << 16;
+    img[3] = 0x11;
+    img[11] = 8 << 16 | (8 + 400 - 1);
+    img[12] = 267;
+    img[13] = 0x240;
+    (img[16], img[17]) = (1, 1);
+    for wd in img {
+        write(&m, 32, CFIFO, wd as u64);
+    }
+    wait_flag(&m, 1 << 6);
+    gl_setup_window(&m, 400, 300, [1.0, 0.0, 0.0]);
+    // The scissor box over the whole window, scissor test on, as Quake III
+    // has it: clamping the unsigned misread to it left nothing to clear.
+    fifo_token(&m, 0x39, &[0, 399, 0, 299]);
+    fifo_token(&m, 0x6E, &[1]);
+    fifo_token(&m, 0x15, &[]);
+    // Window (100, 100) is screen (108, 68) from the bottom.
+    assert_eq!(m.fb_pixel(108, 1023 - 68) & 0xFF_FFFF, 0x00_00FF, "cleared to red");
+    assert_eq!(m.fb_pixel(108, 1023 - 300) & 0xFF_FFFF, 0, "above the window: untouched");
     m.stop_engines();
 }
 
@@ -751,6 +868,67 @@ fn gl_logic_op_xor_and_colour_mask() {
     m.stop_engines();
 }
 
+/// IRIS GL's logicop() (AutoCAD's XOR crosshair, traced): glBlendEquationEXT
+/// (GL_LOGIC_OP), then GL_BLEND enables the logic op instead of blending.
+/// A line XORed twice leaves the background, and blending is back once the
+/// equation is GL_FUNC_ADD again.
+#[test]
+fn gl_blend_equation_logic_op_xors() {
+    let m = gl_board([0.0, 0.0, 0.5]);
+    let bg = gl_px(&m, 200, 150);
+    fifo_token(&m, 0x60, &[0x0BF1]);
+    fifo_token(&m, 0x65, &[1]);
+    fifo_token(&m, 0x40, &[6]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg ^ 0xFF_FFFF, "XORed once");
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg, "XORed twice: the background");
+    // Back to blending: ONE, ONE adds.
+    fifo_token(&m, 0x40, &[3]);
+    fifo_token(&m, 0x60, &[0x8006]);
+    fifo_token(&m, 0x3F, &[1, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    assert_eq!(gl_px(&m, 200, 150), bg | 0xFF, "blending again");
+    m.stop_engines();
+}
+
+/// Every blend equation (EXT_blend_subtract, EXT_blend_minmax) and the
+/// constant colour factors (EXT_blend_color), from the GL tokens to the
+/// pixel: destination (0.25, 0.5, 1.0) drawn unblended first.
+#[test]
+fn gl_blend_equations_and_constant_colour() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    let near = |p: u32, want: [f32; 3], what: &str| {
+        for (k, w) in want.iter().enumerate() {
+            let got = ((p >> (8 * k)) & 0xFF) as i32;
+            assert!((got - (w * 255.0).round() as i32).abs() <= 2, "{what}: {p:#08x} component {k} want {w}");
+        }
+    };
+    let case = |eq: u32, func: [u32; 2], konst: Option<[f32; 4]>, src: [f32; 4], want: [f32; 3], what: &str| {
+        fifo_token(&m, 0x65, &[0]);
+        gl_color4(&m, [0.25, 0.5, 1.0, 1.0]);
+        gl_full_quad(&m);
+        fifo_token(&m, 0x60, &[eq]);
+        fifo_token(&m, 0x3F, &func);
+        if let Some(k) = konst {
+            fifo_token(&m, 0xD9, &k.map(f));
+        }
+        fifo_token(&m, 0x65, &[1]);
+        gl_color4(&m, src);
+        gl_full_quad(&m);
+        near(gl_px(&m, 200, 150), want, what);
+    };
+    case(0x800A, [1, 1], None, [1.0, 1.0, 1.0, 1.0], [0.75, 0.5, 0.0], "SUBTRACT ONE ONE");
+    case(0x800B, [1, 1], None, [0.25, 0.25, 0.25, 1.0], [0.0, 0.25, 0.75], "REVERSE_SUBTRACT ONE ONE");
+    case(0x8007, [0, 0], None, [0.5, 0.5, 0.5, 1.0], [0.25, 0.5, 0.5], "MIN ignores the factors");
+    case(0x8008, [0, 0], None, [0.5, 0.5, 0.5, 1.0], [0.5, 0.5, 1.0], "MAX ignores the factors");
+    case(0x8006, [0x8001, 0], Some([0.5, 0.25, 1.0, 0.5]), [1.0, 1.0, 1.0, 1.0], [0.5, 0.25, 1.0], "CONSTANT_COLOR ZERO");
+    case(0x8006, [0x8004, 0x8003], Some([0.0, 0.0, 0.0, 0.25]), [1.0, 1.0, 1.0, 1.0], [0.8125, 0.875, 1.0], "ONE_MINUS_CONSTANT_ALPHA CONSTANT_ALPHA");
+    m.stop_engines();
+}
+
 /// The classic stencil mask: a triangle writes stencil 1 with colour
 /// writes off, then a full quad drawn where stencil == 1.
 #[test]
@@ -770,6 +948,58 @@ fn gl_stencil_masks_a_later_draw() {
     gl_full_quad(&m);
     assert_eq!(gl_px(&m, 200, 100), 0xFF_0000, "inside the stencilled triangle");
     assert_eq!(gl_px(&m, 20, 20), 0, "outside it");
+    m.stop_engines();
+}
+
+/// One pixel through glReadPixels as libGLcore sends it (traced): SAVE_RSS
+/// with the planes word, the block and transfer through RSS_REG_SHADOW /
+/// SET, GET_PIXELS, the host DMA, RESTORE_RSS. The first `n` bytes.
+fn gl_read_one(m: &Mgras, x: u64, y: u64, planes: u32, xfrmode: u64, n: u32) -> Vec<u8> {
+    fifo_token(m, 0xD2, &[0x11E2_3929, 0x100_0000, if planes != 0 { 0x1E0_00FF } else { 0xFF }, planes, 2]);
+    fifo_token(m, 0x7C, &[1, 4]);
+    write(m, 32, CFIFO, 0x8000_0010);
+    for w in [0x153, 0x0001_0001, 0x226, 0x47] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0x7C, &[2, 6]);
+    write(m, 32, CFIFO, 0x8000_0018);
+    for w in [0x46, x << 16 | y, 0x28E, 0x47, x << 16 | y, 0x290] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0x7F, &[2, 4]);
+    write(m, 32, CFIFO, 0x8000_0010);
+    for w in [0x158, 0x0001_0001, 0x159, xfrmode] {
+        write(m, 32, CFIFO, w);
+    }
+    fifo_token(m, 0xDB, &[0x4009]);
+    let mem = eram_dma_setup(m, 4);
+    fifo_dma(m, 0x0B, 0x9);
+    fifo_token(m, 0xA05, &[0x4009]);
+    fifo_token(m, 0xD3, &[]);
+    m.state_hash();
+    let b = mem.bytes.lock();
+    (0..n).map(|i| b.get(&(0x2000 + i)).copied().unwrap_or(0)).collect()
+}
+
+/// glReadPixels of GL_STENCIL_INDEX (traced, glprim --scene quadrants):
+/// SAVE_RSS's fourth word 0x1800000 names the stencil planes, the transfer
+/// is one byte a pixel (format 1, type 0), and the bytes are the ZST
+/// buffer's top byte, not the colour buffer's red.
+#[test]
+fn gl_read_stencil_index() {
+    let m = gl_board([1.0, 0.0, 0.0]);
+    fifo_token(&m, 0xBE, &[0]);
+    fifo_token(&m, 0x4C, &[]);
+    fifo_token(&m, 0x6F, &[1]);
+    fifo_token(&m, 0x41, &[7, 3, 0xFF]);
+    fifo_token(&m, 0x42, &[0, 0, 2]);
+    gl_tri(&m, [0.0, 1.0, 0.0], [[100.0, 50.0, 0.0], [300.0, 50.0, 0.0], [200.0, 250.0, 0.0]]);
+    fifo_token(&m, 0x6F, &[0]);
+    let read = |x: u64, y: u64, planes: u32| gl_read_one(&m, x, y, planes, 0x0040_0010, 1)[0];
+    assert_eq!(read(200, 100, 0x180_0000), 3, "inside the triangle");
+    assert_eq!(read(20, 20, 0x180_0000), 0, "cleared");
+    // The same transfer with the colour planes: red's byte as before.
+    assert_eq!(read(20, 20, 0), 0xFF, "colour index read of the colour buffer");
     m.stop_engines();
 }
 
@@ -1170,6 +1400,53 @@ fn gl_context_survives_eviction_to_another_slot() {
     m.stop_engines();
 }
 
+/// Maximum Impact's eviction (traced, IRIX 6.5.22): every ERAM transfer
+/// once per GE11, GE0 first. The slot goes to two halves of one host
+/// buffer, GE1's read starting a word early, and both halves come back to
+/// the new slot, each set closed by ERAM_WRITE_END. GE1's half must not
+/// land over GE0's (it did, a word off: Matador came back from being
+/// iconified with its GL state shifted by a register).
+#[test]
+fn gl_context_survives_two_ge_eviction() {
+    let m = super::record::tests::live_board_of(crate::config::GraphicsBoard::MaxImpact);
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    gl_setup_window(&m, 100, 100, [1.0, 0.0, 0.0]);
+    switch_to_gl_context(&m, SLOT_B, 200, 0, 100, 100);
+    let mem = Arc::new(TestMem::default());
+    for p in 0..16 {
+        mem.words.lock().insert(0x1000 + 4 * p, 2 + p);
+    }
+    m.set_phys(mem.clone());
+    let half = 0x17C7 * 4;
+    let dma = |off: u32, bytes: u32, run: u32| {
+        fifo_dma(&m, 0x21, 0x1000);
+        fifo_dma(&m, 0x06, 0);
+        fifo_dma(&m, 0x05, off);
+        fifo_dma(&m, 0x04, 0);
+        fifo_dma(&m, 0x07, 1);
+        fifo_dma(&m, 0x08, bytes);
+        fifo_dma(&m, 0x0B, run);
+    };
+    // Evict A: GE0 at A, GE1 at A - 1, into consecutive halves.
+    dma(0, half, 0x9);
+    fifo_token(&m, 0xFC, &[SLOT_A, 0x17C8]);
+    dma(half, half, 0x9);
+    fifo_token(&m, 0xFC, &[SLOT_A - 1, 0x17C8]);
+    // Back into slot C, one half per GE.
+    for off in [0, half] {
+        fifo_token(&m, 0xFD, &[0x17C8]);
+        dma(off, half, 0x1);
+        fifo_token(&m, 0xFB, &[SLOT_C, 0x17C7]);
+        fifo_token(&m, 0xFA, &[]);
+    }
+    m.state_hash();
+    switch_to_gl_context(&m, SLOT_C, 400, 0, 100, 100);
+    fifo_token(&m, 0x15, &[]);
+    assert_eq!(m.fb_pixel(450, 1023 - 50), 0x00_00FF, "A's clear colour, from its new slot");
+    m.stop_engines();
+}
+
 /// Display lists as libGLcore lays them out (traced): each segment starts
 /// with its link, the body following, and the engine runs the body before
 /// the link. Here: a segment sets red and calls list 1 (DL_PUSH of the
@@ -1248,6 +1525,32 @@ fn gl_bitmap_draws_set_bits_at_the_raster_position() {
     m.stop_engines();
 }
 
+/// StudioTools uses GENERAL_BITMAP for text: rows padded to 64 bits,
+/// split across pixel commands, with a separate raster advance at the end.
+#[test]
+fn gl_general_bitmap_batches_and_raster_advance() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x91, &[0x1800F, 65, 3, f(2.0), f(1.0)]);
+    fifo_token(&m, 0x90, &[1, 8]);
+    fifo_pixel_data(&m, &[0x8000_0000, 0, 0x8000_0000, 0]);
+    assert_eq!(gl_px(&m, 8, 19), 0, "wait for the complete batch");
+    fifo_pixel_data(&m, &[0x4000_0000, 0, 0, 0]);
+    assert_eq!(gl_px(&m, 8, 19), 0xFF_FFFF);
+    assert_eq!(gl_px(&m, 72, 19), 0xFF_FFFF, "last bit of the wide row");
+    assert_eq!(gl_px(&m, 9, 20), 0xFF_FFFF, "second padded row");
+    assert_eq!(gl_px(&m, 8, 21), 0, "third row still pending");
+    fifo_token(&m, 0x90, &[1, 4]);
+    fifo_pixel_data(&m, &[0x2000_0000, 0, 0, 0]);
+    assert_eq!(gl_px(&m, 10, 21), 0xFF_FFFF, "next batch continues above");
+    fifo_token(&m, 0x92, &[f(100.0), f(4.0)]);
+    fifo_token(&m, 0x94, &[0x1800F, 8, 1, f(0.0), f(0.0), f(0.0), f(0.0), 1]);
+    fifo_pixel_data(&m, &[0x8000_0000, 0]);
+    assert_eq!(gl_px(&m, 110, 24), 0xFF_FFFF, "separate raster advance");
+    m.stop_engines();
+}
+
 /// A colour-index GL context (INIT_CI, as gr_osview's IRIS GL window
 /// sends): colours are indices and land in the pixels as 12-bit indices,
 /// for the colour-index visual's colormap; the clear uses the clear index.
@@ -1279,6 +1582,69 @@ fn gl_return_mode(m: &Mgras, addr: u32) -> u32 {
     read(m, 32, 0x70014) as u32
 }
 
+/// Pixel pipeline memory reads back as loaded (test/gltest/gepeek.c's
+/// ge:ADDR): a PIXEL_STATE block at 0x1D6 (libGLcore's colour-index host
+/// draw, traced), then __MGR_RETURN_MODE of each word; a word never loaded
+/// answers 0.
+#[test]
+fn pixel_state_reads_back_as_loaded() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    let block = [0x204u32, 0x1A000, 0, 5, 8, 0xFFFF_FFFF];
+    let mut d = vec![1, 1, 0x18, 0x1D6, 0, 0, 6];
+    d.extend_from_slice(&block);
+    d.push(6);
+    d.extend_from_slice(&block);
+    fifo_token(&m, 0x080, &d);
+    for (k, &w) in block.iter().enumerate() {
+        assert_eq!(gl_return_mode(&m, 0x1D6 + k as u32), w, "word {k}");
+    }
+    assert_eq!(gl_return_mode(&m, 0x1DC), 0, "never loaded");
+    m.stop_engines();
+}
+
+/// An unaligned pixel data command (libGLcore's rows at UNPACK_ALIGNMENT
+/// 1, traced): byte count 16 starting at byte 1 of the first word comes as
+/// five words and a pad. The command after it must parse (here a readback
+/// that gets its answer); taking only the declared four words read the
+/// fifth as a command and swallowed what followed.
+#[test]
+fn unaligned_pixel_data_keeps_the_fifo_in_step() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    write(&m, 32, CFIFO, 0x8000_0000 | 1 << 22 | 16);
+    for w in [0x1122_3344u32, 0x5566_7788, 0x99AA_BBCC, 0xDDEE_FF00, 0x0000_00FF, 0] {
+        write(&m, 32, CFIFO, w as u64);
+    }
+    fifo_token(&m, 0x6E, &[1]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 1);
+    m.stop_engines();
+}
+
+/// The readback flag and answer belong to the context: A asks the GE for
+/// its scissor state, B is switched in and clears the flag (as a client
+/// does before its own readback), and when A is back its answer is still
+/// waiting behind a set flag.
+#[test]
+fn gl_readback_flag_follows_the_context() {
+    let m = live_board();
+    x_server(&m);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    fifo_token(&m, 0x6E, &[1]);
+    write(&m, 32, 0x7000C, 1 << 17);
+    fifo_token(&m, 0x0A2, &[0xB9C, 1, 1]);
+    wait_flag(&m, 1 << 17);
+    switch_to_gl_context(&m, SLOT_B, 200, 0, 100, 100);
+    write(&m, 32, 0x7000C, 1 << 17);
+    switch_to_gl_context(&m, SLOT_A, 0, 0, 100, 100);
+    m.state_hash();
+    assert_ne!(read(&m, 32, 0x70008) & 1 << 17, 0, "A's flag is back");
+    assert_eq!(read(&m, 32, 0x70014), 1, "with A's answer");
+    m.stop_engines();
+}
+
 #[test]
 fn gl_raster_position_queries_valid_bias_and_update() {
     let m = live_board();
@@ -1304,7 +1670,9 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     assert_eq!(ry, 60.0 + 49151.5);
     assert_eq!(rz, 0.5); // glOrtho maps z=0 to window z=0.5
     assert_eq!(rw, 1.0);
-    assert_eq!(dist, 0.0);
+    // The eye-space distance to the raster position (GL 1.1 2.12): (50,
+    // 60, 0) under an identity modelview.
+    assert!((dist - (50.0f32 * 50.0 + 60.0 * 60.0).sqrt()).abs() < 1e-3, "{dist}");
 
     // Raster color readback at 0x2C5..=0x2C8
     let cr = f32::from_bits(gl_return_mode(&m, 0x2C5));
@@ -1334,6 +1702,12 @@ fn gl_raster_position_queries_valid_bias_and_update() {
     let sc_y = gl_return_mode(&m, 0x202);
     assert_eq!(sc_x, (100 << 16) | 10);
     assert_eq!(sc_y, (200 << 16) | 20);
+
+    // glIsEnabled(GL_SCISSOR_TEST) at 0xB9C (Mirai, traced).
+    fifo_token(&m, 0x6E, &[1]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 1);
+    fifo_token(&m, 0x6E, &[0]);
+    assert_eq!(gl_return_mode(&m, 0xB9C), 0);
 
     m.stop_engines();
 }
@@ -1429,6 +1803,109 @@ fn gl_draw_pixels_colour_index_shorts() {
     m.stop_engines();
 }
 
+/// glDrawPixels can split a row's words between SEND_PIXELS words 0 and 1
+/// (traced, Advanced Visualizer restoring its window from 156-pixel RGBA
+/// strips: [0x4E, 0x4E, ..], 624-byte rows), as texture loads do. Taking
+/// word 0 alone made the 0xDA8 image width read as 2-byte pixels, and
+/// each was widened with 0xFF: purple and blue columns.
+#[test]
+fn gl_draw_pixels_rows_are_send_pixels_words_0_and_1() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    let pixels = [0xB2B2_B200u32, 0x4C4C_4C00, 0x1020_3000, 0xFFEE_DD00];
+    let mut rows = Vec::new();
+    for (y, header) in [(20.0f32, [4u32, 0]), (21.0, [2, 2])] {
+        fifo_token(&m, 0x7F, &[1, 2]);
+        write(&m, 32, CFIFO, 0x8000_0008);
+        write(&m, 32, CFIFO, 0x159);
+        write(&m, 32, CFIFO, 0x00C0_0080);
+        fifo_token(&m, 0x38, &[f(10.0), f(y), f(0.0)]);
+        // The image: 4 x 1 pixels (0xDA8 transfer size).
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 0, 6, 0, 0, 3, 0, 1 << 16 | 4, 0]);
+        fifo_token(&m, 0x8D, &[header[0], header[1], 0, 1, 0, 1, 0x49D0, 0x88]);
+        fifo_pixel_data(&m, &pixels);
+        let py = 1023 - y as usize;
+        rows.push((10..15).map(|x| m.fb_pixel(x, py)).collect::<Vec<_>>());
+    }
+    assert_ne!(rows[0][..4], [0; 4], "the reference row was drawn");
+    assert_eq!(rows[0][4], 0);
+    assert_eq!(rows[1], rows[0], "[2, 2] draws what [4, 0] does");
+    m.stop_engines();
+}
+
+/// glPixelZoom(1, -1) (Mirai's splash, traced): the GE pixel state 0xDA8
+/// gives the first row at y -1 and the last at y -rows, so the image runs
+/// down from the raster position, first row on top. The same image drawn
+/// the usual way (y 0 to rows - 1) runs up.
+#[test]
+fn gl_draw_pixels_negative_zoom_runs_down() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    let pixels = [0xB2B2_B200u32, 0x4C4C_4C00, 0x1020_3000, 0xFFEE_DD00];
+    for (x, rect) in [(10.0f32, [0u32, 0, 1, 1]), (30.0, [0, (-1i32) as u32, 1, (-2i32) as u32])] {
+        fifo_token(&m, 0x7F, &[1, 2]);
+        write(&m, 32, CFIFO, 0x8000_0008);
+        write(&m, 32, CFIFO, 0x159);
+        write(&m, 32, CFIFO, 0x00C0_0080);
+        fifo_token(&m, 0x38, &[f(x), f(20.0), f(0.0)]);
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 0, 6, rect[0], rect[1], rect[2], rect[3], 2 << 16 | 2, 0]);
+        fifo_token(&m, 0x8D, &[2, 0, 0, 2, 0, 1, 0x49D0, 0x88]);
+        fifo_pixel_data(&m, &pixels);
+    }
+    let row = |x: usize, y: usize| [m.fb_pixel(x, 1023 - y), m.fb_pixel(x + 1, 1023 - y)];
+    assert_ne!(row(10, 20), [0, 0], "the upright image was drawn");
+    assert_ne!(row(10, 20), row(10, 21), "its rows differ");
+    assert_eq!(row(30, 19), row(10, 20), "first row just below the raster position");
+    assert_eq!(row(30, 18), row(10, 21), "second row below it");
+    assert_eq!(row(30, 20), [0, 0], "nothing above the raster position");
+    m.stop_engines();
+}
+
+/// A GE pixel state block as libGLcore writes it (0x080 GE memory, 0x0CD
+/// ERAM): [?, ?, bytes, address, 0, 0, count, values, count, values].
+fn ge_state(m: &Mgras, token: u32, addr: u32, vals: &[u32]) {
+    let mut d = vec![1, 2, 4 * vals.len() as u32, addr, 0, 0, vals.len() as u32];
+    d.extend_from_slice(vals);
+    d.push(vals.len() as u32);
+    d.extend_from_slice(vals);
+    fifo_token(m, token, &d);
+}
+
+/// glDrawPixels(GL_RGBA, GL_FLOAT) through the GE pixel pipeline as
+/// libGLcore programs it (traced: colmatrix, clamp to 2^32 - 1,
+/// pipecontrol; 32-bit components to the raster engine, 16 bytes a pixel).
+#[test]
+fn gl_draw_pixels_float_through_the_pipeline() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x15, &[]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    write(&m, 32, CFIFO, 0x8000_0008);
+    write(&m, 32, CFIFO, 0x159);
+    write(&m, 32, CFIFO, 0x00C0_0083);
+    ge_state(&m, 0x80, 0x13B, &[0x3E65, 0, 0x156A, 0x1B4, 0x352D, 0xD67]);
+    ge_state(&m, 0x80, 0x1B4, &[0xF, 0, 0x4064, 0x50C, 0x1E4]);
+    let mut clamp = vec![0x50C, 0x1A000, 0x50C, 5, 0];
+    clamp.extend([0x4F7F_FFFFu32; 12]);
+    ge_state(&m, 0xCD, 0xD67, &clamp);
+    ge_state(&m, 0xCD, 0xDB7, &[0, 0, 0, 0, 4, 0]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    ge_state(&m, 0xCD, 0xDA8, &[0, 0, 0, 0, 1 << 16 | 1, 1]);
+    fifo_token(&m, 0x8D, &[4, 0, 0, 1, 0, 1, 0x49D0, 0x8]);
+    fifo_pixel_data(&m, &[f(0.5), f(0.25), f(1.5), f(-1.0)]);
+    m.state_hash();
+    // The raster engine keeps a component's top bits, and libGLcore's
+    // scale (2^32 - 1 as a float, 4294967040) puts 0.5 and 0.25 just under
+    // 128 and 64.
+    assert_eq!(gl_px(&m, 10, 20) & 0xFF_FFFF, 0xFF_3F7F, "R 0.5, G 0.25, B clamped to 1");
+    m.stop_engines();
+}
+
 /// Pixel zoom (snoop's magnifier): the GE pixel state at 0x192 holds
 /// 1 / zoom (token 0x080, traced: 1/6 at zoom 6); each pixel and row of a
 /// SEND_PIXELS image is repeated.
@@ -1463,6 +1940,15 @@ fn gl_draw_pixels_zoomed() {
 /// interface register 5 (0x4009).
 #[test]
 fn gl_read_pixels_to_host_memory() {
+    gl_read_pixels_component_order(true);
+}
+
+#[test]
+fn gl_read_pixels_abgr_to_host_memory() {
+    gl_read_pixels_component_order(false);
+}
+
+fn gl_read_pixels_component_order(rgba: bool) {
     let m = gl_board([0.0, 0.0, 0.0]);
     gl_color4(&m, [1.0, 0.5, 0.25, 1.0]);
     gl_full_quad(&m);
@@ -1481,7 +1967,7 @@ fn gl_read_pixels_to_host_memory() {
     }
     fifo_token(&m, 0x7F, &[2, 4]);
     write(&m, 32, CFIFO, 0x8000_0010);
-    for w in [0x158, 0x0001_0001, 0x159, 0x0088_0080] {
+    for w in [0x158, 0x0001_0001, 0x159, 0x0088_0080 | if rgba { 1 << 22 } else { 0 }] {
         write(&m, 32, CFIFO, w);
     }
     fifo_token(&m, 0xDB, &[0x4009]);
@@ -1492,8 +1978,17 @@ fn gl_read_pixels_to_host_memory() {
     m.state_hash();
     let b = mem.bytes.lock();
     let got: Vec<u8> = (0..4).map(|i| b.get(&(0x2000 + i)).copied().unwrap_or(0)).collect();
-    assert_ne!(got, [0, 0, 0, 0], "the pixel reached host memory (window pixel {px:#x})");
+    let mut expected = [px as u8, (px >> 8) as u8, (px >> 16) as u8, 255];
+    if !rgba { expected.reverse(); }
+    assert_eq!(got, expected, "GE requested component order");
     drop(b);
+    // Feed the readback to glDrawPixels: repeated UI background copies
+    // must preserve their colour rather than rotate alpha into red.
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0x8D, &[1, 0, 0, 1, 0, 1, 0x49D0, 0x99]);
+    fifo_token(&m, 0xC00, &[if rgba { 0xE0D } else { 0xE8D }]);
+    fifo_pixel_data(&m, &[u32::from_be_bytes(got.try_into().unwrap())]);
+    assert_eq!(gl_px(&m, 10, 20), px, "read/draw round trip");
     m.stop_engines();
 }
 
@@ -1687,9 +2182,16 @@ fn gl_tex_level(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32]) {
 /// `gl_tex_level` for host elements `elem` (pixel state 0xDBB: 1 bytes, 3
 /// 16-bit, 4 32-bit) with component scale `scale` (0xD0A; 0 leaves it).
 fn gl_tex_level_as(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32], elem: u32, scale: f32, tl_mode: u32) {
+    gl_tex_level_tm(m, level, n, dest, texels, elem, scale, tl_mode, 0x40858);
+}
+
+/// `gl_tex_level_as` with TEXMODE1 `texmode1` in the context while the
+/// level loads (libGLcore leaves whatever texture was bound before).
+#[allow(clippy::too_many_arguments)]
+fn gl_tex_level_tm(m: &Mgras, level: u32, n: u32, dest: u32, texels: &[u32], elem: u32, scale: f32, tl_mode: u32, texmode1: u32) {
     let log = n.trailing_zeros();
     fifo_token(m, 0x0C, &[]);
-    rss_shadow_list(m, &[(0x1A0, 0), (0x18B, 0), (0x111, 0x40858)]);
+    rss_shadow_list(m, &[(0x1A0, 0), (0x18B, 0), (0x111, texmode1)]);
     rss_shadow_list(m, &[(0x1A1, tl_mode)]);
     rss_shadow_list(m, &[(0x1A2, log << 8 | log << 4 | level)]);
     fifo_token(m, 0xD2, &[0xFFFF_FFFF, 0x0140_0000, 0, 0, 3]);
@@ -1799,6 +2301,47 @@ fn gl_texture_far_quad_maps_as_near() {
     assert!(differ < textured / 200, "{differ} of {textured} pixels differ");
 }
 
+/// A luminance-alpha texture sent as libGLcore sends a direct load
+/// (traced, glprim 64x64 GL_LUMINANCE_ALPHA): SEND_PIXELS words 0 and 1
+/// both half a row's words, the rows as words 3 + 3 * 4. Each texel is
+/// its own luminance (s * 0x20), not texel s / 2's.
+#[test]
+fn gl_texture_rows_are_send_pixels_words_0_and_1() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    // 8x8 texels of (L, A) bytes: 16 bytes = 4 words a row.
+    let bytes: Vec<u8> = (0..8).flat_map(|_t| (0..8u8).flat_map(|s| [s * 0x20, 0xFF])).collect();
+    let words: Vec<u32> = bytes.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let n = 8u32;
+    fifo_token(&m, 0x0C, &[]);
+    rss_shadow_list(&m, &[(0x1A0, 0), (0x18B, 0), (0x111, 0x40449)]);
+    rss_shadow_list(&m, &[(0x1A1, 0x34E22)]);
+    rss_shadow_list(&m, &[(0x1A2, 3 << 8 | 3 << 4)]);
+    fifo_token(&m, 0xD2, &[0xFFFF_FFFF, 0x0140_0000, 0, 0, 3]);
+    fifo_token(&m, 0xCD, &[1, 1, 0x14, 0xDA8, 0, 2, 5, 0, 0, n, n, n << 16 | n, 0]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDB1, 0, 2, 6, n, 0, 0, 0, 0, 0, 0]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDB7, 0, 2, 6, 0, 0, 0, 0, 1, 0, 0]);
+    // Words a row 2 + 2, rows 2 + 3 * 2 = 8.
+    fifo_token(&m, 0x8D, &[2, 2, 0, 2, 2, 1, 0x511A, 0x98]);
+    fifo_pixel_data(&m, &words);
+    fifo_token(&m, 0xD3, &[]);
+    // Luminance-alpha class (2), two components; 8x8 level 0 at page 0.
+    fifo_token(&m, 0x0B, &[]);
+    rss_shadow_list(&m, &[(0x180, 0x10004)]);
+    rss_shadow_list(&m, &[(0x111, 0x40449)]);
+    rss_shadow_list(&m, &[(0x184, 0), (0x185, 0), (0x190, 0)]);
+    fifo_token(&m, 0xEC, &[0xBC6, 0xBC7, 0x191, 0]);
+    rss_shadow_list(&m, &[(0x181, 0x3333), (0x183, 1), (0x18C, 0x8004)]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    gl_tex_quad(&m);
+    // The quad is 200 x 100 pixels: 25 x 12.5 a texel.
+    for s in [1u32, 3, 6, 7] {
+        let (x, y) = (100 + 25 * s as usize + 12, 150);
+        let l = s * 0x20;
+        assert_eq!(gl_px(&m, x, y), l << 16 | l << 8 | l, "texel ({s}, 4) at ({x}, {y})");
+    }
+    m.stop_engines();
+}
+
 /// SGIS_texture_select (traced, TyrQuake's lightmaps): one-component
 /// textures share cells, each in the slot TL_MODE bits 4:3 give at load
 /// and TEXMODE1 bits 8:7 when drawn. Two luminance textures on the same
@@ -1815,6 +2358,56 @@ fn gl_texture_select_slots_share_a_page() {
         gl_tex_quad(&m);
         assert_eq!(gl_px(&m, 125, 112), want, "slot {slot}");
     }
+    m.stop_engines();
+}
+
+/// One-component host texels (GL_ALPHA, GL_LUMINANCE, GL_INTENSITY data,
+/// one byte each) into a one-component texture are the texels, whatever
+/// TEXMODE1's class says during the load: libGLcore writes the new
+/// texture's TEXMODE1 after loading it, so the class there is often the
+/// previous texture's. An alpha class used to store 0xFF for every texel
+/// (Discord Messenger's glyphs drew as solid boxes), and a luminance load
+/// after an alpha one inherited that.
+#[test]
+fn gl_texture_one_component_bytes_are_the_texels() {
+    // TEXMODE1 at load: alpha, luminance and RGBA classes.
+    for texmode1 in [0x40246, 0x40440, 0x40858] {
+        let m = gl_board([0.0, 0.0, 0.0]);
+        gl_tex_level_tm(&m, 0, 4, 0, &[0x00FF_40C0; 4], 1, 0.0, 0x34020, texmode1);
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        // 8-bit components (TL_MODE 6:5 = 1): 32-bit cells, slot 0 first,
+        // low nibble first.
+        let off = super::te1::small_offset(4);
+        let texel = |s: usize| {
+            let h: Vec<char> = rss.te.nibbles_hex((off + s) * 8, 2).chars().collect();
+            u32::from_str_radix(&format!("{}{}", h[1], h[0]), 16).unwrap()
+        };
+        assert_eq!([texel(0), texel(1), texel(2), texel(3)], [0x00, 0xFF, 0x40, 0xC0], "TEXMODE1 {texmode1:#x} at load");
+        drop(_sub);
+        m.stop_engines();
+    }
+}
+
+/// An RGBA level loaded while TEXMODE1 still holds an alpha texture's
+/// class (the texture drawn before it) keeps its four components: the
+/// class only picks alpha out for one-component textures. It used to store
+/// [alpha, 0, 0, 0], and Dear ImGui's glyphs, added to its RGBA atlas after
+/// Discord Messenger's alpha atlas was drawn, came out invisible.
+#[test]
+fn gl_texture_rgba_load_ignores_a_stale_alpha_class() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    gl_tex_level_tm(&m, 0, 4, 0, &[0x1122_33C4; 16], 1, 0.0, 0x34026, 0x40246);
+    let _sub = m.submit.lock();
+    m.wait_idle();
+    let rss = unsafe { &*m.rss.get() };
+    let off = super::te1::small_offset(4);
+    // One 32-bit cell: R G B A, each 8 bits, low nibble first.
+    let cell: Vec<char> = rss.te.nibbles_hex(off * 8, 8).chars().collect();
+    let comp = |k: usize| u32::from_str_radix(&format!("{}{}", cell[2 * k + 1], cell[2 * k]), 16).unwrap();
+    assert_eq!([comp(0), comp(1), comp(2), comp(3)], [0x11, 0x22, 0x33, 0xC4]);
+    drop(_sub);
     m.stop_engines();
 }
 
@@ -2106,6 +2699,30 @@ fn gl_point_size_draws_a_square() {
     m.stop_engines();
 }
 
+/// GL_POINT_SMOOTH (token 0x06C [1]): a 9-pixel point is a disc, so the
+/// corners of its 9x9 box stay clear while the edge middles are drawn;
+/// [0] gives the square back.
+#[test]
+fn gl_smooth_point_is_round() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x4D, &[f(9.0)]);
+    fifo_token(&m, 0x6C, &[1]);
+    gl_color4(&m, [1.0, 1.0, 1.0, 1.0]);
+    fifo_token(&m, 0x16, &[]);
+    fifo_token(&m, 0x00, &[f(50.5), f(50.5), f(0.0)]);
+    fifo_token(&m, 0x20, &[]);
+    for (x, y, on) in [(50, 50, true), (46, 50, true), (54, 50, true), (50, 46, true), (50, 54, true),
+                       (46, 46, false), (54, 54, false), (46, 54, false), (54, 46, false)] {
+        assert_eq!(gl_px(&m, x, y) != 0, on, "smooth: ({x}, {y})");
+    }
+    fifo_token(&m, 0x6C, &[0]);
+    fifo_token(&m, 0x16, &[]);
+    fifo_token(&m, 0x00, &[f(100.5), f(100.5), f(0.0)]);
+    fifo_token(&m, 0x20, &[]);
+    assert!(gl_px(&m, 96, 96) != 0, "square again: corner drawn");
+    m.stop_engines();
+}
+
 /// A textured line: texture coordinates along it, texel by texel.
 #[test]
 fn gl_textured_line() {
@@ -2321,6 +2938,26 @@ fn gl_draw_pixels_chunk_offset() {
     m.stop_engines();
 }
 
+/// A chunk whose RGB16 rows do not fill whole words (Mirai's last strip of
+/// a front-to-back copy, traced: 93 pixels, 558 bytes sent as 140 words):
+/// still 6-byte pixels, and still at its 0xDA8 offset.
+#[test]
+fn gl_draw_pixels_rgb16_padded_rows() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C0_0081]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 0x50, 0, 0x52, 0, 0x1_0003, 1]);
+    fifo_token(&m, 0x8D, &[5, 0, 0, 1, 0, 1, 0x49D0, 0x98]);
+    fifo_pixel_data(&m, &[0xFFFF_8080, 0xBFBF_0000, 0xFFFF_0000, 0, 0xFFFF_0000]);
+    m.state_hash();
+    assert_eq!(gl_px(&m, 90, 20), 0xBF_80FF, "pink at the raster position + 80");
+    assert_eq!(gl_px(&m, 91, 20), 0x00_FF00, "green");
+    assert_eq!(gl_px(&m, 92, 20), 0xFF_0000, "blue");
+    assert_eq!(gl_px(&m, 10, 20), 0, "not at the raster position");
+    m.stop_engines();
+}
+
 /// GL_CLAMP_TO_BORDER_SGIS (TEXMODE2 clamp bits without bit 14, libGLcore's
 /// mapping): past the edge the samples are all border colour, where
 /// GL_CLAMP gives half border, half edge texel.
@@ -2355,6 +2992,44 @@ fn gl_draw_pixels_rgba8_component_order() {
     let b = super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E);
     assert_eq!(rss.mem.get(&b, 11, 20) as u32, 0x7856_3412, "alpha survives upload");
     drop(_sub);
+    m.stop_engines();
+}
+
+#[test]
+fn gl_draw_pixels_flat_transport_keeps_image_shape_and_offset() {
+    for (words_per_row, transport_rows) in [(6, 1), (2, 3)] {
+        let m = gl_board([0.0, 0.0, 0.0]);
+        fifo_token(&m, 0x7F, &[1, 2]);
+        fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+        fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+        // StudioPaint sends narrow tile edges as one transport row, with the
+        // two-dimensional image rectangle still in GE pixel state.
+        fifo_token(&m, 0xCD, &[1, 2, 0x18, 0xDA8, 0, 2, 6, 5, 7, 7, 8, 0x2_0003, 1]);
+        fifo_token(&m, 0x8D, &[words_per_row, 0, 0, transport_rows, 0, 1, 0x49D0, 0x18]);
+        fifo_pixel_data(&m, &[0xFF00_00FF, 0x00FF_00FF, 0x0000_FFFF,
+            0xFFFF_00FF, 0x00FF_FFFF, 0xFF00_FFFF]);
+        let got: Vec<u32> = [(15, 27), (16, 27), (17, 27), (15, 28), (16, 28), (17, 28)]
+            .iter().map(|&(x, y)| gl_px(&m, x, y)).collect();
+        assert_eq!(got, [0xFF, 0xFF00, 0xFF0000, 0xFFFF, 0xFFFF00, 0xFF00FF]);
+        assert_eq!(gl_px(&m, 10, 20), 0, "transport shape must not overwrite the raster origin");
+        assert_eq!(gl_px(&m, 18, 27), 0, "image ends at its rectangle edge");
+        m.stop_engines();
+    }
+}
+
+#[test]
+fn gl_fifo_abgr_rows_ignore_doubleword_padding() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0x7F, &[1, 2]);
+    fifo_pixel_data(&m, &[0x159, 0x00C1_0080]);
+    fifo_token(&m, 0x38, &[f(10.0), f(20.0), f(0.0)]);
+    fifo_dma(&m, 0xC00, 0xE8D);
+    fifo_token(&m, 0x8D, &[3, 0, 0, 2, 0, 1, 0x49D0, 0x99]);
+    fifo_pixel_data(&m, &[0xFF00_0000, 0xFF56_3412, 0xFF00_00FF]);
+    fifo_pixel_data(&m, &[0xFF00_FF00, 0xFFFF_0000, 0xFFFF_FFFF]);
+    let got: Vec<u32> = [(10, 20), (11, 20), (12, 20), (10, 21), (11, 21), (12, 21)]
+        .iter().map(|&(x, y)| gl_px(&m, x, y)).collect();
+    assert_eq!(got, [0, 0x56_3412, 0xFF, 0xFF00, 0xFF0000, 0xFFFFFF]);
     m.stop_engines();
 }
 
@@ -2486,6 +3161,106 @@ fn gl_back_buffer_alternates_with_swaps() {
     m.stop_engines();
 }
 
+/// GL's 12-bit double-buffered visuals on a HighImpact at 1280x1024
+/// (traced): octahedra (INIT_FORMAT_VALUES 0x100) and electropaint (0),
+/// both DRAW_BUFFER [2, 1], in a window whose DRBpointers name one page
+/// for A and B (0x90240). Each frame goes to the half of the word the
+/// screen is not showing.
+#[test]
+fn gl_12bit_double_buffer_draws_word_halves() {
+    for format in [0x100, 0] {
+        let m = gl_board([0.0, 0.0, 0.0]);
+        fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x90240, 0, 0, 0]);
+        fifo_token(&m, 0x9A, &[format, format]);
+        fifo_token(&m, 0x49, &[2, 1, 0]);
+        let word = |m: &Mgras| {
+            let _sub = m.submit.lock();
+            m.wait_idle();
+            let rss = unsafe { &*m.rss.get() };
+            rss.mem.get(&super::pixmem::Buffer::new(0x240, super::pixmem::Kind::Wide, 0x31E), 50, 50) as u32 & 0xFF_FFFF
+        };
+        fifo_token(&m, 0x98, &[1, 1]);
+        gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+        gl_full_quad(&m);
+        // 4:4:4 (format 0) or 5:5:5 (0x100) halves.
+        let (red_b, blue_a) = if format == 0x100 { (0x1F << 15, 0x1F << 10) } else { (0xF << 12, 0xF << 8) };
+        assert_eq!(word(&m), red_b, "format {format:#x}, bank 1: red in B, the high half");
+        fifo_token(&m, 0x98, &[0, 0]);
+        write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+        gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+        gl_full_quad(&m);
+        assert_eq!(word(&m), red_b | blue_a, "format {format:#x}, bank 0: blue in A, B kept");
+        m.stop_engines();
+    }
+}
+
+/// glReadPixels of a 12-bit double-buffered window whose DRBpointers do
+/// name a separate B page (1024x768, traced glprim --visual 4,4,4,4): both
+/// buffers are still halves of A's page, so the read stays there and the
+/// read field picks the half.
+#[test]
+fn gl_12bit_pairs_read_from_their_halves() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x2E0 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0, 0]);
+    fifo_token(&m, 0x49, &[2, 1, 0]);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [1.0, 0.0, 0.0, 1.0]);
+    gl_full_quad(&m);
+    fifo_token(&m, 0x98, &[0, 0]);
+    write(&m, 32, CFIFO, ((0x37 << 8) | 0) as u64);
+    gl_color4(&m, [0.0, 0.0, 1.0, 1.0]);
+    gl_full_quad(&m);
+    let rgba8 = 0x0041_0080;
+    fifo_token(&m, 0x44, &[0, 0, 0x404]);
+    let front = gl_read_one(&m, 50, 50, 0, rgba8, 3);
+    fifo_token(&m, 0x44, &[0, 0, 0x405]);
+    let back = gl_read_one(&m, 50, 50, 0, rgba8, 3);
+    let mut got = [front, back];
+    got.sort();
+    assert_eq!(got, [vec![0, 0, 0xFF], vec![0xFF, 0, 0]], "one buffer red, the other blue");
+    // Depth of the same window: the ZST word, not a pair's half. Format
+    // (2, 3), 32 bits full scale on the host.
+    fifo_token(&m, 0x66, &[1]);
+    fifo_token(&m, 0xBC, &[0x40_0000]);
+    fifo_token(&m, 0x4A, &[]);
+    let z = gl_read_one(&m, 50, 50, 0x1C0_0000, 0x0041_0023, 4);
+    assert_eq!(z[..3], [0x40, 0, 0], "depth 0.25");
+    // Stencil cleared to 5 beside it, the depth kept.
+    fifo_token(&m, 0xBE, &[5]);
+    fifo_token(&m, 0x4C, &[]);
+    assert_eq!(gl_read_one(&m, 50, 50, 0x180_0000, 0x0040_0010, 1), [5], "stencil");
+    assert_eq!(gl_read_one(&m, 50, 50, 0x1C0_0000, 0x0041_0023, 3), [0x40, 0, 0], "depth kept");
+    m.stop_engines();
+}
+
+/// GL's RGBA 12,12,12 visual (INIT_FORMAT_VALUES 0x2300, traced with
+/// gltest --visual 12,12,12): 36-bit pixels that keep twelve bits a
+/// component, drawn to the second page as GL_BACK [4, 1] like 24-bit.
+#[test]
+fn gl_12_12_12_keeps_twelve_bits() {
+    let m = gl_board([0.0, 0.0, 0.0]);
+    fifo_token(&m, 0xE4, &[0, 0x11, 0, 0, 0, 0, 0, 0, 0, 399, 299, 0x240 | 0x140 << 10, 0, 0, 0]);
+    fifo_token(&m, 0x9A, &[0x2300, 0x2300]);
+    fifo_token(&m, 0x49, &[4, 1, 0]);
+    fifo_token(&m, 0x98, &[1, 1]);
+    gl_color4(&m, [0.25, 0.5, 1.0 / 3.0, 1.0]);
+    gl_full_quad(&m);
+    let word = |p: u32| {
+        let _sub = m.submit.lock();
+        m.wait_idle();
+        let rss = unsafe { &*m.rss.get() };
+        rss.mem.get(&super::pixmem::Buffer::new(p, super::pixmem::Kind::Wide, 0x31E), 50, 50)
+    };
+    let c = super::rss::unpack36(word(0x140));
+    let want = [1024, 2048, 1365];
+    for k in 0..3 {
+        assert!(c[k].abs_diff(want[k]) <= 1, "component {k}: {:#x}, want about {:#x}", c[k], want[k]);
+    }
+    assert_eq!(word(0x240) & 0xFF_FFFF, 0, "the front page untouched");
+    m.stop_engines();
+}
+
 /// The bank comes from the kernel (VALIDATE_BANKS), not from counting
 /// swaps: a swap the kernel did not pair with a bank (or one the GE never
 /// saw) leaves the drawing where the kernel last said.
@@ -2562,5 +3337,20 @@ fn state_desc_verify_rejects_an_unregistered_field() {
     t.insert("stray".into(), toml::Value::Integer(1));
     let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
     assert!(err.contains("unknown field 'stray'"), "{err}");
+}
+
+/// glGet(GL_CURRENT_RASTER_COLOR) is the colour glRasterPos latched, even
+/// after the current colour changes (drawing lets later colours through for
+/// IRIS GL's bitmaps; the query keeps OpenGL's latch).
+#[test]
+fn gl_raster_color_query_is_latched() {
+    let m = live_board();
+    x_server(&m);
+    gl_window_400x300(&m);
+    fifo_token(&m, 0x02, &[f(0.5), f(0.25), f(1.0), f(0.75)]);
+    fifo_token(&m, 0x38, &[f(5.0), f(5.0)]);
+    fifo_token(&m, 0x02, &[f(0.0), f(0.0), f(0.0), f(0.0)]);
+    let v: Vec<f32> = (0x2C5..=0x2C8).map(|a| f32::from_bits(gl_return_mode(&m, a))).collect();
+    assert_eq!(v, [0.5, 0.25, 1.0, 0.75]);
     m.stop_engines();
 }

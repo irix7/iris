@@ -190,6 +190,13 @@ impl ShaderCompiler {
             eprintln!("REX JIT: not jittable (line+host) for dm0={dm0_val:#010x}");
             return None;
         }
+        // A host DRAW block with STOPONY is a full block that keeps reloading
+        // HOSTRW (rex3_generic stop_on_word); the shader's host_xstop assumes one
+        // word per call. Rare (glPixelZoom), so leave it to the interpreter.
+        if is_hostw && dm0.colorhost() && dm0.stopony() && adrmode == DRAWMODE0_ADRMODE_BLOCK {
+            eprintln!("REX JIT: not jittable (full host primitive) for dm0={dm0_val:#010x}");
+            return None;
+        }
         if !is_line && adrmode != DRAWMODE0_ADRMODE_SPAN && adrmode != DRAWMODE0_ADRMODE_BLOCK {
             eprintln!("REX JIT: not jittable (adrmode={adrmode:#x}) for dm0={dm0_val:#010x}");
             return None;
@@ -1232,14 +1239,33 @@ fn emit_shader(
 
     // depth_mask used by scr2scr src read and by emit_pixel_write.
     let depth_mask: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+    // DBLSRC reads the second buffer of a double-buffered depth: the plane's
+    // upper half of the pixel (the interpreter's plane_shift_mask).
+    let dblsrc_shift: i64 = match dm1.drawdepth() { 0 => 4, 1 => 8, 2 => 12, _ => 0 };
 
     // ── HOSTR (READ opcode): read fb pixel, pack into host shifter, jump to skip ──
     // Mirrors process_pixel_read: calculate_fb_address + expand + store_host_pixel.
     // No fb write; jump to skip_block with updated shifter.
     let new_shifter_after_pixel: Value = if is_hostr {
         let fb_raw = b.ins().load(types::I32, memv, px_ptr, ir::immediates::Offset32::new(0));
-        let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
-        let masked = b.ins().band_imm_s(fb_raw, depth_mask_i);
+        // The plane's bits, as the interpreter's read_plane takes them: an aux
+        // plane by its own shift (DBLSRC picks the second one), an RGB depth
+        // shifted to its second buffer under DBLSRC, then masked.
+        let masked = if dm1.use_aux() {
+            let (shift0, shift1, mask): (i64, i64, i64) = match dm1.planes() {
+                p if p == DRAWMODE1_PLANES_OLAY => (8,  16, 0xFF),
+                p if p == DRAWMODE1_PLANES_CID  => (0,  4,  0x3),
+                p if p == DRAWMODE1_PLANES_PUP  => (2,  6,  0x3),
+                _                               => (0,  0,  0),
+            };
+            let shift = if dm1.dblsrc() { shift1 } else { shift0 };
+            let v = if shift > 0 { b.ins().ushr_imm_s(fb_raw, shift) } else { fb_raw };
+            b.ins().band_imm_s(v, mask)
+        } else {
+            let depth_mask_i: i64 = match dm1.drawdepth() { 0 => 0xF, 1 => 0xFF, 2 => 0xFFF, _ => 0xFFFFFF };
+            let v = if dm1.dblsrc() && dblsrc_shift > 0 { b.ins().ushr_imm_s(fb_raw, dblsrc_shift) } else { fb_raw };
+            b.ins().band_imm_s(v, depth_mask_i)
+        };
         let expanded = if dm1.rgbmode() && dm1.drawdepth() != 3 {
             emit_expand_ir(&mut b, masked, dm1.drawdepth())
         } else { masked };
@@ -1272,8 +1298,12 @@ fn emit_shader(
                 let extracted  = if read_shift > 0 { b.ins().ushr_imm_s(src_raw, read_shift) } else { src_raw };
                 b.ins().band_imm_s(extracted, aux_read_mask)
             } else {
-                // RGB plane: mask to depth bits then expand to 24-bit if needed.
-                let src_masked = b.ins().band_imm_s(src_raw, depth_mask as i64);
+                // RGB plane: the DBLSRC buffer, masked to depth bits, then
+                // expanded to 24-bit if needed.
+                let src_plane = if dm1.dblsrc() && dblsrc_shift > 0 {
+                    b.ins().ushr_imm_s(src_raw, dblsrc_shift)
+                } else { src_raw };
+                let src_masked = b.ins().band_imm_s(src_plane, depth_mask as i64);
                 if dm1.rgbmode() && dm1.drawdepth() != 3 {
                     emit_expand_ir(&mut b, src_masked, dm1.drawdepth())
                 } else { src_masked }
@@ -1305,7 +1335,13 @@ fn emit_shader(
             // independent of RGB/CI plane format — mirrors combine_host_dda in rex3.rs.
             // Always overlay bits 31:24 so px_afunc/afunc_cmp below see the right value;
             // CI write paths mask down to the plane-depth index and never see these bits.
-            let alpha_byte = if dm0.alphahost() {
+            let alpha_byte = if dm0.alphahost() && !dm0.colorhost() && dm1.hostdepth() <= 1 {
+                // 8-bit host fields carrying alpha alone: the field's whole
+                // leading byte (mirrors fetch_host_pixel).
+                let hi = b.ins().ushr_imm_s(host_shifter_v, 32);
+                let hi32 = b.ins().ireduce(types::I32, hi);
+                b.ins().band_imm_s(hi32, 0xFF00_0000u64 as i64)
+            } else if dm0.alphahost() {
                 b.ins().band_imm_s(host_pixel_v, 0xFF00_0000u64 as i64)
             } else {
                 // Hoisted to the entry block — constant for the whole draw.
@@ -1565,8 +1601,12 @@ fn emit_shader(
         b.ins().ishl(shifter, pad_bits)
     };
 
-    if !stopony {
-        // Span / block without stopony: primitive done after one row
+    // A SPAN never steps y: at its end XSTART is left one past XEND and
+    // YSTART is untouched (rex3.pdf §3.5.3; draw_span; MAME writes back only
+    // x). Only a BLOCK row end wraps x to XSAVE and steps y.
+    let is_span = dm0.adrmode() == DRAWMODE0_ADRMODE_SPAN;
+    if !stopony || is_span {
+        // Span, or block without stopony: primitive done after one row
         let zero8 = b.ins().iconst(types::I8, 0);
         st_bool!(ctx_off!(mid_primitive), zero8);
         // For HOSTR: flush accumulated shifter to ctx.hostrw before returning.
@@ -1577,8 +1617,10 @@ fn emit_shader(
         if is_hostw || is_hostr {
             b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
         }
-        emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
+        let (end_x, end_y) = if is_span { (xstart_next, ystart_v) } else { (xsave_v, ystart_next) };
+        emit_writeback(&mut b, ctx_ptr, &mem, end_x, end_y,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
         b.ins().jump(loop_end, &[]);
     } else {
         // Block with stopony: advance y and check y_end
@@ -1602,6 +1644,7 @@ fn emit_shader(
         }
         emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
             dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
         b.ins().jump(loop_end, &[]);
 
         b.switch_to_block(y_cont_block); b.seal_block(y_cont_block);
@@ -1623,6 +1666,7 @@ fn emit_shader(
             b.ins().store(mem, hostcnt_row_reset, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(hostcnt) as i32));
             emit_writeback(&mut b, ctx_ptr, &mem, xsave_v, ystart_next,
                 dm0, new_cr, new_cg, new_cb, new_ca, zpat_bit_reset, pat_bit_reset, new_lsmode);
+        emit_row_end_pattern_reset(&mut b, ctx_ptr, &mem, dm0);
             b.ins().jump(loop_end, &[]);
         } else {
             // Continue loop: reset x to xsave, new row
@@ -1830,6 +1874,29 @@ fn emit_draw_iline(
         b.ins().band_imm_s(shifted, 7)
     };
 
+    // BRESROUND bit for this octant (BRESRNDINC2[31:24], see BRESROUND_BIT):
+    // set = a step with d == 0 goes diagonal, clear = straight. The bit
+    // position per octant is packed one nibble per octant into a constant.
+    let round_set_v = {
+        const PACKED: u32 = {
+            let mut k = 0u32;
+            let mut o = 0;
+            while o < 8 {
+                k |= crate::dev::ng1::rex3::BRESROUND_BIT[o] << (o * 4);
+                o += 1;
+            }
+            k
+        };
+        let packed = b.ins().iconst(types::I32, PACKED as i64);
+        let sh = b.ins().ishl_imm_s(octant_v, 2);
+        let bitpos = b.ins().ushr(packed, sh);
+        let bitpos = b.ins().band_imm_s(bitpos, 0xF);
+        let rnd = b.ins().ushr_imm_s(bres2_v, 24);
+        let bit = b.ins().ushr(rnd, bitpos);
+        let bit = b.ins().band_imm_s(bit, 1);
+        b.ins().icmp_imm_s(IntCC::NotEqual, bit, 0)
+    };
+
     // incr1: 20-bit, always positive
     let incr1_v = b.ins().band_imm_s(bres_v, 0xFFFFF);
 
@@ -1882,8 +1949,15 @@ fn emit_draw_iline(
         let is_neg = b.ins().icmp_imm_s(IntCC::SignedLessThan, d, 0);
         b.ins().select(is_neg, neg, d)
     };
-    let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
-    let major_v = b.ins().select(dx_gt_dy, dx_abs, dy_abs);
+    // F_LINE/A_LINE: the length along the octant's major axis (their octant
+    // comes from the fixed-point deltas); I_LINE: the longer integer delta.
+    let fract = matches!(dm0.adrmode(), DRAWMODE0_ADRMODE_F_LINE | DRAWMODE0_ADRMODE_A_LINE);
+    let major_v = if fract {
+        b.ins().select(y_major_v, dy_abs, dx_abs)
+    } else {
+        let dx_gt_dy = b.ins().icmp(IntCC::SignedGreaterThan, dx_abs, dy_abs);
+        b.ins().select(dx_gt_dy, dx_abs, dy_abs)
+    };
     let pixel_count_v = b.ins().iadd_imm_s(major_v, 1);
 
     // iterate_one = !stoponx && !stopony (step-mode: always draw exactly 1 pixel)
@@ -2068,10 +2142,15 @@ fn emit_draw_iline(
 
         // Afunction source alpha for lines is always DDA (lines never use host mode —
         // see compile_shader guard), independent of RGB/CI plane format. Mirrors the
-        // block/span shader's alpha_byte overlay.
-        let ca = ld32!(ctx_off!(coloralpha));
-        let ca_c = clamp_color_component(&mut b, ca);
-        let alpha_byte = b.ins().ishl_imm_s(ca_c, 24);
+        // block/span shader's alpha_byte overlay. A_LINE alpha is the pixel
+        // coverage instead, which is not modelled: full (mirrors combine_host_dda).
+        let alpha_byte = if dm0.adrmode() == DRAWMODE0_ADRMODE_A_LINE {
+            b.ins().iconst(types::I32, 0xFF00_0000u32 as i64)
+        } else {
+            let ca = ld32!(ctx_off!(coloralpha));
+            let ca_c = clamp_color_component(&mut b, ca);
+            b.ins().ishl_imm_s(ca_c, 24)
+        };
         let color24 = b.ins().band_imm_s(raw_src, 0x00FF_FFFFi64);
         let raw_src = b.ins().bor(color24, alpha_byte);
 
@@ -2352,8 +2431,10 @@ fn emit_draw_iline(
         // incry2: ±1 based on YDEC (inverted: YDEC=0→-1, YDEC=1→+1)
         let incry2 = b.ins().select(ydec_v, cp1i, cm1i);
 
-        // Choose step 1 or step 2 based on d < 0
-        let d_neg   = b.ins().icmp_imm_s(IntCC::SignedLessThan, d_v, 0);
+        // Step 1 (straight) when d < 0, or d <= 0 with BRESROUND clear.
+        let d_lt    = b.ins().icmp_imm_s(IntCC::SignedLessThan, d_v, 0);
+        let d_le    = b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, d_v, 0);
+        let d_neg   = b.ins().select(round_set_v, d_lt, d_le);
         let dx_step = b.ins().select(d_neg, incrx1, incrx2);
         let dy_step = b.ins().select(d_neg, incry1, incry2);
         let d_incr  = b.ins().select(d_neg, incr1_v, incr2_v);
@@ -2545,6 +2626,21 @@ fn emit_logic_op(b: &mut FunctionBuilder, logicop: u32, src: Value, dst: Value) 
 }
 
 /// Write back all mutable per-draw state from IR values to ctx.
+/// At a row or primitive end the interpreter restarts both pattern bit
+/// positions at 31 whether or not this draw uses the patterns (draw_block,
+/// draw_span); `emit_writeback` stores only the enabled ones, so store the
+/// others here. A later draw that enables a pattern without DOSETUP starts
+/// from them.
+fn emit_row_end_pattern_reset(b: &mut FunctionBuilder, ctx_ptr: Value, mem: &MemFlagsData, dm0: &Dm0) {
+    let c31 = b.ins().iconst(types::I8, 31);
+    if !dm0.enzpattern() {
+        b.ins().store(*mem, c31, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(zpat_bit) as i32));
+    }
+    if !dm0.enlspattern() {
+        b.ins().store(*mem, c31, ctx_ptr, ir::immediates::Offset32::new(ctx_off!(pat_bit) as i32));
+    }
+}
+
 fn emit_writeback(
     b: &mut FunctionBuilder,
     ctx_ptr: Value,
@@ -2856,11 +2952,11 @@ fn emit_expand_ir(b: &mut FunctionBuilder, val: Value, drawdepth: u32) -> Value 
 /// Mirrors Rex3::blend but specialized — constant factors let Cranelift fold all
 /// the factor-selection branches away.
 ///
-/// BLENDALPHA (DRAWMODE1 bit 27) selects what BF_SA resolves to for the SOURCE
-/// multiplier only: '1' = the real source alpha, '0' = 1.0 (spec Table 11).
-/// §3.8 adds "...and destination multiplier is defined by DFACTOR", so DFACTOR
-/// keeps its own definition and still evaluates against the real source alpha.
-/// Substituting into both factors would zero BF_MSA and discard the destination.
+/// BLENDALPHA (DRAWMODE1 bit 27) selects what BF_SA resolves to in the source
+/// multiplier of the ALPHA channel only: '1' = the real source alpha, '0' = 1.0
+/// (spec Table 11, §3.8 "alpha component can be blended in two different
+/// ways"). Red, green and blue always use the real source alpha, and DFACTOR
+/// is unaffected.
 fn emit_blend_ir(
     b: &mut FunctionBuilder,
     src: Value,
@@ -2871,8 +2967,8 @@ fn emit_blend_ir(
 ) -> Value {
     let sa   = b.ins().ushr_imm_s(src, 24); // alpha from src bits[31:24]
     let c255 = b.ins().iconst(types::I32, 255);
-    // Source-side alpha: real alpha when BLENDALPHA=1, otherwise 1.0 (255).
-    let sa_src = if blendalpha { sa } else { c255 };
+    // The alpha channel's source alpha: real when BLENDALPHA=1, otherwise 1.0.
+    let sa_alpha = if blendalpha { sa } else { c255 };
 
     // Extract each 8-bit channel (no nesting)
     let sr   = b.ins().band_imm_s(src, 0xFF);
@@ -2904,8 +3000,8 @@ fn emit_blend_ir(
 
     // Blend one channel: (sc*sf + dc*df)/255, clamped to 255, shifted
     macro_rules! blend_ch {
-        ($sc:expr, $dc:expr, $shift:literal) => {{
-            let sf = get_factor_ir(b, sfactor, $dc, sa_src, c255);
+        ($sc:expr, $dc:expr, $sa:expr, $shift:literal) => {{
+            let sf = get_factor_ir(b, sfactor, $dc, $sa, c255);
             let df = get_factor_ir(b, dfactor, $sc, sa, c255);
             let sc_sf = b.ins().imul($sc, sf);
             let dc_df = b.ins().imul($dc, df);
@@ -2916,10 +3012,10 @@ fn emit_blend_ir(
         }}
     }
 
-    let r_out = blend_ch!(sr, dr, 0);
-    let g_out = blend_ch!(sg, dg, 8);
-    let b_out = blend_ch!(sb, db, 16);
-    let a_out = blend_ch!(sa, da, 24);
+    let r_out = blend_ch!(sr, dr, sa, 0);
+    let g_out = blend_ch!(sg, dg, sa, 8);
+    let b_out = blend_ch!(sb, db, sa, 16);
+    let a_out = blend_ch!(sa, da, sa_alpha, 24);
 
     let t1 = b.ins().bor(r_out, g_out);
     let t2 = b.ins().bor(t1, b_out);

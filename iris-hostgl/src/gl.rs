@@ -10,6 +10,7 @@
 use std::ffi::c_void;
 
 #[cfg_attr(target_os = "macos", link(name = "OpenGL", kind = "framework"))]
+#[cfg_attr(target_os = "linux", link(name = "GL"))]
 extern "C" {
     pub fn glFlush();
     pub fn glFinish();
@@ -25,6 +26,7 @@ extern "C" {
     pub fn glPixelStoref(pname: u32, v: f32);
     pub fn glReadBuffer(mode: u32);
     pub fn glDrawBuffer(mode: u32);
+    pub fn glDrawBuffers(n: i32, bufs: *const u32);
     pub fn glReadPixels(x: i32, y: i32, w: i32, h: i32, fmt: u32, ty: u32, data: *mut c_void);
     pub fn glPolygonOffset(factor: f32, units: f32);
     pub fn glTexEnvi(target: u32, pname: u32, v: i32);
@@ -71,6 +73,16 @@ extern "C" {
 pub const GL_FRAMEBUFFER: u32 = 0x8D40;
 pub const GL_RENDERBUFFER: u32 = 0x8D41;
 pub const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+pub const GL_COLOR_ATTACHMENT1: u32 = 0x8CE1;
+pub const GL_FRONT_LEFT: u32 = 0x0400;
+pub const GL_FRONT_RIGHT: u32 = 0x0401;
+pub const GL_BACK_LEFT: u32 = 0x0402;
+pub const GL_BACK_RIGHT: u32 = 0x0403;
+pub const GL_FRONT: u32 = 0x0404;
+pub const GL_BACK: u32 = 0x0405;
+pub const GL_LEFT: u32 = 0x0406;
+pub const GL_RIGHT: u32 = 0x0407;
+pub const GL_FRONT_AND_BACK: u32 = 0x0408;
 pub const GL_DEPTH_ATTACHMENT: u32 = 0x8D00;
 pub const GL_STENCIL_ATTACHMENT: u32 = 0x8D20;
 pub const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
@@ -85,6 +97,8 @@ pub const GL_DRAW_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 pub const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 pub const GL_NEAREST: u32 = 0x2600;
 pub const GL_SCISSOR_TEST: u32 = 0x0C11;
+pub const GL_LIGHTING: u32 = 0x0B50;
+pub const GL_CLIP_PLANE0: u32 = 0x3000;
 pub const GL_MULTISAMPLE: u32 = 0x809D;
 pub const GL_UNPACK_SWAP_BYTES: u32 = 0x0CF0;
 pub const GL_UNPACK_LSB_FIRST: u32 = 0x0CF1;

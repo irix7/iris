@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 #[derive(Debug)]
@@ -144,6 +145,8 @@ fn net_state_for(running: bool, halted: bool, net_seen: u64) -> NetState {
 
 pub struct EmulatorHandle {
     cmd_tx: Sender<Cmd>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
     evt_rx: Receiver<Evt>,
     thread: Option<JoinHandle<()>>,
     /// Shared latest-framebuffer slot, written by the CaptureRenderer
@@ -165,6 +168,10 @@ pub struct EmulatorHandle {
 impl EmulatorHandle {
     pub fn spawn() -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<Cmd>();
+        let pending_commands = Arc::new(AtomicUsize::new(0));
+        let pending_for_worker = pending_commands.clone();
+        let abandoned_machine = Arc::new(AtomicBool::new(false));
+        let abandoned_for_worker = abandoned_machine.clone();
         let (evt_tx, evt_rx) = unbounded::<Evt>();
         let frame_sink = FrameSink::new();
         let frame_sink_head1 = FrameSink::new();
@@ -182,10 +189,12 @@ impl EmulatorHandle {
             // worker generous headroom. This is virtual address space, lazily
             // committed, so the large reservation has no real cost.
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, sink_head1_for_worker, ps2_for_worker))
+            .spawn(move || worker_loop(cmd_rx, evt_tx, sink_for_worker, sink_head1_for_worker, ps2_for_worker, pending_for_worker, abandoned_for_worker))
             .expect("spawn iris-gui-emu thread");
         Self {
             cmd_tx,
+            pending_commands,
+            abandoned_machine,
             evt_rx,
             thread: Some(thread),
             frame_sink,
@@ -197,7 +206,8 @@ impl EmulatorHandle {
     }
 
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.send(cmd);
+        self.pending_commands.fetch_add(1, Ordering::AcqRel);
+        if self.cmd_tx.send(cmd).is_err() { self.pending_commands.fetch_sub(1, Ordering::Release); }
     }
 
     /// Drain pending events; return them for the UI to consume.
@@ -247,6 +257,14 @@ impl EmulatorHandle {
 
     pub fn is_running(&self) -> bool { self.status.running }
 
+    /// Directory changes must wait for queued Start, Stop, snapshot, and disk
+    /// operations as well as a live machine. Unconsumed events can include a
+    /// Started notification, so check those before trusting the cached status.
+    pub fn can_change_directory(&self) -> bool {
+        !self.is_running() && self.pending_commands.load(Ordering::Acquire) == 0
+            && self.evt_rx.is_empty() && !self.abandoned_machine.load(Ordering::Acquire)
+    }
+
     /// Whether a clean exit needs a "Synchronizing disks" step (a CHD has
     /// diff-borne changes to fold back into its base). Latest reported status.
     pub fn has_pending_chd_sync(&self) -> bool { self.status.chd_sync_pending }
@@ -271,7 +289,7 @@ impl EmulatorHandle {
     /// The worker's Quit handler bounds the stop with a timeout, so this can't
     /// hang on a wedged guest.
     pub fn shutdown(&mut self) {
-        let _ = self.cmd_tx.send(Cmd::Quit);
+        self.send(Cmd::Quit);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -313,6 +331,8 @@ fn worker_loop(
     frame_sink: FrameSink,
     frame_sink_head1: FrameSink,
     ps2_slot: Arc<Mutex<Option<Arc<Ps2Controller>>>>,
+    pending_commands: Arc<AtomicUsize>,
+    abandoned_machine: Arc<AtomicBool>,
 ) {
     let mut machine: Option<Box<Machine>> = None;
     // Live MIPS estimate: read REX3's free-running cycle counter and divide
@@ -329,7 +349,10 @@ fn worker_loop(
     // Tick cadence for the status poll while idle on the command channel.
     const STATUS_TICK: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
-        match cmd_rx.recv_timeout(STATUS_TICK) {
+        let command = cmd_rx.recv_timeout(STATUS_TICK);
+        // RAII covers all early continues and returns in command handlers.
+        let _in_flight = command.as_ref().ok().map(|_| CommandInFlight(&pending_commands));
+        match command {
             // Periodic tick (no command pending): refresh the MIPS estimate.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 if let Some(c) = cycles {
@@ -373,7 +396,7 @@ fn worker_loop(
             }
             Ok(Cmd::Start(cfg)) => {
                 if machine.is_some() {
-                    let _ = evt_tx.send(Evt::Error("emulator already running".into()));
+                    let _ = evt_tx.send(Evt::Error(t!("emu-already-running")));
                     continue;
                 }
                 // Clear the previous run's last frame so the restarted machine
@@ -434,23 +457,23 @@ fn worker_loop(
                     }
                     Err(panic) => {
                         let msg = panic_msg(&panic);
-                        let _ = evt_tx.send(Evt::Error(format!("start failed: {msg}")));
+                        let _ = evt_tx.send(Evt::Error(t!("emu-start-failed", error = msg)));
                     }
                 }
             }
             Ok(Cmd::HaltIrix) => {
                 match machine.as_ref() {
                     Some(m) => m.inject_serial_console(b"halt\n"),
-                    None => { let _ = evt_tx.send(Evt::Error("halt: not running".into())); }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
                 }
             }
             Ok(Cmd::SetNatSubnet(cidr)) => {
                 match machine.as_ref() {
                     Some(m) => match iris::config::parse_nat_subnet(&cidr) {
                         Ok((gateway, client, netmask)) => m.set_nat_subnet(gateway, client, netmask),
-                        Err(e) => { let _ = evt_tx.send(Evt::Error(format!("set NAT subnet '{cidr}': {e}"))); }
+                        Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-nat-subnet-invalid", subnet = &cidr, error = e.to_string()))); }
                     },
-                    None => { let _ = evt_tx.send(Evt::Error("set NAT subnet: not running".into())); }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
                 }
             }
             Ok(Cmd::SetPortForwards(rules)) => {
@@ -467,11 +490,12 @@ fn worker_loop(
                     // Always report the machine as stopped so the user regains
                     // control, even if the stop failed or had to be abandoned.
                     if let Err(msg) = stop_machine_timed(m) {
+                        abandoned_machine.store(true, Ordering::Release);
                         let _ = evt_tx.send(Evt::Error(msg));
                     }
                     let _ = evt_tx.send(Evt::Stopped);
                 } else {
-                    let _ = evt_tx.send(Evt::Error("not running".into()));
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
                 }
             }
             Ok(Cmd::SyncDisks) => {
@@ -501,9 +525,7 @@ fn worker_loop(
                             // picking the disk image) does not convey. Surfaced so
                             // the diff isn't silently left unmerged and the disk
                             // never shrinks.
-                            let _ = evt_tx.send(Evt::Error(format!(
-                                "couldn't compact CHD disks on exit: {e} — grant the disk's \
-                                 folder (File » \"Grant a disk folder…\") so IRIS can write beside it")));
+                            let _ = evt_tx.send(Evt::Error(t!("emu-chd-compact-failed", error = e.to_string())));
                             0
                         }
                     };
@@ -528,7 +550,7 @@ fn worker_loop(
                         ) {
                             Ok(()) => { let _ = evt_tx.send(Evt::SyncDone(1)); }
                             Err(e) => {
-                                let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}")));
+                                let _ = evt_tx.send(Evt::Error(t!("emu-commit-failed", error = e.to_string())));
                                 let _ = evt_tx.send(Evt::SyncDone(0));
                             }
                         }
@@ -553,7 +575,7 @@ fn worker_loop(
                         })();
                         match commit {
                             Ok(_) => { let _ = evt_tx.send(Evt::CowDone { committed: true }); }
-                            Err(e) => { let _ = evt_tx.send(Evt::Error(format!("commit failed: {e}"))); }
+                            Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-commit-failed", error = e.to_string()))); }
                         }
                     } else {
                         let _ = evt_tx.send(Evt::CowDone { committed: false });
@@ -573,12 +595,12 @@ fn worker_loop(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         let _ = evt_tx.send(Evt::CowDone { committed: false });
                     }
-                    Err(e) => { let _ = evt_tx.send(Evt::Error(format!("roll back failed: {e}"))); }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-rollback-failed", error = e.to_string()))); }
                 }
             }
             Ok(Cmd::SaveState(name)) => {
                 let Some(m) = machine.as_mut() else {
-                    let _ = evt_tx.send(Evt::Error("save: not running".into()));
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
                     continue;
                 };
                 // save_snapshot stops the CPU as part of its work; once it
@@ -591,13 +613,13 @@ fn worker_loop(
                 }));
                 match result {
                     Ok(Ok(())) => { let _ = evt_tx.send(Evt::StateSaved(name)); }
-                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(format!("save '{name}' failed: {e}"))); }
-                    Err(p) => { let _ = evt_tx.send(Evt::Error(format!("save panic: {}", panic_msg(&p)))); }
+                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(t!("emu-save-failed", name = &name, error = e.to_string()))); }
+                    Err(p) => { let _ = evt_tx.send(Evt::Error(t!("emu-save-crashed", error = panic_msg(&p)))); }
                 }
             }
             Ok(Cmd::RestoreState(name)) => {
                 let Some(m) = machine.as_mut() else {
-                    let _ = evt_tx.send(Evt::Error("restore: not running".into()));
+                    let _ = evt_tx.send(Evt::Error(t!("emu-not-running")));
                     continue;
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -605,8 +627,8 @@ fn worker_loop(
                 }));
                 match result {
                     Ok(Ok(())) => { let _ = evt_tx.send(Evt::StateRestored(name)); }
-                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(format!("restore '{name}' failed: {e}"))); }
-                    Err(p) => { let _ = evt_tx.send(Evt::Error(format!("restore panic: {}", panic_msg(&p)))); }
+                    Ok(Err(e)) => { let _ = evt_tx.send(Evt::Error(t!("emu-restore-failed", name = &name, error = e.to_string()))); }
+                    Err(p) => { let _ = evt_tx.send(Evt::Error(t!("emu-restore-crashed", error = panic_msg(&p)))); }
                 }
             }
             Ok(Cmd::Screenshot(path)) => {
@@ -615,12 +637,12 @@ fn worker_loop(
                 // GUI thread) because PNG encoding is non-trivial CPU.
                 let frame = frame_sink.snapshot();
                 if frame.width == 0 || frame.height == 0 {
-                    let _ = evt_tx.send(Evt::Error("screenshot: no frame yet".into()));
+                    let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-no-frame")));
                     continue;
                 }
                 match write_png(&path, frame.width as u32, frame.height as u32, &frame.rgba) {
                     Ok(()) => { let _ = evt_tx.send(Evt::Screenshot(path)); }
-                    Err(e) => { let _ = evt_tx.send(Evt::Error(format!("screenshot failed: {e}"))); }
+                    Err(e) => { let _ = evt_tx.send(Evt::Error(t!("emu-screenshot-failed", error = e))); }
                 }
             }
             Ok(Cmd::LoadDisc { id, path, remount }) => {
@@ -634,20 +656,18 @@ fn worker_loop(
                                     .unwrap_or_else(|| loaded_path.clone());
                                 let msg = if remount {
                                     m.remount_cdrom_guest(id);
-                                    format!(
-                                        "SCSI #{id}: loaded {filename} — remount sent to console"
-                                    )
+                                    t!("emu-disc-loaded-remount", id = id, file = &filename)
                                 } else {
-                                    format!("SCSI #{id}: loaded {filename}")
+                                    t!("emu-disc-loaded", id = id, file = &filename)
                                 };
                                 let _ = evt_tx.send(Evt::Error(msg));
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: {e}")));
+                                let _ = evt_tx.send(Evt::Error(t!("emu-scsi-error", id = id, error = e.to_string())));
                             }
                         }
                     }
-                    None => { let _ = evt_tx.send(Evt::Error("load disc: not running".into())); }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
                 }
             }
             Ok(Cmd::EjectCdrom { id }) => {
@@ -655,25 +675,23 @@ fn worker_loop(
                     Some(m) => {
                         match m.hpc3().scsi().eject_to_empty(id as usize) {
                             Ok(()) => {
-                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: tray empty")));
+                                let _ = evt_tx.send(Evt::Error(t!("emu-disc-ejected", id = id)));
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(Evt::Error(format!("SCSI #{id}: {e}")));
+                                let _ = evt_tx.send(Evt::Error(t!("emu-scsi-error", id = id, error = e.to_string())));
                             }
                         }
                     }
-                    None => { let _ = evt_tx.send(Evt::Error("eject: not running".into())); }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
                 }
             }
             Ok(Cmd::RemountCdrom { id }) => {
                 match machine.as_ref() {
                     Some(m) => {
                         m.remount_cdrom_guest(id);
-                        let _ = evt_tx.send(Evt::Error(format!(
-                            "SCSI #{id}: /CDROM remount sent to console"
-                        )));
+                        let _ = evt_tx.send(Evt::Error(t!("emu-remount-sent", id = id)));
                     }
-                    None => { let _ = evt_tx.send(Evt::Error("remount: not running".into())); }
+                    None => { let _ = evt_tx.send(Evt::Error(t!("emu-not-running"))); }
                 }
             }
             Ok(Cmd::Quit) | Err(_) => {
@@ -690,6 +708,11 @@ fn worker_loop(
     }
 }
 
+struct CommandInFlight<'a>(&'a AtomicUsize);
+impl Drop for CommandInFlight<'_> {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Release); }
+}
+
 /// Stop a machine, but never block longer than `STOP_TIMEOUT`. `Machine::stop()`
 /// starts with `cpu.stop()`, which waits for the CPU thread to acknowledge the
 /// halt; a wedged guest can make that never return. We run it on a detached
@@ -702,17 +725,20 @@ fn stop_machine_timed(m: Box<Machine>) -> Result<(), String> {
         .name("iris-gui-stop".into())
         .spawn(move || {
             let mut m = m;
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| m.stop()));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                m.stop();
+                drop(m); // Complete teardown before allowing a directory change.
+            }));
             let _ = done_tx.send(r.map_err(|p| panic_msg(&p)));
         })
         .is_err()
     {
-        return Err("stop: failed to spawn worker thread".into());
+        return Err(t!("emu-stop-spawn-failed"));
     }
     match done_rx.recv_timeout(STOP_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(msg)) => Err(format!("stop failed: {msg}")),
-        Err(_) => Err("stop timed out after 5s — the machine appears wedged; abandoning it".into()),
+        Ok(Err(msg)) => Err(t!("emu-stop-failed", error = msg)),
+        Err(_) => Err(t!("emu-stop-timeout")),
     }
 }
 
@@ -730,5 +756,5 @@ fn write_png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> Result<(), 
 fn panic_msg(p: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = p.downcast_ref::<&'static str>() { return (*s).to_string(); }
     if let Some(s) = p.downcast_ref::<String>()       { return s.clone(); }
-    "<non-string panic>".into()
+    t!("emu-unknown-error")
 }

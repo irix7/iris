@@ -76,6 +76,14 @@ compile_error!(
 // (delete this) if memory regresses.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+/// The version this binary was built as: `RELEASE_VERSION` from the
+/// distribution build (`nightly.YYYY.MM.DD` or `X.Y.Z`, see
+/// scripts/dist/version.sh), or the crate version for a plain `cargo build`.
+/// Cargo tracks `option_env!`, so changing it rebuilds this crate.
+pub const VERSION: &str = match option_env!("RELEASE_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 /// Compile-time feature flags exposed for tooling (e.g. iris-gui) so it can
 /// surface "rebuild with ..." hints without duplicating the cargo feature set.
@@ -84,6 +92,7 @@ pub mod build_features {
     pub const JITV2:     bool = cfg!(feature = "jitv2");
     pub const REX_JIT:   bool = cfg!(feature = "rex-jit");
     pub const GR4_JIT:   bool = cfg!(feature = "gr4-jit");
+    pub const GR2_JIT:   bool = cfg!(feature = "gr2-jit");
     /// Lightning build strips breakpoint checks and the traceback buffer
     /// from the MIPS executor hot path. Interactive debugging (GDB stub,
     /// monitor breakpoints) is non-functional in this build.
@@ -94,10 +103,10 @@ pub mod build_features {
     /// or doesn't, decided at build time.
     pub const HOSTCALL: bool = cfg!(feature = "hostcall");
     /// Host OpenGL for IRIX programs over host call 3000 (`iris-hostgl`).
-    /// Implies `hostcall`. Only macOS has a backend (CGL) — `hostgl` can be
-    /// built elsewhere, but `register()` then has nothing to register, so
-    /// this is `false` off macOS even in a `--features hostgl` build.
-    pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(target_os = "macos");
+    /// Implies `hostcall`. macOS (CGL) and Linux (EGL) have backends —
+    /// `hostgl` can be built elsewhere, but `register()` then has nothing to
+    /// register, so this is `false` there even in a `--features hostgl` build.
+    pub const HOSTGL: bool = cfg!(feature = "hostgl") && cfg!(any(target_os = "macos", target_os = "linux"));
     // There is deliberately no `CPU` constant here any more. The emulated CPU
     // stopped being a build-time property: all three CPU/cache models are
     // monomorphised into every binary and `Machine::new` picks between them
@@ -126,6 +135,7 @@ pub mod build_features {
             ("idle-pause", cfg!(feature = "idle-pause")),
             ("rex-jit", cfg!(feature = "rex-jit")),
             ("gr4-jit", cfg!(feature = "gr4-jit")),
+            ("gr2-jit", cfg!(feature = "gr2-jit")),
             ("lightning", cfg!(feature = "lightning")),
             ("hostcall", cfg!(feature = "hostcall")),
             ("hostgl", cfg!(feature = "hostgl")),
@@ -143,6 +153,7 @@ pub mod build_features {
             ("fetchverify", cfg!(feature = "fetchverify")),
             ("j2wp", cfg!(feature = "j2wp")),
             ("llstats", cfg!(feature = "llstats")),
+            ("perfetto", cfg!(feature = "perfetto")),
         ];
         FEATURES.iter().filter(|(_, e)| *e).map(|(n, _)| *n).collect()
     }
@@ -181,6 +192,7 @@ pub mod ui;
 pub mod cpu;
 pub mod dev;
 pub mod gfifo;
+pub mod trace_writer;
 pub mod gfx_display;
 pub mod compositor;
 pub mod gl_compositor;
@@ -208,6 +220,13 @@ pub mod crash_diag;
 pub mod state;
 mod nv_storage;
 pub mod hwwatch;
+#[macro_use]
+mod perfetto_macros;
+pub use perfetto_macros::{PfBits, PfLevel, PfValue};
+#[cfg(feature = "perfetto")]
+pub mod perfetto;
 
 #[cfg(test)]
 mod platform_profile_tests;
+#[cfg(test)]
+pub(crate) mod test_board;

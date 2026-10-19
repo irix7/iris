@@ -1545,7 +1545,14 @@ impl MemoryController {
                 self.log_vdma_start(&job, tlb_hi, tlb_lo);
             }
 
-            let result = self.dma_run(&job, &mut || self.wait_gio_space());
+            let result = {
+                #[cfg(feature = "perfetto")]
+                let def = if job.fill { &crate::perfetto::events::VDMA_FILL }
+                    else if job.to_host { &crate::perfetto::events::VDMA_TO_HOST }
+                    else { &crate::perfetto::events::VDMA_TO_GIO };
+                crate::pf_scope!(*def, job.line_count as u64 * job.line_width as u64);
+                self.dma_run(&job, &mut || self.wait_gio_space())
+            };
 
             let end_time = crate::platform::get_host_ticks();
             let elapsed = end_time.wrapping_sub(start_time);
@@ -2219,7 +2226,7 @@ mod line_bulk_tests_support {
         }
     }
 
-    pub(super) fn mc_with(sink: Arc<GioSink>) -> MemoryController {
+    fn mc_with(sink: Arc<GioSink>) -> MemoryController {
         let phys: Arc<dyn BusDevice> = sink;
         let mc = MemoryController::new(
             Arc::new(PlMutex::new(Eeprom93c56::new())), true, [1, 0, 0, 0]);

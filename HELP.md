@@ -35,7 +35,7 @@ emulating the Indy.
 
 The **iris-gui status bar MIPS** figure (or the CLI window title `MIPS` readout)
 is **real throughput**: MIPS instructions executed per wall-clock second on the
-host. `lightning` builds and the JIT stack (`--features jitv2,rex-jit`) give
+host. `lightning` builds and the JIT stack (`--features jitv2,gpujit`) give
 higher MIPS; the hinv MHz string stays the same.
 
 The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
@@ -44,8 +44,11 @@ The guest's MHz comes from the CP0 Count rate, which is fixed: Count ticks at
 no calibration or inference. Override it with `[clock] fixed_mhz` or
 `--clock-fixed-mhz` if a guest needs something else.
 
-The status bar **Hz** value counts the guest's clock ticks: CP0 Compare (IP7)
-matches or IOC 8254 timer interrupts, depending on the kernel's timer source.
+The status bar **Hz** value counts the guest kernel's fast clock: CP0 Compare
+(IP7) matches, or IOC 8254 timer 1 interrupts, depending on the kernel's timer
+source. IRIX on Indigo2 and IP28 keeps time with the 8254: timer 0 is the
+100 Hz system clock and timer 1 the 1000 Hz fast clock (parked when nothing
+needs it), so the figure reads 1000 while the fast clock runs.
 
 For a repeatable speed number, use the benchmark: `iris-bench run`, or the
 Benchmark tab in iris-gui (see [bench/README.md](bench/README.md)).
@@ -168,6 +171,26 @@ DHCP reply options provided:
 | Router | Gateway IP (default `192.168.0.1`) |
 | DNS server | `8.8.8.8` (guest DNS queries are forwarded to the host's DNS server whatever address they are sent to) |
 | Lease time | 86400 s (24 h) |
+
+### TFTP (PROM network boot)
+
+`tftp_dir = "DIR"` under `[network]` (or `--tftp-dir DIR`) serves DIR
+read-only over TFTP at the gateway (`192.168.0.1`, UDP 69). Names are taken
+relative to DIR even when they start with `/`, as `tftpd -s` does, and
+nothing outside DIR (`..`, symlinks out) is reachable. Both modes work:
+`octet` (what the PROM uses) and `netascii` (the default of IRIX's
+`/usr/bsd/tftp` and most other command-line clients).
+
+With TFTP on, the BOOTP reply names the requested file when DIR has it, so
+the PROM can boot from it:
+
+```
+>> boot -f bootp()/unix          # loads DIR/unix
+```
+
+To reach the Command Monitor on a machine that autoboots, press Esc while
+the PROM says "Starting up the system" (from the monitor console:
+`ps2 esc`). `test/tftp/` has a guest-side client and a test script.
 
 ### NAT
 
@@ -413,7 +436,7 @@ In iris-gui the setting is **Keyboard** on the Display tab. There, ろ and the c
 ろ types `\` (never `_`) and 無変換/変換/かな do nothing. Use the
 standalone `iris` window if you need them.
 
-The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing.
+The window is freely resizable. At 1× and 2× scale the display is rendered with nearest-neighbour pixel-perfect sampling; at all other sizes trilinear filtering with mipmaps is used. `lock_aspect_ratio = false` in `iris.toml` allows free resizing with letterboxing. When the guest changes video mode (PROM, then IRIX during boot) the window snaps to the new resolution times the configured `scale` / `--2x`.
 
 ---
 
@@ -435,7 +458,7 @@ nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 # RAM bank sizes in MB: 0 (absent), 8, 16, 32, 64, 128; IP28 also 256/512.
 banks = [128, 128, 0, 0]
 
-scale = 1                   # window scale; --2x overrides
+scale = 1                   # window scale, kept across guest mode changes; --2x overrides
 headless = false            # no window, no REX3 (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
@@ -534,8 +557,9 @@ standard     = "ntsc"       # or "pal"
 camera_index = 0            # host camera, source = "camera" only
 
 [audio]
+# host = "default"          # Linux: "alsa" (the default) or "pulseaudio" (PulseAudio or PipeWire)
 prebuf_ms = 20
-# cpal_buffer_frames = 512
+# cpal_buffer_frames = 512  # unset: the host's default (PulseAudio: 512)
 
 # [ultra64]                 # N64 dev board
 # enabled = true
@@ -609,6 +633,7 @@ Display and audio
   --2x                        2× window scaling
   --headless                  No window, no REX3 graphics (audio unaffected)
   --noaudio                   Disable HAL2 audio (graphics unaffected)
+  --audio-host HOST           Host audio for HAL2: default, alsa or pulseaudio (Linux)
 
 Networking
   --nat-subnet <CIDR>         NAT subnet, e.g. 192.168.5.0/24
@@ -667,7 +692,7 @@ iris --headless
 # Headless with audio also disabled (lightest possible server mode)
 iris --headless --noaudio
 
-# Network-boot from the PROM: then `boot -f bootp()unix` at the PROM monitor
+# Network-boot from the PROM: then `boot -f bootp()/unix` at the PROM monitor
 iris --tftp-dir ./tftpboot
 
 # Run two isolated VMs side by side, each with its own ports, CI socket, MAC
@@ -714,11 +739,18 @@ usage string. The following tables list the same set, grouped.
 
 ### CPU / execution
 
+Every command works the same way against a running CPU: `start`, `stop`,
+`status`, `wait` and `help` never touch the core; run control (`run`, `step`,
+`next`, `finish`) needs a stopped CPU and says so; everything else pauses a
+running CPU for the duration of the command and resumes it afterwards. So
+`bp add`, `regs`, `mem` and friends work at any time and never hang.
+
 | Command | Description |
 |---------|-------------|
 | `start` | Start CPU execution |
 | `stop` | Stop (pause) CPU execution |
-| `status` | Running state, PC, and the CP0 Count rate/Count/Compare |
+| `status` | Running or stopped, the PC, why it last stopped (which breakpoint, its condition and hit count), and the CP0 Count rate. Never blocks |
+| `wait [ms]` | Block until the CPU stops (breakpoint, exception catch) or `ms` pass (default 10000), then say where and why |
 | `run [addr]` / `c` / `cont` | Run until breakpoint or exception (or until `addr`) |
 | `step [n\|addr]` / `s` | Step n instructions (default 1), or until `addr` |
 | `si` | Step without taking interrupts **[DEV]** |
@@ -741,7 +773,7 @@ usage string. The following tables list the same set, grouped.
 
 | Command | Description |
 |---------|-------------|
-| `mem <addr> [n]` / `m` | Dump virtual memory (hex+ascii) |
+| `mem <addr> [n] [b\|h\|w\|d]` / `m` | Dump virtual memory in bytes, halves, words (default) or doublewords |
 | `mw <addr> <val> [b\|h\|w\|d]` | Write virtual memory |
 | `stack [addr] [n]` | Dump stack |
 | `ms <addr> [max]` | Read string from virtual memory |
@@ -755,18 +787,32 @@ usage string. The following tables list the same set, grouped.
 | Command | Description |
 |---------|-------------|
 | `sym <addr>` | Look up nearest symbol |
+| `sym <name>` | Every copy of a name, with the map file it came from |
 | `loadsym <file>` | Load symbol map from file |
 | `proc info` | IRIX kernel utsname and friends (needs `loadsym` first) |
+| `eframe <addr> [o32\|64]` / `ef` | Decode an IRIX exception frame (the `ep` of a panic): registers, cause, sr, EPC, then a backtrace of the interrupted context |
+| `putbuf [size]` / `dmesg` | The IRIX kernel console log, i.e. what a panic printed (needs the kernel's map) |
+
+A name defined in more than one loaded map (the PROM and the kernel both have
+`bcopy`) is ambiguous in expressions: the error lists the copies, and
+`bcopy:1` picks one. Internal lookups (`proc`, `putbuf`) use the copy from the
+map loaded last.
 
 ### Breakpoints
 
 | Command | Description |
 |---------|-------------|
-| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical) |
-| `bp list` / `bl` | List breakpoints |
+| `bp add <addr> [type] [if <expr>]` / `b` | Add breakpoint. Types: `pc` (default), `r`, `w`, `f` (virtual read/write/fetch), `pr`, `pw`, `pf` (physical). The condition may use registers (`a0`, `c0_badvaddr`, ...) and symbols; a name that is neither is refused |
+| `bp list` / `bl` | List breakpoints with type, symbol, condition and hit count |
 | `bp del <id>` / `bb` | Delete breakpoint |
 | `bp enable <id>` / `be` | Enable breakpoint |
 | `bp disable <id>` / `bd` | Disable breakpoint |
+| `bp ignore <id> <n>` | Let the next n hits pass without stopping |
+| `bp clear` | Delete all breakpoints |
+| `bp save <file>` / `bp load <file>` | Write the breakpoints as `bp add` lines / read them back (survives a restart) |
+
+A breakpoint hit while the CPU runs freely is reported by `status` and
+`wait`, not printed (the terminal is a monitor console too).
 
 ### Undo / traceback
 
@@ -775,13 +821,13 @@ usage string. The following tables list the same set, grouped.
 | `undo [n]` / `u` | Undo n instructions **[DEV]** |
 | `undo <on\|off\|clear\|resize <n>>` | Control undo buffer **[DEV]** |
 | `bt [n]` | Print call backtrace |
-| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer |
+| `dt [n]` / `dt file <path> [n]` | Disassemble traceback buffer (the history holds 1,048,576 instructions; asking for more says so) |
 
 ### TLB / cache
 
 | Command | Description |
 |---------|-------------|
-| `tlb dump` | Dump all TLB entries |
+| `tlb dump` | Dump the TLB entries this CPU has (48 on R4400/R5000, 64 on R10000) |
 | `tlb trans <vaddr> [asid]` | Translate via TLB |
 | `tlb debug <on\|off>` | TLB trace logging **[DEV]** |
 | `l1i <check\|dump> <addr\|index>` | L1 instruction cache |
@@ -844,11 +890,11 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `bt445 status` | BT445 RAMDAC state |
 | `bt445 identity` | Reset RAMDAC palette to linear identity ramp |
 | `bt445 debug <on\|off>` | BT445 trace **[DEV]** |
-| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace |
+| `gr2 [status]` / `gr2 trace <file> [hq,re3,cpu\|all]` | GR2 XZ/Extreme state and command trace (trace: `gputrace` builds) |
 | `gr2 fbdump [DIR]` | GR2 framebuffer dump, including composed screen |
 | `re3 ...` | GR2 raster register inspection (see monitor `help`) |
 | `mgras [status]` | IMPACT state and inventory summary |
-| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace |
+| `mgras trace <file> [hq,rss,cpu,tex\|all]` | IMPACT command / raster / CPU / texture trace (`gputrace` builds) |
 | `mgras fbdump [DIR]` / `mgras shot <path>` | IMPACT framebuffer dump / screenshot |
 | `mgras rec <file>` / `mgras rec off` | Record / stop recording board accesses |
 | `rss ...` | IMPACT raster inspection (see monitor `help`) |
@@ -868,6 +914,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pdma dump <on\|off\|hal\|scsi\|enet\|MASK>` | PDMA trace **[DEV]** |
 | `pdma chain <addr>` | Decode DMA descriptor chain at physical address |
 | `ioc status` | IOC interrupt controller state |
+| `ioc ticks` | 8254 timer service since the last call: ticks fired, acknowledged and merged, fire-to-acknowledge waits |
 | `rtc status` / `rtc dump` | Real-time clock registers (and any `[rtc_offset]`) / NVRAM dump |
 | `rtc save [file]` | Save RTC NVRAM to file |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
@@ -876,7 +923,7 @@ Changed") on the next `TEST UNIT READY` poll — no restart required.
 | `pit debug <on\|off>` | PIT trace **[DEV]** |
 | `hal2 status` | HAL2 audio controller state |
 | `ps2 status` | PS/2 controller state |
-| `ps2 type <ascii>` / `ps2 enter` | Type text / press Enter on the guest keyboard |
+| `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (stops PROM autoboot) on the guest keyboard |
 | `ps2 mouse <dx> <dy> [buttons]` | Inject relative mouse motion and optional button mask |
 | `ps2 debug <on\|off>` | PS/2 keyboard/mouse trace |
 | `serial status` | SCC channel A/B registers and FIFO state |

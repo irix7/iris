@@ -25,6 +25,8 @@ pub mod gr2comp;
 pub mod gr2disp;
 pub mod hq2;
 pub mod re3;
+#[cfg(feature = "gr2-jit")]
+pub mod re3_jit;
 pub mod vc1;
 pub mod xmap5;
 
@@ -34,6 +36,9 @@ mod re3_tests;
 #[cfg(test)]
 #[path = "hq2_tests.rs"]
 mod hq2_tests;
+#[cfg(all(test, feature = "gr2-jit"))]
+#[path = "re3_jit_tests.rs"]
+mod re3_jit_tests;
 
 use std::cell::{Cell, UnsafeCell};
 use std::io::Write as IoWrite;
@@ -152,6 +157,11 @@ pub struct Gr2Stats {
 
 pub struct Gr2 {
     variant: Gr2Variant,
+    /// Perfetto edge trackers (zero-valid, so `new`'s zeroed allocation
+    /// initialises them): a guest read stalled on the engines, a store
+    /// stalled on a full FIFO.
+    pf_wait: crate::PfLevel,
+    pf_fifo_full: crate::PfLevel,
     regs: UnsafeCell<Gr2Regs>,
     re3: UnsafeCell<Re3>,
     hq_engine: UnsafeCell<Hq2Engine>,
@@ -222,6 +232,14 @@ pub struct Gr2 {
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
     hq_thread: Mutex<Option<thread::Thread>>,
     re3_thread: Mutex<Option<thread::Thread>>,
+    /// The engine threads parked (`sleep`): producers unpark one only then,
+    /// so a push reads a line nobody writes instead of taking the thread's
+    /// slot lock and unparking it every time. Each on its own cache line.
+    hq_asleep: crossbeam_utils::CachePadded<AtomicBool>,
+    /// Bumped by every CPU write to the RE3 registers: HQ2's register
+    /// shadow (`hq_loop`'s Sink) no longer knows what RE3 holds then.
+    re3_cpu_writes: crossbeam_utils::CachePadded<AtomicU32>,
+    re3_asleep: crossbeam_utils::CachePadded<AtomicBool>,
 
     pub screen: Mutex<Rex3Screen>,
     pub renderer: Mutex<Option<Box<dyn Renderer>>>,
@@ -282,6 +300,8 @@ impl Gr2 {
             addr_of_mut!((*p).fin3_target).write(AtomicU64::new(SEQ_NONE));
             addr_of_mut!((*p).gedma_target).write(AtomicU64::new(SEQ_NONE));
             addr_of_mut!((*p).fin2_target).write(AtomicU64::new(SEQ_NONE));
+            #[cfg(feature = "gr2-jit")]
+            addr_of_mut!((*(*p).re3.get()).jit.mode).write(re3_jit::default_mode());
             let a = a.assume_init();
             a.power_on();
             a
@@ -377,7 +397,7 @@ impl Gr2 {
             }
             return false;
         }
-        Self::wake(&self.hq_thread);
+        self.wake_hq();
         true
     }
 
@@ -411,7 +431,7 @@ impl Gr2 {
             }
             return false;
         }
-        Self::wake(&self.hq_thread);
+        self.wake_hq();
         true
     }
 
@@ -506,10 +526,39 @@ impl Gr2 {
         }
     }
 
-    fn wake(slot: &Mutex<Option<thread::Thread>>) {
+    fn unpark(slot: &Mutex<Option<thread::Thread>>) {
         if let Some(t) = slot.lock().as_ref() {
             t.unpark();
         }
+    }
+
+    /// After a push: unpark the consumer if it is asleep. The fence pairs
+    /// with `sleep`'s: either this sees the thread asleep, or the thread
+    /// sees the push before it parks.
+    fn wake(asleep: &AtomicBool, slot: &Mutex<Option<thread::Thread>>) {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if asleep.load(Ordering::Relaxed) {
+            Self::unpark(slot);
+        }
+    }
+
+    /// An engine thread with nothing to do: park for up to 2 ms, unless
+    /// `has_work` finds a push made before `asleep` was raised.
+    fn sleep(asleep: &AtomicBool, has_work: impl FnOnce() -> bool) {
+        asleep.store(true, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !has_work() {
+            thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        asleep.store(false, Ordering::Relaxed);
+    }
+
+    fn wake_hq(&self) {
+        Self::wake(&self.hq_asleep, &self.hq_thread);
+    }
+
+    fn wake_re3(&self) {
+        Self::wake(&self.re3_asleep, &self.re3_thread);
     }
 
     // ── board ID registers ───────────────────────────────────────────────────
@@ -651,6 +700,7 @@ impl Gr2 {
                 if !self.hq_push_word((off - FIFO) >> 2, val as u64) {
                     return BUS_BUSY;
                 }
+                self.wake_hq();
             }
             HQUCODE..HQUCODE_END => r.hq.ucode[((off - HQUCODE) >> 2) as usize] = val,
             GEWIN..GEWIN_END => r.ge.write(((off - GEWIN) >> 10) as usize, ((off >> 2) & 0xff) as usize, val),
@@ -661,6 +711,7 @@ impl Gr2 {
                 if !self.hq_push_word(hq2::HQ_TOKEN_GEDMA, val as u64) {
                     return BUS_BUSY;
                 }
+                self.wake_hq();
             }
             // FIN3 write port (HQ2.h): Xsgi writes 0 after seeing FIN3;
             // the kernel restores a context's saved FIN3 here. The flag is
@@ -674,6 +725,7 @@ impl Gr2 {
                     return BUS_BUSY;
                 }
                 r.hq.write(off - HQREGS, val, &mut r.ge);
+                self.wake_hq();
             }
             HQREGS..HQREGS_END => {
                 if off - HQREGS == hq2::HQ_FIN2 {
@@ -739,11 +791,12 @@ impl Gr2 {
     }
 
     fn re3_write(&self, reg: usize, val: u32) -> u32 {
+        self.re3_cpu_writes.fetch_add(1, Ordering::Relaxed);
         if !self.re3_fifo.try_push(reg as u32, val as u64) {
             return BUS_BUSY;
         }
         self.re3_queued_seq.fetch_add(1, Ordering::Release);
-        Self::wake(&self.re3_thread);
+        self.wake_re3();
         BUS_OK
     }
 
@@ -768,7 +821,7 @@ impl Gr2 {
                 return BusRead32::busy();
             }
             self.re3_queued_seq.fetch_add(1, Ordering::Release);
-            Self::wake(&self.re3_thread);
+            self.wake_re3();
         }
         BusRead32::ok(v)
     }
@@ -776,56 +829,141 @@ impl Gr2 {
     // ── engine threads ───────────────────────────────────────────────────────
 
     fn hq_loop(&self) {
-        struct Sink<'a>(&'a Gr2);
-        impl Re3Sink for Sink<'_> {
-            fn reg(&mut self, reg: usize, val: u32) {
-                self.0.re3_fifo.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
-                self.0.re3_queued_seq.fetch_add(1, Ordering::Release);
-                Gr2::wake(&self.0.re3_thread);
+        /// RE3 FIFO entries HQ2 stages before pushing them as one unit.
+        const STAGE: usize = 64;
+        /// The RE3 FIFO as HQ2 writes it: entries are staged and pushed in
+        /// order, as one unit, under one lock and with one wake check: at the
+        /// end of each span (the IR write), when the stage is full, before
+        /// anything that waits on RE3 or must follow what is queued, and when
+        /// HQ2 runs out of work. A span's dozen register writes each took the
+        /// FIFO lock and a SeqCst fence (the wake check) before.
+        ///
+        /// It also skips register writes that would not change the register:
+        /// RE3 keeps a register's value until the next write, so resending
+        /// it (the span slopes, the colour of a flat polygon, Y along a run
+        /// of pieces, ...) only costs FIFO entries. `shadow` holds what HQ2
+        /// last sent where `known` has the bit; registers whose write does
+        /// more than store (IR, RWDATA, which RE3 also writes, and the RGB /
+        /// YX fan-outs) always go, and a CPU write to RE3 forgets it all.
+        struct Sink<'a> {
+            g: &'a Gr2,
+            stage: [(u32, u64); STAGE],
+            n: usize,
+            shadow: [u32; 64],
+            known: u64,
+            cpu_writes: u32,
+        }
+        // Every wait on RE3 gives up once `stop()` clears `running`: RE3 exits
+        // on its sentinel, and anything HQ2 queues behind that is never drained.
+        impl Sink<'_> {
+            fn stopped(&self) -> bool {
+                !self.g.running.load(Ordering::Relaxed)
             }
-            fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32) {
-                let a = (sx as u16 as u64) | ((sy as u16 as u64) << 16) | ((w as u16 as u64) << 32) | ((h as u16 as u64) << 48);
-                let b = (dx as u16 as u64) | ((dy as u16 as u64) << 16);
-                while !self.0.re3_fifo.try_push2(re3::RE3_OP_COPY_A, a, re3::RE3_OP_COPY_B, b) {
+            fn push(&mut self, op: u32, val: u64) {
+                if self.n == STAGE {
+                    self.flush();
+                }
+                self.stage[self.n] = (op, val);
+                self.n += 1;
+            }
+            /// Push what is staged and wake RE3.
+            fn flush(&mut self) {
+                if self.n == 0 {
+                    return;
+                }
+                while !self.g.re3_fifo.try_push_slice(&self.stage[..self.n]) {
+                    if self.stopped() {
+                        self.n = 0;
+                        return;
+                    }
                     std::hint::spin_loop();
                 }
-                self.0.re3_queued_seq.fetch_add(2, Ordering::Release);
-                Gr2::wake(&self.0.re3_thread);
+                self.g.re3_queued_seq.fetch_add(self.n as u64, Ordering::Release);
+                self.n = 0;
+                self.g.wake_re3();
+            }
+            /// Wait for RE3 to finish everything queued; false if stopped first.
+            fn drain_re3(&mut self) -> bool {
+                self.flush();
+                while !self.g.re3_fifo.is_empty() || self.g.re3_busy.load(Ordering::Acquire) {
+                    if self.stopped() {
+                        return false;
+                    }
+                    std::hint::spin_loop();
+                }
+                true
+            }
+        }
+        impl Re3Sink for Sink<'_> {
+            fn reg(&mut self, reg: usize, val: u32) {
+                let r = reg & 63;
+                let v = val & re3::REGMASK[r];
+                let cpu = self.g.re3_cpu_writes.load(Ordering::Relaxed);
+                if cpu != self.cpu_writes {
+                    self.cpu_writes = cpu;
+                    self.known = 0;
+                }
+                match r {
+                    re3::REG_IR | re3::REG_RWDATA => {}
+                    re3::REG_RGB => self.known &= !(1 << re3::REG_R | 1 << re3::REG_G | 1 << re3::REG_B),
+                    re3::REG_YX => self.known &= !(1 << re3::REG_X | 1 << re3::REG_Y),
+                    _ => {
+                        if self.known & (1 << r) != 0 && self.shadow[r] == v {
+                            return;
+                        }
+                        self.shadow[r] = v;
+                        self.known |= 1 << r;
+                    }
+                }
+                self.push(reg as u32 | re3::RE3_SRC_HQ, val as u64);
+                if r == re3::REG_IR {
+                    self.flush();
+                }
+            }
+            fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32, mode: u32) {
+                let a = (sx as u16 as u64) | ((sy as u16 as u64) << 16) | ((w as u16 as u64) << 32) | ((h as u16 as u64) << 48);
+                let b = (dx as u16 as u64) | ((dy as u16 as u64) << 16) | ((mode as u64) << 32);
+                // One unit: COPY_B executes with the COPY_A before it.
+                if self.n + 2 > STAGE {
+                    self.flush();
+                }
+                self.push(re3::RE3_OP_COPY_A, a);
+                self.push(re3::RE3_OP_COPY_B, b);
+                self.flush();
             }
             fn finish(&mut self, flag: usize) {
                 // The host polls the flag to learn the request is done, so it
                 // must not be seen before the drawing it follows: drain RE3.
-                while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                if !self.drain_re3() {
+                    return;
                 }
-                self.0.regs().hq.fin[flag].store(1, Ordering::Release);
+                self.g.regs().hq.fin[flag].store(1, Ordering::Release);
             }
             fn shram(&mut self, word: usize, val: u32) {
-                if let Some(w) = self.0.regs().shram.get_mut(word) {
+                if let Some(w) = self.g.regs().shram.get_mut(word) {
                     *w = val;
                 }
             }
             fn gedma_out(&mut self, words: &[u32]) {
-                self.0.gedma_begin();
+                self.flush();
+                self.g.gedma_begin();
                 for &w in words {
-                    if !self.0.gedma_push(w) {
+                    if !self.g.gedma_push(w) {
                         break;
                     }
                 }
             }
             fn op(&mut self, op: u32, val: u64) {
-                self.0.re3_fifo.push(op, val);
-                self.0.re3_queued_seq.fetch_add(1, Ordering::Release);
-                Gr2::wake(&self.0.re3_thread);
+                self.push(op, val);
             }
             fn read_image(&mut self, req: &hq2::ReadImage, dest: hq2::ReadDest) {
-                while !self.0.re3_fifo.is_empty() || self.0.re3_busy.load(Ordering::Acquire) {
-                    std::hint::spin_loop();
+                if !self.drain_re3() {
+                    return;
                 }
                 // SAFETY: RE3 is drained and idle; VRAM and Z are only read
                 // here, as the display thread does.
-                let re3 = unsafe { &*self.0.re3.get() };
-                let plane: &[u32] = if req.decode == hq2::ReadDecode::Depth { &re3.zbuf } else { &re3.vram };
+                let re3 = unsafe { &*self.g.re3.get() };
+                let plane: &[u32] = if matches!(req.decode, hq2::ReadDecode::Depth { .. }) { &re3.zbuf } else { &re3.vram };
                 let read = |x: i32, y: i32| {
                     if x < 0 || y < 0 || x as usize >= re3::FB_W || y as usize >= re3::FB_H {
                         0
@@ -835,21 +973,21 @@ impl Gr2 {
                 };
                 match dest {
                     hq2::ReadDest::Shram(base) => {
-                        req.pack(read, &mut self.0.regs().shram[base..]);
-                        self.0.regs().hq.fin[hq2::FIN3].store(1, Ordering::Release);
+                        req.pack(read, &mut self.g.regs().shram[base..]);
+                        self.g.regs().hq.fin[hq2::FIN3].store(1, Ordering::Release);
                     }
                     hq2::ReadDest::Gedma => {
                         let mut words = vec![0u32; req.rows as usize * req.words_per_row as usize];
                         req.pack(read, &mut words);
                         self.gedma_out(&words);
                         // The kernel polls FIN2 once its VDMA has read them.
-                        self.0.regs().hq.fin[hq2::FIN2].store(1, Ordering::Release);
+                        self.g.regs().hq.fin[hq2::FIN2].store(1, Ordering::Release);
                     }
                 }
             }
         }
         *self.hq_thread.lock() = Some(thread::current());
-        let mut sink = Sink(self);
+        let mut sink = Sink { g: self, stage: [(0, 0); STAGE], n: 0, shadow: [0; 64], known: 0, cpu_writes: 0 };
         let backoff = crossbeam_utils::Backoff::new();
         let mut is_busy = false;
         while self.running.load(Ordering::Relaxed) {
@@ -874,6 +1012,9 @@ impl Gr2 {
                 self.hq_fifo.consume();
                 backoff.reset();
             } else {
+                // Out of work: what is staged goes to RE3 before HQ2 reports
+                // idle.
+                sink.flush();
                 self.hq_fifo.flush_head();
                 self.hq_busy.store(false, Ordering::Release);
                 if is_busy {
@@ -883,7 +1024,7 @@ impl Gr2 {
                     if let Some(cb) = self.dma_space_cb.get() { cb(); }
                 }
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.hq_asleep, || self.hq_fifo.peek().is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -917,7 +1058,12 @@ impl Gr2 {
                     re3::RE3_OP_COPY_B => {
                         let a = self.copy_a.get();
                         let f = |v: u64, s: u32| (v >> s) as u16 as i16 as i32;
-                        re3.copy_rect(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16));
+                        let mode = (val >> 32) as u32;
+                        if mode == 0 {
+                            re3.copy_rect(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16));
+                        } else {
+                            re3.copy_rect_gl(f(a, 0), f(a, 16), f(a, 32), f(a, 48), f(val, 0), f(val, 16), mode);
+                        }
                         true
                     }
                     re3::RE3_OP_READ_ADVANCE => {
@@ -925,19 +1071,19 @@ impl Gr2 {
                         false
                     }
                     re3::RE3_OP_PIXFMT => {
-                        re3.ctx.pixfmt = val as u32;
+                        re3.set_pixfmt(val as u32);
                         false
                     }
                     re3::RE3_OP_ZCTL => {
-                        re3.ctx.zctl = val as u32;
+                        re3.set_zctl(val as u32);
                         false
                     }
                     re3::RE3_OP_STENCIL => {
-                        re3.ctx.stencil = val;
+                        re3.set_stencil(val);
                         false
                     }
                     re3::RE3_OP_BLEND => {
-                        re3.ctx.blend = val as u32;
+                        re3.set_blend(val as u32);
                         false
                     }
                     re3::RE3_OP_ALPHA => {
@@ -972,7 +1118,7 @@ impl Gr2 {
                     if let Some(cb) = self.dma_space_cb.get() { cb(); }
                 }
                 if backoff.is_completed() {
-                    thread::park_timeout(std::time::Duration::from_millis(2));
+                    Self::sleep(&self.re3_asleep, || self.re3_fifo.peek().is_some());
                 } else {
                     backoff.snooze();
                 }
@@ -1001,10 +1147,14 @@ impl Resettable for Gr2 {
 
 impl BusDevice for Gr2 {
     fn read32(&self, addr: u32) -> BusRead32 {
-        self.reg_read((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4))
+        let r = self.reg_read((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4));
+        crate::pf_level!(self.pf_wait, crate::perfetto::events::GR2_WAIT, r.status == BUS_BUSY);
+        r
     }
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        self.reg_write((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val)
+        let st = self.reg_write((addr - GR2_BASE) & (GR2_SLOT_SIZE - 4), val);
+        self.pf_write(st);
+        st
     }
     // Narrow accesses hit 8/16-bit peripheral chips on word addresses: the
     // access carries the register value whatever its width or lane (GR2.h).
@@ -1034,6 +1184,21 @@ impl BusDevice for Gr2 {
         BusRead64::ok(((hi.data as u64) << 32) | lo.data as u64)
     }
     fn write64(&self, addr: u32, val: u64) -> u32 {
+        let st = self.write64_inner(addr, val);
+        self.pf_write(st);
+        st
+    }
+}
+
+impl Gr2 {
+    /// Perfetto: a store refused with BUS_BUSY is the CPU stalled on a
+    /// full FIFO; the next accepted one ends the stall.
+    #[inline]
+    fn pf_write(&self, st: u32) {
+        crate::pf_level!(self.pf_fifo_full, crate::perfetto::events::GR2_FIFO_FULL, st == BUS_BUSY);
+    }
+
+    fn write64_inner(&self, addr: u32, val: u64) -> u32 {
         let off = (addr - GR2_BASE) & (GR2_SLOT_SIZE - 8);
         let (hi, lo) = ((val >> 32) as u32, val as u32);
         if (FIFO..FIFO_END).contains(&off) {
@@ -1042,15 +1207,17 @@ impl BusDevice for Gr2 {
             if !self.hq_push2_words(idx, hi as u64, idx + 1, lo as u64) {
                 return BUS_BUSY;
             }
+            self.wake_hq();
             return BUS_OK;
         }
         if (RE3_REGS..RE3_REGS_END).contains(&off) {
             let reg = ((off - RE3_REGS) >> 2) as u32;
+            self.re3_cpu_writes.fetch_add(1, Ordering::Relaxed);
             if !self.re3_fifo.try_push2(reg, hi as u64, reg + 1, lo as u64) {
                 return BUS_BUSY;
             }
             self.re3_queued_seq.fetch_add(2, Ordering::Release);
-            Self::wake(&self.re3_thread);
+            self.wake_re3();
             return BUS_OK;
         }
         let st = self.reg_write(off, hi);
@@ -1083,8 +1250,8 @@ impl Device for Gr2 {
         }
         self.hq_fifo.push(u32::MAX, 0);
         self.re3_fifo.push(re3::RE3_OP_EXIT, 0);
-        Self::wake(&self.hq_thread);
-        Self::wake(&self.re3_thread);
+        Self::unpark(&self.hq_thread);
+        Self::unpark(&self.re3_thread);
         for t in self.threads.lock().drain(..) {
             let _ = t.join();
         }

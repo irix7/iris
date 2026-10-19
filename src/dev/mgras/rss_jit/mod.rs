@@ -22,6 +22,8 @@
 //! process-wide map; a primitive whose shader is not ready yet runs in the
 //! interpreter. `IRIS_GR4_JIT=off|sync|async` picks the mode (`sync`
 //! compiles on first use and waits, for tests and comparisons).
+//! `IRIS_NO_JIT` (set by the Mac App Store build, whose sandbox kills
+//! Cranelift's executable pages) forces it off, as it does the REX3 JIT.
 
 pub mod compiler;
 pub mod key;
@@ -45,9 +47,20 @@ pub const MODE_ASYNC: u32 = 0;
 /// Compile on first use and wait (tests, comparisons).
 pub const MODE_SYNC: u32 = 2;
 
-/// The mode a new board starts in: `IRIS_GR4_JIT`, else async (off in unit
-/// tests, so the interpreter's tests stay deterministic unless asked).
+/// Whether the host forbids JIT code (`IRIS_NO_JIT`): off then, whatever
+/// `IRIS_GR4_JIT` or `mgras jit` ask for. Off never reaches `store()`, so
+/// no compiler thread or executable page is ever made.
+pub fn forbidden() -> bool {
+    std::env::var_os("IRIS_NO_JIT").is_some()
+}
+
+/// The mode a new board starts in: off if `forbidden`, else `IRIS_GR4_JIT`,
+/// else async (off in unit tests, so the interpreter's tests stay
+/// deterministic unless asked).
 pub fn default_mode() -> u32 {
+    if forbidden() {
+        return MODE_OFF;
+    }
     match std::env::var("IRIS_GR4_JIT").as_deref() {
         Ok("off") | Ok("0") => MODE_OFF,
         Ok("sync") => MODE_SYNC,
@@ -170,6 +183,13 @@ pub struct CommonCtx {
     pub cidwmask: u32,
     /// Depth buffer tiles per row.
     pub zxtiles: u32,
+    /// log2 of the raster engines rows alternate over (`pixmem::re_shift`),
+    /// and the mask of y's engine bits.
+    pub yshift: u32,
+    pub remask: u32,
+    /// The rows this engine draws (`Rss::owns_row`).
+    pub engine: u32,
+    pub own_mask: u32,
     /// The window coordinates that land on screen: x in [vis[0], vis[1]),
     /// y in [vis[2], vis[3]). Triangles skip the rest (they draw nothing
     /// there and nothing else depends on visiting them).
@@ -199,6 +219,8 @@ pub struct GlCtx {
     /// Shared-page offsets by log2 of a level's larger side (0 above 16).
     pub small_off: [u32; 16],
     pub small_boff: [u32; 16],
+    /// The constant blend colour (12.16, `rss::blend_const`).
+    pub blend_c: [i32; 4],
     /// Texture environment colour and alpha; fog colour (12.16).
     pub env_c: [i32; 3],
     pub env_a: i32,
@@ -262,14 +284,17 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
     let pp1 = rss.reg(reg::PP1FILLMODE);
     let lsb = rss.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
     let msbs = rss.reg(reg::COLORMASKMSBS);
-    let wide = rss::rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
+    let wide = rss::rgb_pixtype(pp1);
     let ptype = (pp1 >> 8) & 7;
+    let pair = b.kind == Kind::Wide && rss::rgb12_pair(pp1);
     let mask = if b.kind == Kind::Overlay {
-        if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else { (msbs >> 4) & 0xF }
-    } else if ptype == 2 {
-        if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (msbs & 0xFF) << 24 }
-    } else if ptype == 6 {
-        lsb & 0xFFF
+        if rss::draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 }
+    } else if pair || ptype == 2 {
+        // Planes 31:0 (ColorMaskMSBs are 35:32, outside these pixels).
+        lsb
+    } else if rss::ci_pixtype(pp1) {
+        // Both 12-bit halves (`rss::ci_pixtype`).
+        lsb & 0xFF_FFFF
     } else {
         u32::MAX
     };
@@ -277,7 +302,13 @@ fn target(rss: &Rss, b: Buffer, back: bool) -> Target {
         ptr: b.ptr,
         xtiles: b.xtiles,
         mask,
-        lop_width: if ptype == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF },
+        lop_width: if ptype == 2 || pair {
+            u32::MAX
+        } else if wide || b.kind == Kind::Wide {
+            0xFF_FFFF
+        } else {
+            0xFFF
+        },
     }
 }
 
@@ -290,14 +321,14 @@ fn common(rss: &mut Rss) -> PipeKey {
     let drbsize = rss.reg(reg::DRBSIZE);
     let b = rss.target();
     c.tgt = [Target::default(); 2];
-    c.tgt[0] = target(rss, b, field == rss::DRAW_B);
+    c.tgt[0] = target(rss, b, rss::draws_b(field));
     let draw = if field == rss::DRAW_CID {
         Draw::Cid
     } else if b.kind == Kind::Overlay {
         Draw::Overlay
     } else {
         match rss.second_buffer() {
-            Some(p) if field == rss::DRAW_A_AND_B => {
+            Some(p) if rss::draws_a_and_b(field) && !rss::rgb12_pair(pp1) && !rss::ci_pixtype(pp1) => {
                 let b2 = Buffer::new(p, Kind::Wide, drbsize);
                 if b2 != b {
                     c.tgt[1] = target(rss, b2, true);
@@ -311,9 +342,12 @@ fn common(rss: &mut Rss) -> PipeKey {
     };
     let ptype = (pp1 >> 8) & 7;
     let pix = match ptype {
-        0 if pp1 & (1 << 13) == 0 => Pix::Rgb12,
+        _ if rss::rgb12_pair(pp1) => {
+            let layout = rss::Pair::of(pp1).unwrap_or(rss::Pair::P444);
+            Pix::of_pair(layout, rss::draws_b(field), pp1 & rss::PP1_DITHER != 0)
+        }
         2 => Pix::Rgba8,
-        6 => Pix::Ci12,
+        4..=7 => Pix::Ci12,
         _ => Pix::Plain,
     };
     let winmode = rss.reg(reg::PP1WINMODE);
@@ -347,6 +381,10 @@ fn common(rss: &mut Rss) -> PipeKey {
     let cl = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     c.vis = [cl(-ox), cl(w - ox), cl(ylo), cl(yhi)];
     c.zxtiles = pixmem::xtiles(drbsize).0;
+    c.yshift = pixmem::re_shift(drbsize);
+    c.remask = (1 << c.yshift) - 1;
+    c.engine = rss.engine;
+    c.own_mask = rss.own_mask;
     let key = PipeKey {
         cid_test: c.cidmatch != 0,
         nclip: nclip as u8,
@@ -382,7 +420,12 @@ fn gl_common(rss: &mut Rss, mut k: PipeKey) -> PipeKey {
     k.z = (zm & rss::ZMODE_TEST != 0).then_some((zm & 7) as u8);
     c.zmask = ((zm >> 4) & 0xFF_FFFF) as u64;
     let bf = rss.reg(reg::BLENDFACTOR);
-    k.blend = (bf & rss::BLEND_ENABLE != 0).then_some(Blend { src: (bf & 0xF) as u8, dst: ((bf >> 4) & 0xF) as u8 });
+    k.blend = (bf & rss::BLEND_ENABLE != 0).then_some(Blend {
+        src: (bf & 0xF) as u8,
+        dst: ((bf >> 4) & 0xF) as u8,
+        eq: ((bf >> rss::BLEND_EQ_SHIFT) & 7) as u8,
+    });
+    c.blend_c = rss.blend_constant();
     let m1 = rss.reg(te_reg::TEXMODE1);
     if m1 & te1::TEXMODE1_ENABLE != 0 {
         let m2 = rss.reg(te_reg::TEXMODE2);
@@ -472,6 +515,10 @@ const BIT_SKIP_LAST: u32 = 4;
 /// primitive's own fields. Returns the key bits the primitive adds to the
 /// cached key (`key`), or None when no shader covers it.
 pub(super) fn prepare(rss: &mut Rss, a: &Args) -> Option<u32> {
+    // 12:12:12 pixels need the 36-bit word: the interpreter draws them.
+    if rss.deep36() {
+        return None;
+    }
     RasterCtx::set_pointers(rss);
     if rss.jit.ok2d == 0 {
         // A GL primitive key, to keep the GL fields when packed.
@@ -535,7 +582,10 @@ pub(super) fn prepare(rss: &mut Rss, a: &Args) -> Option<u32> {
             if bytes.len() % bpp != 0 && bytes.len().div_ceil(bpp) <= x.width as usize {
                 return None;
             }
-            let fmt = XFmt::of(x.format.0 << 4 | x.format.1);
+            if !rss::jit_xfer_ok(x.format) {
+                return None;
+            }
+            let fmt = if x.format == (8, 0x11) { XFmt::Rgba16 } else { XFmt::of(x.format.0 << 4 | x.format.1) };
             let code = key::XBPP.iter().position(|&b| b as u32 == x.bpp)? as u32;
             let c = &mut rss.jit_ctx;
             set_block(c, &x.block);

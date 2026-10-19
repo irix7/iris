@@ -118,6 +118,7 @@ fn claim_ip7(seq: &AtomicU64, ticket: u64, irq: &AtomicU64, fasttick: &AtomicU64
         .is_ok()
     {
         irq.fetch_or(CAUSE_IP7 as u64, Ordering::SeqCst);
+        crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
         #[cfg(feature = "idle-pause")]
         crate::cpu::idle_park::wake();
         fasttick.fetch_add(1, Ordering::Relaxed);
@@ -247,6 +248,12 @@ impl CyclesPtr {
     /// `CyclesPtr` hasn't been wired up yet (`dangling()`/not yet set).
     pub fn get(self) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { std::ptr::read_volatile(self.0) } }
+    }
+
+    /// The counter's address (null when dangling), for readers that keep it
+    /// somewhere a `CyclesPtr` cannot go, such as an `AtomicPtr`.
+    pub fn raw(self) -> *const u64 {
+        self.0
     }
 }
 
@@ -1954,6 +1961,7 @@ impl MipsCore {
                 // re-raise it).
                 self.cp0_cause &= !CAUSE_IP7;
                 self.hot.interrupts.fetch_and(!(CAUSE_IP7 as u64), Ordering::SeqCst);
+                crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, false);
 
                 // Now classify what the guest actually asked for. Count here
                 // is virtual and materialized in lumps from retired cycles,
@@ -2505,6 +2513,19 @@ pub fn deliver_exception(core: &mut MipsCore, status: u32) {
 pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd: bool) {
     const EXEC_IS_TLB_REFILL: u32 = 1 << 28;
     const EXEC_IS_XTLB_REFILL: u32 = 1 << 29;
+    const EXEC_IS_CACHE_ERR: u32 = 1 << 30;
+
+    // Cache Error: ERL and ErrorEPC, the uncached vector, and nothing else —
+    // Cause, EPC and EXL are untouched (R4000 UM ch. 5, VR5000 UM 7.3.9).
+    // The caller has already loaded CacheErr.
+    if status & EXEC_IS_CACHE_ERR != 0 {
+        core.cp0_errorepc = if bd { fault_pc.wrapping_sub(4) } else { fault_pc };
+        core.cp0_status |= STATUS_ERL;
+        let base = if core.cp0_status & STATUS_BEV != 0 { 0xFFFFFFFF_BFC00200u64 } else { 0xFFFFFFFF_A0000000u64 };
+        core.pc = base + 0x100;
+        core.in_delay_slot = false;
+        return;
+    }
 
     let is_tlb_refill = status & EXEC_IS_TLB_REFILL != 0;
     let is_xtlb_refill = status & EXEC_IS_XTLB_REFILL != 0;
@@ -2603,9 +2624,13 @@ mod ip7_ticket_tests {
     #[test]
     fn a_compare_write_leaves_its_deadline_ticket_claimable() {
         let mut core = core_past_its_compare();
-        let before = core.cp0_count as u32;
-        // A future deadline: no classification path should claim the ticket.
-        core.write_cp0(11, (before.wrapping_add(330_000)) as u64);
+        // The live Count, not the `cp0_count` field: that is still the stale
+        // 0 here, which put the "future" deadline at an absolute ~10 ms of
+        // wall clock. A loaded CI runner (macOS) overshot the 3 ms sleep past
+        // it, so the write saw a genuine crossing. One second ahead of now
+        // can't be reached before write_cp0 looks.
+        let before = core.count_peek();
+        core.write_cp0(11, (before.wrapping_add(33_000_000)) as u64);
 
         let shared = core.ip7_seq_shared.load(Ordering::SeqCst);
         assert_ne!(

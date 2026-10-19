@@ -98,6 +98,17 @@ pub struct ClientSide {
     pub emul: emul::Emul,
     /// The accumulation buffers framebuffer objects cannot have (accum.rs).
     pub accum: accum::Accum,
+    /// The library keeps front and back apart (OP_FRONT_BUFFERS).
+    pub fronts: bool,
+    /// What glDrawBuffer and glReadBuffer last named; `None`, the back buffer.
+    /// Framebuffer objects keep these, not contexts, so they are put back
+    /// whenever the context's drawables are bound (draw::bind_with).
+    pub draw_buffer: Option<u32>,
+    pub read_buffer: Option<u32>,
+    /// The internal format each texture image was given, as the program
+    /// named it, by (texture, target, level); a proxy target's under texture
+    /// 0. See `texture_internal_answer`.
+    pub asked_internal: HashMap<(u32, u32, i32), i32>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -319,6 +330,38 @@ macro_rules! get_value {
     )* };
 }
 get_value!(u8, i32, u32, f32, f64);
+
+/// macOS's OpenGL (2.1 Metal, seen on an M4 Pro): with lighting on, once a
+/// clip plane is switched off nothing more is drawn -- not until lighting is
+/// itself switched, which this does. UroMan (IRIX 6.5's O2 demos) cuts the
+/// body open with a clip plane and draws the organs after switching it off:
+/// they were not there.
+fn relight_after_clip_plane() {
+    #[cfg(target_os = "macos")]
+    // SAFETY: plain state, put back as it was.
+    unsafe {
+        if glIsEnabled(GL_LIGHTING) != 0 {
+            glDisable(GL_LIGHTING);
+            glEnable(GL_LIGHTING);
+        }
+    }
+}
+
+/// The texture bound to `target` on the host, 0 for a proxy target, or None
+/// for a target not kept (see Exec::note_internal).
+fn texture_of(target: u32) -> Option<u32> {
+    let binding = match target {
+        0x0DE0 => 0x8068,           // GL_TEXTURE_1D: GL_TEXTURE_BINDING_1D
+        0x0DE1 => 0x8069,           // GL_TEXTURE_2D
+        0x806F => 0x806A,           // GL_TEXTURE_3D
+        0x8063 | 0x8064 | 0x8070 => return Some(0), // the proxies
+        _ => return None,
+    };
+    let mut name = 0i32;
+    // SAFETY: a query of one integer.
+    unsafe { glGetIntegerv(binding, &mut name) };
+    Some(name as u32)
+}
 
 impl<'a> Exec<'a> {
     #[allow(clippy::too_many_arguments)]
@@ -737,6 +780,39 @@ impl<'a> Exec<'a> {
     pub fn gl_internal(&mut self, internal: i32) -> i32 {
         let tex = self.client.emul.bound_texture();
         self.client.emul.select_format(tex, internal).unwrap_or(internal)
+    }
+
+    /// A texture image was given `internal` by the program (glTexImage*,
+    /// glCopyTexImage*): kept for glGetTexLevelParameter's answer.
+    pub fn note_internal(&mut self, target: u32, level: i32, internal: i32) {
+        let Some(tex) = texture_of(target) else { return };
+        self.client.asked_internal.insert((tex, target, level), internal);
+    }
+
+    /// GL_TEXTURE_INTERNAL_FORMAT (GL_TEXTURE_COMPONENTS) is answered with
+    /// the internal format the program asked for, as IRIX's libGL answers it
+    /// (and Mesa's), not the sized one the Mac picked: GL_RGBA, not GL_RGBA8.
+    /// Cosmo Player checks a proxy texture's answer against what it asked
+    /// for, and on the Mac's took every texture size to be refused: LivingO2
+    /// (the O2 demos) drew each texture as one texel. A level the host has no
+    /// image for (a refused proxy: 0) is left as it answered.
+    pub fn texture_internal_answer(&self, target: u32, level: i32, pname: u32, answer: &mut [i32]) {
+        const GL_TEXTURE_INTERNAL_FORMAT: u32 = 0x1003;
+        if pname != GL_TEXTURE_INTERNAL_FORMAT || answer.first().is_none_or(|&a| a == 0) {
+            return;
+        }
+        let Some(tex) = texture_of(target) else { return };
+        if let Some(&asked) = self.client.asked_internal.get(&(tex, target, level)) {
+            answer[0] = asked;
+        }
+    }
+
+    pub fn texture_internal_answer_f(&self, target: u32, level: i32, pname: u32, answer: &mut [f32]) {
+        let mut i = [answer.first().map_or(0, |&a| a as i32)];
+        self.texture_internal_answer(target, level, pname, &mut i);
+        if let Some(a) = answer.first_mut() {
+            *a = i[0] as f32;
+        }
     }
 
     /// The pixel format to give the host for the one the guest named.
@@ -1189,6 +1265,9 @@ impl<'a> Exec<'a> {
                 }
             }
         }
+        if !on && (GL_CLIP_PLANE0..GL_CLIP_PLANE0 + 6).contains(&cap) {
+            relight_after_clip_plane();
+        }
         if self.client.emul.set_enable(cap, on) {
             self.client.emul.update();
         }
@@ -1236,6 +1315,43 @@ impl<'a> Exec<'a> {
     /// fixed-function emulation (`emul`) is written for the units we exercise;
     /// 8 is far above what IRIX-era software asks for (Quake III wants 2), and
     /// a ceiling is easier to raise later than a wrong answer is to find.
+    /// SGI_color_matrix's state, answered here when the host GL has no
+    /// colour matrix: Mesa's compatibility profile has no ARB_imaging, so it
+    /// refused these queries with GL_INVALID_ENUM and left the answer 0.
+    /// SGI's IRIS GL (IGLOO) asks for GL_MAX_COLOR_MATRIX_STACK_DEPTH when it
+    /// sets up a window, sizes a stack from it, and crashed on 0: on a Linux
+    /// host every IRIS GL program that asked for a stencil buffer died in
+    /// gconfig(). The answers are IMPACT's -- a stack of 2, 1 deep, holding
+    /// the identity -- and no error is raised. True when answered here.
+    pub fn color_matrix_query<T: GetValue>(&mut self, pname: u32, out: &mut [T]) -> bool {
+        const GL_COLOR_MATRIX: u32 = 0x80B1;
+        const GL_COLOR_MATRIX_STACK_DEPTH: u32 = 0x80B2;
+        const GL_MAX_COLOR_MATRIX_STACK_DEPTH: u32 = 0x80B3;
+        if !(GL_COLOR_MATRIX..=GL_MAX_COLOR_MATRIX_STACK_DEPTH).contains(&pname)
+            || !self.backend.lookup("glColorTable").is_null()
+        {
+            return false;
+        }
+        match pname {
+            GL_COLOR_MATRIX => {
+                for (i, v) in out.iter_mut().take(16).enumerate() {
+                    *v = T::from_i64((i % 5 == 0) as i64);
+                }
+            }
+            GL_COLOR_MATRIX_STACK_DEPTH => {
+                if let Some(v) = out.first_mut() {
+                    *v = T::from_i64(1);
+                }
+            }
+            _ => {
+                if let Some(v) = out.first_mut() {
+                    *v = T::from_i64(2);
+                }
+            }
+        }
+        true
+    }
+
     pub fn get_limit<T: GetValue>(&mut self, pname: u32, out: &mut [T]) {
         // The accumulation buffer is this library's (accum.rs), not the
         // host's, which has none to report.
@@ -1475,26 +1591,20 @@ impl<'a> Exec<'a> {
         unsafe { glGetError() }
     }
 
-    /// glDrawBuffer / glReadBuffer. A GLX window's buffers are, here, the one
-    /// colour attachment of the drawable's framebuffer object: the back buffer
-    /// is what is drawn, and the front is what the last swap showed -- the
-    /// same pixels until the next frame is drawn. Every colour buffer a
-    /// double-buffered window has names that attachment; anything else is the
-    /// host's to refuse.
+    /// glDrawBuffer / glReadBuffer. For a library that keeps front and back
+    /// apart (OP_FRONT_BUFFERS), a window's front buffer is its own colour
+    /// attachment, and FRONT_AND_BACK draws into both. Otherwise, as before,
+    /// a window's buffers are the one colour attachment of its framebuffer
+    /// object: the back buffer is what is drawn, and the front is what the
+    /// last swap showed. Anything else is the host's to refuse
+    /// (draw::apply_buffers).
     pub fn color_buffer(&mut self, draw: bool, mode: u32) {
-        let mapped = match mode {
-            // FRONT_LEFT, FRONT_RIGHT, BACK_LEFT, BACK_RIGHT, FRONT, BACK,
-            // LEFT, RIGHT, FRONT_AND_BACK
-            0x0400..=0x0408 => GL_COLOR_ATTACHMENT0,
-            other => other,
-        };
-        // SAFETY: plain state.
-        unsafe {
-            if draw {
-                glDrawBuffer(mapped)
-            } else {
-                glReadBuffer(mapped)
-            }
+        if draw {
+            self.client.draw_buffer = Some(mode);
+            draw::apply_buffers(self.draws.get(&self.current_draw), None, self.client.fronts, Some(mode), None);
+        } else {
+            self.client.read_buffer = Some(mode);
+            draw::apply_buffers(None, self.draws.get(&self.current_read), self.client.fronts, None, Some(mode));
         }
     }
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use crate::config::{AudioBackendKind, AudioConfig, ResamplerKind};
+use crate::config::{AudioBackendKind, AudioConfig, AudioHost, ResamplerKind};
 use crate::devlog::LogModule;
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -274,6 +274,10 @@ impl RateCtl {
 
 // Sample rates to try when opening the persistent output stream, in order.
 const PREFERRED_RATES: &[u32] = &[48000, 44100, 22050];
+/// The PulseAudio stream's period, in frames, unless `[audio]
+/// cpal_buffer_frames` says otherwise (see `output_buffer`).
+#[cfg(target_os = "linux")]
+const PULSE_FRAMES: u32 = 512;
 
 // ─── Audio output (owned by Codec A, opened once at start, closed at stop) ───
 
@@ -834,18 +838,60 @@ fn audio_output_sizing(cfg: &AudioConfig, rate: u32) -> AudioOutputSizing {
     }
 }
 
+/// The host `[audio] host` asks for. cpal's `pulseaudio` feature makes its
+/// own `default_host()` prefer PulseAudio whenever a server runs, so the
+/// default is chosen here instead: the platform's usual host (ALSA on Linux).
+fn output_host(want: AudioHost) -> cpal::Host {
+    #[cfg(target_os = "linux")]
+    {
+        if want == AudioHost::Pulseaudio {
+            match cpal::host_from_id(cpal::HostId::PulseAudio) {
+                Ok(h) => return h,
+                Err(e) => eprintln!("HAL2: [audio] host = \"pulseaudio\", but no PulseAudio server answers ({e}); using ALSA"),
+            }
+        }
+        if let Ok(h) = cpal::host_from_id(cpal::HostId::Alsa) {
+            return h;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if want != AudioHost::Default {
+        eprintln!("HAL2: [audio] host = {want:?} is for Linux; using this platform's default");
+    }
+    cpal::default_host()
+}
+
+/// How much the host buffers: `[audio] cpal_buffer_frames` if set, else the
+/// host's default -- except PulseAudio's, a target of about two seconds
+/// (pipewire-pulse's too), which made IRIX's sound that late: there a fixed
+/// period of PULSE_FRAMES asks for 2 x 512 frames, ~21 ms at 48 kHz.
+fn output_buffer(audio: &AudioConfig, host: cpal::HostId) -> cpal::BufferSize {
+    match (audio.cpal_buffer_frames, host) {
+        (Some(frames), _) => cpal::BufferSize::Fixed(frames),
+        #[cfg(target_os = "linux")]
+        (None, cpal::HostId::PulseAudio) => cpal::BufferSize::Fixed(PULSE_FRAMES),
+        _ => cpal::BufferSize::Default,
+    }
+}
+
 /// Open a persistent stereo i16 cpal output stream, trying PREFERRED_RATES in order.
 /// The stream plays silence when the ring buffer is empty.
 fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &AudioConfig) -> Option<CpalOutput> {
-    let host = cpal::default_host();
+    let host = output_host(cfg.host);
     let device = host.default_output_device()?;
+    // A fixed size the device refuses falls back to the host's default.
+    let mut sizes = vec![output_buffer(cfg, host.id())];
+    if sizes[0] != cpal::BufferSize::Default {
+        sizes.push(cpal::BufferSize::Default);
+    }
 
+    for buffer_size in sizes {
     for &rate in PREFERRED_RATES {
         let sizing = audio_output_sizing(cfg, rate);
         let config = cpal::StreamConfig {
             channels: 2,
             sample_rate: rate,
-            buffer_size: sizing.buffer_size,
+            buffer_size,
         };
         let ring_size = sizing.ring_size;
         let err_fn = |err: cpal::Error| { eprintln!("HAL2: cpal stream error: {:?}", err); };
@@ -913,6 +959,11 @@ fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &A
         });
     }
 
+        if buffer_size != cpal::BufferSize::Default {
+            eprintln!("HAL2: no output stream with a {:?} buffer; trying the host's default", buffer_size);
+        }
+    }
+
     eprintln!("HAL2: failed to open audio output at any rate (tried {:?})", PREFERRED_RATES);
     None
 }
@@ -921,7 +972,12 @@ fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &A
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
 
 impl Hal2 {
-    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>, audio_config: AudioConfig) -> Self {
+    pub fn new(dma_clients: Vec<Arc<dyn DmaClient>>) -> Self {
+        Self::with_audio(dma_clients, AudioConfig::default())
+    }
+
+    /// HAL2 playing through the host and buffer `[audio]` asks for.
+    pub fn with_audio(dma_clients: Vec<Arc<dyn DmaClient>>, audio: AudioConfig) -> Self {
         Self {
             state: Arc::new(Mutex::new(Hal2State {
                 isr: 0,
@@ -943,7 +999,7 @@ impl Hal2 {
             })),
             dma_clients,
             timer_manager: Arc::new(std::sync::OnceLock::new()),
-            audio_config,
+            audio_config: audio,
             ca_state: Arc::new(Mutex::new(CodecAState::new())),
             cb_state: Arc::new(Mutex::new(CodecBState { timer_id: None })),
             at_state: Arc::new(Mutex::new(AesTxState { timer_id: None })),
@@ -1005,6 +1061,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 0 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ca_state = self.ca_state.clone();
@@ -1038,6 +1095,7 @@ impl Hal2 {
             if due == 0 {
                 return TimerReturn::Continue;
             }
+            crate::pf_scope!(crate::perfetto::events::HAL2_PACE, due);
             let moved = drain_codec_a(&mut st, &dma_client, mode, pitch_rate, rate, prebuf_ms, resampler_kind, due);
             drop(st);
             if closed_loop {
@@ -1059,6 +1117,7 @@ impl Hal2 {
         let id = self.ca_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 0);
         }
         self.ca_state.lock().reset_audio(); // keeps `out` (stream stays open)
     }
@@ -1077,6 +1136,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 1 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let mut pacer = Pacer::new(rate);
@@ -1102,6 +1162,7 @@ impl Hal2 {
         let id = self.cb_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 1);
         }
     }
 
@@ -1119,6 +1180,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 2 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
@@ -1142,6 +1204,7 @@ impl Hal2 {
         let id = self.at_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 2);
         }
     }
 
@@ -1159,6 +1222,7 @@ impl Hal2 {
         };
 
         if rate == 0 || dma_ch >= self.dma_clients.len() { return; }
+        crate::pf_instant!(crate::perfetto::events::HAL2_ARM, 3 << 8 | dma_ch);
 
         let dma_client = self.dma_clients[dma_ch].clone();
         let ar_state = self.ar_state.clone();
@@ -1179,6 +1243,7 @@ impl Hal2 {
         let id = self.ar_state.lock().timer_id.take();
         if let Some(id) = id {
             if let Some(tm) = self.timer_manager.get() { tm.remove(id); }
+            crate::pf_instant!(crate::perfetto::events::HAL2_DISARM, 3);
         }
         self.ar_state.lock().loopback.clear();
     }
@@ -1651,7 +1716,7 @@ fn read_frame_from(client: &Arc<dyn DmaClient>, mode: usize) -> Option<(i16, i16
 
 impl Default for Hal2 {
     fn default() -> Self {
-        Self::new(Vec::new(), AudioConfig::default())
+        Self::with_audio(Vec::new(), AudioConfig::default())
     }
 }
 
@@ -2381,7 +2446,7 @@ mod tests {
 
     #[test]
     fn save_load_round_trip() {
-        let src = Hal2::new(Vec::new(), AudioConfig::default());
+        let src = Hal2::with_audio(Vec::new(), AudioConfig::default());
         {
             let mut s = src.state.lock();
             s.isr = 0x18;
@@ -2409,7 +2474,7 @@ mod tests {
 
         let v1 = src.save_state();
 
-        let dst = Hal2::new(Vec::new(), AudioConfig::default());
+        let dst = Hal2::with_audio(Vec::new(), AudioConfig::default());
         dst.load_state(&v1).expect("load_state");
         let v2 = dst.save_state();
 
@@ -2421,7 +2486,7 @@ mod tests {
     /// schema signature is what `measure` records).
     #[test]
     fn state_desc_verify_rejects_a_renamed_field() {
-        let src = Hal2::new(Vec::new(), AudioConfig::default());
+        let src = Hal2::with_audio(Vec::new(), AudioConfig::default());
         let desc = src.state_desc().expect("hal2 has a state description");
         let saved = desc.save();
         desc.verify(&saved).expect("freshly saved hal2 value verifies");

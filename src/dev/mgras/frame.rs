@@ -34,12 +34,45 @@ pub const DEFAULT_SIZE: (usize, usize) = (1280, 1024);
 pub const CURSOR_MAX: usize = 64;
 
 /// How a window ID's main planes display. `rgb`: the pixel is `0x00BBGGRR`;
-/// otherwise its low 12 bits index the colormap from `cmap_base`.
+/// otherwise its low `index_mask` bits index the colormap from `cmap_base`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MainMode {
     pub rgb: bool,
     pub cmap_base: u16,
+    /// Colour index planes shown: 8 for format 1 (the X server's CI8
+    /// windows draw through mask 0xFF and leave the planes above alone,
+    /// so they hold whatever an earlier window wrote), 12 otherwise.
+    pub index_mask: u16,
+    /// Pixel pairs (see `rss::Pair`) in this layout: buffer A, or B when
+    /// the window ID's BUF_SELECT bit is set.
+    pub pair: Option<rss::Pair>,
+}
+
+impl MainMode {
+    /// Decode an XMAP main mode word: format in bits 4:0 (4 and up RGB),
+    /// colormap block in 9:5.
+    pub fn of(m: u32) -> Self {
+        MainMode {
+            rgb: m & 0x1F >= 4,
+            cmap_base: (((m >> 5) & 0x1F) * 256) as u16,
+            index_mask: if m & 0x1F == 1 { 0xFF } else { 0xFFF },
+            pair: pair_format(m),
+        }
+    }
+}
+
+/// XMAP main mode formats (bits 4:0) that display pixel pairs, traced
+/// with GL's 12-bit double-buffered visuals, the kernel's swaps flipping
+/// BUF_SELECT: 5 the 4:4:4 layout (RGBA 4,4,4,4: electropaint, PP1 pixel
+/// type 0) and 7 the 5:5:5 one (RGBA 5,5,5,1: octahedra, pixel type 1).
+/// 0x15 is GL's 24-bit double-buffered visual (two pages).
+pub(super) fn pair_format(mode: u32) -> Option<rss::Pair> {
+    match mode & 0x1F {
+        5 => Some(rss::Pair::P444),
+        7 => Some(rss::Pair::P555),
+        _ => None,
+    }
 }
 
 /// How a window ID's overlay planes display: off, or a non-zero 8-bit value
@@ -100,6 +133,12 @@ impl Frame {
             dcb.vc3.main_did_runs(y, &mut runs);
             fill_did_row(&mut self.did_main[y * W..(y + 1) * W], &mut runs);
         }
+        for did in 0..32u32 {
+            let m = dcb.xmap.main_mode(did);
+            self.main_mode[did as usize] = MainMode::of(m);
+            let o = dcb.xmap.overlay_mode(did);
+            self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
+        }
         let mut row = [0u32; W];
         let mut row_b = [0u32; W];
         for y in 0..h {
@@ -108,10 +147,19 @@ impl Frame {
             rss.mem.read_row(&main, fb_y, &mut self.main[dst..dst + w]);
             if select != 0 {
                 rss.mem.read_row(&back, fb_y, &mut row_b[..w]);
-                for x in 0..w {
-                    if select >> (self.did_main[dst + x] & 31) & 1 != 0 {
-                        self.main[dst + x] = row_b[x];
-                    }
+            }
+            for x in 0..w {
+                let did = self.did_main[dst + x] & 31;
+                let b = select >> did & 1 != 0;
+                let mode = self.main_mode[did as usize];
+                if let Some(pair) = mode.pair {
+                    self.main[dst + x] = pair.unpack(self.main[dst + x], b) & 0xFF_FFFF;
+                } else if b && !mode.rgb {
+                    // Colour index: B is the word's high 12 bits
+                    // (`rss::ci_pixtype`).
+                    self.main[dst + x] = (self.main[dst + x] >> 12) & 0xFFF;
+                } else if b {
+                    self.main[dst + x] = row_b[x];
                 }
             }
             match overlay {
@@ -127,12 +175,6 @@ impl Frame {
         for y in 0..h {
             dcb.vc3.overlay_did_runs(y, &mut runs);
             fill_did_row(&mut self.did_overlay[y * W..(y + 1) * W], &mut runs);
-        }
-        for did in 0..32u32 {
-            let m = dcb.xmap.main_mode(did);
-            self.main_mode[did as usize] = MainMode { rgb: m & 0x1F >= 4, cmap_base: (((m >> 5) & 0x1F) * 256) as u16 };
-            let o = dcb.xmap.overlay_mode(did);
-            self.overlay_mode[did as usize] = OverlayMode { on: o != 0, cmap_base: (((o >> 3) & 0x1F) * 256) as u16 };
         }
         self.cmap.copy_from_slice(&dcb.cmap[0].pal);
         for (g, d) in self.gamma.iter_mut().zip(dcb.dac.gamma.iter()) {
@@ -185,7 +227,7 @@ impl Frame {
                 if m.rgb {
                     self.gamma_rgb(v, v >> 8, v >> 16)
                 } else {
-                    let c = self.cmap[(m.cmap_base as usize + (v & 0xFFF) as usize) & 0x1FFF];
+                    let c = self.cmap[(m.cmap_base as usize + (v & m.index_mask as u32) as usize) & 0x1FFF];
                     self.gamma_rgb(c >> 16, c >> 8, c)
                 }
             }

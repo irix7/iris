@@ -1,5 +1,6 @@
 //! GR2 introspection: monitor commands (`gr2 ...`, `re3 ...`) and the
-//! annotated FIFO trace (`gr2 trace <file> [hq|re3|all]`).
+//! annotated FIFO trace (`gr2 trace <file> [hq|re3|all]`), in `gputrace`
+//! builds; without the feature `tracing` is a constant false.
 //!
 //! Trace lines look like
 //!   `  12.345678 HQ  #000123 fifo[0x198 PUC_DRAWCHAR] = 0x00000008`
@@ -79,9 +80,12 @@ impl Gr2Trace {
 }
 
 impl Gr2 {
-    #[inline]
+    /// Whether a trace of `what` runs. A constant false without `gputrace`,
+    /// so every `if self.tracing(..)` on a bus or engine path compiles away,
+    /// formatting and all.
+    #[inline(always)]
     pub(super) fn tracing(&self, what: u32) -> bool {
-        self.trace_mask.load(Ordering::Relaxed) & what != 0
+        cfg!(feature = "gputrace") && self.trace_mask.load(Ordering::Relaxed) & what != 0
     }
 
     /// One CPU access outside the FIFOs (board offset, value read/written).
@@ -166,7 +170,7 @@ impl Gr2 {
                 t.line(format_args!("RE3 #{seq:06} op  COPYRECT dst=({}, {})  [GL y, bottom-up]", f(0), f(16)));
             }
             re3::RE3_OP_READ_ADVANCE => t.line(format_args!("RE3 #{seq:06} op  READBUF advance")),
-            re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", 3 => "CI8", 4 => "RGB8", _ => "native" })),
+            re3::RE3_OP_PIXFMT => t.line(format_args!("RE3 #{seq:06} op  PIXFMT {}", match val { 1 => "RGB12", 2 => "CI12", 3 => "CI8", 4 => "RGB8", 5 => "RGB4", _ => "native" })),
             re3::RE3_OP_ZCTL => t.line(format_args!("RE3 #{seq:06} op  ZCTL test={} func={} zmask={:#08x}", val & 1, (val >> 1) & 7, (val >> 8) & 0xff_ffff)),
             re3::RE3_OP_STENCIL => t.line(format_args!("RE3 #{seq:06} op  STENCIL on={} func={} ref={} mask={:#x} wmask={:#x} ops fail={} zfail={} zpass={}",
                 val & 1, (val >> 1) & 7, (val >> 4) & 0xff, (val >> 12) & 0xff, (val >> 20) & 0xff, (val >> 28) & 0xf, (val >> 32) & 0xf, (val >> 36) & 0xf)),
@@ -192,6 +196,50 @@ impl Gr2 {
     }
 
     // ── monitor commands ─────────────────────────────────────────────────────
+
+    /// `gr2 jit [on|off|sync|list]`: the span JIT's mode and shaders.
+    #[cfg(feature = "gr2-jit")]
+    fn cmd_jit(&self, args: &[&str], w: &mut dyn Write) -> std::io::Result<()> {
+        use super::re3_jit::{self, SpanKey, MODE_ASYNC, MODE_OFF, MODE_SYNC};
+        let mode = match args {
+            ["on"] | ["async"] => Some(MODE_ASYNC),
+            ["off"] => Some(MODE_OFF),
+            ["sync"] => Some(MODE_SYNC),
+            ["list"] => {
+                for (k, bytes) in re3_jit::store().compiled() {
+                    writeln!(w, "{k:#018x} {bytes:6}B  {}", SpanKey::unpack(k))?;
+                }
+                return Ok(());
+            }
+            [] => None,
+            _ => return writeln!(w, "usage: gr2 jit [on|off|sync|list]"),
+        };
+        if mode.is_some_and(|m| m != MODE_OFF) && re3_jit::forbidden() {
+            return writeln!(w, "gr2 jit: IRIS_NO_JIT is set (this host does not allow JIT code)");
+        }
+        if let Some(m) = mode {
+            // The RE3 thread reads the mode at each span; either engine
+            // draws the same pixels, so no handshake is needed.
+            // SAFETY: an aligned u32 store into the RE3 state.
+            unsafe { std::ptr::addr_of_mut!((*self.re3.get()).jit.mode).write_volatile(m) };
+        }
+        writeln!(w, "{}", self.jit_summary())
+    }
+
+    #[cfg(feature = "gr2-jit")]
+    fn jit_summary(&self) -> String {
+        use super::re3_jit::{self, MODE_OFF, MODE_SYNC};
+        // SAFETY: read-only peek (may tear).
+        let j = unsafe { &*self.re3.get() }.jit;
+        let name = match j.mode {
+            MODE_OFF => "off",
+            MODE_SYNC => "sync",
+            _ => "on",
+        };
+        let (compiled, queued, failed, bytes) = re3_jit::store().summary();
+        format!("span JIT {name}: {} spans by shader, {} while compiling; {compiled} shaders ({bytes} bytes), {queued} queued, {failed} failed",
+            j.hits, j.misses)
+    }
 
     pub(super) fn cmd_gr2(&self, args: &[&str], w: &mut dyn Write) -> std::io::Result<()> {
         let r = self.regs();
@@ -298,6 +346,8 @@ impl Gr2 {
                     re3::FB_H - 1 - y, p >> 28, (p >> 24) & 0xf, p & 0xffffff, xm.mode[did])?;
             }
             "trace" => return self.cmd_trace(&args[1..], w),
+            #[cfg(feature = "gr2-jit")]
+            "jit" => return self.cmd_jit(&args[1..], w),
             "fbdump" => {
                 let dir = std::path::PathBuf::from(args.get(1).copied().unwrap_or("gr2dump"));
                 match self.dump_framebuffer(&dir) {
@@ -307,6 +357,8 @@ impl Gr2 {
             }
             _ => {
                 writeln!(w, "gr2 [status]                   board summary")?;
+                #[cfg(feature = "gr2-jit")]
+                writeln!(w, "gr2 jit [on|off|sync|list]     RE3 span JIT mode, counts, shaders")?;
                 writeln!(w, "gr2 hq                         HQ2 registers + interpreter state")?;
                 writeln!(w, "gr2 ge <n> [start] [count]     GE7 window words")?;
                 writeln!(w, "gr2 shram [start] [count]      shared RAM words")?;
@@ -376,6 +428,8 @@ impl Gr2 {
             r.vc1.sysctl, r.vc1.reg16(vc1::VID_EP), r.vc1.reg16(vc1::DID_EP), r.xmap[0].mode[0])?;
         writeln!(w, "  dac readmask r/g/b = {:#04x}/{:#04x}/{:#04x}",
             r.dac[0].readmask, r.dac[1].readmask, r.dac[2].readmask)?;
+        #[cfg(feature = "gr2-jit")]
+        writeln!(w, "  {}", self.jit_summary())?;
         if r.pll_programs > 0 {
             writeln!(w, "  clock: {} (programmed {} times)", pll_describe(&r.pll_last), r.pll_programs)?;
         }
@@ -405,6 +459,9 @@ impl Gr2 {
                 } else {
                     writeln!(w, "trace not active")?;
                 }
+            }
+            Some(_) if !cfg!(feature = "gputrace") => {
+                writeln!(w, "gr2 trace needs a build with the gputrace feature (on with developer)")?;
             }
             Some(path) => {
                 // Categories: hq, re3, cpu, or combinations like hq,cpu; default all.

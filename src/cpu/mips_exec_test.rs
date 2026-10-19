@@ -1990,6 +1990,30 @@ mod tests {
                    "EPC must point at the branch, i.e. fault_pc - 4");
     }
 
+    /// A Cache Error goes to the uncached vector (0xA000_0100, or 0xBFC0_0300
+    /// under BEV) with ERL and ErrorEPC, and changes nothing else: Cause, EPC
+    /// and EXL keep whatever they held (R4000 UM ch. 5, VR5000 UM 7.3.9).
+    #[test]
+    fn test_cache_error_takes_the_uncached_vector_with_erl() {
+        use crate::cpu::mips_core::{MipsCore, deliver_exception_at, STATUS_BEV, STATUS_ERL, STATUS_EXL};
+        use crate::cpu::mips_exec::EXEC_CACHE_ERR;
+
+        for (bev, vector) in [(false, 0xFFFF_FFFF_A000_0100u64), (true, 0xFFFF_FFFF_BFC0_0300)] {
+            let mut core = MipsCore::new();
+            core.cp0_status = if bev { STATUS_BEV } else { 0 };
+            core.cp0_cause = 0x1234;
+            core.cp0_epc = 0x5678;
+            deliver_exception_at(&mut core, EXEC_CACHE_ERR, 0xFFFF_FFFF_8800_0010, true);
+
+            assert_eq!(core.pc, vector, "BEV={bev}");
+            assert_eq!(core.cp0_errorepc, 0xFFFF_FFFF_8800_000C, "ErrorEPC: the branch, for a delay slot");
+            assert_ne!(core.cp0_status & STATUS_ERL, 0, "ERL set");
+            assert_eq!(core.cp0_status & STATUS_EXL, 0, "EXL untouched");
+            assert_eq!((core.cp0_cause, core.cp0_epc), (0x1234, 0x5678), "Cause/EPC untouched");
+            assert!(!core.in_delay_slot);
+        }
+    }
+
     /// CP0 instructions must be refused in user mode unless Status.CU0 is set.
     ///
     /// `exec_cop0` is the single dispatch point for MFC0/MTC0/TLB*/ERET/WAIT, and
@@ -6183,5 +6207,79 @@ mod tests {
         let err = desc.verify(&toml::Value::Table(t)).unwrap_err();
         assert!(err.contains("gpr"), "names the field: {err}");
         assert!(err.contains("missing") || err.contains("unknown"), "{err}");
+    }
+
+    // ── Monitor command semantics ────────────────────────────────────────
+
+    /// A writer the tests can read back.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().extend_from_slice(b); Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// Run a monitor command, returning (result, output).
+    fn mon(cpu: &crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache>, line: &str) -> (Result<(), String>, String) {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let cap = Capture::default();
+        let r = crate::traits::Device::execute_command(cpu, words[0], &words[1..], Box::new(cap.clone()));
+        let out = String::from_utf8_lossy(&cap.0.lock()).into_owned();
+        (r, out)
+    }
+
+    /// A CPU executing NOPs (zeroed mock memory) from 0x80000000 upward.
+    fn nop_cpu() -> crate::cpu::mips_exec::MipsCpu<PassthroughTlb, PassthroughCache> {
+        let (mut exec, _mem) = create_executor();
+        exec.core.pc = 0xffff_ffff_8000_0000;
+        crate::cpu::mips_exec::MipsCpu::new(exec)
+    }
+
+    #[test]
+    fn breakpoints_can_be_set_while_running_and_report_their_hit() {
+        let cpu = nop_cpu();
+        crate::traits::Device::start(&cpu);
+        assert!(cpu.is_running());
+        // Adding a breakpoint pauses the core and resumes it.
+        let (r, out) = mon(&cpu, "bp add 0x80040000 pc if a0 == 0");
+        assert!(r.is_ok(), "{:?}", r);
+        assert!(out.contains("Breakpoint added: 1:") && out.contains("if a0 == 0"), "{}", out);
+        // Run control is refused while running, with one clear message.
+        let (r, _) = mon(&cpu, "step");
+        assert!(r.unwrap_err().contains("CPU is running"));
+        // Status never blocks.
+        let (r, out) = mon(&cpu, "status");
+        assert!(r.is_ok());
+        assert!(out.starts_with("running") || out.starts_with("stopped"), "{}", out);
+        // The NOP sled reaches the breakpoint; wait says which one stopped it.
+        let (r, out) = mon(&cpu, "wait 10000");
+        assert!(r.is_ok());
+        assert!(out.contains("stopped pc=ffffffff80040000"), "{}", out);
+        assert!(out.contains("breakpoint 1:") && out.contains("hit 1 time"), "{}", out);
+        assert!(!cpu.is_running());
+        let (_, out) = mon(&cpu, "bp list");
+        assert!(out.contains("[hits 1]"), "{}", out);
+    }
+
+    #[test]
+    fn bad_conditions_are_refused_and_lists_round_trip() {
+        let cpu = nop_cpu();
+        let (r, _) = mon(&cpu, "bp add 0x80001000 pc if c0_badaddr == 0");
+        assert!(r.unwrap_err().contains("bad condition"), "a typo must not make a silent breakpoint");
+        assert!(mon(&cpu, "bp add 0x80001000 pc if (c0_badvaddr & 0xc0000000) == 0x80000000").0.is_ok());
+        assert!(mon(&cpu, "bp add 0x80002000 write").0.is_ok());
+        assert!(mon(&cpu, "bp disable 2").0.is_ok());
+        assert!(mon(&cpu, "bp ignore 1 3").0.is_ok());
+        let path = std::env::temp_dir().join(format!("iris-bp-{}.txt", std::process::id()));
+        let p = path.to_str().unwrap();
+        assert!(mon(&cpu, &format!("bp save {}", p)).0.is_ok());
+        assert!(mon(&cpu, "bp clear").0.is_ok());
+        assert!(!mon(&cpu, "bp list").1.contains("1:"));
+        let (r, out) = mon(&cpu, &format!("bp load {}", p));
+        assert!(r.is_ok(), "{:?} {}", r, out);
+        let (_, list) = mon(&cpu, "bp list");
+        assert!(list.contains("if (c0_badvaddr & 0xc0000000) == 0x80000000"), "{}", list);
+        assert!(list.contains("write disabled"), "{}", list);
+        let _ = std::fs::remove_file(&path);
     }
 }

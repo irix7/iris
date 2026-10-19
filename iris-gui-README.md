@@ -28,7 +28,7 @@ cargo run -p iris-gui --release
 
 The first build compiles libchdman-rs, the camera backends (nokhwa / V4L),
 and Cranelift. CHD and camera support are unconditional in the core; iris-gui
-also enables `rex-jit`. Device use is configured at runtime.
+also enables `gpujit` (the REX3 and IMPACT graphics JITs). Device use is configured at runtime.
 
 A debug build (`cargo run -p iris-gui` without `--release`) is fine for
 iterating on the GUI itself but uses an unoptimized iris core, which means
@@ -40,9 +40,10 @@ emulation will be noticeably slow.
 |---|---|
 | `pcap` | PCAP bridged networking; the Networking tab lists host interfaces. Needs libpcap / a WinPcap-compatible SDK |
 | `hostcall` | Host services for IRIX programs over private syscalls 3000-3009. No per-machine setting — the Debug tab just reports it's built in |
-| `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) only for now — builds elsewhere but registers no backend |
+| `hostgl` | Host OpenGL for IRIX programs (implies `hostcall`); IRIX's replacement libGL replays its GL calls on the host GPU. macOS (CGL) and Linux (EGL; needs libGL to build, libEGL and Mesa's EGL/DRI drivers at run time; see CHANGELOG) — builds elsewhere but registers no backend |
 | `premiere` | `iris/lightning` + `iris/idle-pause` for maximum in-process speed |
-| `bundled` | Distributed build: hides the iris.toml import/export items. Set by the Release workflow |
+| `perfetto` | Perfetto trace recording; the Debug tab gains Start/Stop for a `.pftrace` (see `docs/perfetto.md`) |
+| `bundled` | Distributed build: hides source-checkout tools such as premiere preparation. Machine TOML storage is shared by source, Release, and App Store builds. Set by the Release workflow |
 | `appstore` | Mac App Store build: implies `bundled`, hides the CI tab, enables security-scoped bookmarks and folder grants |
 
 DaynaPort, Ultra64, IP28/R10000, and the graphics board models are built in.
@@ -81,18 +82,19 @@ cargo tree -p iris | grep -E 'egui|eframe|rfd'   # should print nothing
 
 ## 2. First run
 
-On a cold start (no `gui.json`), the **New machine** dialog opens
+When no machine TOML files exist, the **New machine** dialog opens
 automatically. You'll be asked for:
 
-- **Name** — used for the machine entry in `gui.json`. Conflicts get a
-  numeric suffix (`indy`, `indy-2`, …).
+- **Name** — names the machine folder and its TOML file. Conflicts get a
+  numeric suffix (`indy`, `indy-2`, …). Names cannot contain path separators
+  or reserved filename characters.
 - **Machine model** — Indy (IP24), Indigo2 (IP22), or Indigo2 IMPACT (IP28).
   **Processor** offers R4400, R5000, and R10000. Selecting IP28 defaults to
   R10000 and IMPACT Solid graphics.
 - **PROM image** — defaults to "Use embedded PROM (bundled with iris)",
   which lets iris fall back to its built-in PROM blob with no disk file
   needed for IP24, IP22, or IP28. Each profile selects its own embedded image.
-- **NVRAM file** — defaults to a stable per-user path (see Storage) and is
+- **NVRAM file** — defaults to `nvram.bin` in the machine folder (see Storage) and is
   seeded with a default NVRAM on first use. Indigo2 profiles also have a
   **NVRAM EEPROM file**, which stores their PROM environment and MAC.
 - **Total RAM** — preset totals. Tick **Advanced: configure individual banks**
@@ -102,7 +104,7 @@ automatically. You'll be asked for:
   image afterwards from the SCSI menu (**Create blank HDD image…**).
 - **CD-ROM (SCSI #4)** — optional install media.
 
-Hit **Create**. The machine is saved to `gui.json` and becomes active. Start it
+Click **Create**. The machine is saved to `machines/<name>/<name>.toml` and becomes active. Start it
 from the **Machine** menu.
 
 If the NVRAM or motherboard EEPROM has no Ethernet MAC, iris-gui writes one
@@ -132,7 +134,7 @@ light for the internal network).
 
 | Menu | Contents |
 | --- | --- |
-| **File** | New machine… / Switch to machine / Import iris.toml… / Export current to iris.toml… / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
+| **File** | New machine… / Switch to machine / Rename current… / Delete current machine / Prepare for premiere… (source builds) / Disk folder access (App Store) / Quit |
 | **Machine** | Start / Stop / Reset / Reset NVRAM (fresh PRAM) / Processor (R4400, R5000, or R10000, applies at next Start) / Save and Restore state / Screenshot… / Serial console… |
 | **Memory** | Total presets, plus per-bank submenus |
 | **SCSI** | Per-ID submenu (SCSI #1 … #7) with context-appropriate actions, plus per-disk **Commit changes to disk** / **Discard changes** for COW overlays and CHD diffs while stopped |
@@ -153,13 +155,13 @@ IRIX with a media-change Unit Attention, no restart needed.
 
 | Tab | What's there |
 | --- | --- |
-| **General** | Platform, CPU, CP0 Count clock, persistent JIT code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log |
+| **General** | Platform, CPU, cache model (auto/full/shadow), CP0 Count clock, JIT compile threads and persistent code cache (jitv2 builds), RTC offset, graphics board (Newport, GR2 XZ/Extreme, IMPACT Solid/High/Maximum), Newport heads/resolution, PROM, NVRAM, motherboard EEPROM, ttyd1 serial log, monitor and serial ports |
 | **Disks** | SCSI devices: image paths, CD-ROM discs, COW overlay, scratch volume, DaynaPort, second controller (IP22) |
-| **Networking** | NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), NFS share, PCAP interface, **Check networking** diagnostics |
+| **Networking** | Ethernet address (`eaddr`, written to NVRAM on Indy or the NVRAM EEPROM on Indigo2/IP28 while stopped), NAT subnet (applied live, with conflict checks against host interfaces), port forwards (added/removed live), TFTP boot folder (NAT mode), NFS share, PCAP interface, **Check networking** diagnostics |
 | **Memory** | RAM banks and the resulting total |
 | **Display** | Display resolution, window scale, headless, audio on/off and buffering, keyboard shape (ANSI/ISO/JIS) |
 | **Video-In** | VINO source: **off** (default), **test_pattern**, **camera** (with a Test Camera preview), **black**; standard; camera index |
-| **Debug** | Build features, GDB stub port, capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
+| **Debug** | Build features (including the REX3, GR2 and IMPACT graphics JITs and jitv2), GDB stub port, Perfetto trace Start/Stop (`perfetto` builds), capture renderer, idle park, devlog spec, thread affinity. Hidden in lightning builds |
 | **CI / Automation** | CI socket, `--ci-display`, serial transcript, SCSI interrupt deferral. Hidden in App Store builds |
 | **Benchmark** | The bare-metal benchmark suite, run in-process on a headless machine (see `bench/README.md`) |
 
@@ -195,58 +197,120 @@ PCAP-mode NFS IP).
 
 ### Where things live
 
-- `<config dir>/iris/gui.json` — **the system of record.** Contains all saved
-  machines, the active machine pointer, UI scale, VM screen scale, and
-  fullscreen pref. `<config dir>` is `dirs::config_dir()`: `~/.config` on Linux,
-  `~/Library/Application Support` on macOS, `%APPDATA%` on Windows.
-- `<config dir>/iris/nvram.bin` — the default NVRAM path. It is absolute on
-  purpose, so the NVRAM is the same however the app was launched; older relative
-  `nvram.bin` entries are migrated.
-- `<config dir>/iris/nveeprom.bin` — the default NVRAM EEPROM path (Indigo2/IP28's
-  motherboard EEPROM, where `eaddr` and PROM env actually live on those profiles —
-  Indy has no such chip). Same absolute-path and migration treatment as `nvram.bin`
-  above. Editable on the General tab, right below NVRAM file.
-- `iris.toml` — the **standalone iris CLI's** config format. iris-gui
-  treats it as *import/export only* via the File menu (hidden in `bundled`
-  builds), so a machine configured in the GUI can still be booted with
-  `cargo run -- --config exported.toml`.
+The storage root is `<config dir>/iris`: `~/Library/Application Support/iris`
+on macOS, `$XDG_CONFIG_HOME/iris` (default `~/.config/iris`) on Linux, including
+AppImage builds, and `%APPDATA%/iris` on Windows. Mac App Store builds use
+Foundation's container home, so the root is inside
+`~/Library/Containers/<bundle id>/Data/Library/Application Support/iris`.
+
+```text
+iris/
+├── gui.json
+└── machines/
+    ├── indy/
+    │   ├── indy.toml
+    │   ├── nvram.bin
+    │   ├── nveeprom.bin
+    │   └── disks/
+    │       └── scsi1.raw
+    └── indigo2/
+        ├── indigo2.toml
+        └── disks/
+```
+
+`gui.json` holds GUI preferences and the active machine name. Each machine's
+TOML file is its configuration source, using the same `MachineConfig` schema
+as the standalone `iris` CLI. At launch, the GUI lists
+`machines/<name>/<name>.toml` and selects the last opened machine. If that
+machine is unavailable, it selects the first available machine or opens
+**New machine** when the list is empty. Invalid TOML files produce visible
+errors and remain untouched.
+
+The selected machine folder is the emulator's working directory. Config paths
+inside that folder stay relative to it, including files selected with **Browse**:
+
+```toml
+prom = "(embedded)"
+nvram = "nvram.bin"
+nveeprom = "nveeprom.bin"
+
+[scsi.1]
+path = "disks/scsi1.raw"
+```
+
+New disk images default to `disks/scsiN.raw`. External images stay in place;
+the TOML keeps them as absolute paths (`/Volumes/Media/root.chd`), exactly as
+selected or typed. A hand-written relative path such as `../../media/root.chd`
+is also preserved as written.
+The same resolution applies to disc changers, NFS shares, TFTP folders, serial
+logs, ELF binaries, test dumps, filesystem CI sockets, and JIT cache folders.
+TCP CI addresses and network interface names retain their original spelling.
+
+NVRAM and motherboard EEPROM default to separate files in each machine folder.
+App Store CHD diffs use that machine's `chd-diffs/` folder. Security-scoped
+bookmarks remain in `gui.json` and use resolved absolute paths, including
+external resources reached through `..`.
+
+To run the same machine with the CLI, change to its folder and pass its TOML:
+
+```sh
+cd "$HOME/Library/Application Support/iris/machines/indy"
+/path/to/iris --config indy.toml
+```
 
 ### `gui.json` shape
 
 ```json
 {
-  "ui_scale": 1.15,
-  "fullscreen": false,
+  "ui_scale": 1.25,
+  "vm_scale": 0.75,
+  "language": "",
   "active_machine": "indy",
-  "machines": {
-    "indy":     { "prom": "(embedded)", "nvram": "/home/me/.config/iris/nvram.bin", ... },
-    "irix-65":  { ... }
-  },
-  "recent_configs": [...],
-  "last_config": null
+  "recent_configs": [],
+  "last_config": null,
+  "bookmarks": {},
+  "disk_folders": []
 }
 ```
 
-`MachineConfig` (defined in `src/config.rs`) is serde-serialized directly, so the
-schema follows the canonical iris config. Existing `gui.json` files from earlier
-iris-gui builds upgrade automatically (missing fields default).
+`language` is a folder name under `iris-gui/locales` (View → Language);
+empty follows the system language.
 
-### Autosave
+The legacy `recent_configs` and `last_config` keys remain compatible with
+older preferences. Machine configurations are never serialized into this JSON.
+The File menu has no TOML import or export actions: place a machine TOML in its
+matching folder instead. **Prepare for premiere** uses the existing machine
+TOML; it no longer creates a separate exported config.
 
-Every form field, dialog result, and menu action that mutates the config
-calls `App::mark_dirty()`. Each frame, `App::maybe_autosave()` flushes after
-**~600 ms of inactivity** — debouncing keystrokes without leaving you in a
-"did it save?" state.
+### Autosave and machine management
 
-Hard flushes also occur before **Start**, on **Quit**, on **Switch to machine**,
-and on **Import iris.toml…**.
+Config edits save to the active TOML after **~600 ms of inactivity**. Hard
+flushes also occur before **Start**, **Quit**, **Switch to machine**, and
+**Rename current**. Preference saves do not rewrite machine TOMLs. Selecting
+or starting a machine rereads its file, so external edits take effect too.
+
+Switching, creating, renaming, and deleting machines require the emulator to
+be stopped and its queued file operations to finish. Renaming moves the
+machine folder and renames its TOML together, retaining its disks and
+battery-backed state. Deleting removes the TOML registration and retains the
+folder's disk and NVRAM files. Retained folders reserve their names to prevent
+accidental reuse.
 
 ### Migration
 
-If you had an older iris-gui that pointed `last_config` at an
-`iris.toml`, the first launch of the new build will import that TOML as
-a named machine (using the file stem), clear the legacy pointer, and
-adopt it as `active_machine`. No manual steps required.
+On the first launch with machines embedded in `gui.json`, the GUI keeps
+`gui.json.pre-toml.bak`, writes each machine to its TOML folder, and removes
+only the machine payloads from the preferences. It copies battery-backed
+state into each machine's folder, preserving PROM settings and MAC addresses.
+Existing disks stay in place and their paths become relative. App Store CHD
+diffs are copied from the shared redirect into the machine's redirect, and
+the original files remain available for rollback. Names that cannot be used
+as folder names receive deterministic safe names.
+
+A legacy `last_config` pointer also migrates once into a machine folder; its
+source TOML stays untouched. If migration fails, the original JSON and its
+backup remain intact, and preference writes stop until the error is resolved.
+
 
 ---
 
@@ -339,7 +403,7 @@ iris/
 ├── Cargo.toml         [workspace] iris, iris-gui, iris-hostcall; iris-hostgl excluded
 ├── src/               iris library + CLI
 └── iris-gui/
-    ├── Cargo.toml     depends on iris with rex-jit; CHD/camera built into core
+    ├── Cargo.toml     depends on iris with gpujit; CHD/camera built into core
     ├── build.rs       APP_VERSION (from RELEASE_VERSION or the crate version)
     ├── assets/        icons, default NVRAM
     └── src/
@@ -351,7 +415,8 @@ iris/
         ├── bench_ui.rs        Benchmark tab
         ├── scsi_menu.rs       SCSI menu (per-ID actions, disc pickers)
         ├── safe_stop.rs       Stop-safety evaluator
-        ├── settings.rs        GuiSettings: gui.json, NVRAM seeding and MAC helpers
+        ├── settings.rs        GUI preferences, migration, NVRAM seeding and MAC helpers
+        ├── machines.rs        TOML folders, relative paths, discovery, and rename
         ├── ram.rs             RAM presets shared by menus and tabs
         ├── netplan.rs         subnet math for the Networking tab
         ├── netfix.rs          "check / fix guest networking" logic
@@ -424,6 +489,11 @@ a build feature — read `MachineConfig::machine.cpu`.
 
 ### Conventions
 
+- Every user-visible string is a Fluent message in `iris-gui/locales/<lang>/*.ftl`,
+  looked up with `t!("id")` (`src/i18n.rs`). Optional captions and tooltips go
+  through `subtitle()` and `.tip()`, which draw nothing when the catalog value
+  is empty. `locales/README.md` covers the writing style and adding a language;
+  `cargo test -p iris-gui i18n` checks ids and arguments against the code.
 - `Result<T, String>` for fallible APIs (matches in-tree iris style; no
   anyhow / thiserror).
 - `log` macros for diagnostics; the existing iris `devlog` module

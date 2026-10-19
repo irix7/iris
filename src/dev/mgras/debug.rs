@@ -13,7 +13,8 @@
 //! with repeats of one register and runs through a memory collapsed. Written
 //! from the CPU, HQ3 and RSS threads, so tracing slows the pipeline.
 //!
-//! `IRIS_MGRAS_TRACE=<file>` starts a full trace at power-on.
+//! `IRIS_MGRAS_TRACE=<file>` starts a full trace at power-on. All of it needs
+//! the `gputrace` feature; without it `tracing` is a constant false.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -23,7 +24,7 @@ use std::time::Instant;
 
 use super::hq3::host;
 use super::rss::{self, Rss, REG_NAMES};
-use super::{dcb, disp, tag, Mgras, MGRAS_SLOT_GFX_BASE};
+use super::{dcb, disp, tag, te1, Mgras, MGRAS_SLOT_GFX_BASE};
 
 pub const TRACE_HQ: u32 = 1;
 pub const TRACE_RSS: u32 = 2;
@@ -88,9 +89,12 @@ impl MgrasTrace {
 }
 
 impl Mgras {
-    #[inline]
+    /// Whether a trace of `what` runs. A constant false without `gputrace`,
+    /// so every `if self.tracing(..)` on a bus or engine path compiles away,
+    /// formatting and all.
+    #[inline(always)]
     pub(super) fn tracing(&self, what: u32) -> bool {
-        self.trace_mask.load(Ordering::Relaxed) & what != 0
+        cfg!(feature = "gputrace") && self.trace_mask.load(Ordering::Relaxed) & what != 0
     }
 
     /// One CPU access outside the FIFOs (board offset, value read/written).
@@ -174,6 +178,9 @@ impl Mgras {
 
     /// Start the annotated trace into `path` for the categories in `mask`.
     pub(super) fn start_trace(&self, path: &str, mask: u32) -> std::io::Result<()> {
+        if !cfg!(feature = "gputrace") {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "needs a build with the gputrace feature (on with developer)"));
+        }
         let f = File::create(path)?;
         let mut t = self.trace.lock();
         t.out = Some(BufWriter::with_capacity(1 << 20, f));
@@ -210,6 +217,17 @@ impl Mgras {
         };
         match args {
             [] | ["status"] => return e(self.mgras_status(w)),
+            ["probe", "off"] => {
+                self.set_probe(None);
+                return e(writeln!(w, "readback probes cleared"));
+            }
+            ["probe", _, _, _] => {
+                let (lo, hi, v) = (num(1, 0), num(2, 0), num(3, 0));
+                if !self.set_probe(Some((lo, hi, v))) {
+                    return Err("mgras probe: all 8 slots taken (mgras probe off)".into());
+                }
+                return e(writeln!(w, "GE readbacks {lo:#x}..={hi:#x} answer {v:#x}"));
+            }
             ["rec", "off"] => {
                 let what = self.submit.lock().as_ref().map(|r| { let r = r.lock(); format!("{} ({} records)", r.path, r.records) });
                 self.set_recording(None).map_err(|e| format!("mgras rec: {e}"))?;
@@ -235,7 +253,7 @@ impl Mgras {
             }
             ["trace", path, rest @ ..] => {
                 let mask = trace_mask(rest.first().copied().unwrap_or("all"));
-                self.start_trace(path, mask).map_err(|e| format!("mgras trace: cannot create {path}: {e}"))?;
+                self.start_trace(path, mask).map_err(|e| format!("mgras trace {path}: {e}"))?;
                 return e(writeln!(w, "tracing to {path} (mask {mask:#x})"));
             }
             ["dump", path] => {
@@ -261,6 +279,18 @@ impl Mgras {
             ["stats"] => return e(self.stats(w)),
             #[cfg(feature = "gr4-jit")]
             ["jit", rest @ ..] => return self.cmd_jit(rest, w),
+            ["tram", page, rest @ ..] => {
+                // A row of 32-bit texel cells (8-bit components) of a
+                // level `wd` wide at `page`: nibbles in TRAM order.
+                let num = |s: &str| s.parse::<usize>().map_err(|_| format!("mgras tram: bad number {s}"));
+                let page = num(page)?;
+                let row = rest.first().map(|s| num(s)).transpose()?.unwrap_or(0);
+                let wd = rest.get(1).map(|s| num(s)).transpose()?.unwrap_or(32);
+                let rss = unsafe { &*self.rss.get() };
+                let base = page * te1::PAGE_NIBBLES + row * wd * 8;
+                let cells: Vec<String> = (0..wd).map(|s| rss.te.nibbles_hex(base + s * 8, 8)).collect();
+                return e(writeln!(w, "page {page} row {row}: {}", cells.join(" ")));
+            }
             _ => {}
         }
         let f = self.front();
@@ -281,7 +311,7 @@ impl Mgras {
                 let rif: Vec<String> = eng.raster_if_regs.iter().enumerate().filter(|(_, v)| **v != 0).map(|(i, v)| format!("{i:#x}={v:#x}")).collect();
                 e(writeln!(w, "  raster interface: {}  formatter {:#x}", rif.join(" "), eng.formatter))?;
                 e(writeln!(w, "  fifo: hq {} (busy {})  rss {} (busy {})  idle={}", self.hq_fifo.len(),
-                    self.hq_busy.load(Ordering::Relaxed), self.rss_fifo.len(), self.rss_busy.load(Ordering::Relaxed), self.idle()))
+                    self.hq_busy.load(Ordering::Relaxed), self.rss_fifo.len(), self.rss_busy_text(), self.idle()))
             }
             "gl" => {
                 drop(f);
@@ -384,7 +414,7 @@ impl Mgras {
         let num = |i: usize, d: u32| args.get(i).and_then(|s| s.parse::<u32>().ok()).unwrap_or(d);
         match args.first().copied().unwrap_or("regs") {
             "regs" => {
-                e(writeln!(w, "RSS: fifo {} pending, busy={}", self.rss_fifo.len(), self.rss_busy.load(Ordering::Relaxed)))?;
+                e(writeln!(w, "RSS: fifo {} pending, busy={}", self.rss_fifo.len(), self.rss_busy_text()))?;
                 for r in 0..0x400u32 {
                     let v = rss.reg(r);
                     let name = REG_NAMES.get(r as usize).copied().unwrap_or("");
@@ -411,6 +441,17 @@ impl Mgras {
         }
     }
 
+    /// The engines' busy flags, and with two engines each one's backlog.
+    fn rss_busy_text(&self) -> String {
+        let b: Vec<String> = (0..self.nrss)
+            .map(|i| {
+                let busy = self.rss_busy[i].load(Ordering::Relaxed);
+                if self.nrss == 1 { busy.to_string() } else { format!("RE{i} {busy} ({} queued)", self.rss_fifo.len_at(i)) }
+            })
+            .collect();
+        b.join(", ")
+    }
+
     fn mgras_status(&self, w: &mut dyn Write) -> std::io::Result<()> {
         // SAFETY: read-only peek at the RSS (may tear while drawing).
         let rss = unsafe { &*self.rss.get() };
@@ -425,8 +466,12 @@ impl Mgras {
             None => writeln!(w, "  cursor hidden")?,
         }
         writeln!(w, "  fill modes seen: {:x?}", rss.fillmodes_seen())?;
-        let mut hist: HashMap<u32, usize> = HashMap::new();
         let (main, _) = super::frame::scanout_buffers(rss, &f.dcb);
+        let pal = &f.dcb.cmap[0].pal;
+        let blocks: Vec<usize> = (0..pal.len() / 256).filter(|k| pal[k * 256..(k + 1) * 256].iter().any(|c| *c != 0)).collect();
+        // Not under the front lock: the scan takes a while.
+        drop(f);
+        let mut hist: HashMap<u32, usize> = HashMap::new();
         for y in 0..1024 {
             for x in 0..1280 {
                 *hist.entry(rss.mem.get(&main, x, y) as u32).or_default() += 1;
@@ -435,10 +480,7 @@ impl Mgras {
         let mut top: Vec<_> = hist.into_iter().collect();
         top.sort_by(|a, b| b.1.cmp(&a.1));
         writeln!(w, "  main buffer (page {}) values over 1280x1024 (value, pixels): {:x?}", main.ptr, &top[..top.len().min(8)])?;
-        let pal = &f.dcb.cmap[0].pal;
-        let blocks: Vec<usize> = (0..pal.len() / 256).filter(|k| pal[k * 256..(k + 1) * 256].iter().any(|c| *c != 0)).collect();
         writeln!(w, "  colormap blocks in use: {blocks:?}")?;
-        drop(f);
         if let Some(r) = self.submit.lock().as_ref() {
             let r = r.lock();
             writeln!(w, "  recording: {} ({} records)", r.path, r.records)?;
@@ -469,8 +511,14 @@ impl Mgras {
         writeln!(w, "RSS: primitives by IR opcode {}", prims.join(" "))?;
         let blocks: Vec<String> = r.blocks.iter().enumerate().filter(|(_, n)| **n != 0).map(|(k, n)| format!("{k}:{n}")).collect();
         writeln!(w, "  blocks by type {}  fast fills {}", blocks.join(" "), r.fast_fills)?;
-        writeln!(w, "  stipple chunks {}  PIO dw written {} read {}  DMA lines in {}",
-            r.stipple_chunks, r.pio_write_dw, r.pio_read_dw, r.dma_lines_in)?;
+        writeln!(w, "  stipple chunks {}  PIO dw written {} read {}  DMA lines in {} (dropped, no write armed: {})",
+            r.stipple_chunks, r.pio_write_dw, r.pio_read_dw, r.dma_lines_in, r.dma_lines_dropped)?;
+        for id in 0..self.nrss {
+            // SAFETY: as above.
+            let r = unsafe { &*self.engine_cell(id).get() }.stats;
+            writeln!(w, "  engine {id}: DMA lines in {}, to the texture engine {}, by the JIT {}, dropped {}; interpreted pixels stored {} clipped {}",
+                r.dma_lines_in, r.dma_lines_te, r.dma_lines_jit, r.dma_lines_dropped, r.dma_px_put, r.dma_px_clipped)?;
+        }
         #[cfg(feature = "gr4-jit")]
         {
             // SAFETY: as above.
@@ -500,12 +548,17 @@ impl Mgras {
             [] => None,
             _ => return Err("usage: mgras jit [on|off|sync|list]".into()),
         };
+        if mode.is_some_and(|m| m != MODE_OFF) && rss_jit::forbidden() {
+            return Err("mgras jit: IRIS_NO_JIT is set (this host does not allow JIT code)".into());
+        }
         if let Some(m) = mode {
             // The RSS thread reads the mode: change it with the board idle.
             let _sub = self.submit.lock();
             self.wait_idle();
             // SAFETY: the board is idle and `submit` keeps it so.
-            unsafe { &mut *self.rss.get() }.jit.mode = m;
+            for id in 0..super::MAX_ENGINES {
+                unsafe { &mut *self.engine_cell(id).get() }.jit.mode = m;
+            }
         }
         // SAFETY: read-only peek (may tear).
         let j = unsafe { &*self.rss.get() }.jit;
@@ -575,6 +628,7 @@ fn help(w: &mut dyn Write) -> std::io::Result<()> {
     for l in [
         "mgras [status]                    board summary",
         "mgras hq                          HQ3 flags, enables, engine, DMA/RE-interface registers, FIFOs",
+        "mgras probe LO HI VALUE | off     GE readbacks at LO..=HI answer VALUE (mapping libGLcore's decoding)",
         "mgras ge [n] [start] [count]      GE11 microcode lines",
         "mgras ucode [start] [count]       HQ3 microcode RAM",
         "mgras vc3 | vc3 sram <a> [n]      VC3 registers, cursor, DID runs / SRAM words",

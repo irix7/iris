@@ -415,7 +415,7 @@ pub(crate) fn rgb24_to_rgb12(val: u32) -> u32 {
 // Bayer 4x4 dither matrix packed as 16 nibbles in a u64.
 // Indexed by (y&3)<<2|(x&3): threshold = (BAYER_PACKED >> (idx*4)) & 0xF.
 // Table: [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
-const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
+pub(crate) const BAYER_PACKED: u64 = 0x5D7F91B36E4CA280;
 
 /// Pack bayer index into bits 27:24 of color value (top byte unused by 24-bit BGR).
 /// Encoding: bits[3:2] = y&3, bits[1:0] = x&3 → index = (y&3)<<2|(x&3).
@@ -777,16 +777,17 @@ pub fn blend<M: Mode>(m: &M, src: u32, dst: u32) -> u32 {
     let s_factor_sel = m.sfactor();
     let d_factor_sel = m.dfactor();
 
-    // BLENDALPHA (DRAWMODE1 bit 27) substitutes the SOURCE multiplier only.
-    // Spec §3.8: "When source multiplier is set to source alpha (SFACTOR=4) ...
+    // BLENDALPHA (DRAWMODE1 bit 27) changes how the ALPHA component is blended,
+    // nothing else. Spec §3.8: "When source multiplier is set to source alpha
+    // (SFACTOR=4), alpha component can be blended in two different ways ...
     // When BLENDALPHA is set to 0, the source multiplier for blending alpha is
-    // one instead of source alpha AND DESTINATION MULTIPLIER IS DEFINED BY
-    // DFACTOR." The trailing clause is load-bearing: DFACTOR keeps its own
-    // definition, so a DFACTOR of BF_MSA still evaluates 1 - source alpha
-    // against the real alpha. Substituting in both factors would zero BF_MSA
-    // and discard the destination entirely, which the spec does not say.
+    // one instead of source alpha and destination multiplier is defined by
+    // DFACTOR." The pin table calls the bit "Blend source alpha with alpha".
+    // So red, green and blue always use the real source alpha; only the alpha
+    // channel's source multiplier becomes 1.0. IRIX's OpenGL relies on this:
+    // it draws GL_SRC_ALPHA / GL_ONE_MINUS_SRC_ALPHA with BLENDALPHA=0.
     let sa_real = (src >> 24) & 0xFF;
-    let sa_src = if m.blendalpha() != 0 { sa_real } else { 255 };
+    let sa_alpha = if m.blendalpha() != 0 { sa_real } else { 255 };
 
     // `c` is the *other* operand's channel — destination when computing the
     // source factor, source when computing the destination factor — which is
@@ -811,7 +812,7 @@ pub fn blend<M: Mode>(m: &M, src: u32, dst: u32) -> u32 {
         let s_c = (src >> shift) & 0xFF;
         let d_c = (dst >> shift) & 0xFF;
         
-        let sf = get_factor(s_factor_sel, d_c, sa_src);
+        let sf = get_factor(s_factor_sel, d_c, if i == 3 { sa_alpha } else { sa_real });
         let df = get_factor(d_factor_sel, s_c, sa_real);
         
         let val = (s_c * sf + d_c * df) / 255;
@@ -1199,7 +1200,17 @@ pub fn fetch_host_pixel<M: Mode>(ctx: &mut Rex3Context, m: &M) -> u32 {
         ctx.hostcnt = host_count(m);
     }
 
-    let pixel = host_unpack(m, ctx.host_shifter);
+    let mut pixel = host_unpack(m, ctx.host_shifter);
+    // ALPHAHOST without COLORHOST: the host fields are alpha, blending the DDA
+    // colour (spec §3.9). Fields are 8 bits wide for host depths 4 and 8
+    // (§3.10: "a field of 8, 16, or 32 bits"), so the whole leading byte is
+    // the alpha; unpacking it as a 4- or 8-bit colour would lose it. IRIX's
+    // smooth points send their per-pixel coverage this way.
+    if m.alphahost() != 0 && m.colorhost() == 0
+        && matches!(m.hostdepth(), DRAWMODE1_HOSTDEPTH_12 | DRAWMODE1_HOSTDEPTH_8)
+    {
+        pixel = (pixel & 0x00FF_FFFF) | ((ctx.host_shifter >> 32) as u32 & 0xFF00_0000);
+    }
     ctx.host_shifter <<= host_shift(m);
     ctx.hostcnt -= 1;
     pixel
@@ -1260,6 +1271,12 @@ fn combine_host_dda<M: Mode>(ctx: &Rex3Context, m: &M, host_pixel: u32) -> u32 {
     // mask down to the plane-depth index and never look at these bits.
     let a = if m.alphahost() != 0 {
         (host_pixel >> 24) & 0xFF
+    } else if m.adrmode() == DRAWMODE0_ADRMODE_A_LINE {
+        // Antialiased lines take their alpha from the line's pixel coverage
+        // (§3.6), not the DDA: IRIX's OpenGL draws GL_LINE_SMOOTH this way
+        // without loading COLORALPHA. Coverage is not modelled, so every pixel
+        // counts as fully covered.
+        0xFF
     } else {
         Rex3Context::clamp_color_component(ctx.coloralpha)
     };
@@ -1383,7 +1400,15 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     // In host mode (READ or DRAW+colorhost), each GO processes exactly one word's worth
     // of pixels (host_count pixels). stop_on_word causes the loop to exit after the
     // word boundary so the next GO picks up where we left off.
-    let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || colorhost;
+    //
+    // Except a host DRAW block with STOPONY: that is a full block, not Segments I
+    // (rex3.pdf §3.5.4.1 has STOPONX=STOPONY=0). It runs to its end on one GO and
+    // reloads the shifter from HOSTRW whenever it empties; a single PIO word is
+    // re-read, so its pixels replicate across the block. IRIX's glPixelZoom path
+    // (snoop) draws each zoomed pixel this way: a 6x6 STOPONX|STOPONY block fed
+    // one 32bpp word. MAME's block loop behaves the same.
+    // See rules/rex3/host-full-block-replicates.md.
+    let stop_on_word = opcode == DRAWMODE0_OPCODE_READ || (colorhost && !stopony);
 
     // stop_on_word takes priority over stoponx — host mode governs its own stop.
     let stoponx = m.stoponx() != 0 || stop_on_word;
@@ -1470,6 +1495,11 @@ pub fn draw_block_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
             // divergence the JIT/interpreter HOSTR stress test catches.
             if stop_on_word && ctx.hostcnt > 0 {
                 break;
+            }
+            // Full host block: each row starts on a fresh word too, but the
+            // primitive carries on into it.
+            if colorhost && !stop_on_word {
+                ctx.hostcnt = 0;
             }
 
             first = true; // pixel in next row will be first
@@ -1595,83 +1625,72 @@ pub fn draw_span_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
     }
 }
 
-/// Fractional d correction for F_LINE/A_LINE from 21.11 endpoint sub-pixel position.
-/// Fractional nibble is bits [10:7] of the 21.11 coordinate (16.4(7) layout).
-pub fn fline_apply_fract(
-    ctx: &Rex3Context,
-    d: &mut i32,
-    x: &mut i32,
-    y: &mut i32,
-    incrx2: i32,
-    incry2: i32,
-    y_major: bool,
-) {
-    let octant = ctx.bresoctinc1.octant() & 7;
-    let x1p = ctx.xstart >> 11;
-    let y1p = ctx.ystart >> 11;
-    let x2p = ctx.xend >> 11;
-    let y2p = ctx.yend >> 11;
-    let mut dx = (x1p - x2p).abs();
-    let mut dy = (y1p - y2p).abs();
-    let mut xf = ((ctx.xstart >> 7) & 0xF) as i32;
-    let mut yf = ((ctx.ystart >> 7) & 0xF) as i32;
 
+/// Bresenham setup for F_LINE/A_LINE (rex3.pdf §3.6.1.2, "Code for aliased
+/// line with fractional endpoints"). The pixels: the start point's own pixel,
+/// then in each column of the major axis the row holding the true line at the
+/// column's centre (pixel n covers [n, n+1)), moving at most one row per
+/// column.
+///
+/// - Octant, `incr1`, `incr2` and `d` come from the fixed-point (16.4)
+///   endpoint deltas. Integer deltas get short strokes' slopes badly wrong
+///   (fsn: 2.5 x 1.44 became 2 x 2).
+/// - All terms are in 1/256 pixel, so the fractional term is exact (the
+///   errata's s18.8 BRESD). For any on-screen line `incr1`/`incr2` still fit
+///   their 20/21-bit fields.
+/// - The spec's octant table has y pointing up (its octant 1 is hardware
+///   octant 5, YDEC set) and the registers have y growing down, so its y
+///   fraction is 1 - the register's.
+/// - No first-pixel adjustment: neither the pseudocode's E test nor the
+///   errata's E/G tests. IRIS GL's software Z buffer, which computes the
+///   same pixels, confirms the start point's own pixel in 113 of 119 strokes
+///   where the rules disagree (fsn.rec; the rest are 1-pixel strokes next to
+///   others).
+///
+/// See rules/rex3/soft-z-lines-zpattern-and-bresround.md.
+pub fn fline_setup(ctx: &mut Rex3Context) {
+    use crate::dev::ng1::rex3::{OCTANT_XDEC, OCTANT_XMAJOR, OCTANT_YDEC, REX3_BRES_OCTANTS};
+    // 21.11 -> 16.4
+    let (x1, y1) = (ctx.xstart >> 7, ctx.ystart >> 7);
+    let (x2, y2) = (ctx.xend >> 7, ctx.yend >> 7);
+    let mut dx = (x1 - x2).abs();
+    let mut dy = (y1 - y2).abs();
+
+    let mut octant = 0u32;
+    if y1 > y2 { octant |= OCTANT_YDEC; }
+    if x1 > x2 { octant |= OCTANT_XDEC; }
+    if dx > dy { octant |= OCTANT_XMAJOR; }
+
+    // Register row n + f is spec row -(n+1) + (1 - f); f = 0 is spec
+    // fraction 1 in row -(n+1), which keeps the start pixel on row n.
+    let mut xf = x1 & 0xF;
+    let mut yf = 0x10 - (y1 & 0xF);
+    // The spec's table, verbatim: map the start fractions into its octant 1,
+    // swapping for y-major octants, 1 - f on an axis that runs backwards.
     match octant {
-        1 => {
-            std::mem::swap(&mut xf, &mut yf);
-            std::mem::swap(&mut dx, &mut dy);
-        }
-        3 => {
-            xf = 0x10 - xf;
-            std::mem::swap(&mut xf, &mut yf);
-            std::mem::swap(&mut dx, &mut dy);
-        }
+        1 => { std::mem::swap(&mut xf, &mut yf); std::mem::swap(&mut dx, &mut dy); }
+        3 => { xf = 0x10 - xf; std::mem::swap(&mut xf, &mut yf); std::mem::swap(&mut dx, &mut dy); }
         7 => { xf = 0x10 - xf; }
-        6 => {
-            xf = 0x10 - xf;
-            yf = 0x10 - yf;
-        }
-        2 => {
-            let t = 0x10 - xf;
-            xf = 0x10 - yf;
-            yf = t;
-            std::mem::swap(&mut dx, &mut dy);
-        }
-        0 => {
-            let t = 0x10 - yf;
-            yf = xf;
-            xf = t;
-            std::mem::swap(&mut dx, &mut dy);
-        }
+        6 => { xf = 0x10 - xf; yf = 0x10 - yf; }
+        2 => { let t = 0x10 - xf; xf = 0x10 - yf; yf = t; std::mem::swap(&mut dx, &mut dy); }
+        0 => { let t = 0x10 - yf; yf = xf; xf = t; std::mem::swap(&mut dx, &mut dy); }
         4 => { yf = 0x10 - yf; }
         _ => {}
     }
+    // Now dx = major, dy = minor, in 1/16 pixel; d and the increments in 1/256.
+    let incr1 = 32 * dy;
+    let incr2 = 32 * (dy - dx);
+    let d = 16 * (3 * dy - 2 * dx) + 2 * (dx * yf - dy * xf);
 
-    // `*d` arrives holding the I_LINE decision variable (2*minor - major,
-    // computed by setup() and shared by all line adrmodes). The REX3 spec
-    // (rex3_pdf.md 3.6.1.2/3.6.2.1) defines F_LINE/A_LINE's base d as
-    // 3*minor - 2*major instead — confirmed against MAME's do_fline,
-    // which independently derives the same 3dy-2dx formula. The two
-    // formulas differ by exactly (minor - major); apply that correction
-    // before adding the fractional term below. Without it, the fractional
-    // term is added to the wrong baseline and can flip d's sign on the
-    // very first step for near-degenerate (small minor-axis) lines,
-    // producing a spurious extra step in the minor-axis direction that
-    // the line never recovers from (confirmed via a real R4400/REX3
-    // fractional-line test that undershot its endpoint by one row).
-    *d += dy - dx;
-    *d += 2 * (((dx * yf) >> 4) - ((dy * xf) >> 4));
-    let major_delta = if y_major { dy } else { dx };
-    let e = *d - 2 * major_delta;
-    if e > 0 {
-        *d = e;
-        let x_major = !y_major;
-        if x_major {
-            *y -= incry2;
-        } else {
-            *x += incrx2;
-        }
-    }
+    // The first pixel is the start point's own pixel: no E/G adjustment.
+    let (x, y) = (x1 >> 4, y1 >> 4);
+
+    ctx.bresoctinc1.set_octant(octant);
+    ctx.bresoctinc1.set_incr1((incr1 as u32) & 0xFFFFF);
+    ctx.bresrndinc2.set_incr2((incr2 as u32) & 0x1FFFFF);
+    ctx.bresd = (d as u32) & 0x7FF_FFFF;
+    ctx.xstart = x << 11;
+    ctx.ystart = y << 11;
 }
 
 pub fn draw_iline_g<M: Mode>(fb: &Framebuffers, ctx: &mut Rex3Context, m: &M) {
@@ -1748,7 +1767,10 @@ fn draw_line_bresenham<M: Mode>(
     // degenerate setup GO followed by a horizontal stipple continuation).
     let adx = (x2 - x).abs();
     let ady = (y2 - y).abs();
-    let major = adx.max(ady);
+    // F_LINE/A_LINE: the length along the axis the octant calls major. Their
+    // octant comes from the fixed-point deltas, and near 45 degrees the
+    // integer deltas can say the other axis is longer.
+    let major = if fract { if y_major { ady } else { adx } } else { adx.max(ady) };
     let mut pixel_count = major + 1;
     if m.length32() != 0 && pixel_count > 32 {
         pixel_count = 32;
@@ -1766,9 +1788,12 @@ fn draw_line_bresenham<M: Mode>(
 
     let lsadvlast  = m.lsadvlast() != 0;
 
+    // Which way a step with d == 0 goes is programmable per octant.
+    let straight_on_zero = crate::dev::ng1::rex3::bres_straight_on_zero(ctx, octant as u32);
+
     macro_rules! bres_step {
         () => {
-            if d < 0 {
+            if d < 0 || (d == 0 && straight_on_zero) {
                 x += incrx1; y -= incry1; d += incr1;
             } else {
                 x += incrx2; y -= incry2; d += incr2;

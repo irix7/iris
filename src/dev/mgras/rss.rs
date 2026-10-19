@@ -60,14 +60,22 @@ pub mod reg {
     /// Model-private: a TE read returns TRAM's bytes as they lie (the
     /// texture manager's save of pages), not texels.
     pub const TE_RAW: u32 = 0x3F7;
+    /// Model-private: pixel transfers move stencil indices, the top byte
+    /// of the ZST buffer (DRBpointers aimed at it); the depth stays.
+    pub const ZST_STENCIL: u32 = 0x3F8;
+    /// Model-private: the window depth pixel transfers take, z.8 (the
+    /// current raster position's; our GE HLE loads it on
+    /// LOAD_RASTER_POS_INFO, which libGLcore sends before each
+    /// glDrawPixels / glCopyPixels draw: no depth crosses the bus).
+    pub const XFER_Z: u32 = 0x3F9;
     pub const FILLMODE: u32 = 0x110;
     pub const CONFIG: u32 = 0x112;
     pub const XYWIN: u32 = 0x115;
     /// Background colour, where an opaque stipple draws its 0 bits: a colour
-    /// index, or in RGB modes blue (bits 23:12) and green (11:0), 12 bits
-    /// each, with red in the next register.
+    /// index, or in RGB modes green (bits 23:12) and red (11:0), 12 bits
+    /// each, with blue in bits 11:0 of the next register (bkgrd_rg/ba).
     pub const BG_COLOR: u32 = 0x140;
-    pub const BG_COLOR_RED: u32 = 0x141;
+    pub const BG_COLOR_BLUE: u32 = 0x141;
     /// The clip rectangle: x and y ranges, each `min << 16 | max`, and its
     /// control (bit 0 enable, bit 4 keep the inside rather than the outside).
     pub const CLIP_X: u32 = 0x147;
@@ -92,6 +100,8 @@ pub mod reg {
     pub const DRBSIZE: u32 = 0x16E;
     pub const ZMODE: u32 = 0x168;
     pub const BLENDFACTOR: u32 = 0x165;
+    pub const BLENDCOLOR_RG: u32 = 0x16B;
+    pub const BLENDCOLOR_BA: u32 = 0x16C;
     pub const STENCILMODE: u32 = 0x166;
     pub const STENCILMASK: u32 = 0x167;
     pub const AFUNCMODE: u32 = 0x169;
@@ -327,6 +337,76 @@ pub const OP_GL_LINE: u32 = 0x2;
 /// NOTEQUAL GEQUAL ALWAYS, "incoming OP stored".
 pub(super) const TEST_ENABLE: u32 = 1 << 3;
 pub(super) const BLEND_ENABLE: u32 = 1 << 8;
+
+/// Blending, everything OpenGL 1.1 and IMPACT's extensions name
+/// (EXT_blend_color, EXT_blend_minmax, EXT_blend_subtract; GL_LOGIC_OP is
+/// the GE's business: it becomes PP1's logic op). Only the GE HLE writes
+/// these, so beyond the factors' 4-bit fields the encoding is ours (SGI's
+/// diagnostics set BlendSfactor / BlendDfactor and nothing else):
+///   BlendFactor (0x165) source 3:0, destination 7:4, enable 8, equation
+///     11:9 (`BLEND_EQ_*`). Factor codes 0..=10 in OpenGL order (ZERO ONE
+///     SRC_COLOR ONE_MINUS_SRC_COLOR SRC_ALPHA ONE_MINUS_SRC_ALPHA
+///     DST_ALPHA ONE_MINUS_DST_ALPHA DST_COLOR ONE_MINUS_DST_COLOR
+///     SRC_ALPHA_SATURATE), then 11 CONSTANT_COLOR, 12
+///     ONE_MINUS_CONSTANT_COLOR, 13 CONSTANT_ALPHA, 14
+///     ONE_MINUS_CONSTANT_ALPHA.
+///   BlendcolorRG (0x16B) red 27:16, green 11:0; BlendcolorBA (0x16C) blue
+///     27:16, alpha 11:0: the constant colour, 12 bits a component.
+pub(super) const BLEND_EQ_SHIFT: u32 = 9;
+pub(super) const BLEND_EQ_ADD: u32 = 0;
+pub(super) const BLEND_EQ_SUBTRACT: u32 = 1;
+pub(super) const BLEND_EQ_REVERSE_SUBTRACT: u32 = 2;
+pub(super) const BLEND_EQ_MIN: u32 = 3;
+pub(super) const BLEND_EQ_MAX: u32 = 4;
+
+/// The constant blend colour, 12.16 (`BlendcolorRG` / `BA`).
+pub(super) fn blend_const(rg: u32, ba: u32) -> [i32; 4] {
+    let c = |v: u32| ((v & 0xFFF) as i32) << 16;
+    [c(rg >> 16), c(rg), c(ba >> 16), c(ba)]
+}
+
+/// One blend factor for component `k` (12.16).
+#[inline]
+fn blend_factor(code: u32, k: usize, s: &[i32; 4], d: &[i32; 4], kc: &[i32; 4]) -> i32 {
+    use fixed::ONE;
+    match code {
+        0 => 0,
+        1 => ONE,
+        2 => s[k],
+        3 => ONE - s[k],
+        4 => s[3],
+        5 => ONE - s[3],
+        6 => d[3],
+        7 => ONE - d[3],
+        8 => d[k],
+        9 => ONE - d[k],
+        10 => if k == 3 { ONE } else { s[3].min(ONE - d[3]) },
+        11 => kc[k],
+        12 => ONE - kc[k],
+        13 => kc[3],
+        14 => ONE - kc[3],
+        _ => ONE,
+    }
+}
+
+/// Source `s` blended onto destination `d` (12.16 components) as
+/// BlendFactor `bf` says, the constant colour `kc`; clamped.
+pub(super) fn blend_rgba(bf: u32, kc: &[i32; 4], s: &[i32; 4], d: &[i32; 4]) -> [i32; 4] {
+    use fixed::mul;
+    let (sf, df) = (bf & 0xF, (bf >> 4) & 0xF);
+    let eq = (bf >> BLEND_EQ_SHIFT) & 7;
+    [0, 1, 2, 3].map(|k| {
+        let a = || mul(s[k], blend_factor(sf, k, s, d, kc));
+        let b = || mul(d[k], blend_factor(df, k, s, d, kc));
+        fixed::clamp(match eq {
+            BLEND_EQ_SUBTRACT => a().wrapping_sub(b()),
+            BLEND_EQ_REVERSE_SUBTRACT => b().wrapping_sub(a()),
+            BLEND_EQ_MIN => s[k].min(d[k]),
+            BLEND_EQ_MAX => s[k].max(d[k]),
+            _ => a().wrapping_add(b()),
+        })
+    })
+}
 const FILL_POLY_STIPPLE: u32 = 1 << 2;
 /// Polygon stipple RAM in the indirect device space (SGI's POLYSTIP_RAM).
 pub const POLY_STIPPLE_RAM: u32 = 0xA000_0000;
@@ -373,6 +453,33 @@ pub(super) fn draw_buffer(pp1fillmode: u32) -> u32 {
 }
 pub(super) const DRAW_B: u32 = 0x02;
 pub(super) const DRAW_A_AND_B: u32 = 0x03;
+/// Draw field 4: buffer B as DRBpointers' second page, 5: A and that page.
+/// GL's 24-bit double-buffered visuals use them (DRAW_BUFFER [4, 1]), and
+/// so does the X server for a double-buffered 24-bit window (System
+/// Manager's panes, fill mode 0xC012204 / 0xC016A04; traced 2026-10-13).
+pub(super) const DRAW_B_PAGE: u32 = 0x04;
+pub(super) const DRAW_A_AND_B_PAGE: u32 = 0x05;
+
+/// Colour-index pixel types (fill mode bits 10:8 = 4..=7: libGLcore's CI12
+/// 0x400, CI8 0x500 / 0x600, the X server's CI8 windows 0xC004504). A
+/// double-buffered colour-index window keeps both buffers in one word, A
+/// in bits 11:0 and B in bits 23:12 (libGLcore's masks 0xFFF / 0xFFF000,
+/// DRAW_BUFFER 2 for B as in the other 12-bit visuals), so the X server's
+/// whole-word copies (window moves) carry both. Writes put the index in
+/// both halves and the plane mask picks; draw field 2 / 3 stay on the page.
+pub(super) fn ci_pixtype(pp1fillmode: u32) -> bool {
+    !rgb_pixtype(pp1fillmode)
+}
+
+/// Whether draw field `f` writes buffer B only (2, or 4 as a second page).
+pub(super) fn draws_b(f: u32) -> bool {
+    f == DRAW_B || f == DRAW_B_PAGE
+}
+
+/// Whether draw field `f` writes both buffers (3, or 5).
+pub(super) fn draws_a_and_b(f: u32) -> bool {
+    f == DRAW_A_AND_B || f == DRAW_A_AND_B_PAGE
+}
 pub(super) const DRAW_CID: u32 = 0x50;
 
 /// PP1 window mode (`pp1winmode`; SGI's fields WINxLSBs, WINyLSBs,
@@ -412,10 +519,164 @@ mod block {
     pub const DMA_WRITE: u32 = 5;
 }
 
-/// Whether the pixel processors' pixel type (fill mode bits 10:8) is an RGB
-/// one; the others are colour index.
+/// Whether the pixel processors' pixel type (PP1 fill mode bits 10:8, SGI's
+/// PixType) is an RGB one: 0 4:4:4 pairs, 1 5:5:5 pairs, 2 RGBA8888
+/// (SGI's diagnostics: "32-bit rgba"), 3 RGB121212 (also the X server's
+/// 24-bit windows, fill mode 0xC006304). 4-7 are colour index (`ci_pixtype`).
+/// The pixel type alone says which; the plane masks do not.
 pub(super) fn rgb_pixtype(pp1fillmode: u32) -> bool {
-    matches!((pp1fillmode >> 8) & 7, 0 | 1 | 2 | 4)
+    (pp1fillmode >> 8) & 7 <= 3
+}
+
+/// 36-bit RGB pixels (pixel type 3 with bit 13): 12 bits a component,
+/// the top 8 of each where 8-8-8 keeps them (red 7:0, green 15:8, blue
+/// 23:16) and the low nibbles in planes 35:24 (red 27:24, green 31:28,
+/// blue 35:32; their order is our guess). The X server draws its 24-bit
+/// windows in this type (fill mode 0xC006304) through plane mask 0xFFFFFF,
+/// the 8-bit parts; GL's RGBA 12,12,12 visual (INIT_FORMAT_VALUES 0x2300)
+/// writes all 36 planes (libGLcore: LSB masks all ones, MSBs 0xF), and its
+/// window's XMAP format is 0x19, not 24-bit's 0x15. Double buffered like
+/// 24-bit: a second page (DRAW_BUFFER [4, 1]).
+pub(super) fn rgb36(pp1fillmode: u32) -> bool {
+    (pp1fillmode >> 8) & 7 == 3 && pp1fillmode & (1 << 13) != 0
+}
+
+/// Three 12-bit components (red first) as a 36-bit pixel.
+pub(super) fn pack36(c: [u32; 3]) -> u64 {
+    (0..3).fold(0u64, |w, k| w | ((c[k] >> 4 & 0xFF) as u64) << (8 * k) | ((c[k] & 0xF) as u64) << (24 + 4 * k))
+}
+
+/// A 36-bit pixel's three 12-bit components.
+pub(super) fn unpack36(w: u64) -> [u32; 3] {
+    [0, 1, 2].map(|k| ((w >> (8 * k) & 0xFF) as u32) << 4 | (w >> (24 + 4 * k) & 0xF) as u32)
+}
+
+/// An 8-8-8 colour as a 36-bit pixel, components widened (c << 4 | c >> 4).
+pub(super) fn rgb36_from8(v: u32) -> u64 {
+    pack36([0, 1, 2].map(|k| { let c = (v >> (8 * k)) & 0xFF; c << 4 | c >> 4 }))
+}
+
+/// 12-bit RGB pixels (pixel type 0 or 1, buffer size bit 13 clear) come in
+/// pairs: one word holds buffer A in bits 11:0 and buffer B in bits 23:12,
+/// on one page. The pixel processors put the colour in both halves and
+/// the plane mask picks which are written. The X server draws A with
+/// draw field 1 and mask 0xFFF, B with field 2 and 0xFFF000, both with
+/// field 3 and 0xFFFFFF (traced, 6.5.22 TrueColor). GL's 12-bit
+/// double-buffered visual (INIT_FORMAT_VALUES 0x100, DRAW_BUFFER [2, 1])
+/// draws that way on a HighImpact at 1280x1024, where DRBpointers and
+/// the XMAP DIB name the same page for A and B (0x90240), there being no
+/// room for a second 24-bit buffer.
+pub(super) fn rgb12_pair(pp1fillmode: u32) -> bool {
+    matches!((pp1fillmode >> 8) & 7, 0 | 1) && pp1fillmode & (1 << 13) == 0
+}
+
+/// PP1 fill mode bit 3: dither 12-bit pixels down from 8 bits a component
+/// with the 4x4 Bayer matrix REX3 and GR2's RE3 use. Our choice of bit:
+/// glEnable(GL_DITHER) reaches the GE as a token (0x067) whose effect on
+/// the pixel processors is microcode we have not seen, and no driver
+/// sets this bit in any trace. The GL front-end sets it.
+pub(super) const PP1_DITHER: u32 = 1 << 3;
+
+/// The two pixel-pair layouts (libGLcore InitFormatValues' plane masks,
+/// A | B): pixel type 0 holds 4:4:4 RGB in bits 11:0 / 23:12 and a 4-bit
+/// alpha in 27:24 / 31:28 (0x0F000FFF | 0xF0FFF000, the RGBA 4,4,4,4
+/// visual and the X server's 12-bit windows); pixel type 1 holds 5:5:5 RGB
+/// in 14:0 / 29:15 and a 1-bit alpha in 30 / 31 (0x40007FFF | 0xBFFF8000,
+/// the RGBA 5,5,5,1 visual). Red is lowest (as X's 12-bit host format;
+/// unconfirmed for 5:5:5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pair {
+    P444,
+    P555,
+}
+
+impl Pair {
+    /// The layout a fill mode draws pairs in, if it does.
+    pub(super) fn of(pp1fillmode: u32) -> Option<Pair> {
+        rgb12_pair(pp1fillmode).then(|| if (pp1fillmode >> 8) & 7 == 1 { Pair::P555 } else { Pair::P444 })
+    }
+
+    /// Bits a colour component.
+    pub(super) fn bits(self) -> u32 {
+        match self {
+            Pair::P444 => 4,
+            Pair::P555 => 5,
+        }
+    }
+
+    /// Where buffer B's colour starts (A's ends).
+    pub(super) fn shift_b(self) -> u32 {
+        3 * self.bits()
+    }
+
+    /// Buffer `b`'s alpha: its bit position and width.
+    pub(super) fn alpha(self, b: bool) -> (u32, u32) {
+        match self {
+            Pair::P444 => (if b { 28 } else { 24 }, 4),
+            Pair::P555 => (if b { 31 } else { 30 }, 1),
+        }
+    }
+
+    /// The word with an 8-8-8-8 colour in both halves (the plane mask picks
+    /// what is written), dithered when the fill mode says so.
+    pub(super) fn pack(self, pp1fillmode: u32, v: u32, x: i32, y: i32) -> u32 {
+        let t = (pp1fillmode & PP1_DITHER != 0).then(|| crate::dev::ng1::rex3_generic::bayer_threshold(((y as u32 & 3) << 2) | (x as u32 & 3)));
+        self.pack_with(v, t)
+    }
+
+    /// `pack` at Bayer threshold `t` (None: truncate).
+    pub(super) fn pack_with(self, v: u32, t: Option<u32>) -> u32 {
+        let n = self.bits();
+        let c = (0..3).fold(0, |c, k| c | quantise((v >> (8 * k)) & 0xFF, n, t) << (n * k));
+        let (a0, aw) = self.alpha(false);
+        let (a1, _) = self.alpha(true);
+        let a = (v >> 24) >> (8 - aw);
+        c | c << self.shift_b() | a << a0 | a << a1
+    }
+
+    /// Buffer `b`'s half of a word as 8-8-8-8, components widened by
+    /// repeating their bits.
+    pub(super) fn unpack(self, w: u32, b: bool) -> u32 {
+        let n = self.bits();
+        let c = if b { w >> self.shift_b() } else { w };
+        let rgb = (0..3).fold(0, |o, k| o | widen((c >> (n * k)) & ((1 << n) - 1), n) << (8 * k));
+        let (a0, aw) = self.alpha(b);
+        rgb | widen((w >> a0) & ((1 << aw) - 1), aw) << 24
+    }
+}
+
+/// An 8-bit component to `n` bits: truncated, or dithered against the
+/// 4-bit Bayer threshold `t` as REX3 does (scaled to the fraction's width).
+pub(super) fn quantise(ch: u32, n: u32, t: Option<u32>) -> u32 {
+    match t {
+        None => ch >> (8 - n),
+        Some(t) => {
+            let s = ch - (ch >> n);
+            let f = s & ((1 << (8 - n)) - 1);
+            ((s >> (8 - n)) + (f > t >> (n - 4)) as u32).min((1 << n) - 1)
+        }
+    }
+}
+
+/// An `n`-bit component to 8 bits, its bits repeated.
+pub(super) fn widen(v: u32, n: u32) -> u32 {
+    match n {
+        0 => 0,
+        1 => v * 0xFF,
+        _ => (v << (8 - n) | v >> (2 * n - 8)) & 0xFF,
+    }
+}
+
+/// An 8-8-8 colour (red in 7:0) to a 12-bit pixel, red in 3:0 (the host
+/// format X uses for its 12-bit visual).
+pub(super) fn to_rgb12(v: u32) -> u32 {
+    (v >> 4 & 0xF) | (v >> 8 & 0xF0) | (v >> 12 & 0xF00)
+}
+
+/// A 12-bit pixel to 8-8-8, each nibble repeated.
+pub(super) fn from_rgb12(c: u32) -> u32 {
+    let n = (c & 0xF) | (c & 0xF0) << 4 | (c & 0xF00) << 8;
+    n | n << 4
 }
 
 /// Pixel processor logic op (fill mode bit 2 enables it; bits 29:26 hold
@@ -459,9 +720,9 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
     if format == (7, 1) {
         return pack_rgb((v >> 40) as u32, (v >> 24) as u32, (v >> 8) as u32);
     }
-    // RGBA with 16-bit components (glCopyPixels draws back so).
+    // RGBA with 16-bit components (glCopyPixels draws back so), alpha too.
     if format == (8, 1) {
-        return pack_rgb((v >> 56) as u32, (v >> 40) as u32, (v >> 24) as u32);
+        return pack_rgb((v >> 56) as u32, (v >> 40) as u32, (v >> 24) as u32) | ((v >> 8) as u32 & 0xFF) << 24;
     }
     // RGB, a byte each, red first (glCopyTexImage reads the screen so).
     if format == (7, 0) {
@@ -479,7 +740,10 @@ fn from_host(format: (u32, u32), v: u64) -> u32 {
         (8, 8) => pack_rgb(c4(0), c4(4), c4(8)),
         (8, 10) => pack_rgb(c5(0), c5(5), c5(10)),
         (8, 0) => v,
-        (0, 1) => v & 0xFFF,
+        // Colour indices in any integer type (libGLcore: bytes, shorts,
+        // 32-bit, signed or not): the index's bits, up to a 12-bit visual's.
+        (0, 0 | 4) => v & 0xFF,
+        (0, _) => v & 0xFFF,
         _ => v,
     }
 }
@@ -495,7 +759,7 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
     }
     if format == (8, 1) {
         let w = |s: u32| c(s) as u64 * 0x101;
-        return w(0) << 48 | w(8) << 32 | w(16) << 16 | 0xFFFF;
+        return w(0) << 48 | w(8) << 32 | w(16) << 16 | w(24);
     }
     if format == DEPTH_FORMAT {
         let z = v & 0xFF_FFFF;
@@ -504,8 +768,162 @@ fn to_host(format: (u32, u32), v: u32) -> u64 {
     (match format {
         (8, 8) => c(0) >> 4 | (c(8) >> 4) << 4 | (c(16) >> 4) << 8,
         (8, 10) => c(0) >> 3 | (c(8) >> 3) << 5 | (c(16) >> 3) << 10,
+        // A colour index in the element's low bits (a byte keeps the low 8).
+        (0, 0 | 4) => v & 0xFF,
+        (0, _) => v & 0xFFF,
         _ => v,
     }) as u64
+}
+
+/// XFRMODE's transfer format as `Xfer` keeps it: (PixelFormat,
+/// CompType), and for RGBA (format 8) RGBorder (bit 22) as CompType bit 4.
+/// Traced with libGLcore (`test/gltest/pixtest.c`): formats 3 red, 4 green,
+/// 5 blue, 6 alpha, 7 RGB, 8 RGBA (2 depth, 1 stencil, 0 colour index);
+/// types 0 / 4 unsigned / signed bytes, 1 / 5 shorts, 3 / 7 32-bit (8 and
+/// 10 the X server's packed 4-4-4-4 and 5-5-5). RGBorder 1 sends red
+/// first, 0 alpha first (SGI: "RGBorder = 0; /* ABGR */"); RGB formats
+/// are red first either way.
+pub(crate) fn xfer_format(mode: u32) -> (u32, u32) {
+    let (f, t) = ((mode >> 4) & 0xF, mode & 0xF);
+    if f == 8 && mode & 1 << 22 != 0 && matches!(t, 0 | 1 | 3 | 4 | 5 | 7) {
+        return (8, t | 0x10);
+    }
+    (f, t)
+}
+
+/// A transfer format converted component by component (`host_pixel`,
+/// `fb_pixel`), not one of the X server's and the kernel's own.
+pub(crate) fn generic_format(f: (u32, u32)) -> bool {
+    let t = f.1 & 0xF;
+    match f.0 {
+        8 => f.1 & 0x10 != 0 || matches!(t, 1 | 3 | 4 | 5 | 7),
+        7 => matches!(t, 3 | 4 | 5 | 7),
+        3..=6 => matches!(t, 0 | 1 | 3 | 4 | 5 | 7),
+        _ => false,
+    }
+}
+
+/// Whether the raster JIT knows this format (its `XFmt` set; its RGBA16 is
+/// red first, RGBorder set).
+pub(crate) fn jit_xfer_ok(f: (u32, u32)) -> bool {
+    // Colour indices beyond the X server's bytes and shorts: interpreter.
+    if f.0 == 0 && !matches!(f.1, 0 | 1) {
+        return false;
+    }
+    !generic_format(f) || f == (8, 0x11)
+}
+
+/// Whether a transfer format gives its pixels an alpha (RGBA or alpha
+/// alone; the packed 4:4:4:4 and 5:5:5:1 types arrive without it, see
+/// `from_host`).
+fn transfer_alpha(f: (u32, u32)) -> bool {
+    matches!(f.0, 6 | 8) && !matches!(f, (8, 8) | (8, 10))
+}
+
+/// Framebuffer components (0 red .. 3 alpha) of a generic format, in host
+/// order.
+fn format_comps(f: (u32, u32)) -> &'static [usize] {
+    match f.0 {
+        3 => &[0],
+        4 => &[1],
+        5 => &[2],
+        6 => &[3],
+        7 => &[0, 1, 2],
+        _ if f.1 & 0x10 != 0 => &[0, 1, 2, 3],
+        _ => &[3, 2, 1, 0],
+    }
+}
+
+/// Bytes of one component of CompType `t`.
+fn type_size(t: u32) -> usize {
+    match t & 0xF {
+        1 | 5 => 2,
+        3 | 7 => 4,
+        _ => 1,
+    }
+}
+
+/// A framebuffer component, widened to 16 bits (an 8-bit one replicated,
+/// a 12-bit one c << 4 | c >> 8), as a host component of type `t`
+/// (big-endian): unsigned types replicate it, signed ones carry one bit
+/// less of magnitude (GL's ((2^b - 1) c - 1) / 2 within a step).
+fn host_comp(t: u32, v: u16, out: &mut Vec<u8>) {
+    let c = v as f64 / 65535.0;
+    match t & 0xF {
+        0 => out.push((v >> 8) as u8),
+        4 => out.push(((c * 127.0).round() as i8) as u8),
+        1 => out.extend(v.to_be_bytes()),
+        5 => out.extend(((c * 32767.0).round() as i16).to_be_bytes()),
+        3 => out.extend((v as u32 * 0x1_0001).to_be_bytes()),
+        7 => out.extend(((c * 2147483647.0).round() as i32).to_be_bytes()),
+        _ => out.push((v >> 8) as u8),
+    }
+}
+
+/// A host component of type `t` (big-endian bytes) as an 8-bit
+/// framebuffer component: its top bits (the X server's 16-bit transfers
+/// and the raster JIT take them so), negative values 0.
+fn fb_comp(t: u32, b: &[u8]) -> u8 {
+    let g = |k: usize| b.get(k).copied().unwrap_or(0);
+    match t & 0xF {
+        0 => g(0),
+        4 => {
+            let v = (g(0) as i8).max(0) as u8;
+            v << 1 | v >> 6
+        }
+        1 | 3 => g(0),
+        5 | 7 => {
+            let v = if g(0) & 0x80 != 0 { 0 } else { (g(0) << 1) | (g(1) >> 7) };
+            v
+        }
+        _ => g(0),
+    }
+}
+
+/// A framebuffer pixel's components (red .. alpha) widened to 16 bits, as
+/// host bytes of a generic format.
+pub(crate) fn host_pixel(f: (u32, u32), comps: [u16; 4], out: &mut Vec<u8>) {
+    for &k in format_comps(f) {
+        host_comp(f.1, comps[k], out);
+    }
+}
+
+/// An 0xAABBGGRR pixel's components widened to 16 bits.
+fn comps16(px: u32) -> [u16; 4] {
+    [0, 1, 2, 3].map(|k| ((px >> (8 * k)) & 0xFF) as u16 * 0x101)
+}
+
+/// Host bytes of a generic format as a framebuffer pixel; components the
+/// format lacks are 0.
+pub(crate) fn fb_pixel(f: (u32, u32), b: &[u8]) -> u32 {
+    let n = type_size(f.1);
+    format_comps(f).iter().enumerate().fold(0, |px, (i, &k)| px | (fb_comp(f.1, &b[(i * n).min(b.len())..]) as u32) << (8 * k))
+}
+
+/// A pipeline component for the raster engine: `v` in CompType `t`'s
+/// range (the GE's clamp scaled it), as big-endian bytes.
+pub(crate) fn pack_comp(t: u32, v: f64, out: &mut Vec<u8>) {
+    let r = v.round();
+    match t & 0xF {
+        0 => out.push(r.clamp(0.0, 255.0) as u8),
+        4 => out.push(r.clamp(-128.0, 127.0) as i8 as u8),
+        1 => out.extend((r.clamp(0.0, 65535.0) as u16).to_be_bytes()),
+        5 => out.extend((r.clamp(-32768.0, 32767.0) as i16).to_be_bytes()),
+        3 => out.extend((r.clamp(0.0, 4294967295.0) as u32).to_be_bytes()),
+        7 => out.extend((r.clamp(-2147483648.0, 2147483647.0) as i32).to_be_bytes()),
+        _ => out.push(r.clamp(0.0, 255.0) as u8),
+    }
+}
+
+/// Components a pixel of this XFRMODE has (for the GE pipeline's output).
+pub(crate) fn xfer_comps(mode: u32) -> usize {
+    match (mode >> 4) & 0xF {
+        7 => 3,
+        8 => 4,
+        // Texture loads: one-component (L, I, A) and two-component texels.
+        10 => 2,
+        _ => 1,
+    }
 }
 
 pub(super) fn signed16(v: u32) -> i32 {
@@ -563,6 +981,8 @@ pub(super) struct Xfer {
     pub format: (u32, u32),
     pub begin_skip: u32,
     pub stride_skip: u32,
+    /// XFRMODE bit 18: a PIO read in the DMA order (the X server's).
+    pub pio_dma_order: bool,
     /// PIO write stream: the line being assembled, its byte offset within
     /// its first doubleword, the bytes collected (in `Rss::line_buf`), and
     /// filler still to skip.
@@ -609,9 +1029,14 @@ impl Xfer {
 
 /// Bytes per pixel for an xfrmode (PixelFormat, PixelCompType) pair.
 pub(crate) fn bytes_per_pixel(xfrmode: u32) -> u32 {
+    let f = xfer_format(xfrmode);
+    if generic_format(f) {
+        return (format_comps(f).len() * type_size(f.1)) as u32;
+    }
     match ((xfrmode >> 4) & 0xF, xfrmode & 0xF) {
-        (0, 0) => 1,
-        (0, 1) | (8, 8) | (8, 10) => 2,
+        (0, 0) | (0, 4) => 1,
+        (0, 1) | (0, 5) | (8, 8) | (8, 10) => 2,
+        (0, 3) | (0, 7) => 4,
         (8, 0) | (2, 3) => 4,
         (7, 0) => 3,
         (8, 1) => 8,
@@ -633,6 +1058,16 @@ pub struct RssStats {
     pub pio_write_dw: u64,
     pub pio_read_dw: u64,
     pub dma_lines_in: u64,
+    /// DMA lines that came with no write transfer armed, dropped.
+    pub dma_lines_dropped: u64,
+    /// DMA lines that went to the texture engine (a TE load armed).
+    pub dma_lines_te: u64,
+    /// DMA lines drawn by the raster JIT.
+    pub dma_lines_jit: u64,
+    /// Pixels of interpreted DMA lines: stored, and outside the visible
+    /// region (screen masks, clip IDs, the other engine's rows).
+    pub dma_px_put: u64,
+    pub dma_px_clipped: u64,
 }
 
 /// Registers a GL batch leaves as it set them when it ends (`gl_leave`
@@ -657,14 +1092,63 @@ pub const ZST_PAGE: u32 = 0;
 /// Longest PIO line, in bytes (2048 pixels of 6 bytes, with room to spare).
 const MAX_LINE_BYTES: usize = 16384;
 
-/// The raster subsystem's state. Plain data, valid zeroed: build it in
-/// place on zeroed memory and run `Rss::init`, or use `new_boxed`.
+/// Clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH + x`.
+pub type CidPlanes = [u8; WIDTH * HEIGHT];
+
+/// What a board's raster engines draw into: pixel memory and the clip-ID
+/// planes. One per board, shared by its engines, each of which writes only
+/// the scanlines it owns (`Rss::owns_row`). Plain data, valid zeroed.
+#[repr(C)]
+pub struct Planes {
+    pub mem: PixMem,
+    pub cid: CidPlanes,
+    /// The texture engine's tables and TRAM, likewise shared: the engines
+    /// only sample it, and its writes (`Rss::te_write`) are synchronised.
+    pub te: Te1,
+    pub te_sync: TeSync,
+}
+
+/// The engines' handshake around a write to their shared `Te1`: each
+/// engine but 0 says how many writes it has reached (`arrived`, one cache
+/// line each), engine 0 how many it has made (`done`). Valid zeroed.
+#[repr(C)]
+pub struct TeSync {
+    pub arrived: [crossbeam_utils::CachePadded<std::sync::atomic::AtomicU64>; 4],
+    pub done: std::sync::atomic::AtomicU64,
+}
+
+/// A raster engine's handle on part of its board's `Planes`. The engines'
+/// threads share it the way they share the framebuffer with the display
+/// thread: plain data, disjoint rows, tearing tolerated.
+#[repr(transparent)]
+pub struct Plane<T>(*mut T);
+
+impl<T> std::ops::Deref for Plane<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: set by `Rss::init` to the board's planes, which outlive it.
+        unsafe { &*self.0 }
+    }
+}
+
+impl<T> std::ops::DerefMut for Plane<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as above; each engine writes only its own rows.
+        unsafe { &mut *self.0 }
+    }
+}
+
+/// The raster subsystem's state: one raster engine (RE4, its PP1s and its
+/// TE1/TRAM). Plain data, valid zeroed: build it in place on zeroed memory
+/// and run `Rss::init`, or use `new_boxed`.
 #[repr(C)]
 pub struct Rss {
     regs: [u32; 0x400],
     device: RegMap<256>,
     /// Pixel memory. In colour-index modes a pixel's low byte is the index.
-    pub mem: PixMem,
+    pub mem: Plane<PixMem>,
     /// The PIO write line being assembled.
     line_buf: [u8; MAX_LINE_BYTES],
     stipple: Slot<Stipple>,
@@ -677,27 +1161,51 @@ pub struct Rss {
     /// Fill modes seen with a block, for bring-up logging.
     fillmodes: [u32; 32],
     fillmodes_n: usize,
-    /// The texture engine and TRAM.
-    pub te: Te1,
+    /// The texture engine and TRAM (`Planes::te`, shared by the engines).
+    pub te: Plane<Te1>,
+    te_sync: Plane<TeSync>,
+    /// The engines sharing this `Te1` (0 when only one draws), and the
+    /// writes made so far.
+    pub te_shared: u32,
+    te_writes: u64,
+    /// Diagnostic: stale texture samples seen, and the last one's (want,
+    /// have) (`Te1::stale`).
+    pub stale_events: u32,
+    pub stale_last: [u32; 2],
     /// A texture load transfer is armed (XFRCONTROL to the texture side):
     /// DMA lines go to the texture loader.
     te_load: u32,
     /// A texture read transfer is armed: armed, texels a line, lines.
     te_read: [u32; 3],
-    /// The clip-ID planes: two bits a framebuffer pixel, index `y * WIDTH +
-    /// x`. The X server paints a window's visible region with an ID (1-3)
+    /// The clip-ID planes (`CidPlanes`). The X server paints a window's visible region with an ID (1-3)
     /// when its clip is too complex for the four screen masks, and the
     /// kernel has that window's GL drawing match it (`pp1winmode`). Where
     /// the board keeps them in RDRAM is not known (X draws them with
     /// DRBpointers at the main buffer); nothing reads them back, so they
     /// are kept apart here. Separate from the VC3's display IDs.
-    pub cid: [u8; WIDTH * HEIGHT],
+    pub cid: Plane<CidPlanes>,
+    /// Which scanlines this engine draws: those with `(y ^ engine) &
+    /// own_mask == 0`. A board with one engine draws them all (mask 0);
+    /// Maximum Impact's two alternate (mask 1), as their RE4s do.
+    pub engine: u32,
+    pub own_mask: u32,
+    /// Planes this engine allocated itself (`new_boxed`), freed on drop.
+    owned_planes: *mut Planes,
     /// The raster JIT's per-board state (mode, cached keys, counters), and
     /// the context its shaders draw from.
     #[cfg(feature = "gr4-jit")]
     pub jit: super::rss_jit::JitState,
     #[cfg(feature = "gr4-jit")]
     pub jit_ctx: super::rss_jit::RasterCtx,
+}
+
+impl Drop for Rss {
+    fn drop(&mut self) {
+        if !self.owned_planes.is_null() {
+            // SAFETY: allocated by `new_boxed` with `Box::into_raw`.
+            drop(unsafe { Box::from_raw(self.owned_planes) });
+        }
+    }
 }
 
 /// A triangle's setup (`Rss::tri_setup`): what both the interpreter and
@@ -778,11 +1286,85 @@ impl Rss {
     ///
     /// # Safety
     /// `p` points at a zeroed, exclusively owned `Rss`.
-    pub unsafe fn init(p: *mut Rss) {
+    pub unsafe fn init(p: *mut Rss, planes: *mut Planes) {
+        std::ptr::addr_of_mut!((*p).mem).write(Plane(std::ptr::addr_of_mut!((*planes).mem)));
+        std::ptr::addr_of_mut!((*p).cid).write(Plane(std::ptr::addr_of_mut!((*planes).cid)));
+        std::ptr::addr_of_mut!((*p).te).write(Plane(std::ptr::addr_of_mut!((*planes).te)));
+        std::ptr::addr_of_mut!((*p).te_sync).write(Plane(std::ptr::addr_of_mut!((*planes).te_sync)));
         #[cfg(feature = "gr4-jit")]
         std::ptr::addr_of_mut!((*p).jit.mode).write(super::rss_jit::default_mode());
-        #[cfg(not(feature = "gr4-jit"))]
-        let _ = p;
+    }
+
+    /// Draw only the scanlines `y` with `(y ^ engine) & mask == 0`.
+    pub fn set_engine(&mut self, engine: u32, mask: u32) {
+        self.engine = engine;
+        self.own_mask = mask;
+        #[cfg(feature = "gr4-jit")]
+        self.jit.invalidate();
+    }
+
+    /// Share `Te1` among `engines` engines (`te_write`), counting writes
+    /// from zero. Call with the engines stopped, on each.
+    pub fn share_te(&mut self, engines: u32) {
+        self.te_shared = if engines > 1 { engines } else { 0 };
+        self.te_writes = 0;
+        for a in &self.te_sync.arrived {
+            a.store(0, std::sync::atomic::Ordering::Release);
+        }
+        self.te_sync.done.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Change the texture engine's state (a table write, a texel load).
+    /// With several engines on one `Te1`, engine 0 makes the write once the
+    /// others have reached it too (so they have finished drawing with what
+    /// it replaces), and they go on once it is made; with `defer` (texel
+    /// load lines, hundreds a texture) they go on at once and wait for the
+    /// writes they have passed only before their next entry that is not a
+    /// DMA line (`te_settle`). All meet the same writes in the same order:
+    /// they read one stream.
+    fn te_write(&mut self, defer: bool, f: impl FnOnce(&mut Te1, &[u32; 0x400])) {
+        use std::sync::atomic::Ordering;
+        if self.te_shared == 0 {
+            f(&mut self.te, &self.regs);
+            return;
+        }
+        self.te_writes += 1;
+        let n = self.te_writes;
+        let wait = crossbeam_utils::Backoff::new();
+        if self.engine == 0 {
+            for a in &self.te_sync.arrived[1..self.te_shared as usize] {
+                while a.load(Ordering::Acquire) < n {
+                    wait.snooze();
+                }
+            }
+            f(&mut self.te, &self.regs);
+            self.te_sync.done.store(n, Ordering::Release);
+        } else {
+            self.te_sync.arrived[self.engine as usize].store(n, Ordering::Release);
+            if !defer {
+                self.te_settle();
+            }
+        }
+    }
+
+    /// An engine but 0 on a shared `Te1`: wait until engine 0 has made every
+    /// texture engine write this engine has passed. Run before anything
+    /// that may read the texture engine.
+    #[inline]
+    pub fn te_settle(&self) {
+        use std::sync::atomic::Ordering;
+        if self.te_shared != 0 && self.engine != 0 && self.te_sync.done.load(Ordering::Acquire) < self.te_writes {
+            let wait = crossbeam_utils::Backoff::new();
+            while self.te_sync.done.load(Ordering::Acquire) < self.te_writes {
+                wait.snooze();
+            }
+        }
+    }
+
+    /// Whether this engine draws framebuffer row `y`.
+    #[inline]
+    pub fn owns_row(&self, y: i32) -> bool {
+        ((y as u32) ^ self.engine) & self.own_mask == 0
     }
 
     /// A GL batch begins (our GE11 HLE): save the raster registers and
@@ -816,10 +1398,12 @@ impl Rss {
     #[cfg(test)]
     pub fn new_boxed() -> Box<Rss> {
         let mut b = Box::<Rss>::new_zeroed();
+        let planes = Box::into_raw(super::plain::boxed_zeroed::<Planes>());
         // SAFETY: zeroed and exclusively owned; `init` writes the fields that
-        // are not valid zeroed.
+        // are not valid zeroed. The planes are this engine's to free.
         unsafe {
-            Rss::init(b.as_mut_ptr());
+            Rss::init(b.as_mut_ptr(), planes);
+            std::ptr::addr_of_mut!((*b.as_mut_ptr()).owned_planes).write(planes);
             b.assume_init()
         }
     }
@@ -892,9 +1476,9 @@ impl Rss {
                 self.te_read = [read as u32, size & 0xFFFF, size >> 16];
             }
             te_reg::TXMIPMAP | te_reg::TXBORDER | te_reg::DETAILSCALE => {
-                let i = &mut self.regs[te_reg::TXADDR as usize];
-                self.te.table_write(r, *i, val);
-                *i = i.wrapping_add(1);
+                let i = self.regs[te_reg::TXADDR as usize];
+                self.te_write(false, |te, _| te.table_write(r, i, val));
+                self.regs[te_reg::TXADDR as usize] = i.wrapping_add(1);
             }
             _ => {}
         }
@@ -922,7 +1506,15 @@ impl Rss {
     /// with other pixel types; colour-index drawing masks 8 or 12 planes, or
     /// all 32 when the PROM and kernel draw).
     pub(super) fn rgb_mode(&self) -> bool {
-        rgb_pixtype(self.reg(reg::PP1FILLMODE)) || self.reg(reg::COLORMASKLSBSA) == 0xFF_FFFF
+        rgb_pixtype(self.reg(reg::PP1FILLMODE))
+    }
+
+    /// A 36-bit RGB write that reaches the low-nibble planes (35:24):
+    /// 12:12:12 drawing, which keeps all twelve bits. Writes of the 8-bit
+    /// planes alone (the X server's) store the value as it is.
+    pub(super) fn deep36(&self) -> bool {
+        let lsb = self.reg(reg::COLORMASKLSBSA) | self.reg(reg::COLORMASKLSBSB);
+        rgb36(self.reg(reg::PP1FILLMODE)) && (lsb & 0xFF00_0000 != 0 || self.reg(reg::COLORMASKMSBS) & 0xF != 0)
     }
 
     /// Window coordinates to framebuffer coordinates.
@@ -942,7 +1534,7 @@ impl Rss {
     /// `scrmsk{n}y`, each `min << 16 | max`), and bit `n + 3` keeps the
     /// pixels inside it rather than outside.
     fn visible(&self, x: i32, y: i32) -> bool {
-        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) || !self.owns_row(y) {
             return false;
         }
         let m = cid_match(self.reg(reg::PP1WINMODE));
@@ -977,8 +1569,9 @@ impl Rss {
     pub fn target(&self) -> Buffer {
         let kind = if self.draws_overlay() { Kind::Overlay } else { Kind::Wide };
         let drb = self.reg(reg::DRBPOINTERS);
+        let pp1 = self.reg(reg::PP1FILLMODE);
         let ptr = match self.second_buffer() {
-            Some(b) if kind == Kind::Wide && draw_buffer(self.reg(reg::PP1FILLMODE)) == DRAW_B => b,
+            Some(b) if kind == Kind::Wide && draws_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) => b,
             _ => drb,
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
@@ -1005,8 +1598,8 @@ impl Rss {
             return;
         }
         let b = self.target();
-        self.put_in(b, x, y, v, field == DRAW_B);
-        if field == DRAW_A_AND_B {
+        self.put_in(b, x, y, v, draws_b(field));
+        if draws_a_and_b(field) && !(b.kind == Kind::Wide && (rgb12_pair(self.reg(reg::PP1FILLMODE)) || ci_pixtype(self.reg(reg::PP1FILLMODE)))) {
             if let Some(p) = self.second_buffer() {
                 let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
                 // The 12-bit X visuals can give A and B the same page.
@@ -1020,58 +1613,84 @@ impl Rss {
 
     fn put_in(&mut self, b: Buffer, x: i32, y: i32, v: u32, back: bool) {
         let pp1 = self.reg(reg::PP1FILLMODE);
+        if b.kind == Kind::Wide && self.deep36() {
+            self.put_in36(b, x, y, rgb36_from8(v), back);
+            return;
+        }
         let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA });
-        // A write through all planes (window moves copy the screen that way,
-        // 24 bits a pixel) keeps the whole value; so does RGB.
-        let wide = rgb_pixtype(pp1) || lsb == 0xFF_FFFF || lsb == u32::MAX;
+        let wide = rgb_pixtype(pp1);
         let old = self.mem.get(&b, x as u32, y as u32) as u32;
+        if let (Kind::Wide, Some(pair)) = (b.kind, Pair::of(pp1)) {
+            let v = pair.pack(pp1, v, x, y);
+            let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 { logic_op(pp1 >> 26, v, old) } else { v };
+            // ColorMaskLSBs are planes 31:0 (libGLcore's pair masks name
+            // the alpha bits there: 0x0F000FFF, 0x40007FFF).
+            let mask = lsb;
+            self.mem.put(&b, x as u32, y as u32, ((old & !mask) | (v & mask)) as u64);
+            return;
+        }
+        // Colour index: the index in both 12-bit halves (A 11:0, B 23:12;
+        // the plane mask picks, see `ci_pixtype`).
+        let ci = b.kind == Kind::Wide && ci_pixtype(pp1);
+        let v = if ci { (v & 0xFFF) * 0x1001 } else { v };
         let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
-            let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide { 0xFF_FFFF } else { 0xFFF };
+            let width = if (pp1 >> 8) & 7 == 2 { u32::MAX } else if wide || ci { 0xFF_FFFF } else { 0xFFF };
             logic_op(pp1 >> 26, v, old) & width
         } else {
             v
         };
-        // X's 12-bit TrueColor visual uses RGB444 (pixel type 0, buffer
-        // size 0). Keep expanded nibbles in our RGB888 storage, whether
-        // the pixel came from a fill, an iterator, or a host transfer.
-        // Otherwise a scroll through RGBA4444 changes a fresh fill's
-        // 0x20/0x60/0x50 into a different shade on every round trip.
-        let v = if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 0 && pp1 & (1 << 13) == 0 {
-            let nibbles = v & 0xF0_F0F0;
-            nibbles | nibbles >> 4
-        } else {
-            v
-        };
-        // Plane write masks where the pixel format matches our storage
-        // (pixel type 2, RGBA8888: R G B in the low 24 planes, alpha in the
-        // top 8): ColorMaskLSBsA the low 24 planes (all 32 when it is all
-        // ones), ColorMaskMSBs the top 8. Overlay writes: the X server
-        // sends ColorMaskLSBsA 0 and ColorMaskMSBs 0xF0 (overlay visuals,
-        // values 0-15) or 0x70 (popup menus, values 0-3, colormap entries
-        // 0-3); read as the high nibble masking overlay planes 3:0 (our
-        // reading: the stored values stay as the X server wrote them).
-        // Other formats keep their decoded values: their masks describe
-        // a packed storage layout this model does not keep.
+        // Native GL masks name overlay index bits. X uses packed PP1 plane
+        // masks; its decoded CI8 indices include values above the low nibble.
         let v = if b.kind == Kind::Overlay {
-            // Native GL CI8 overlays select the upper overlay planes
-            // (DRAW_BUFFER 0x48). X's 4-bit overlay/popup selector 0x4f
-            // presents those planes as indices 0..15.
-            let mask = if draw_buffer(pp1) == 0x48 {
-                self.reg(reg::COLORMASKMSBS) & 0xFF
-            } else {
-                (self.reg(reg::COLORMASKMSBS) >> 4) & 0xF
-            };
+            let msbs = self.reg(reg::COLORMASKMSBS);
+            let mask = if draw_buffer(pp1) == 0x48 { msbs & 0xFF } else if msbs != 0 { 0xFF } else { 0 };
             (old & !mask) | (v & mask)
         } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 2 {
-            let mask = if lsb == u32::MAX { lsb } else { lsb & 0xFF_FFFF | (self.reg(reg::COLORMASKMSBS) & 0xFF) << 24 };
+            let mask = lsb;
             (old & !mask) | (v & mask)
-        } else if b.kind == Kind::Wide && (pp1 >> 8) & 7 == 6 {
-            let mask = lsb & 0xFFF;
+        } else if ci {
+            let mask = lsb & 0xFF_FFFF;
             (old & !mask) | (v & mask)
         } else {
             v
         };
         self.mem.put(&b, x as u32, y as u32, v as u64);
+    }
+
+    /// A 12:12:12 write (see `rgb36`) through the 36-bit plane mask:
+    /// ColorMaskLSBs for planes 31:0, ColorMaskMSBs for 35:32 (libGLcore
+    /// writes the visual's 0xF there and all ones to the LSB masks).
+    fn put_in36(&mut self, b: Buffer, x: i32, y: i32, v: u64, back: bool) {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let lsb = self.reg(if back { reg::COLORMASKLSBSB } else { reg::COLORMASKLSBSA }) as u64;
+        let mask = lsb | ((self.reg(reg::COLORMASKMSBS) & 0xF) as u64) << 32;
+        let old = self.mem.get(&b, x as u32, y as u32);
+        let v = if pp1 & PP1_LOGIC_OP_ENABLE != 0 {
+            let op = pp1 >> 26;
+            logic_op(op, v as u32, old as u32) as u64 | (logic_op(op, (v >> 32) as u32, (old >> 32) as u32) as u64) << 32
+        } else {
+            v
+        };
+        self.mem.put(&b, x as u32, y as u32, (old & !mask) | (v & mask));
+    }
+
+    /// `put` of a 12:12:12 pixel: the target buffer, and B as well for
+    /// draw field 3.
+    fn put36(&mut self, x: i32, y: i32, v: u64) {
+        let field = draw_buffer(self.reg(reg::PP1FILLMODE));
+        if !self.visible(x, y) || field == DRAW_CID {
+            return;
+        }
+        let b = self.target();
+        self.put_in36(b, x, y, v, draws_b(field));
+        if draws_a_and_b(field) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.put_in36(b2, x, y, v, true);
+                }
+            }
+        }
     }
 
     /// Drawing goes to the overlay planes.
@@ -1082,19 +1701,44 @@ impl Rss {
     /// Pixel reads select A, B, or the overlay independently of drawing.
     fn source(&self) -> Buffer {
         let drb = self.reg(reg::DRBPOINTERS);
-        let (ptr, kind) = match read_buffer(self.reg(reg::PP1FILLMODE)) {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let (ptr, kind) = match read_buffer(pp1) {
             READ_OVERLAY => (drb, Kind::Overlay),
-            READ_B => (self.second_buffer().unwrap_or(drb), Kind::Wide),
+            // 12-bit pairs and colour index keep B in A's words.
+            READ_B if !rgb12_pair(pp1) && !ci_pixtype(pp1) => (self.second_buffer().unwrap_or(drb), Kind::Wide),
             _ => (drb, Kind::Wide),
         };
         Buffer::new(ptr, kind, self.reg(reg::DRBSIZE))
+    }
+
+    /// The read source's word at (x, y), undecoded.
+    fn get_word(&self, x: i32, y: i32) -> u32 {
+        if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
+            return 0;
+        }
+        self.mem.get(&self.source(), x as u32, y as u32) as u32
     }
 
     fn get(&self, x: i32, y: i32) -> u32 {
         if !(0..WIDTH as i32).contains(&x) || !(0..HEIGHT as i32).contains(&y) {
             return 0;
         }
-        self.mem.get(&self.source(), x as u32, y as u32) as u32
+        let w = self.get_word(x, y);
+        if self.regs[reg::ZST_STENCIL as usize] != 0 {
+            return w >> 24;
+        }
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        if rgb36(pp1) && read_buffer(pp1) != READ_OVERLAY {
+            return w & 0xFF_FFFF;
+        }
+        // A colour-index window's B buffer: the word's high half.
+        if ci_pixtype(pp1) && read_buffer(pp1) == READ_B {
+            return (w >> 12) & 0xFFF;
+        }
+        match (read_buffer(pp1), Pair::of(pp1)) {
+            (r @ (0 | READ_B), Some(pair)) => pair.unpack(w, r == READ_B),
+            _ => w,
+        }
     }
 
     /// Block pixel `(col, row)` in framebuffer coordinates.
@@ -1223,6 +1867,11 @@ impl Rss {
                     if op == OP_AREA_LTOR { "left to right" } else { "right to left" },
                     pos(0x003), pos(0x004), pos(0x005), pos(0x000))
             }
+            OP_GL_LINE => {
+                let pos = |n: u32| f32::from_bits(self.reg(n)) - 49151.5;
+                format!("GL LINE ({}, {})-({}, {}) config={:#x} {target}",
+                    pos(0x00C), pos(0x00D), pos(0x00E), pos(0x00F), self.reg(reg::GLINECONFIG))
+            }
             op => format!("IR {ir:#x} (opcode {op:#x} not modelled) fm={fm:#x} {target}"),
         }
     }
@@ -1289,8 +1938,8 @@ impl Rss {
     pub(super) fn background(&self) -> u32 {
         let bg = self.reg(reg::BG_COLOR);
         if self.rgb_mode() {
-            let red = self.reg(reg::BG_COLOR_RED) & 0xFFF;
-            pack_rgb(red >> 4, (bg & 0xFFF) >> 4, ((bg >> 12) & 0xFFF) >> 4)
+            let blue = self.reg(reg::BG_COLOR_BLUE) & 0xFFF;
+            pack_rgb((bg & 0xFFF) >> 4, ((bg >> 12) & 0xFFF) >> 4, blue >> 4)
         } else {
             bg & 0xFFF
         }
@@ -1323,6 +1972,9 @@ impl Rss {
         }
         let smp = (t.tex != 0).then(|| self.te.sampler(&self.regs));
         for j in t.j0..t.j1 {
+            if self.own_mask != 0 && !self.owns_row(self.to_fb(0, j).1) {
+                continue;
+            }
             let dj = t.yref_i.wrapping_sub(j);
             let yc = j as f64 + 0.5;
             let major = t.x0 + t.s0 * (t.yref - yc);
@@ -1416,8 +2068,8 @@ impl Rss {
         ];
         if texture {
             if let Some((want, have)) = self.te.stale(&self.regs) {
-                self.te.stale_events += 1;
-                self.te.stale_last = [want, have];
+                self.stale_events += 1;
+                self.stale_last = [want, have];
             }
         }
         let fog = self.reg(reg::FOG_ON) != 0;
@@ -1605,11 +2257,32 @@ impl Rss {
         if af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
             return;
         }
+        let (ux, uy) = (fx as u32, fy as u32);
+        if !self.depth_stencil(ux, uy, z) {
+            return;
+        }
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let b = self.target();
+        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
+                }
+            }
+        }
+    }
+
+    /// The stencil and depth tests at framebuffer `(ux, uy)` for a
+    /// fragment at window depth `z` (z.12), updating the ZST buffer as
+    /// the stencil ops and the depth write mask say: whether the fragment
+    /// passes. True with both tests off.
+    fn depth_stencil(&mut self, ux: u32, uy: u32, z: i64) -> bool {
         let st = self.reg(reg::STENCILMODE);
         let zm = self.reg(reg::ZMODE);
         let (sten, ztest) = (st & TEST_ENABLE != 0, zm & ZMODE_TEST != 0);
         let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, self.reg(reg::DRBSIZE));
-        let (ux, uy) = (fx as u32, fy as u32);
         if sten || ztest {
             let zst = self.mem.get(&zbuf, ux, uy);
             let s_old = ((zst >> 24) & 0xFF) as u32;
@@ -1641,21 +2314,9 @@ impl Rss {
             if new != zst {
                 self.mem.put(&zbuf, ux, uy, new);
             }
-            if !zpass {
-                return;
-            }
+            return zpass;
         }
-        let pp1 = self.reg(reg::PP1FILLMODE);
-        let b = self.target();
-        self.fragment_color(b, ux, uy, rgba, pp1, draw_buffer(pp1) == DRAW_B);
-        if draw_buffer(pp1) == DRAW_A_AND_B {
-            if let Some(p) = self.second_buffer() {
-                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
-                if b2 != b {
-                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
-                }
-            }
-        }
+        true
     }
 
     /// A fragment's colour (12.16, clamped) blended or not, shifted down
@@ -1663,6 +2324,15 @@ impl Rss {
     fn fragment_color(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
         use fixed::{mul, ONE};
         let dst = self.mem.get(&b, ux, uy) as u32;
+        if b.kind == Kind::Wide && self.deep36() {
+            self.fragment_color36(b, ux, uy, rgba, pp1, back);
+            return;
+        }
+        // Pixel pairs: blend with this buffer's half and alpha.
+        let dst = match (b.kind, Pair::of(pp1)) {
+            (Kind::Wide, Some(pair)) => pair.unpack(dst, back),
+            _ => dst,
+        };
         // A logic op other than copy replaces blending (OpenGL).
         let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
         let rgb = self.rgb_mode();
@@ -1670,24 +2340,7 @@ impl Rss {
             let blend = self.reg(reg::BLENDFACTOR);
             let c = if blend & BLEND_ENABLE != 0 && !logic {
                 let d = [0, 8, 16, 24].map(|s| (fixed::widen((dst >> s) & 0xFF, 2) << 16) as i32);
-                let f = |code: u32, k: usize| -> i32 {
-                    match code {
-                        0 => 0,
-                        1 => ONE,
-                        2 => rgba[k],
-                        3 => ONE - rgba[k],
-                        4 => rgba[3],
-                        5 => ONE - rgba[3],
-                        6 => d[3],
-                        7 => ONE - d[3],
-                        8 => d[k],
-                        9 => ONE - d[k],
-                        10 => if k == 3 { ONE } else { rgba[3].min(ONE - d[3]) },
-                        _ => ONE,
-                    }
-                };
-                let (sf, df) = (blend & 0xF, (blend >> 4) & 0xF);
-                [0, 1, 2, 3].map(|k| fixed::clamp(mul(rgba[k], f(sf, k)).wrapping_add(mul(d[k], f(df, k)))))
+                blend_rgba(blend, &self.blend_constant(), &rgba, &d)
             } else {
                 rgba
             };
@@ -1698,12 +2351,51 @@ impl Rss {
         self.put_in(b, ux as i32, uy as i32, src, back);
     }
 
+    /// The constant blend colour (`blend_const`).
+    pub(super) fn blend_constant(&self) -> [i32; 4] {
+        blend_const(self.reg(reg::BLENDCOLOR_RG), self.reg(reg::BLENDCOLOR_BA))
+    }
+
+    /// `fragment_color` into a 12:12:12 buffer: blending reads and the
+    /// result keeps all twelve bits a component (no alpha planes: the
+    /// destination alpha is 1).
+    fn fragment_color36(&mut self, b: Buffer, ux: u32, uy: u32, rgba: [i32; 4], pp1: u32, back: bool) {
+        use fixed::{mul, ONE};
+        let dst = self.mem.get(&b, ux, uy);
+        let logic = pp1 & PP1_LOGIC_OP_ENABLE != 0 && (pp1 >> 26) & 0xF != 3;
+        let blend = self.reg(reg::BLENDFACTOR);
+        let c = if blend & BLEND_ENABLE != 0 && !logic {
+            let d = unpack36(dst).map(|c| (c << 16) as i32);
+            let d = [d[0], d[1], d[2], ONE];
+            blend_rgba(blend, &self.blend_constant(), &rgba, &d)
+        } else {
+            rgba
+        };
+        let v = pack36([0, 1, 2].map(|k| (fixed::clamp(c[k]) >> 16) as u32));
+        self.put_in36(b, ux as i32, uy as i32, v, back);
+    }
+
     fn fill(&mut self, b: &Block) {
+        // 12:12:12 fast fills keep the fill colour's twelve bits.
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        if self.deep36() && !self.draws_overlay() && self.reg(reg::FILLMODE) & FILL_FAST != 0 {
+            let v = pack36([0, 1, 2].map(|k| self.reg(reg::FILL_COLOR_R + k) & 0xFFF));
+            for row in 0..b.rows() {
+                for col in 0..b.cols() {
+                    let (x, y) = self.block_px(b, col, row);
+                    self.put36(x, y, v);
+                }
+            }
+            return;
+        }
         #[cfg(feature = "gr4-jit")]
         if super::rss_jit::fill(self, b) {
             return;
         }
         for row in 0..b.rows() {
+            if self.own_mask != 0 && !self.owns_row(self.block_px(b, 0, row).1) {
+                continue;
+            }
             for col in 0..b.cols() {
                 let (x, y) = self.block_px(b, col, row);
                 self.put(x, y, b.color);
@@ -1755,9 +2447,13 @@ impl Rss {
             pio_read,
             width: self.reg(reg::XFRSIZE) & 0xFFFF,
             bpp: bytes_per_pixel(mode),
-            format: ((mode >> 4) & 0xF, mode & 0xF),
+            format: xfer_format(mode),
             begin_skip: begin,
-            stride_skip: (mode >> 14) & 0x1FF,
+            // Bits 17:14 (traced up to 6, the row padding to a
+            // doubleword); 18 keeps a PIO read in the DMA order, 19 and 20
+            // enable zoom and decimation, 22 is RGBorder.
+            stride_skip: (mode >> 14) & 0xF,
+            pio_dma_order: mode & 1 << 18 != 0,
             line: 0,
             line_begin: begin,
             pending: 0,
@@ -1788,11 +2484,38 @@ impl Rss {
     }
 
     fn put_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        if self.regs[reg::ZST_STENCIL as usize] != 0 {
+            self.put_stencil_line(x, line, bytes);
+            return;
+        }
+        let frag = self.transfer_fragments();
         #[cfg(feature = "gr4-jit")]
-        if super::rss_jit::xfer_line(self, x, line, bytes) {
+        if !frag && super::rss_jit::xfer_line(self, x, line, bytes) {
+            self.stats.dma_lines_jit += 1;
             return;
         }
         let bpp = x.bpp as usize;
+        for k in 0..(bytes.len() / bpp.max(1)).min(x.width as usize) {
+            let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+            if self.visible(fx, fy) {
+                self.stats.dma_px_put += 1;
+            } else if self.owns_row(fy) {
+                self.stats.dma_px_clipped += 1;
+            }
+        }
+        let alpha = transfer_alpha(x.format);
+        if generic_format(x.format) {
+            for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
+                let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+                let v = fb_pixel(x.format, px);
+                if frag {
+                    self.put_fragment(fx, fy, v, alpha);
+                } else {
+                    self.put(fx, fy, v);
+                }
+            }
+            return;
+        }
         for (k, px) in bytes.chunks(bpp).enumerate().take(x.width as usize) {
             // Big-endian bytes.
             let v = px.iter().fold(0u64, |a, &b| (a << 8) | b as u64);
@@ -1806,18 +2529,149 @@ impl Rss {
                 }
                 continue;
             }
-            self.put(fx, fy, from_host(x.format, v));
+            if frag {
+                self.put_fragment(fx, fy, from_host(x.format, v), alpha);
+            } else {
+                self.put(fx, fy, from_host(x.format, v));
+            }
         }
+    }
+
+    /// Whether transferred pixels go through the per-fragment stage, as
+    /// glDrawPixels' fragments do: with the depth or stencil test on, or
+    /// (RGB drawing) the alpha test or blending. Harbingers of Destiny
+    /// draws its dialogue layer as a window-sized RGBA image, transparent
+    /// outside the box, under glAlphaFunc(GL_GEQUAL, 0.9); written
+    /// straight, the transparent pixels covered the 3D scene in black. The
+    /// fragments' depth is the raster position's (`reg::XFER_Z`).
+    fn transfer_fragments(&self) -> bool {
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        if draw_buffer(pp1) == DRAW_CID || draw_buffer(pp1) & 0x70 == 0x40 {
+            return false;
+        }
+        let zst = self.reg(reg::ZMODE) & ZMODE_TEST != 0 || self.reg(reg::STENCILMODE) & TEST_ENABLE != 0;
+        let rgb = self.rgb_mode()
+            && (self.reg(reg::AFUNCMODE) & TEST_ENABLE != 0 || self.reg(reg::BLENDFACTOR) & BLEND_ENABLE != 0);
+        zst || rgb
+    }
+
+    /// Transferred pixel `v` (a framebuffer value) at framebuffer `(fx,
+    /// fy)` through the alpha test, the stencil and depth tests at the
+    /// raster position's depth, and blending (`fragment_color`), into the
+    /// buffer or buffers drawing goes to. Without `alpha` the format has
+    /// none and the fragment's alpha is 1, as OpenGL gives it. In colour
+    /// index `v` is the index (no alpha test, no blending).
+    fn put_fragment(&mut self, fx: i32, fy: i32, v: u32, alpha: bool) {
+        if !self.visible(fx, fy) {
+            return;
+        }
+        let rgb = self.rgb_mode();
+        let rgba = if rgb {
+            let v = if alpha { v } else { v | 0xFF << 24 };
+            [0, 8, 16, 24].map(|s| (fixed::widen((v >> s) & 0xFF, 2) << 16) as i32)
+        } else {
+            [((v & 0xFFF) << 16) as i32, 0, 0, 0]
+        };
+        let af = self.reg(reg::AFUNCMODE);
+        if rgb && af & TEST_ENABLE != 0 && !compare(af & 7, rgba[3] as f64, (((af >> 4) & 0xFFF) << 16) as f64) {
+            return;
+        }
+        let (ux, uy) = (fx as u32, fy as u32);
+        if !self.depth_stencil(ux, uy, (self.reg(reg::XFER_Z) as i64) << 4) {
+            return;
+        }
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let b = self.target();
+        self.fragment_color(b, ux, uy, rgba, pp1, draws_b(draw_buffer(pp1)));
+        if draws_a_and_b(draw_buffer(pp1)) && !rgb12_pair(pp1) && !ci_pixtype(pp1) {
+            if let Some(p) = self.second_buffer() {
+                let b2 = Buffer::new(p, Kind::Wide, self.reg(reg::DRBSIZE));
+                if b2 != b {
+                    self.fragment_color(b2, ux, uy, rgba, pp1, true);
+                }
+            }
+        }
+    }
+
+    /// Stencil indices (the transfer's low byte a pixel) into the ZST
+    /// buffer's top byte, through the stencil write mask.
+    fn put_stencil_line(&mut self, x: &Xfer, line: u32, bytes: &[u8]) {
+        let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, self.reg(reg::DRBSIZE));
+        let wmask = ((self.reg(reg::STENCILMASK) >> 8) & 0xFF) as u64;
+        for (k, px) in bytes.chunks(x.bpp as usize).enumerate().take(x.width as usize) {
+            let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+            if self.visible(fx, fy) {
+                let s = *px.last().unwrap_or(&0) as u64;
+                let old = self.mem.get(&zbuf, fx as u32, fy as u32);
+                let new = (old & !(wmask << 24)) | (s & wmask) << 24;
+                self.mem.put(&zbuf, fx as u32, fy as u32, new);
+            }
+        }
+    }
+
+    /// The read pixel's components at (fx, fy) widened to 16 bits: a
+    /// 12:12:12 visual's twelve bits, else the 8-bit framebuffer value.
+    fn comps16(&self, fx: i32, fy: i32) -> [u16; 4] {
+        let px = self.get(fx, fy);
+        if rgb36(self.reg(reg::PP1FILLMODE)) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) {
+            let u = unpack36(self.mem.get(&self.source(), fx as u32, fy as u32));
+            let w = |c: u32| (c << 4 | c >> 8) as u16;
+            return [w(u[0]), w(u[1]), w(u[2]), comps16(px)[3]];
+        }
+        comps16(px)
     }
 
     /// Byte `i` (big-endian) of transfer pixel `k` of `line`, as the host sees it.
     fn line_byte(&self, x: &Xfer, line: u32, k: u32, i: u32) -> u8 {
         let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
-        let v = to_host(x.format, self.get(fx, fy));
+        // PIO reads of RGB(A) come in the reverse of the DMA order: RGBA
+        // (RGBorder set) alpha first, ABGR (clear) red first. libGLcore's
+        // packed-type reads (__glMgr_PackPixels, one row at a time) unpack
+        // them so: its 4-4-4-4 and 8-8-8-8 come out right in both orders.
+        // The X server's reads (XGetImage, xfrmode 0x40080) set bit 18 and
+        // take the pixel word in the DMA order (traced: colours right).
+        if x.pio_read && !x.pio_dma_order && matches!(x.format.0, 7 | 8) {
+            let c = self.comps16(fx, fy);
+            let mut out = Vec::with_capacity(x.bpp as usize);
+            let order: &[usize] = match x.format.0 {
+                8 if x.format.1 & 0x10 == 0 => &[0, 1, 2, 3],
+                8 => &[3, 2, 1, 0],
+                _ => &[2, 1, 0],
+            };
+            for &k in order {
+                host_comp(x.format.1, c[k], &mut out);
+            }
+            return out.get(i as usize).copied().unwrap_or(0);
+        }
+        if generic_format(x.format) {
+            let mut out = Vec::with_capacity(x.bpp as usize);
+            host_pixel(x.format, self.comps16(fx, fy), &mut out);
+            return out.get(i as usize).copied().unwrap_or(0);
+        }
+        // Depth: the ZST word as it is, never a 12-bit pair's half.
+        let px = if x.format == DEPTH_FORMAT { self.get_word(fx, fy) } else { self.get(fx, fy) };
+        let pp1 = self.reg(reg::PP1FILLMODE);
+        let v = match x.format {
+            // 16-bit components from a 12:12:12 pixel: all twelve bits.
+            (7, 1) | (8, 1) if rgb36(pp1) && (0..WIDTH as i32).contains(&fx) && (0..HEIGHT as i32).contains(&fy) => {
+                let u = unpack36(self.mem.get(&self.source(), fx as u32, fy as u32));
+                let c = |k: usize| (u[k] << 4 | u[k] >> 8) as u64;
+                if x.format == (7, 1) { c(0) << 32 | c(1) << 16 | c(2) } else { c(0) << 48 | c(1) << 32 | c(2) << 16 | 0xFFFF }
+            }
+            _ => to_host(x.format, px),
+        };
         (v >> (8 * (x.bpp - 1 - i))) as u8
     }
 
     fn get_line(&self, x: &Xfer, line: u32) -> Vec<u8> {
+        if generic_format(x.format) {
+            let mut out = Vec::with_capacity((x.width * x.bpp) as usize);
+            for k in 0..x.width {
+                let (fx, fy) = self.block_px(&x.block, k as i32, line as i32);
+                host_pixel(x.format, self.comps16(fx, fy), &mut out);
+            }
+            return out;
+        }
         (0..x.width).flat_map(|k| (0..x.bpp).map(move |i| (k, i))).map(|(k, i)| self.line_byte(x, line, k, i)).collect()
     }
 
@@ -1899,12 +2753,19 @@ impl Rss {
     pub fn dma_write_line(&mut self, line: u32, bytes: &[u8]) {
         self.stats.dma_lines_in += 1;
         if self.te_load != 0 {
-            self.te.load_line(&self.regs, line, bytes);
+            self.stats.dma_lines_te += 1;
+            self.te_write(true, |te, regs| te.load_line(regs, line, bytes));
             return;
         }
-        if let Some(x) = self.xfer.take() {
-            self.put_line(&x, line, bytes);
-            self.xfer.set(Some(x));
+        match self.xfer.take() {
+            Some(x) if !x.read => {
+                self.put_line(&x, line, bytes);
+                self.xfer.set(Some(x));
+            }
+            x => {
+                self.xfer.set(x);
+                self.stats.dma_lines_dropped += 1;
+            }
         }
     }
 
@@ -1936,6 +2797,11 @@ mod tests {
         r.mem.get(&main_buffer(), x as u32, (SCREEN_H - 1 - y_top) as u32) as u32
     }
 
+    /// A 12-bit pixel pair's buffer A (low half) as 8-8-8.
+    fn px12(r: &Rss, x: usize, y_top: usize) -> u32 {
+        from_rgb12(px(r, x, y_top) & 0xFFF)
+    }
+
     /// The X server's setup: window origin at the top row, Y-flip on, so
     /// block coordinates are X's top-down ones.
     fn x_server() -> Box<Rss> {
@@ -1944,8 +2810,11 @@ mod tests {
         r.write(reg::XYWIN, 1023 << 16, false);
         r.write(reg::DRBSIZE, 0x31E, false);
         r.write(reg::DRBPOINTERS, 0x240, false);
-        // All planes writable, as the X server sets them.
-        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        // A colour-index window's buffer A, planes 11:0 (the X server's CI8
+        // windows write through 0xFF; colour index takes no other planes,
+        // see `ci_pixtype`).
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF, false);
         r.write(reg::PP1FILLMODE, 0x0C00_4504, false);
         r
     }
@@ -1954,6 +2823,47 @@ mod tests {
         r.write(reg::IR_ALIAS, 0x18, false);
         r.write(reg::BLOCKXYSTARTI, x0 << 16 | y0, false);
         r.write(reg::BLOCKXYENDI, x1 << 16 | y1, true);
+    }
+
+    #[test]
+    fn marquee_ci12_fill_and_stipple_preserve_indices_and_masks() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_4404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 3, false);
+        block(&mut r, 15, 671, 16, 671);
+        assert_eq!(px(&r, 15, 671), 3);
+        r.write(reg::FILLMODE, 1 << 22 | FILL_CHAR_STIPPLE, false);
+        r.write(reg::RED, 0xABC << 12, false);
+        block(&mut r, 15, 671, 16, 671);
+        r.write(reg::CHAR_H, 0x8000_0000, true);
+        assert_eq!(px(&r, 15, 671), 0xABC);
+        assert_eq!(px(&r, 16, 671), 3);
+        r.write(reg::COLORMASKLSBSA, 0xF, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 5, false);
+        block(&mut r, 15, 671, 15, 671);
+        assert_eq!(px(&r, 15, 671), 0xAB5);
+    }
+
+    #[test]
+    fn maya_popup_hover_preserves_upper_overlay_color_bits() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C13_F504, false);
+        r.write(reg::DRBPOINTERS, 0x101C0, false);
+        r.write(reg::COLORMASKLSBSA, 0, false);
+        r.write(reg::COLORMASKMSBS, 0x70, false);
+        let b = r.target();
+        let y = (SCREEN_H - 1 - 139) as u32;
+        r.mem.put(&b, 18, y, 4);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 0x10, false);
+        block(&mut r, 18, 139, 18, 139);
+        assert_eq!(r.mem.get(&b, 18, y), 0x10);
+        r.write(reg::FILL_COLOR_R, 0, false);
+        block(&mut r, 18, 139, 18, 139);
+        assert_eq!(r.mem.get(&b, 18, y), 0);
     }
 
     #[test]
@@ -1971,26 +2881,123 @@ mod tests {
     /// The draw-buffer field picks DRBpointers' first page (1), its second
     /// (2) or both (3): an X double-buffered window draws its back buffer
     /// with 2 while the screen shows A.
+    /// PowerAnimator's back-to-front copy: fill B (field 2), read B by
+    /// DMA (read field B, 16-bit index), write the bytes into A (field 1).
+    #[test]
+    fn ci_back_to_front_copy_through_the_host() {
+        let mut r = x_server();
+        #[cfg(feature = "gr4-jit")]
+        {
+            r.jit.mode = super::super::rss_jit::MODE_SYNC;
+        }
+        r.write(reg::PP1FILLMODE, 0x0C00_8404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF000, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF000, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::FILL_COLOR_R, 0x800, false);
+        block(&mut r, 10, 5, 11, 5);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x800_000);
+        r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+        r.write(reg::XFRMODE, 0xC1_8001, false);
+        r.write(reg::PP1FILLMODE, 0x0C20_4404, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFFF, false);
+        r.write(reg::FILLMODE, 0x100_0000, false);
+        block(&mut r, 10, 5, 11, 5);
+        let bytes = r.dma_read_line(0);
+        assert_eq!(bytes, [0x08, 0x00, 0x08, 0x00], "B's index, 16 bits");
+        r.write(reg::PP1FILLMODE, 0x0C00_4404, false);
+        r.write(reg::FILLMODE, 0x1140_0000, false);
+        block(&mut r, 10, 5, 11, 5);
+        r.dma_write_line(0, &bytes);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x800_800, "A now holds the copy");
+        // And back into B with PowerAnimator's whole context (traced).
+        for (k, v) in [
+            (reg::PP1WINMODE, 1),
+            (reg::ZMODE, 0),
+            (reg::AFUNCMODE, 7),
+            (reg::STENCILMODE, 7),
+            (reg::STENCILMASK, 0xFFFF),
+            (crate::dev::mgras::te1::reg::TEXMODE1, 0x40440),
+            (reg::PP1FILLMODE, 0x0C00_8404),
+            (reg::COLORMASKLSBSA, 0xFFF000),
+            (reg::COLORMASKLSBSB, 0xFFF000),
+            (reg::FILLMODE, 0x1140_0000),
+            (reg::XFRMODE, 0xC0_8001),
+        ] {
+            r.write(k, v, false);
+        }
+        block(&mut r, 10, 5, 11, 5);
+        r.dma_write_line(0, &[0x08, 0x06, 0x08, 0x02]);
+        assert_eq!(px(&r, 10, 5) & 0xFF_FFFF, 0x806_800, "B by DMA in PowerAnimator's context");
+    }
+
+    /// A double-buffered colour-index window keeps both buffers in one
+    /// word (A 11:0, B 23:12), not on a second page: the X server moves
+    /// windows with whole-word copies, which must carry both (PowerAnimator
+    /// lost its menus to a window move when B lived on the second page).
+    #[test]
+    fn ci_double_buffer_is_two_halves_of_one_word() {
+        let mut r = x_server();
+        let a = r.reg(reg::DRBPOINTERS) & 0x3FF;
+        let b_page = a + 0x100;
+        r.write(reg::DRBPOINTERS, (r.reg(reg::DRBPOINTERS) & !0xF_FFFF) | b_page << 10 | a, false);
+        let ci = (r.reg(reg::PP1FILLMODE) & !((0x7F << 14) | 0x700)) | 0x600;
+        let word = |r: &Rss, page: u32| {
+            let buf = Buffer::new(page, Kind::Wide, r.reg(reg::DRBSIZE));
+            r.mem.get(&buf, 10, (SCREEN_H - 1 - 5) as u32) as u32
+        };
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        for (field, mask, c) in [(1u32, 0xFFFu32, 0x123u32), (2, 0xFFF000, 0x456)] {
+            r.write(reg::PP1FILLMODE, ci | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            r.write(reg::FILL_COLOR_R, c, false);
+            block(&mut r, 10, 5, 10, 5);
+        }
+        assert_eq!(word(&r, a) & 0xFF_FFFF, 0x456_123, "A in 11:0, B in 23:12 of A's page");
+        assert_eq!(word(&r, b_page), 0, "the second page untouched");
+        // Field 3 writes both halves of the same word.
+        r.write(reg::PP1FILLMODE, ci | 3 << 14, false);
+        r.write(reg::COLORMASKLSBSA, 0xFF_FFFF, false);
+        r.write(reg::COLORMASKLSBSB, 0xFF_FFFF, false);
+        r.write(reg::FILL_COLOR_R, 0x789, false);
+        block(&mut r, 10, 5, 10, 5);
+        assert_eq!(word(&r, a) & 0xFF_FFFF, 0x789_789);
+        assert_eq!(word(&r, b_page), 0);
+        // Reading B (read field 1) takes the high half.
+        r.write(reg::PP1FILLMODE, ci | 1 << 21, false);
+        assert_eq!(r.get(10, (SCREEN_H - 1 - 5) as i32), 0x789);
+    }
+
     #[test]
     fn draw_buffer_field_picks_a_b_or_both() {
         let mut r = x_server();
         let a = r.reg(reg::DRBPOINTERS) & 0x3FF;
         let b_page = a + 0x100;
         r.write(reg::DRBPOINTERS, (r.reg(reg::DRBPOINTERS) & !0xF_FFFF) | b_page << 10 | a, false);
-        let fm = r.reg(reg::PP1FILLMODE) & !(0x7F << 14);
+        // An RGB window (RGBA8888): fields 2 and 3 name the second page here
+        // (colour index keeps B in the word's high half instead).
+        let fm = (r.reg(reg::PP1FILLMODE) & !((0x7F << 14) | 0x700)) | 0x200;
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKLSBSB, u32::MAX, false);
         let read = |r: &Rss, page: u32, x: u32, y: u32| {
             let buf = Buffer::new(page, Kind::Wide, r.reg(reg::DRBSIZE));
-            r.mem.get(&buf, x, (SCREEN_H - 1 - y as usize) as u32) as u32 & 0xFFF
+            r.mem.get(&buf, x, (SCREEN_H - 1 - y as usize) as u32) as u32 & 0xFF
         };
         r.write(reg::FILLMODE, FILL_FAST, false);
-        for (field, x, c) in [(1u32, 10, 0x11), (2, 20, 0x22), (3, 30, 0x33)] {
+        for (field, x, c) in [(1u32, 10, 0x11), (2, 20, 0x22), (3, 30, 0x33), (4, 40, 0x44), (5, 50, 0x55)] {
             r.write(reg::PP1FILLMODE, fm | field << 14, false);
-            r.write(reg::FILL_COLOR_R, c, false);
+            r.write(reg::FILL_COLOR_R, c << 4, false);
             block(&mut r, x, 5, x, 5);
         }
         assert_eq!([read(&r, a, 10, 5), read(&r, b_page, 10, 5)], [0x11, 0], "field 1: A");
         assert_eq!([read(&r, a, 20, 5), read(&r, b_page, 20, 5)], [0, 0x22], "field 2: B");
         assert_eq!([read(&r, a, 30, 5), read(&r, b_page, 30, 5)], [0x33, 0x33], "field 3: both");
+        // A double-buffered 24-bit X window (System Manager's panes) and
+        // GL's 24-bit visuals: 4 the second page, 5 both.
+        assert_eq!([read(&r, a, 40, 5), read(&r, b_page, 40, 5)], [0, 0x44], "field 4: B's page");
+        assert_eq!([read(&r, a, 50, 5), read(&r, b_page, 50, 5)], [0x55, 0x55], "field 5: both");
     }
 
     #[test]
@@ -2004,12 +3011,32 @@ mod tests {
         r.mem.put(&ba, 10, 1018, 0x123456);
         r.mem.put(&bb, 10, 1018, 0x654321);
         r.write(reg::FILLMODE, 2 << 22, false);
-        r.write(reg::XFRMODE, 0x80, false);
+        r.write(reg::XFRMODE, 0x40080, false);
         r.write(reg::XFRSIZE, 1 << 16 | 1, false);
         for (read, draw, expected) in [(0, 2, 0x123456), (1, 1, 0x654321), (0, 3, 0x123456), (1, 3, 0x654321)] {
             r.write(reg::PP1FILLMODE, 0x0C00_0204 | read << 21 | draw << 14, false);
             block(&mut r, 10, 5, 10, 5);
             assert_eq!(r.pio_read_hi(), expected, "read {read}, draw {draw}");
+        }
+    }
+
+    /// PIO reads of RGBA come in the reverse of the DMA order (libGLcore's
+    /// packed-type reads: RGBA alpha first, ABGR red first) unless XFRMODE
+    /// bit 18 asks for the DMA order (the X server's XGetImage).
+    #[test]
+    fn pio_read_order_follows_rgborder_and_bit_18() {
+        let mut r = x_server();
+        let a = 0x240;
+        r.write(reg::DRBPOINTERS, a | a << 10, false);
+        let ba = Buffer::new(a, Kind::Wide, r.reg(reg::DRBSIZE));
+        r.mem.put(&ba, 10, 1018, 0x4433_2211);
+        r.write(reg::FILLMODE, 2 << 22, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        r.write(reg::PP1FILLMODE, 0x0C00_0204 | 2 << 14, false);
+        for (mode, expected) in [(0x40_0080, 0x4433_2211), (0x80, 0x1122_3344), (0x4_0080, 0x4433_2211)] {
+            r.write(reg::XFRMODE, mode, false);
+            block(&mut r, 10, 5, 10, 5);
+            assert_eq!(r.pio_read_hi(), expected, "xfrmode {mode:#x}");
         }
     }
 
@@ -2033,7 +3060,8 @@ mod tests {
             r.write(reg::FILL_COLOR_B, colour & 0xF00, false);
             block(&mut r, 10, 5, 10, 5);
             let expected = from_host((8, 8), colour as u64);
-            assert_eq!(px(&r, 10, 5), expected, "fresh fill {colour:#x}");
+            assert_eq!(px12(&r, 10, 5), expected, "fresh fill {colour:#x}");
+            assert_eq!(px(&r, 10, 5) >> 12, px(&r, 10, 5) & 0xFFF, "field 3: both halves");
             for _ in 0..3 {
                 r.write(reg::PP1FILLMODE, 0, false);
                 r.write(reg::COLORMASKLSBSA, 0xFFF, false);
@@ -2045,9 +3073,125 @@ mod tests {
                 r.write(reg::FILLMODE, 5 << 22, false);
                 block(&mut r, 10, 5, 10, 5);
                 r.dma_write_line(0, &bytes);
-                assert_eq!(px(&r, 10, 5), expected, "scroll {colour:#x}");
+                assert_eq!(px12(&r, 10, 5), expected, "scroll {colour:#x}");
             }
         }
+    }
+
+    /// 12-bit pixel pairs: A in a word's low half, B in its high half, on
+    /// A's page whatever DRBpointers' second field says; reads pick the
+    /// half with the read field.
+    #[test]
+    fn rgb12_pairs_share_a_word() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x140 << 10, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        let fill = |r: &mut Rss, field: u32, mask: u32, rgb: [u32; 3]| {
+            r.write(reg::PP1FILLMODE, 0x0C00_0004 | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            for (k, c) in rgb.iter().enumerate() {
+                r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+            }
+            block(r, 10, 5, 10, 5);
+        };
+        fill(&mut r, 1, 0xFFF, [0xF00, 0, 0]);
+        fill(&mut r, 2, 0xFFF000, [0, 0, 0xF00]);
+        assert_eq!(px(&r, 10, 5), 0xF00_00F, "B blue high, A red low");
+        let page_b = Buffer::new(0x140, Kind::Wide, r.reg(reg::DRBSIZE));
+        assert_eq!(r.mem.get(&page_b, 10, (SCREEN_H - 1 - 5) as u32), 0, "the second page is not B");
+        let y = (SCREEN_H - 1 - 5) as i32;
+        assert_eq!(r.get(10, y), 0xFF, "read field 0: A");
+        r.write(reg::PP1FILLMODE, 0x0C00_0004 | 1 << 21, false);
+        assert_eq!(r.get(10, y), 0xFF_0000, "read field 1: B");
+    }
+
+    /// Pixel type 1 pairs are 5:5:5 with a 1-bit alpha (libGLcore's plane
+    /// masks 0x40007FFF / 0xBFFF8000): A in 14:0 and bit 30, B in 29:15
+    /// and bit 31, all under the 32-bit ColorMaskLSBs.
+    #[test]
+    fn rgb555_pairs_with_alpha_planes() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        let fill = |r: &mut Rss, field: u32, mask: u32, rgba: [u32; 4]| {
+            r.write(reg::PP1FILLMODE, 0x0C00_0104 | field << 14, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::COLORMASKLSBSB, mask, false);
+            r.write(reg::COLORMASKMSBS, 0, false);
+            for (k, c) in rgba.iter().enumerate() {
+                r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+            }
+            block(r, 10, 5, 10, 5);
+        };
+        // A: red 0x84 (5 bits: 0x10), alpha 1. B: blue, alpha 0.
+        fill(&mut r, 1, 0x4000_7FFF, [0x840, 0, 0, 0xFF0]);
+        fill(&mut r, 2, 0xBFFF_8000, [0, 0, 0xFF0, 0]);
+        assert_eq!(px(&r, 10, 5), 0x1F << 25 | 1 << 30 | 0x10, "B blue in 29:25, A alpha, A red 0x10");
+        let y = (SCREEN_H - 1 - 5) as i32;
+        assert_eq!(r.get(10, y), 0xFF00_0084, "A: red widened (0x10 -> 0x84), alpha 0xFF");
+        r.write(reg::PP1FILLMODE, 0x0C00_0104 | 1 << 21, false);
+        assert_eq!(r.get(10, y), 0x00FF_0000, "B: blue, alpha 0");
+    }
+
+    /// 36-bit RGB (pixel type 3, bit 13): X's 24-bit fills write the 8-bit
+    /// planes; a 12:12:12 write through all 36 planes (LSBs all ones, MSBs
+    /// 0xF) keeps the low nibbles in 35:24, and the 8-bit parts stay where
+    /// 24-bit readers look.
+    #[test]
+    fn rgb36_keeps_twelve_bits() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_6304, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        for (k, c) in [0x123u32, 0x456, 0x789].iter().enumerate() {
+            r.write(reg::FILL_COLOR_R + k as u32, *c, false);
+        }
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
+        r.write(reg::COLORMASKMSBS, 0xF, false);
+        block(&mut r, 3, 3, 3, 3);
+        let w = r.mem.get(&main_buffer(), 3, (SCREEN_H - 1 - 3) as u32);
+        assert_eq!(w, 0x9_6378_4512, "8-bit parts 0x784512, nibbles 9 6 3 in 35:24");
+        assert_eq!(unpack36(w), [0x123, 0x456, 0x789]);
+        let y = (SCREEN_H - 1 - 3) as i32;
+        assert_eq!(r.get(3, y), 0x78_4512, "reads see 8-8-8");
+        // X's 24-plane fill over it: the 8-bit parts (we store X's value
+        // as it is, nibbles cleared; the board presumably keeps them).
+        r.write(reg::COLORMASKLSBSA, 0xFF_FFFF, false);
+        r.write(reg::COLORMASKMSBS, 0, false);
+        r.write(reg::FILL_COLOR_R, 0xFF0, false);
+        block(&mut r, 3, 3, 3, 3);
+        assert_eq!(r.mem.get(&main_buffer(), 3, y as u32) & 0xFF_FFFF, 0x78_45FF);
+    }
+
+    /// Dithered 12-bit pairs: a grey of 0x7F (7.5 in 4 bits) splits evenly
+    /// between 7 and 8 over each 4x4 Bayer tile; undithered it truncates.
+    #[test]
+    fn rgb12_dither_spreads_over_the_bayer_tile() {
+        let mut r = x_server();
+        r.write(reg::DRBPOINTERS, 0x240 | 0x240 << 10, false);
+        r.write(reg::FILLMODE, FILL_FAST, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFF, false);
+        for k in 0..3 {
+            r.write(reg::FILL_COLOR_R + k, 0x7F0, false);
+        }
+        let tile = |r: &Rss| {
+            let mut n = [0u32; 16];
+            for y in 0..4 {
+                for x in 0..4 {
+                    let c = px(r, 20 + x, 8 + y) & 0xFFF;
+                    assert!(c & 0xF == c >> 4 & 0xF && c & 0xF == c >> 8, "grey stays grey: {c:#05x}");
+                    n[(c & 0xF) as usize] += 1;
+                }
+            }
+            n
+        };
+        r.write(reg::PP1FILLMODE, 0x0C00_4004, false);
+        block(&mut r, 20, 8, 23, 11);
+        assert_eq!(tile(&r)[7], 16, "undithered: truncated");
+        r.write(reg::PP1FILLMODE, 0x0C00_4004 | PP1_DITHER, false);
+        block(&mut r, 20, 8, 23, 11);
+        let n = tile(&r);
+        assert_eq!((n[7], n[8]), (8, 8), "dithered: half each");
     }
 
     #[test]
@@ -2082,13 +3226,14 @@ mod tests {
     #[test]
     fn rgb_fast_fill_packs_components() {
         let mut r = x_server();
-        r.write(reg::PP1FILLMODE, 3 << 26 | 0x104, false); // RGB pixel type, copy
+        r.write(reg::PP1FILLMODE, 3 << 26 | 0x2204, false); // RGBA8888, copy
+        r.write(reg::COLORMASKLSBSA, u32::MAX, false);
         r.write(reg::FILLMODE, FILL_FAST, false);
         r.write(reg::FILL_COLOR_R, 0xF00, false);
         r.write(reg::FILL_COLOR_G, 0x800, false);
         r.write(reg::FILL_COLOR_B, 0x100, false);
         block(&mut r, 0, 0, 0, 0);
-        assert_eq!(px(&r, 0, 0), 0x10_80F0);
+        assert_eq!(px(&r, 0, 0) & 0xFF_FFFF, 0x10_80F0);
     }
 
     #[test]
@@ -2191,6 +3336,75 @@ mod tests {
         assert_eq!(px(&r, 7, 7), 0x50_5050);
     }
 
+    /// glDrawPixels under the alpha test: a transparent pixel leaves the
+    /// framebuffer alone, an opaque one is written (Harbingers of
+    /// Destiny's dialogue layer over its 3D scene). Blending applies too.
+    #[test]
+    fn transfers_pass_the_alpha_test_and_blend() {
+        let mut r = x_server();
+        r.write(reg::PP1FILLMODE, 0x0C00_6204, false);
+        r.write(reg::COLORMASKLSBSA, 0xFFFF_FFFF, false);
+        r.write(reg::FILLMODE, 5 << 22, false);
+        r.write(reg::XFRMODE, 0x80, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+        block(&mut r, 7, 7, 8, 7);
+        r.dma_write_line(0, &[0xFF, 0x50, 0x50, 0x50, 0xFF, 0x50, 0x50, 0x50]);
+        assert_eq!(px(&r, 7, 7) & 0xFF_FFFF, 0x50_5050);
+        // glAlphaFunc(GL_GEQUAL, 0.9): ref 0.9 of 4095.
+        r.write(reg::AFUNCMODE, 0xE66 << 4 | TEST_ENABLE | 6, false);
+        block(&mut r, 7, 7, 8, 7);
+        r.dma_write_line(0, &[0x00, 0x11, 0x11, 0x11, 0xFF, 0x22, 0x22, 0x22]);
+        assert_eq!(px(&r, 7, 7) & 0xFF_FFFF, 0x50_5050, "transparent pixel written");
+        assert_eq!(px(&r, 8, 7) & 0xFF_FFFF, 0x22_2222, "opaque pixel dropped");
+        // Alpha test off, blending on (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA):
+        // half alpha mixes 0xD0 into 0x50.
+        r.write(reg::AFUNCMODE, 7, false);
+        r.write(reg::BLENDFACTOR, BLEND_ENABLE | 5 << 4 | 4, false);
+        r.write(reg::XFRSIZE, 1 << 16 | 1, false);
+        block(&mut r, 7, 7, 7, 7);
+        r.dma_write_line(0, &[0x80, 0xD0, 0xD0, 0xD0]);
+        let c = px(&r, 7, 7) & 0xFF;
+        assert!((0x8C..=0x94).contains(&c), "blend gave {c:#x}, want about 0x90");
+    }
+
+    /// glDrawPixels with the depth test: each pixel takes the raster
+    /// position's depth (XFER_Z), passes GL_LESS only over a farther
+    /// stored depth, and writes its depth through the depth write mask.
+    /// Colour index tests the same way.
+    #[test]
+    fn transfers_take_the_raster_depth() {
+        let mut r = x_server();
+        let zbuf = Buffer::new(ZST_PAGE, Kind::Wide, r.reg(reg::DRBSIZE));
+        let fy = (SCREEN_H - 1 - 7) as u32;
+        let zat = |r: &Rss, x: u32| r.mem.get(&zbuf, x, fy) & 0xFF_FFFF;
+        for (pp1, mask, near, far, a, b) in [
+            (0x0C00_6204u32, 0xFFFF_FFFFu32, 0x50_5050u32, 0x22_2222u32, [0xFF, 0x50, 0x50, 0x50], [0xFF, 0x22, 0x22, 0x22]),
+            (0x0C00_4404, 0xFFF, 0x123, 0x456, [0x01, 0x23, 0, 0], [0x04, 0x56, 0, 0]),
+        ] {
+            r.write(reg::PP1FILLMODE, pp1, false);
+            r.write(reg::COLORMASKLSBSA, mask, false);
+            r.write(reg::ZMODE, 0, false);
+            r.write(reg::FILLMODE, 5 << 22, false);
+            r.write(reg::XFRMODE, if pp1 & 0x700 == 0x200 { 0x80 } else { 0x01 }, false);
+            r.write(reg::XFRSIZE, 1 << 16 | 2, false);
+            block(&mut r, 7, 7, 8, 7);
+            let line: Vec<u8> = if pp1 & 0x700 == 0x200 { [a, a].concat() } else { vec![a[0], a[1], a[0], a[1]] };
+            r.dma_write_line(0, &line);
+            assert_eq!(px(&r, 7, 7) & mask & 0xFF_FFFF, near, "{pp1:#x}: drawn with the test off");
+            // Stored depth 0.25 at x 7, 0.75 at x 8; raster depth 0.5, GL_LESS.
+            r.mem.put(&zbuf, 7, fy, 0x40_0000);
+            r.mem.put(&zbuf, 8, fy, 0xC0_0000);
+            r.write(reg::XFER_Z, 0x80_0000 << 8, false);
+            r.write(reg::ZMODE, 0xFF_FFFF << 4 | ZMODE_TEST | 1, false);
+            block(&mut r, 7, 7, 8, 7);
+            let line: Vec<u8> = if pp1 & 0x700 == 0x200 { [b, b].concat() } else { vec![b[0], b[1], b[0], b[1]] };
+            r.dma_write_line(0, &line);
+            assert_eq!(px(&r, 7, 7) & mask & 0xFF_FFFF, near, "{pp1:#x}: nearer stored depth kept");
+            assert_eq!(px(&r, 8, 7) & mask & 0xFF_FFFF, far, "{pp1:#x}: farther stored depth drawn over");
+            assert_eq!((zat(&r, 7), zat(&r, 8)), (0x40_0000, 0x80_0000), "{pp1:#x}: depth written where drawn");
+        }
+    }
+
     #[test]
     fn xor_fill_toggles_and_restores() {
         let mut r = x_server();
@@ -2234,24 +3448,56 @@ mod tests {
     }
 
     /// In RGB modes the background is three 12-bit components across two
-    /// registers, as IRIX writes it for a 12-bit window's icon: white
-    /// is 0xf00f00 (blue, green) and 0xf00 (red). These are the values from
-    /// a trace of the desktop repainting its Icon Catalog.
+    /// registers, red lowest like the packed colour. The values are the
+    /// syserrpanel stop sign from a trace of the desktop repainting its
+    /// Icon Catalog: red 0xf0 dithered with a light red (0xc0, 0x70, 0x70),
+    /// which hardware shows as a red sign.
     #[test]
     fn opaque_stipple_background_in_rgb_modes() {
         let mut r = x_server();
         r.write(reg::PP1FILLMODE, 0x0C00_4004, false); // RGB pixel type
         r.write(reg::COLORMASKLSBSA, 0xFFF, false);
         r.write(reg::FILLMODE, FILL_LINE_STIPPLE | FILL_LINE_STIPPLE_OPAQUE, false);
-        r.write(reg::PACKEDCOLOR, 0xA0_A0A0, false);
-        r.write(reg::BG_COLOR, 0xC00_700, false);
-        r.write(reg::BG_COLOR_RED, 0x300, false);
+        r.write(reg::PACKEDCOLOR, 0xF0, false);
+        r.write(reg::BG_COLOR, 0x700_C00, false);
+        r.write(reg::BG_COLOR_BLUE, 0x700, false);
         r.write(reg::LINE_STIPPLE, 0xAAAA_AAAA, false);
         r.write(reg::IR_ALIAS, 0x15, false);
         r.write(reg::LINE_START, 300 << 16 | 40, false);
         r.write(reg::LINE_END, 301 << 16 | 40, true);
-        assert_eq!(px(&r, 300, 40), 0xAA_AAAA);
-        assert_eq!(px(&r, 301, 40), pack_rgb(0x33, 0x77, 0xCC), "expanded RGB444 background");
+        assert_eq!(px12(&r, 300, 40), 0xFF);
+        assert_eq!(px12(&r, 301, 40), pack_rgb(0xCC, 0x77, 0x77), "expanded RGB444 background");
+    }
+
+    /// The syserrpanel stop sign as traced from 4Dwm (testdata): every
+    /// pixel of the dithered sign is red or light red, half each, never the
+    /// green the old background decode gave.
+    #[test]
+    fn syserrpanel_stop_sign_trace_dithers_red() {
+        let mut r = x_server();
+        for line in include_str!("testdata/syserrpanel_stop_sign.txt").lines() {
+            let mut f = line.split_whitespace();
+            let Some(name) = f.next().filter(|n| !n.starts_with('#')) else { continue };
+            let reg = REG_NAMES.iter().position(|&n| n == name).unwrap_or_else(|| panic!("register {name}"));
+            let val = u32::from_str_radix(f.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+            r.write(reg as u32, val, f.next() == Some("x"));
+        }
+        let buf = r.target();
+        let (red, light) = (pack_rgb(0xFF, 0, 0), pack_rgb(0xCC, 0x77, 0x77));
+        let (mut n_red, mut n_light) = (0u32, 0u32);
+        for y in 266..=294 {
+            for x in 740..800 {
+                // Draw field 2, mask 0xFFF000: buffer B, the high half.
+                match r.mem.get(&buf, x, 767 - y) as u32 {
+                    0 => {}
+                    p if p & 0xFFF != 0 => panic!("({x}, {y}) wrote buffer A: {p:#08x}"),
+                    p if from_rgb12(p >> 12) == red => n_red += 1,
+                    p if from_rgb12(p >> 12) == light => n_light += 1,
+                    p => panic!("({x}, {y}) is {p:#08x}, not red or light red"),
+                }
+            }
+        }
+        assert!(n_red > 200 && n_red.abs_diff(n_light) < 10, "red {n_red}, light red {n_light}");
     }
 
     /// Block type 0 is a fill in the iterated colour, drawn at once (the

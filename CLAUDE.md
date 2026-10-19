@@ -37,8 +37,8 @@ instance operation for development. Sync upstream with
 
 ```
 cargo run --release                                       # interpreter
-cargo run --release --features lightning,rex-jit          # recommended for speed
-cargo run --release --features jitv2,rex-jit              # enable MIPS JIT v2 (experimental)
+cargo run --release --features lightning,gpujit           # recommended for speed (gpujit = rex-jit,gr4-jit,gr2-jit)
+cargo run --release --features jitv2,gpujit               # enable MIPS JIT v2 (experimental)
 cargo run --release -- --cpu r5000                        # CPU is a runtime choice, not a feature
 cargo run -p iris-gui --release                           # GUI front-end
 ```

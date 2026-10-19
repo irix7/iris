@@ -35,7 +35,9 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
 
 use super::{ClipRect, Draw, PipeKey, Pix, Prim, RasterCtx, ShaderFn, Target, Tex, XFmt};
-use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, TILE_H, TILE_W, WORD_MASK};
+use crate::dev::mgras::rss::Pair;
+use crate::dev::ng1::rex3_generic::BAYER_PACKED;
+use crate::dev::mgras::pixmem::{PAGES, PAGE_WORDS, RE_WORDS, TILE_H, TILE_W, WORD_MASK};
 use crate::dev::mgras::rss::WIDTH;
 use crate::dev::mgras::fixed;
 use crate::dev::mgras::te1::{PAGE_NIBBLES, TRAM_NIBBLES};
@@ -153,6 +155,10 @@ struct E<'a> {
     clips: Vec<[Value; 5]>,
     tgt: [[Value; 4]; 2],
     zxtiles: Value,
+    yshift: Value,
+    remask: Value,
+    engine: Value,
+    own_mask: Value,
 }
 
 impl<'a> E<'a> {
@@ -175,6 +181,10 @@ impl<'a> E<'a> {
         let cidmatch = if k.cid_test { ld(&mut b, I32, off!(common.cidmatch)) } else { zero };
         let cidwmask = if k.draw == Draw::Cid { ld(&mut b, I32, off!(common.cidwmask)) } else { zero };
         let zxtiles = if zbuf { ld(&mut b, I32, off!(common.zxtiles)) } else { zero };
+        let yshift = ld(&mut b, I32, off!(common.yshift));
+        let remask = ld(&mut b, I32, off!(common.remask));
+        let engine = ld(&mut b, I32, off!(common.engine));
+        let own_mask = ld(&mut b, I32, off!(common.own_mask));
         let clips = (0..k.nclip as i32)
             .map(|n| {
                 let base = off!(common.clip) + n * size_of::<ClipRect>() as i32;
@@ -194,7 +204,7 @@ impl<'a> E<'a> {
             Draw::Dual => 2,
             _ => 1,
         };
-        let masked = k.draw == Draw::Overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12);
+        let masked = k.draw == Draw::Overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12) || k.pix.pair();
         for (t, row) in tgt.iter_mut().enumerate().take(ntgt) {
             let base = off!(common.tgt) + (t * size_of::<Target>()) as i32;
             let f = |b: &mut FunctionBuilder, o: usize| b.ins().load(I32, mr, ctx, base + o as i32);
@@ -221,6 +231,7 @@ impl<'a> E<'a> {
             i32s.extend([off!(gl.smp.max_level), off!(gl.smp.ls), off!(gl.smp.lt)]);
             i32s.extend((0..3).map(|k| off!(gl.env_c) + 4 * k));
             i32s.extend((0..3).map(|k| off!(gl.fog_c) + 4 * k));
+            i32s.extend((0..4).map(|k| off!(gl.blend_c) + 4 * k));
             for o in i32s {
                 invs.insert(o, ld(&mut b, I32, o));
             }
@@ -230,7 +241,7 @@ impl<'a> E<'a> {
                 invs.insert(o, ld(&mut b, I32, o));
             }
         }
-        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles }
+        E { b, k, ctx, m, mr, invs, blk, words, cidp, tram, ox, oy, ysign, cidmatch, cidwmask, clips, tgt, zxtiles, yshift, remask, engine, own_mask }
     }
 
     // ── small helpers ────────────────────────────────────────────────────
@@ -345,6 +356,12 @@ impl<'a> E<'a> {
     /// `for v in start..end` (signed i32); the body gets `v` and the block
     /// that continues the loop, and may branch there.
     fn for_range(&mut self, start: Value, end: Value, body: impl FnOnce(&mut Self, Value, Block)) {
+        let one = self.i32c(1);
+        self.for_range_step(start, end, one, body)
+    }
+
+    /// `for_range` counting up by `step` (> 0).
+    fn for_range_step(&mut self, start: Value, end: Value, step: Value, body: impl FnOnce(&mut Self, Value, Block)) {
         let iv = self.var(I32, start);
         let head = self.b.create_block();
         let bodyb = self.b.create_block();
@@ -362,7 +379,7 @@ impl<'a> E<'a> {
         self.b.switch_to_block(cont);
         self.b.seal_block(cont);
         let i = self.get(iv);
-        let i1 = self.b.ins().iadd_imm_s(i, 1);
+        let i1 = self.b.ins().iadd(i, step);
         self.set(iv, i1);
         self.b.ins().jump(head, &[]);
         self.b.seal_block(head);
@@ -478,13 +495,17 @@ impl<'a> E<'a> {
     // ── pixel memory (pixmem) ────────────────────────────────────────────
 
     /// `Buffer::locate`, the y half: the page of the row's first tile and
-    /// the row's offset within its page.
+    /// the row's offset within its page, plus its raster engine's memory.
     fn locate_row(&mut self, ptr: Value, xt: Value, y: Value) -> (Value, Value) {
+        let re = self.b.ins().band(y, self.remask);
+        let y = self.b.ins().ushr(y, self.yshift);
         let ty = self.b.ins().ushr_imm_s(y, 4);
         let row = self.b.ins().imul(ty, xt);
         let page = self.b.ins().iadd(ptr, row);
         let yin = self.b.ins().band_imm_s(y, TILE_H as i64 - 1);
         let yoff = self.b.ins().imul_imm_s(yin, TILE_W as i64);
+        let reoff = self.b.ins().imul_imm_s(re, RE_WORDS as i64);
+        let yoff = self.b.ins().iadd(yoff, reoff);
         (page, yoff)
     }
 
@@ -584,8 +605,8 @@ impl<'a> E<'a> {
     fn put_in(&mut self, r: &Row, t: usize, x: Value, v: Value) {
         let k = self.k;
         let overlay = t == 0 && k.draw == Draw::Overlay;
-        let rep12 = !overlay && k.pix == Pix::Rgb12;
-        let masked = overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12);
+        let pair = !overlay && k.pix.pair();
+        let masked = overlay || matches!(k.pix, Pix::Rgba8 | Pix::Ci12) || pair;
         let [_, _, mask, lop_width] = self.tgt[t];
         let (addr, shift) = self.locate_x(r.tgt[t], x, overlay);
         let old = (k.logic.is_some() || masked).then(|| {
@@ -593,14 +614,17 @@ impl<'a> E<'a> {
             self.b.ins().ireduce(I32, w)
         });
         let mut v = v;
+        if let (true, Some(layout)) = (pair, k.pix.pair_layout()) {
+            v = self.pair_pack(r, x, v, layout);
+        }
+        // Colour index: the index in both 12-bit halves (`rss::ci_pixtype`).
+        if !overlay && k.pix == Pix::Ci12 {
+            let i = self.b.ins().band_imm_s(v, 0xFFF);
+            v = self.b.ins().imul_imm_s(i, 0x1001);
+        }
         if let Some(op) = k.logic {
             let r = self.logic_op(op, v, old.unwrap());
             v = self.b.ins().band(r, lop_width);
-        }
-        if rep12 {
-            let n = self.b.ins().band_imm_s(v, 0xF0_F0F0);
-            let lo = self.b.ins().ushr_imm_s(n, 4);
-            v = self.b.ins().bor(n, lo);
         }
         if masked {
             let keep = self.b.ins().band_not(old.unwrap(), mask);
@@ -611,11 +635,65 @@ impl<'a> E<'a> {
         self.put_px(addr, shift, v);
     }
 
+    /// `rss::Pair::pack`: an 8-8-8-8 colour in both halves of a pair word
+    /// (components truncated, or dithered through the REX3 4x4 Bayer matrix
+    /// when the key dithers, `rss::quantise`), alpha in both alpha fields.
+    fn pair_pack(&mut self, r: &Row, x: Value, v: Value, layout: Pair) -> Value {
+        let n = layout.bits();
+        let thr = r.bayer.map(|row| {
+            let xi = self.b.ins().band_imm_s(x, 3);
+            let idx = self.b.ins().bor(row, xi);
+            let sh = self.b.ins().ishl_imm_s(idx, 2);
+            let sh = self.b.ins().uextend(I64, sh);
+            let m = self.i64c(BAYER_PACKED as i64);
+            let t = self.b.ins().ushr(m, sh);
+            let t = self.b.ins().ireduce(I32, t);
+            let t = self.b.ins().band_imm_s(t, 0xF);
+            if n > 4 { self.b.ins().ushr_imm_s(t, (n - 4) as i64) } else { t }
+        });
+        let mut c = self.i32c(0);
+        for k in 0..3u32 {
+            let ch = self.b.ins().ushr_imm_s(v, (8 * k) as i64);
+            let ch = self.b.ins().band_imm_s(ch, 0xFF);
+            let q = match thr {
+                Some(t) => {
+                    let hi = self.b.ins().ushr_imm_s(ch, n as i64);
+                    let s = self.b.ins().isub(ch, hi);
+                    let d = self.b.ins().ushr_imm_s(s, (8 - n) as i64);
+                    let f = self.b.ins().band_imm_s(s, ((1 << (8 - n)) - 1) as i64);
+                    let up = self.b.ins().icmp(IntCC::UnsignedGreaterThan, f, t);
+                    let up = self.b.ins().uextend(I32, up);
+                    let d = self.b.ins().iadd(d, up);
+                    let max = self.i32c((1 << n) - 1);
+                    self.b.ins().umin(d, max)
+                }
+                None => self.b.ins().ushr_imm_s(ch, (8 - n) as i64),
+            };
+            let q = if k > 0 { self.b.ins().ishl_imm_s(q, (n * k) as i64) } else { q };
+            c = self.b.ins().bor(c, q);
+        }
+        let hi = self.b.ins().ishl_imm_s(c, layout.shift_b() as i64);
+        let mut w = self.b.ins().bor(c, hi);
+        let (a0, aw) = layout.alpha(false);
+        let (a1, _) = layout.alpha(true);
+        let a = self.b.ins().ushr_imm_s(v, (32 - aw) as i64);
+        for at in [a0, a1] {
+            let f = self.b.ins().ishl_imm_s(a, at as i64);
+            w = self.b.ins().bor(w, f);
+        }
+        w
+    }
+
     /// The parts of `Rss::visible` and of every address that depend on the
     /// framebuffer row alone. A row off screen goes on to `kill`.
     fn row(&mut self, fy: Value, kill: Block) -> Row {
         let yo = self.b.ins().icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, fy, WIDTH as i64);
         self.bail(yo, kill);
+        // Another raster engine's scanline.
+        let other = self.b.ins().bxor(fy, self.engine);
+        let other = self.b.ins().band(other, self.own_mask);
+        let other = self.b.ins().icmp_imm_s(IntCC::NotEqual, other, 0);
+        self.bail(other, kill);
         let cid = (self.k.cid_test || self.k.draw == Draw::Cid).then(|| {
             let rowoff = self.b.ins().imul_imm_s(fy, WIDTH as i64);
             let rowoff = self.b.ins().uextend(I64, rowoff);
@@ -641,7 +719,11 @@ impl<'a> E<'a> {
             let zp = self.i32c(crate::dev::mgras::rss::ZST_PAGE as i64);
             self.locate_row(zp, self.zxtiles, fy)
         });
-        let mut r = Row { cid, clip, tgt, z };
+        let bayer = self.k.pix.dither().then(|| {
+            let y = self.b.ins().band_imm_s(fy, 3);
+            self.b.ins().ishl_imm_s(y, 2)
+        });
+        let mut r = Row { cid, clip, tgt, z, bayer };
         // Pin it all, so it is computed once per row.
         let mut vals: Vec<Value> = Vec::new();
         vals.extend(r.cid);
@@ -654,6 +736,7 @@ impl<'a> E<'a> {
         if let Some((a, b)) = r.z {
             vals.extend([a, b]);
         }
+        vals.extend(r.bayer);
         let mut p = self.pin(&vals).into_iter();
         if r.cid.is_some() {
             r.cid = p.next();
@@ -666,6 +749,9 @@ impl<'a> E<'a> {
         }
         if r.z.is_some() {
             r.z = Some((p.next().unwrap(), p.next().unwrap()));
+        }
+        if r.bayer.is_some() {
+            r.bayer = p.next();
         }
         r
     }
@@ -748,8 +834,22 @@ impl<'a> E<'a> {
         let color = self.ld(I32, off!(color));
         let [bxs, bys, bdx, bdy] = self.blk;
         let fx0 = self.b.ins().iadd(self.ox, bxs);
-        let zero = self.i32c(0);
-        self.for_range(zero, rows, |e, row, next_row| {
+        // Only this engine's scanlines (`row` still checks): with an odd
+        // row step the rows go round the engines, so take every engines-th
+        // one, from the first that is ours: row r is at fy0 + s r (s =
+        // ysign * bdy, odd, its own inverse modulo 2 and 4), so
+        // r = (engine - fy0) s modulo the engines.
+        let odd = self.b.ins().band_imm_s(bdy, 1);
+        let all = self.b.ins().ineg(odd);
+        let m = self.b.ins().band(self.own_mask, all);
+        let sy0 = self.b.ins().imul(self.ysign, bys);
+        let fy0 = self.b.ins().iadd(self.oy, sy0);
+        let first = self.b.ins().isub(self.engine, fy0);
+        let s = self.b.ins().imul(self.ysign, bdy);
+        let first = self.b.ins().imul(first, s);
+        let first = self.b.ins().band(first, m);
+        let step = self.b.ins().iadd_imm_s(m, 1);
+        self.for_range_step(first, rows, step, |e, row, next_row| {
             let ry = e.b.ins().imul(row, bdy);
             let y = e.b.ins().iadd(bys, ry);
             let sy = e.b.ins().imul(e.ysign, y);
@@ -931,8 +1031,13 @@ impl<'a> E<'a> {
                 pack(self, r, g, b)
             }
             XFmt::Rgba16 => {
+                // Alpha too (bits 31:24 of the pixel).
                 let (r, g, b) = (comp64(self, 56), comp64(self, 40), comp64(self, 24));
-                pack(self, r, g, b)
+                let rgb = pack(self, r, g, b);
+                let a = comp64(self, 8);
+                let a = self.b.ins().band_imm_s(a, 0xFF);
+                let a = self.b.ins().ishl_imm_s(a, 24);
+                self.b.ins().bor(rgb, a)
             }
             XFmt::Rgb8 => {
                 let (r, g, b) = (comp64(self, 16), comp64(self, 8), comp64(self, 0));
@@ -1053,7 +1158,17 @@ impl<'a> E<'a> {
         let vis: Vec<Value> = (0..4).map(|n| self.ld(I32, off!(common.vis) + 4 * n)).collect();
         let jlo = self.b.ins().smax(j0, vis[2]);
         let jhi = self.b.ins().smin(j1, vis[3]);
-        self.for_range(jlo, jhi, |e, j, next_row| {
+        // Only this engine's scanlines (`row` still checks): every
+        // engines-th row, from the first one it owns, (engine - fy0) ysign
+        // rows on modulo the engines.
+        let sy0 = self.b.ins().imul(self.ysign, jlo);
+        let fy0 = self.b.ins().iadd(self.oy, sy0);
+        let skip = self.b.ins().isub(self.engine, fy0);
+        let skip = self.b.ins().imul(skip, self.ysign);
+        let skip = self.b.ins().band(skip, self.own_mask);
+        let jlo = self.b.ins().iadd(jlo, skip);
+        let step = self.b.ins().iadd_imm_s(self.own_mask, 1);
+        self.for_range_step(jlo, jhi, step, |e, j, next_row| {
             let sy = e.b.ins().imul(e.ysign, j);
             let fy = e.b.ins().iadd(e.oy, sy);
             let span = e.row(fy, next_row);
@@ -1396,6 +1511,38 @@ impl<'a> E<'a> {
         }
     }
 
+    /// `rss::Pair::unpack`: buffer A's or B's half of a pair word as
+    /// 8-8-8-8, every component (alpha too) widened by repeating its bits.
+    fn pair_half(&mut self, w: Value, layout: Pair, b: bool) -> Value {
+        let n = layout.bits();
+        let c = if b { self.b.ins().ushr_imm_s(w, layout.shift_b() as i64) } else { w };
+        let mut out = self.i32c(0);
+        for k in 0..3 {
+            let comp = self.b.ins().ushr_imm_s(c, (n * k) as i64);
+            let comp = self.b.ins().band_imm_s(comp, ((1 << n) - 1) as i64);
+            let v = self.widen(comp, n);
+            let v = if k > 0 { self.b.ins().ishl_imm_s(v, (8 * k) as i64) } else { v };
+            out = self.b.ins().bor(out, v);
+        }
+        let (a0, aw) = layout.alpha(b);
+        let a = self.b.ins().ushr_imm_s(w, a0 as i64);
+        let a = self.b.ins().band_imm_s(a, ((1 << aw) - 1) as i64);
+        let a = self.widen(a, aw);
+        let a = self.b.ins().ishl_imm_s(a, 24);
+        self.b.ins().bor(out, a)
+    }
+
+    /// `rss::widen`: an `n`-bit component to 8 bits.
+    fn widen(&mut self, v: Value, n: u32) -> Value {
+        if n == 1 {
+            return self.b.ins().imul_imm_s(v, 0xFF);
+        }
+        let hi = self.b.ins().ishl_imm_s(v, (8 - n) as i64);
+        let lo = self.b.ins().ushr_imm_s(v, (2 * n - 8) as i64);
+        let o = self.b.ins().bor(hi, lo);
+        self.b.ins().band_imm_s(o, 0xFF)
+    }
+
     /// `Rss::fragment_color`: blend (12.16) or not, shift down, write.
     fn fragment_color(&mut self, r: &Row, t: usize, x: Value, rgba: [Value; 4]) {
         let k = self.k;
@@ -1406,6 +1553,10 @@ impl<'a> E<'a> {
                     let (a, sh) = self.locate_x(r.tgt[t], x, overlay);
                     let dst = self.get_px(a, sh);
                     let dst = self.b.ins().ireduce(I32, dst);
+                    let dst = match k.pix.pair_layout() {
+                        Some(layout) if !overlay => self.pair_half(dst, layout, k.pix.pair_b()),
+                        _ => dst,
+                    };
                     // Destination bytes widened to 12 bits, 12.16.
                     let d: Vec<Value> = (0..4)
                         .map(|c| {
@@ -1419,28 +1570,44 @@ impl<'a> E<'a> {
                         .collect();
                     let nd3 = self.fone_minus(d[3]);
                     let sat = self.b.ins().smin(rgba[3], nd3);
+                    let kc: Vec<Value> = (0..4).map(|k| self.inv(off!(gl.blend_c) + 4 * k)).collect();
                     let mut out = [rgba[0]; 4];
                     for (kk, o) in out.iter_mut().enumerate() {
-                        let f = |e: &mut Self, code: u8| -> Value {
-                            match code {
-                                0 => e.i32c(0),
-                                2 => rgba[kk],
-                                3 => e.fone_minus(rgba[kk]),
-                                4 => rgba[3],
-                                5 => e.fone_minus(rgba[3]),
-                                6 => d[3],
-                                7 => e.fone_minus(d[3]),
-                                8 => d[kk],
-                                9 => e.fone_minus(d[kk]),
-                                10 if kk != 3 => sat,
-                                _ => e.i32c(fixed::ONE as i64),
+                        // `rss::blend_rgba`.
+                        let s = match bl.eq {
+                            3 => self.b.ins().smin(rgba[kk], d[kk]),
+                            4 => self.b.ins().smax(rgba[kk], d[kk]),
+                            eq => {
+                                let f = |e: &mut Self, code: u8| -> Value {
+                                    match code {
+                                        0 => e.i32c(0),
+                                        2 => rgba[kk],
+                                        3 => e.fone_minus(rgba[kk]),
+                                        4 => rgba[3],
+                                        5 => e.fone_minus(rgba[3]),
+                                        6 => d[3],
+                                        7 => e.fone_minus(d[3]),
+                                        8 => d[kk],
+                                        9 => e.fone_minus(d[kk]),
+                                        10 if kk != 3 => sat,
+                                        11 => kc[kk],
+                                        12 => e.fone_minus(kc[kk]),
+                                        13 => kc[3],
+                                        14 => e.fone_minus(kc[3]),
+                                        _ => e.i32c(fixed::ONE as i64),
+                                    }
+                                };
+                                let fs = f(self, bl.src);
+                                let fd = f(self, bl.dst);
+                                let a = self.fmul16(rgba[kk], fs);
+                                let b = self.fmul16(d[kk], fd);
+                                match eq {
+                                    1 => self.b.ins().isub(a, b),
+                                    2 => self.b.ins().isub(b, a),
+                                    _ => self.b.ins().iadd(a, b),
+                                }
                             }
                         };
-                        let fs = f(self, bl.src);
-                        let fd = f(self, bl.dst);
-                        let a = self.fmul16(rgba[kk], fs);
-                        let b = self.fmul16(d[kk], fd);
-                        let s = self.b.ins().iadd(a, b);
                         *o = self.fclamp16(s);
                     }
                     out
@@ -1983,6 +2150,8 @@ struct Row {
     clip: Vec<(Value, Value)>,
     tgt: [(Value, Value); 2],
     z: Option<(Value, Value)>,
+    /// Dithering: the Bayer matrix row, (fy & 3) << 2.
+    bayer: Option<Value>,
 }
 
 /// A level's geometry (i64): its size, its page and offset in it, and its

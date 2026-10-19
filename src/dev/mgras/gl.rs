@@ -41,11 +41,18 @@
 //!
 //! Not yet: point size, textured lines and points, texgen, 1D/3D textures.
 
+#[path = "glquery.rs"]
+mod query;
+
 use super::hq3::Hq3Sink;
 use super::te1::{self, reg as te_reg};
 use crate::dev::gl::light::{Lighting, MAX_LIGHTS};
 use crate::dev::gl::math::{self, Mat4, Stack};
-use crate::dev::gl::vertex::{Clip, Viewport, Wv, MAX_POLY};
+use crate::dev::gl::vertex::{self, Clip, Viewport, MAX_POLY};
+
+/// IMPACT vertices: texture coordinates (s, t, r, q) and a fog factor, for
+/// the TE and per-fragment fog.
+type Wv = vertex::Wv<4, 1>;
 
 /// GL tokens the GE handles (numbers as in `hq3::token_name`).
 mod tok {
@@ -71,6 +78,21 @@ mod tok {
     /// mgrTM_SendTexmode1: on when the bound texture is complete).
     pub const TEX_ON: u32 = 0x00B;
     pub const TEX_OFF: u32 = 0x00C;
+    /// glEnable / glDisable(GL_POINT_SMOOTH): [1] / [0] (libGLcore's
+    /// __glMgrim_Enable; traced).
+    pub const POINT_SMOOTH: u32 = 0x06C;
+    /// Pixel operations and texture loads come between these (libGLcore's
+    /// __glMgrSaveTexmode(1, 0, 0, 0) / __glMgrRestoreTexmode, traced
+    /// around glDrawPixels, glCopyPixels, glTexImage and glCopyTexImage):
+    /// the GE keeps the texture mode aside and draws the operation
+    /// untextured.
+    pub const SAVE_TEXMODE: u32 = 0x0E9;
+    pub const RESTORE_TEXMODE: u32 = 0x0EA;
+    /// A texture load's lookup table: none (mgrTM_DoTexLoad sends this
+    /// where it would send the TL table), and the end of each sub-load
+    /// (after every SEND_PIXELS of the load).
+    pub const TL_NO_TABLE: u32 = 0x09B;
+    pub const TL_SUBLOAD_END: u32 = 0x09C;
     /// GE pixel state (ERAM) writes: [?, ?, bytes, address, 0, 2, count,
     /// values]; the layout PIXEL_STATE also has.
     pub const INIT_PIXEL_STATE_ERAM: u32 = 0x0CD;
@@ -103,6 +125,10 @@ mod tok {
     /// glBitmap: format, row length in bits, rows, x / y origin and x / y
     /// move (floats), data words; the rows follow as FIFO pixel data.
     pub const BITMAP: u32 = 0x094;
+    /// Large glBitmap images: header, row batches, then raster advance.
+    pub const GENERAL_BITMAP: u32 = 0x091;
+    pub const BITMAP_ROWS: u32 = 0x090;
+    pub const BITMAP_MOVE: u32 = 0x092;
     /// glDrawPixels through the GE's pixel path (libGLcore
     /// __glMgrSendPixels), 8 words: data words per row, two skips, the
     /// pixel-state counts, rows (provisional), the GE routine (0x49D0 for
@@ -221,6 +247,19 @@ mod tok {
     /// glEnable / glDisable, 1 / 0 (3 / 0 for dither).
     pub const ALPHA_TEST: u32 = 0x064;
     pub const BLEND: u32 = 0x065;
+    /// glBlendEquationEXT (1 word, the GL enum). GL_LOGIC_OP (0x0BF1) makes
+    /// GL_BLEND enable the colour logic op instead (EXT_blend_logic_op):
+    /// IRIS GL's logicop(), e.g. AutoCAD's XOR crosshair.
+    pub const BLEND_EQUATION: u32 = 0x060;
+    /// glBlendColorEXT: four floats (EXT_blend_color).
+    pub const BLEND_COLOR: u32 = 0x0D9;
+    pub const FOG_INDEX: u32 = 0x0B8;
+    pub const LINE_SMOOTH: u32 = 0x069;
+    pub const POLYGON_OFFSET: u32 = 0x0E7;
+    /// State queries: copy a light's / material's parameter to GE
+    /// 0x32E..0x331 (`query`).
+    pub const GET_MATERIALFV: u32 = 0x0EE;
+    pub const GET_LIGHTFV: u32 = 0x0EF;
     pub const DEPTH_TEST: u32 = 0x066;
     pub const DITHER: u32 = 0x067;
     pub const LINE_STIPPLE_ON: u32 = 0x06A;
@@ -288,6 +327,8 @@ mod re {
     pub const COLORMASKLSBSA: u32 = 0x163;
     pub const COLORMASKLSBSB: u32 = 0x164;
     pub const BLENDFACTOR: u32 = 0x165;
+    pub const BLENDCOLOR_RG: u32 = 0x16B;
+    pub const BLENDCOLOR_BA: u32 = 0x16C;
     pub const STENCILMODE: u32 = 0x166;
     pub const STENCILMASK: u32 = 0x167;
     pub const ZMODE: u32 = 0x168;
@@ -302,6 +343,8 @@ const FILL_FAST: u32 = 1 << 20;
 const FILL_DMA_WRITE: u32 = 0x1140_0000;
 /// Fill mode: block type 4, a DMA read transfer (SAVE_RSS's value).
 const FILL_DMA_READ: u32 = 0x0100_0000;
+/// Fill mode: block type 2, a PIO read transfer.
+const FILL_PIO_READ: u32 = 0x0080_0000;
 /// Fill mode: polygon stipple (provisional bit, see rss.rs) / line stipple.
 const FILL_POLY_STIPPLE: u32 = 1 << 2;
 const FILL_LINE_STIPPLE: u32 = 1 << 5;
@@ -309,6 +352,8 @@ const FILL_LINE_STIPPLE: u32 = 1 << 5;
 /// server's TrueColor value: pixel type 2, logic op copy enabled, draw
 /// buffer 0x01); bits 29:26 hold the logic op.
 const PP1_RGB24_BUFFER_A: u32 = 0x0C00_6204;
+/// `Gl::pixel_format`: INIT_FORMAT_VALUES has come (0 is a format).
+const PIXEL_FORMAT_SENT: u32 = 1 << 31;
 /// Area / GL line IR opcodes (provisional numbers, see rss.rs).
 const IR_AREA_LTOR: u32 = super::rss::OP_AREA_LTOR;
 const IR_AREA_RTOL: u32 = super::rss::OP_AREA_RTOL;
@@ -356,6 +401,8 @@ pub struct Gl {
     mv: Stack<32>,
     proj: Stack<4>,
     tex: Stack<4>,
+    /// SGI_color_matrix's stack (glMatrixMode(GL_COLOR)).
+    cm: Stack<2>,
     mvp: Mat4,
     mvp_dirty: u32,
     vp: Viewport,
@@ -387,7 +434,8 @@ pub struct Gl {
     draw_bits_swapped: u32,
     draw_words: u32,
     buffer_count: u32,
-    /// The driver's PP1 pixel-format and buffer-size fields.
+    /// The driver's PP1 pixel-format and buffer-size fields
+    /// (INIT_FORMAT_VALUES), with `PIXEL_FORMAT_SENT` once it has sent them.
     pixel_format: u32,
     swapped: u32,
     /// The kernel has named the bank drawn into (`set_draw_bank`): swaps
@@ -421,6 +469,10 @@ pub struct Gl {
     /// Colour logic op: on, op index.
     logic: u32,
     logic_op: u32,
+    /// glBlendEquationEXT's enum; 0 (never set) is GL_FUNC_ADD.
+    blend_eq: u32,
+    /// glBlendColorEXT, clamped to [0, 1] (the default is 0, 0, 0, 0).
+    blend_color: [f32; 4],
     /// Stencil: on, function, ref, compare mask, ops (fail, zfail, zpass),
     /// write mask, clear value.
     stencil: u32,
@@ -455,6 +507,9 @@ pub struct Gl {
     /// A glBitmap header waiting for its rows (pixel data).
     bitmap: [u32; 8],
     bitmap_pending: u32,
+    /// GENERAL_BITMAP rows are padded to 64 bits and arrive in batches.
+    bitmap_general: u32,
+    bitmap_row: u32,
     /// A SEND_PIXELS header waiting for its rows, and the raster engine's
     /// transfer mode as the driver last set it (host pixel format).
     send_pixels: [u32; 8],
@@ -467,7 +522,8 @@ pub struct Gl {
     pub pixel_block: [u32; 2],
     read_back: u32,
     /// Between SAVE_RSS and RESTORE_RSS: a GL pixel operation, whose
-    /// register lists belong inside the raster bracket.
+    /// register lists belong inside the raster bracket. 2 denotes a
+    /// framebuffer read, whose DMA bytes need GE component ordering.
     pub pixel_op: u32,
     /// Primitive assembly: the open primitive (`prim`), vertices since its
     /// BEGIN, and the buffered vertices (strips and fans keep the first
@@ -512,9 +568,22 @@ pub struct Gl {
     texgen_plane: u32,
     /// glPointSize.
     point_size: f32,
+    /// GL_POINT_SMOOTH (POINT_SMOOTH).
+    point_smooth: u32,
     /// A texture read transfer is armed (READ_TEXTURE .. RESTORE_RSS).
     tex_reading: u32,
+    /// SAVE_RSS's fourth word: the planes the pixel operation transfers
+    /// (traced, glReadPixels: 0 colour, 0x1C00000 depth, 0x1800000 stencil).
+    pixel_planes: u32,
     pub stats_triangles: u64,
+    /// The GE pixel pipeline's memory (program, module states, lookup
+    /// tables), the context's own.
+    pub pix: super::pixpipe::PixMem,
+    /// XFRFACTOR as libGLcore set it (the raster engine's x zoom /
+    /// decimation step, 8.8).
+    pub xfr_factor: u32,
+    /// What state queries return (`query::Query`).
+    q: query::Query,
 }
 
 impl Gl {
@@ -540,6 +609,8 @@ impl Gl {
         self.mv.init();
         self.proj.init();
         self.tex.init();
+        self.cm.init();
+        self.q.init();
         self.mvp = math::IDENT;
         self.depth_range = [0.0, 1.0];
         self.vp.set(0.0, 0.0, 1.0, 1.0, 0.0, 1.0, ZMAX);
@@ -581,6 +652,7 @@ impl Gl {
         match self.matrix_mode {
             0x1701 => &mut self.proj,
             0x1702 => &mut self.tex,
+            0x1800 => &mut self.cm,
             _ => &mut self.mv,
         }
     }
@@ -630,6 +702,13 @@ impl Gl {
         let v: Vec<f32> = d[1..].iter().map(|&w| f32::from_bits(w)).collect();
         let g = |k: usize| v.get(k).copied().unwrap_or(0.0);
         let mv = *self.mv.get();
+        let pname = match cmd {
+            tok::LIGHT_AMBIENT => 0x1200,
+            tok::LIGHT_DIFFUSE => 0x1201,
+            tok::LIGHT_SPECULAR => 0x1202,
+            c => 0x1203 + (c - tok::LIGHT_POSITION),
+        };
+        self.q.light(i, pname, [g(0), g(1), g(2), g(3)], &mv);
         let l = &mut self.lt.lights[i as usize];
         match cmd {
             tok::LIGHT_AMBIENT => l.ambient = [g(0), g(1), g(2)],
@@ -660,6 +739,7 @@ impl Gl {
         let (face, pname) = (d[0], d[1]);
         let v: Vec<f32> = d[2..].iter().map(|&w| f32::from_bits(w)).collect();
         let g = |k: usize| v.get(k).copied().unwrap_or(0.0);
+        self.q.material(face, pname, [g(0), g(1), g(2), g(3)]);
         let faces: &[usize] = match face {
             0x404 => &[0],
             0x405 => &[1],
@@ -708,7 +788,6 @@ impl Gl {
             0x897 => Some(0xAB9 + self.tex.top * 16),
             0x29F => Some(if self.ci != 0 { self.index_mask } else { self.color_mask }),
             0xB7E..=0xB81 => Some(self.clear_color[(addr - 0xB7E) as usize].to_bits()),
-            0xB86 => Some((self.clear_depth as f32 / ZMAX).to_bits()),
             0xB87 => Some((self.clear_index as f32).to_bits()),
             0xB88 => Some(self.clear_stencil),
             0xB91..=0xB94 => Some(match addr {
@@ -724,10 +803,13 @@ impl Gl {
                 let [x0, x1, y0, y1] = self.scissor_rect();
                 Some([x0, y0, x1, y1][(addr - 0xB98) as usize] as u32)
             }
+            // glIsEnabled(GL_SCISSOR_TEST): libGLcore asks the GE. Mirai
+            // reads it before copying its front buffer to the back and
+            // turns the test off for the copy only when this says it is on;
+            // a 0 left the last widget's scissor box clipping the copy.
+            0xB9C => Some(self.scissor_test),
             0xBB1 => Some(self.point_size.to_bits()),
             0xBB2 => Some(self.line_width.to_bits()),
-            0xBBA => Some(self.line_repeat + 1),
-            0x1FC => Some(self.dither),
             // Scissor box 0 (window coordinates inclusive: xmin, xmax, ymin, ymax):
             // 0x200 returns (xmax << 16) | xmin, 0x202 returns (ymax << 16) | ymin.
             // Read by libGLcore __glMgrim_DrawPixels for scissor box clipping.
@@ -748,11 +830,14 @@ impl Gl {
                 Some(v.to_bits())
             }
             0x2C4 => Some(1.0f32.to_bits()),
+            // libGLcore reads GE word 3 ([0, 0]) before every texture load
+            // and pixel operation and ignores the answer (traced): a round
+            // trip that waits for the pipeline. What the word holds is not
+            // known.
+            3 => Some(0),
             // Bit 2 (0x4) is the valid flag tested by libGLcore (__glMgrDoGet);
             // bit 0 (0x1) is tested by other callers. Return 0x7 when valid.
             0x2D0 => Some(if self.raster_valid != 0 { 0x7 } else { 0 }),
-            0x2BF => Some(0.0f32.to_bits()),
-            0x2C5..=0x2C8 => Some(self.raster_color[(addr - 0x2C5) as usize].to_bits()),
             0x3A..=0x49 => {
                 let m = match self.matrix_mode {
                     0x1701 => self.proj.get(),
@@ -763,7 +848,9 @@ impl Gl {
             }
             0x4A..=0x59 => Some(self.proj.get()[(addr - 0x4A) as usize].to_bits()),
             0x6A..=0x79 => Some(self.tex.get()[(addr - 0x6A) as usize].to_bits()),
-            _ => None,
+            // Pixel pipeline memory (PIXEL_STATE / INIT_PIXEL_STATE_ERAM
+            // words) as loaded; test/gltest/gepeek.c reads it this way.
+            _ => self.query_word(addr).or_else(|| self.pix.loaded(addr).then(|| self.pix.read(addr))),
         }
     }
 
@@ -862,6 +949,7 @@ impl Gl {
             tok::LIGHT_MODEL_AMBIENT => {
                 let a = args_f32(d);
                 self.lt.amb_sum = [a[0], a[1], a[2]];
+                self.q.lmodel_ambient = a;
             }
             tok::LIGHT_MODEL_LOCAL_VIEWER => self.lt.local_viewer = on,
             tok::LIGHT_MODEL_TWO_SIDE => self.lt.two_sided = on,
@@ -871,6 +959,7 @@ impl Gl {
             }
             tok::COLOR_MATERIAL_FRONT | tok::COLOR_MATERIAL_BACK | tok::COLOR_MATERIAL_BOTH => {
                 self.lt.cmat_face = cmd - tok::COLOR_MATERIAL_FRONT;
+                self.q.cmat = [[0x404, 0x405, 0x408][(cmd - tok::COLOR_MATERIAL_FRONT) as usize], w0];
                 self.lt.cmat_param = match w0 {
                     0x1600 => 1,
                     0x1200 => 2,
@@ -899,13 +988,20 @@ impl Gl {
             }
             tok::FOG => self.lt.fog_on = on,
             tok::FOG_MODE => {
+                self.q.fog_mode = w0;
                 self.lt.fog_mode = match w0 { 0x2601 => 0, 0x801 => 2, _ => 1 };
                 self.update_fog();
             }
             tok::FOG_COLOR => {
                 let a = args_f32(d);
                 self.lt.fog_color = [a[0], a[1], a[2]];
+                self.q.fog_color = a;
             }
+            tok::FOG_INDEX => self.q.fog_index = w0,
+            tok::LINE_SMOOTH => self.q.line_smooth = on,
+            tok::POLYGON_OFFSET if d.len() >= 2 => self.q.poly_offset = [f32::from_bits(w0), f32::from_bits(d[1])],
+            tok::GET_LIGHTFV if d.len() >= 2 => self.q.get_light(w0, d[1]),
+            tok::GET_MATERIALFV if d.len() >= 2 => self.q.get_material(w0, d[1]),
             tok::FOG_START | tok::FOG_END | tok::FOG_DENSITY => {
                 let v = f32::from_bits(w0);
                 match cmd {
@@ -940,7 +1036,12 @@ impl Gl {
             tok::ALPHA_TEST => self.set_state(|g| g.alpha_test = on, sink),
             tok::ALPHA_FUNC if d.len() >= 2 => self.set_state(|g| (g.alpha_func, g.alpha_ref) = (w0 & 7, d[1].min(0xFFF)), sink),
             tok::BLEND => self.set_state(|g| g.blend = on, sink),
-            tok::BLEND_FUNC if d.len() >= 2 => self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink),
+            tok::BLEND_FUNC if d.len() >= 2 => {
+                self.q.blend_func = [w0, d[1]];
+                self.set_state(|g| (g.blend_src, g.blend_dst) = (blend_code(w0), blend_code(d[1])), sink)
+            }
+            tok::BLEND_EQUATION => self.set_state(|g| g.blend_eq = w0, sink),
+            tok::BLEND_COLOR if d.len() >= 4 => self.set_state(|g| g.blend_color = args_f32(d).map(|c| c.clamp(0.0, 1.0)), sink),
             tok::LOGIC_OP_ON => self.set_state(|g| g.logic = on, sink),
             tok::LOGIC_OP => self.set_state(|g| g.logic_op = w0 & 0xF, sink),
             tok::STENCIL_TEST => self.set_state(|g| g.stencil = on, sink),
@@ -991,7 +1092,7 @@ impl Gl {
                 self.end_raster(sink);
             }
             tok::VERTEX4F => self.vertex(args_f32(d), sink),
-            tok::INIT_FORMAT_VALUES => self.set_state(|g| g.pixel_format = w0 & 0x2700, sink),
+            tok::INIT_FORMAT_VALUES => self.set_state(|g| g.pixel_format = PIXEL_FORMAT_SENT | w0 & 0x2700, sink),
             tok::INIT_RGB => self.ci = 0,
             tok::INIT_CI => self.ci = 1,
             tok::CLEAR_INDEX => self.clear_index = if w0 >> 16 == 0 { w0 } else { f32::from_bits(w0) as u32 },
@@ -1002,6 +1103,10 @@ impl Gl {
                 self.raster = [w.x, w.y, w.z];
                 self.raster_color = w.c;
                 self.raster_valid = (w.ok != 0 && inside) as u32;
+                let e = math::xform(self.mv.get(), args_f32(d));
+                self.q.raster_dist = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+                self.q.raster_color = w.c;
+                self.q.raster_tex = math::xform(self.tex.get(), self.texcoord);
             }
             tok::UPDATE_RASTER_POS => {
                 let a = args_f32(d);
@@ -1011,11 +1116,21 @@ impl Gl {
             tok::LOAD_RASTER_POS_INFO => {
                 self.color = self.raster_color;
                 if self.ci != 0 { self.current_index = self.color[0] * 4095.0; }
+                // The depth glDrawPixels / glCopyPixels fragments take
+                // (traced: no depth crosses the bus for them, Zmode does).
+                let z = (self.raster[2].clamp(0.0, ZMAX) as f64 * 256.0).round() as u32;
+                sink.rss_write(super::rss::reg::XFER_Z, z, false);
             }
             tok::INDEX_MASK => self.set_state(|g| g.index_mask = w0 & 0xFFF, sink),
             tok::READ_BUFFER => self.read_back = (d.get(2) == Some(&0x405)) as u32,
-            tok::SAVE_RSS => self.pixel_op = 1,
+            tok::SAVE_RSS => {
+                self.pixel_op = 1;
+                self.pixel_planes = d.get(3).copied().unwrap_or(0);
+            }
             tok::READ_TEXTURE if d.len() >= 5 => {
+                if sink.tracing_tex() {
+                    sink.trace(format!("TEX read {}x{} page {:#x} xfrmode {:#x}", d[0], d[1], self.te_tables[0][0], d[4]));
+                }
                 self.begin_raster(sink);
                 sink.rss_write(re::XFRMODE, d[4], false);
                 sink.rss_write(re::XFRSIZE, d[1] << 16 | (d[0] & 0xFFFF), false);
@@ -1027,6 +1142,12 @@ impl Gl {
             tok::READ_TEXTURE_RAW if d.len() >= 3 => {
                 self.begin_raster(sink);
                 let size = self.te[te1::CONTEXT_REGS.iter().position(|&r| r == te_reg::TXSIZE).unwrap_or(0)];
+                if sink.tracing_tex() {
+                    sink.trace(format!(
+                        "TEX save {} rows x {} page {:#x} txsize {size:#x} xfrmode {:#x}",
+                        d[0], 1u32 << (size & 0xF), self.te_tables[0][0], d[1]
+                    ));
+                }
                 sink.rss_write(re::XFRMODE, d[1], false);
                 sink.rss_write(re::XFRSIZE, d[0] << 16 | 1 << (size & 0xF), false);
                 sink.rss_write(super::rss::reg::TE_RAW, 1, false);
@@ -1061,18 +1182,26 @@ impl Gl {
                     sink.rss_write(re::XFRCONTROL, 0, false);
                     sink.rss_write(super::rss::reg::TE_RAW, 0, false);
                 }
+                if self.stencil_pixels() {
+                    sink.rss_write(super::rss::reg::ZST_STENCIL, 0, false);
+                }
+                self.pixel_planes = 0;
                 self.pixel_op = 0;
                 self.end_raster(sink);
             }
-            tok::GET_PIXELS => self.get_pixels(sink),
+            tok::GET_PIXELS => self.get_pixels(w0 & 2 != 0, sink),
             tok::PIXEL_STATE | tok::INIT_PIXEL_STATE_ERAM if d.len() >= 7 => {
-                let (addr, n) = (d[3], d[6] as usize);
-                for (k, &v) in d[7..].iter().take(n).enumerate() {
-                    self.pixel_state(addr + k as u32, v);
-                }
+                self.pixel_state_block(d);
             }
             tok::TEX_COORD => self.texcoord = args_f32(d),
             tok::POINT_SIZE => self.point_size = f32::from_bits(w0),
+            tok::POINT_SMOOTH => self.point_smooth = on,
+            // Our pixel paths never texture, which is what the bracket
+            // asks the GE for; the texture state itself stays as it was.
+            tok::SAVE_TEXMODE | tok::RESTORE_TEXMODE => {}
+            // The TE load path here needs neither (an absent table is the
+            // identity; each SEND_PIXELS is a whole sub-load).
+            tok::TL_NO_TABLE | tok::TL_SUBLOAD_END => {}
             tok::TEX_GENIV if d.len() >= 3 && d[0].wrapping_sub(0x2000) < 4 && d[1] == 0x2500 => {
                 self.texgen_mode[(d[0] - 0x2000) as usize] = match d[2] {
                     0x2401 => 0,
@@ -1115,7 +1244,27 @@ impl Gl {
             }
             tok::BITMAP if d.len() >= 8 => {
                 self.bitmap.copy_from_slice(&d[..8]);
+                self.bitmap_general = 0;
+                self.bitmap_row = 0;
                 self.bitmap_pending = 1;
+            }
+            tok::GENERAL_BITMAP if d.len() >= 5 => {
+                self.bitmap = [d[0], d[1], d[2], d[3], d[4], 0, 0, 0];
+                self.bitmap_general = 1;
+                self.bitmap_row = 0;
+                self.bitmap_pending = 0;
+            }
+            tok::BITMAP_ROWS if d.len() >= 2 && self.bitmap_general != 0 => {
+                self.bitmap[7] = d[1];
+                self.bitmap_pending = 1;
+            }
+            tok::BITMAP_MOVE if d.len() >= 2 => {
+                if self.raster_valid != 0 {
+                    self.raster[0] += f32::from_bits(d[0]);
+                    self.raster[1] += f32::from_bits(d[1]);
+                }
+                self.bitmap_general = 0;
+                self.bitmap_pending = 0;
             }
             _ => return false,
         }
@@ -1148,7 +1297,7 @@ impl Gl {
                 cb = self.lt.fog_color(e, cb);
             }
         }
-        let mut w = Wv { c, cb, h, e, f, ..Default::default() };
+        let mut w = Wv { c, cb, h, e, f: [f], ..Default::default() };
         if self.tex_on != 0 {
             let tc = self.texgen(v, e);
             w.t = math::xform(self.tex.get(), tc);
@@ -1504,7 +1653,7 @@ impl Gl {
                 put64(sink, dr, (qb[k] - qa[k]) / len as f64 * te1::ITER_ONE);
             }
         }
-        self.fog_plane(a.f as f64, (b.f as f64 - a.f as f64) / len as f64, 0.0, sink);
+        self.fog_plane(a.f[0] as f64, (b.f[0] as f64 - a.f[0] as f64) / len as f64, 0.0, sink);
         sink.rss_write(re::IR, IR_GL_LINE, true);
     }
 
@@ -1521,15 +1670,37 @@ impl Gl {
         self.bitmap_pending != 0 || self.send_pixels_pending != 0
     }
 
+    pub fn wants_pixel_rows(&self) -> bool {
+        self.send_pixels_pending != 0
+    }
+
     /// Words a pending SEND_PIXELS image needs before it can be drawn or
     /// loaded (words per row times rows, when the header says; 0 for
     /// glBitmap, drawn as it comes).
     pub fn pixel_words_needed(&self) -> usize {
         if self.send_pixels_pending == 0 {
-            return 0;
+            return if self.bitmap_pending != 0 { self.bitmap[7] as usize } else { 0 };
         }
         let rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
-        (self.send_pixels[0] as usize * rows).min(1 << 22)
+        (self.send_pixels_row_words() * rows).min(1 << 22)
+    }
+
+    /// Words in one SEND_PIXELS row: header words 0 + 1. Texture loads
+    /// split their rows evenly between the two ([0x10, 0x10] for 128-byte
+    /// rows); so does glDrawPixels by DMA (Advanced Visualizer's window
+    /// restore, 156-pixel RGBA strips: [0x4E, 0x4E, ..]), while FIFO
+    /// glDrawPixels and TRAM restores send word 1 as 0. Word 0 alone gave
+    /// half a row: a draw then took the pixels for 2-byte ones and widened
+    /// each with 0xFF (purple/blue columns in a restored window).
+    fn send_pixels_row_words(&self) -> usize {
+        (self.send_pixels[0] + self.send_pixels[1]) as usize
+    }
+
+    /// The pixel operation transfers stencil indices (SAVE_RSS's planes).
+    /// SAVE_RSS word 3 has the planes in bits 24:22 for a read (word 4
+    /// = 2) and in bits 20:18 for a draw (word 4 = 3): 6 stencil, 7 depth.
+    fn stencil_pixels(&self) -> bool {
+        self.pixel_planes & 0x1C0_0000 == 0x180_0000 || self.pixel_planes & 0x1C_0000 == 0x18_0000
     }
 
     /// glReadPixels: a DMA read block over the pixel block, in the read
@@ -1537,49 +1708,91 @@ impl Gl {
     /// 2 / type 3, our reading); the host starts the transfer itself
     /// (raster interface register 5, see hq3.rs). The raster state stays
     /// loaded until RESTORE_RSS.
-    fn get_pixels(&mut self, sink: &mut dyn Hq3Sink) {
+    fn get_pixels(&mut self, pio: bool, sink: &mut dyn Hq3Sink) {
+        self.pixel_op = 2;
         self.begin_raster(sink);
-        let depth = (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3;
+        let stencil = self.stencil_pixels();
+        let depth = stencil || (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3;
         let drb = if depth {
             super::rss::ZST_PAGE
         } else {
             let w = self.window.drb;
             let (a, b) = (w & 0x3FF, (w >> 10) & 0x3FF);
-            (w & !0x3FF) | if (self.read_back != 0) != (self.swapped != 0) { b } else { a }
+            // 12-bit pairs: both buffers are halves of A's page (the read
+            // field below picks the half), whatever DRB's B page says.
+            let back = (self.read_back != 0) != (self.swapped != 0) && !self.rgb12_pair() && !self.ci_pair();
+            (w & !0x3FF) | if back { b } else { a }
         };
         sink.rss_write(re::DRBPOINTERS, drb, false);
-        self.fill_mode(FILL_DMA_READ, sink);
+        if stencil {
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
+        }
+        if !depth && (self.rgb12_pair() || self.ci_pair()) {
+            // 12-bit pairs: the read field picks the half.
+            let b = (self.read_back != 0) != (self.swapped != 0);
+            sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0x1F << 21)) | (b as u32) << 21, false);
+        }
+        // GET_PIXELS' word is the transfer control the host starts it
+        // with: 0x4009 a DMA read, 0x400A a PIO read through the char
+        // registers (libGLcore reads packed-type rows so, one a time).
+        self.fill_mode(if pio { FILL_PIO_READ } else { FILL_DMA_READ }, sink);
         sink.rss_write(re::XFRMODE, self.xfrmode, false);
         sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
         sink.rss_write(re::BLOCK_XYSTARTI, self.pixel_block[0], false);
         sink.rss_write(re::BLOCK_XYENDI, self.pixel_block[1], true);
     }
 
-    /// glDrawPixels' rows (FIFO pixel data, `send_pixels[0]` words a row,
+    /// glDrawPixels' rows (FIFO pixel data, `send_pixels_row_words` a row,
     /// bottom row first) at the raster position, as the GE streams them:
     /// a raster-engine DMA write block the size of the image, the host
     /// format from the transfer mode (the driver sets `xfrmode` itself), so
     /// the pixels go through the raster engine's format conversion, plane
     /// masks and clipping. Pixel transfer stages (index shift/offset, maps,
     /// zoom) are taken as identity.
-    fn draw_pixels(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    fn draw_pixels(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
-        let wpr = self.send_pixels[0] as usize;
+        let mut wpr = self.send_pixels_row_words();
         if self.raster_valid == 0 || wpr == 0 || words.len() < wpr {
             return;
         }
         // Rows: header words 3 + 3 * 4 (mandel 1 + 0, snoop 2 + 3 * 18 =
         // 56), else what came.
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
-        let rows = if hdr_rows > 0 { hdr_rows.min(words.len() / wpr) } else { words.len() / wpr };
+        let mut rows = if hdr_rows > 0 { hdr_rows.min(words.len() / wpr) } else { words.len() / wpr };
         let bpp = super::rss::bytes_per_pixel(self.xfrmode) as usize;
+        // libGLcore's draws come with their GE pixel pipeline: the host's
+        // elements in, the raster engine's pixels out.
+        if self.pix.has_program() {
+            if let Some((ws, wpr2, rows2)) = self.run_pixel_pipeline(lut, words, wpr, rows, bpp) {
+                self.draw_pixels_words(&ws, wpr2, rows2, bpp, sink);
+                return;
+            }
+        }
+        // SEND_PIXELS counts transport rows. Narrow StudioPaint tile edges
+        // arrive flattened (e.g. 6x11 pixels as one 66-word row); 0xDA8
+        // still gives the image shape and its offset from the raster position.
+        let xs = self.tl_rect[4];
+        let (image_w, image_h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        if image_w > 0 && image_h > 0 && image_h != rows
+            && image_w * bpp % 4 == 0
+            && image_w * image_h * bpp == wpr * rows * 4
+        {
+            wpr = image_w * bpp / 4;
+            rows = image_h;
+        }
         // The host's pixels may carry fewer components than the raster
         // engine's format: glCopyPixels draws RGB16 back in RGBA16 (the GE's
         // pixel pipeline adds alpha). The image's size (pixel state 0xDA8's
         // transfer size, when its rows match) gives the host's pixel size.
-        let xs = self.tl_rect[4];
+        // Rows are padded to whole words: Mirai's front-to-back copies
+        // send RGB16 strips 160 pixels wide and a narrower last one (93
+        // pixels, 558 bytes in 140 words). Taken as raster-format pixels,
+        // the last strip came out 70 pixels wide at the window's left edge.
         let host_bpp = match (xs & 0xFFFF) as usize {
             w if w > 0 && (xs >> 16) as usize == rows && wpr * 4 % w == 0 => wpr * 4 / w,
+            w if w > 0 && (xs >> 16) as usize == rows => {
+                (1..=bpp).rev().find(|hb| (w * hb).div_ceil(4) == wpr).unwrap_or(bpp)
+            }
             _ => bpp,
         };
         let comp = if self.xfrmode & 0xF == 1 { 2 } else { 1 };
@@ -1605,8 +1818,144 @@ impl Gl {
         self.draw_pixels_words(&words, wpr, rows, bpp, sink);
     }
 
+    /// SEND_PIXELS' image through the GE pixel pipeline (`pixpipe`): the
+    /// raster engine's pixels (`bpp` bytes each), a row of words per image
+    /// row, and the row count; None when the image's shape does not fit
+    /// what came. The image is 0xDA8's transfer size; its rows come one a
+    /// transport row, or packed together in fewer (libGLcore sends a
+    /// short-row image as one).
+    fn run_pixel_pipeline(&self, lut: &[u32], words: &[u32], wpr: usize, rows: usize, bpp: usize) -> Option<(Vec<u32>, usize, usize)> {
+        let xs = self.tl_rect[4];
+        let (mut w, mut h) = ((xs & 0xFFFF) as usize, (xs >> 16) as usize);
+        // Zoomed: 0xDA8's size is the GE's output (rows repeated, columns
+        // replicated); the source is the transport rows of columns / the
+        // replication.
+        let rep = self.pix.xzoom_rep();
+        if rep > 1 || self.xfrmode & (3 << 19) != 0 || (self.zoom_inv > 0.0 && self.zoom_inv != 1.0) {
+            w /= rep;
+            h = rows;
+        }
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let out_comps = super::rss::xfer_comps(self.xfrmode);
+        let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+        let fit = if rows == h { wpr * 4 } else { bytes.len() / h };
+        let (comps, esize, _) = self.pix.input_shape_fit(out_comps, Some((fit, w)));
+        let row_in = if esize == 0 { (w * comps).div_ceil(8) } else { w * comps * esize };
+        let stride = if rows == h { wpr * 4 } else { row_in };
+        if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
+            return None;
+        }
+        let ty = self.xfrmode & 0xF;
+        // Colour and stencil indices keep their low bits (GL masks them),
+        // components clamp.
+        let index = matches!((self.xfrmode >> 4) & 0xF, 0 | 1);
+        let wrap = match ty {
+            0 => 0xFF,
+            1 => 0xFFFF,
+            _ => 0xFFFF_FFFF,
+        };
+        let wpr_out = (w * bpp).div_ceil(4);
+        let mut out = Vec::with_capacity(wpr_out * h);
+        let mut rb = Vec::with_capacity(wpr_out * 4);
+        for r in 0..h {
+            rb.clear();
+            for v in self.pix.run_row(lut, &bytes[r * stride..r * stride + row_in], w, out_comps) {
+                let v = if index { (v.round() as i64 & wrap) as f64 } else { v };
+                super::rss::pack_comp(ty, v, &mut rb);
+            }
+            rb.resize(wpr_out * 4, 0);
+            out.extend(rb.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])));
+        }
+        Some((out, wpr_out, h))
+    }
+
+    /// A zoomed image (see `draw_pixels_words`): destination pixels from
+    /// 0xDA8's first to last, each taking the source pixel the GE's and the
+    /// raster engine's steps give it.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pixels_zoomed(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, ge_rep: usize, re_zoom: u32, sink: &mut dyn Hq3Sink) {
+        let r = [0, 1, 2, 3].map(|k| self.tl_rect[k] as i32);
+        let (nx, ny) = ((r[2] - r[0]).abs() + 1, (r[3] - r[1]).abs() + 1);
+        let (dx, dy) = (if r[2] < r[0] { -1 } else { 1 }, if r[3] < r[1] { -1 } else { 1 });
+        let (fx0, fy0) = ((self.raster[0] + r[0] as f32).floor() as i32, (self.raster[1] + r[1] as f32).floor() as i32);
+        let src_w = self.row_pixels(wpr, bpp);
+        if src_w == 0 || rows == 0 {
+            return;
+        }
+        let f = (self.xfr_factor & 0xFFFF).max(1) as usize;
+        // Each destination pixel samples at its centre.
+        let src_col = |j: usize| -> usize {
+            let g = match re_zoom {
+                z if z & 1 << 19 != 0 => (2 * j + 1) * 256 / (2 * f),
+                z if z & 1 << 20 != 0 => (2 * j + 1) * f / 512,
+                _ => j,
+            };
+            (g / ge_rep.max(1)).min(src_w - 1)
+        };
+        let inv = if self.zoom_inv > 0.0 { self.zoom_inv as f64 } else { 1.0 };
+        let src_row = |j: usize| -> usize { (((j as f64 + 0.5) * inv) as usize).min(rows - 1) };
+        let (ex0, ex1) = (fx0.min(fx0 + dx * (nx - 1)), fx0.max(fx0 + dx * (nx - 1)));
+        let (ey0, ey1) = (fy0.min(fy0 + dy * (ny - 1)), fy0.max(fy0 + dy * (ny - 1)));
+        let (mut cx0, mut cx1, mut cy0, mut cy1) = (ex0, ex1, ey0, ey1);
+        if self.scissor_test != 0 {
+            let [sx0, sx1, sy0, sy1] = self.scissor_rect();
+            (cx0, cx1, cy0, cy1) = (cx0.max(sx0), cx1.min(sx1), cy0.max(sy0), cy1.min(sy1));
+        }
+        if cx0 > cx1 || cy0 > cy1 {
+            return;
+        }
+        let (w, h) = (cx1 - cx0 + 1, cy1 - cy0 + 1);
+        self.begin_raster(sink);
+        if (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3 {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+        } else if self.stencil_pixels() {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
+        }
+        self.fill_mode(FILL_DMA_WRITE, sink);
+        // The raster engine's zoom is done here: plain transfer.
+        sink.rss_write(re::XFRMODE, self.xfrmode & !(3 << 19), false);
+        sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
+        sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
+        sink.rss_write(re::BLOCK_XYSTARTI, xy(cx0, cy0), false);
+        sink.rss_write(re::BLOCK_XYENDI, xy(cx1, cy1), true);
+        let byte = |i: usize| words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
+        let rev = bpp == 4 && self.xfrmode & 0xFF == 0x80 && self.xfrmode & 1 << 22 == 0;
+        for (line, y) in (cy0..=cy1).enumerate() {
+            let sr = src_row(((y - fy0) * dy) as usize);
+            let mut bytes = Vec::with_capacity(w as usize * bpp);
+            for x in cx0..=cx1 {
+                let sc = src_col(((x - fx0) * dx) as usize);
+                let base = sr * wpr * 4 + sc * bpp;
+                let start = bytes.len();
+                bytes.extend((0..bpp).map(|k| byte(base + k)));
+                if rev {
+                    bytes[start..start + 4].reverse();
+                }
+            }
+            sink.dma_write_line(line as u32, &bytes);
+        }
+        self.end_raster(sink);
+    }
+
     /// glDrawPixels' rows, `wpr` words each, in the raster engine's format
     /// (`bpp` bytes a pixel).
+    /// Pixels a row of `wpr` words holds at `bpp` bytes a pixel: 0xDA8's
+    /// transfer width when the padded row is that many pixels rounded up
+    /// to words (13 16-bit indices come as 7 words, not 14 pixels), else
+    /// as many as fit.
+    fn row_pixels(&self, wpr: usize, bpp: usize) -> usize {
+        let fit = wpr * 4 / bpp.max(1);
+        let w = (self.tl_rect[4] & 0xFFFF) as usize;
+        if w > 0 && w < fit && (w * bpp).div_ceil(4) == wpr {
+            w
+        } else {
+            fit
+        }
+    }
+
     fn draw_pixels_words(&mut self, words: &[u32], wpr: usize, rows: usize, bpp: usize, sink: &mut dyn Hq3Sink) {
         // Pixel zoom (same both ways, any factor): output pixel i takes
         // source pixel floor(i / zoom), as OpenGL's zoomed rectangles do
@@ -1615,19 +1964,39 @@ impl Gl {
         // A large image comes in chunks (glCopyPixels draws back 80 pixels
         // wide): pixel state 0xDA8 holds the chunk's place in the image
         // (x0, y0, x1, y1, transfer size), relative to the raster position.
+        // The first row and column are at (x0, y0), the last at (x1, y1):
+        // a negative pixel zoom reverses them (Mirai's splash, drawn with
+        // zoom (1, -1): y from -1 down to -395 for 395 rows).
         let xs = self.tl_rect[4];
-        let (ox, oy) = if xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == wpr * 4 / bpp.max(1) {
+        // Zoomed images, as the board draws them (traced, pixtest zoom
+        // cases): the GE repeats rows by its 1 / zy step (pixel state
+        // 0x192) and, for a fractional x zoom, each pixel ceil(zx) times
+        // (`xzoom`); the raster engine then zooms x by XFRFACTOR / 256
+        // (XFRMODE bit 19) or decimates by it (bit 20: 256 x the GE's
+        // columns / the destination's). 0xDA8 holds the destination's
+        // first and last pixel, so its extents and direction.
+        let ge_rep = self.pix.xzoom_rep();
+        let re_zoom = self.xfrmode & (3 << 19);
+        if xs != 0 && (re_zoom != 0 || ge_rep > 1 || (self.zoom_inv > 0.0 && self.zoom_inv != 1.0)) {
+            return self.draw_pixels_zoomed(words, wpr, rows, bpp, ge_rep, re_zoom, sink);
+        }
+        let src_w = self.row_pixels(wpr, bpp);
+        let rect = xs != 0 && (xs >> 16) as usize == rows && (xs & 0xFFFF) as usize == src_w;
+        let (ox, oy) = if rect {
             (self.tl_rect[0] as i32 as f32 * zoom, self.tl_rect[1] as i32 as f32 * zoom)
         } else {
             (0.0, 0.0)
         };
+        let flip_x = rect && (self.tl_rect[2] as i32) < (self.tl_rect[0] as i32);
+        let flip_y = rect && (self.tl_rect[3] as i32) < (self.tl_rect[1] as i32);
         let (x0, y0) = ((self.raster[0] + ox).floor() as i32, (self.raster[1] + oy).floor() as i32);
-        let src_w = wpr * 4 / bpp;
         let out_w = ((src_w as f32 * zoom).round() as i32).max(1);
         let out_h = ((rows as f32 * zoom).round() as i32).max(1);
+        let span = |o: i32, n: i32, flip: bool| if flip { (o - n + 1, o) } else { (o, o + n - 1) };
+        let ((ex0, ex1), (ey0, ey1)) = (span(x0, out_w, flip_x), span(y0, out_h, flip_y));
         // The scissor box (window coordinates, inclusive) cuts the
         // rectangle, as it does every fragment.
-        let (mut cx0, mut cx1, mut cy0, mut cy1) = (x0, x0 + out_w - 1, y0, y0 + out_h - 1);
+        let (mut cx0, mut cx1, mut cy0, mut cy1) = (ex0, ex1, ey0, ey1);
         if self.scissor_test != 0 {
             let [sx0, sx1, sy0, sy1] = self.scissor_rect();
             (cx0, cx1, cy0, cy1) = (cx0.max(sx0), cx1.min(sx1), cy0.max(sy0), cy1.min(sy1));
@@ -1640,6 +2009,9 @@ impl Gl {
         if (self.xfrmode >> 4) & 0xF == 2 && self.xfrmode & 0xF == 3 {
             // Depth pixels (glCopyPixels of depth draws them back).
             sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+        } else if self.stencil_pixels() {
+            sink.rss_write(re::DRBPOINTERS, super::rss::ZST_PAGE, false);
+            sink.rss_write(super::rss::reg::ZST_STENCIL, 1, false);
         }
         self.fill_mode(FILL_DMA_WRITE, sink);
         sink.rss_write(re::XFRMODE, self.xfrmode, false);
@@ -1647,24 +2019,27 @@ impl Gl {
         sink.rss_write(re::IR_ALIAS, IR_BLOCK_SETUP, false);
         sink.rss_write(re::BLOCK_XYSTARTI, xy(cx0, cy0), false);
         sink.rss_write(re::BLOCK_XYENDI, xy(cx1, cy1), true);
-        let src_px = |r: usize, c: usize| -> [u8; 8] {
-            let mut px = [0u8; 8];
+        let src_px = |r: usize, c: usize| -> [u8; 16] {
+            let mut px = [0u8; 16];
             for (k, b) in px.iter_mut().enumerate().take(bpp) {
                 let i = r * wpr * 4 + c * bpp + k;
                 *b = words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
             }
-            // GE pixels have component order RGBA after HQ formatting;
-            // the RSS's byte RGBA transfer is a packed ABGR X pixel.
-            if bpp == 4 && self.xfrmode & 0xFF == 0x80 {
+            // GE pixels are RGBA; byte RGBA with RGBorder clear goes to the
+            // raster engine alpha first (`rss::xfer_format`).
+            if bpp == 4 && self.xfrmode & 0xFF == 0x80 && self.xfrmode & 1 << 22 == 0 {
                 px[..4].reverse();
             }
             px
         };
-        for (line, oy) in (cy0 - y0..=cy1 - y0).enumerate() {
-            let sr = ((oy as f32 / zoom) as usize).min(rows - 1);
+        // Output pixel i from the first row / column takes source pixel
+        // floor(i / zoom).
+        let from = |p: i32, o: i32, flip: bool| if flip { o - p } else { p - o };
+        for (line, y) in (cy0..=cy1).enumerate() {
+            let sr = ((from(y, y0, flip_y) as f32 / zoom) as usize).min(rows - 1);
             let mut bytes = Vec::with_capacity(w as usize * bpp);
-            for ox in cx0 - x0..=cx1 - x0 {
-                let sc = ((ox as f32 / zoom) as usize).min(src_w - 1);
+            for x in cx0..=cx1 {
+                let sc = ((from(x, x0, flip_x) as f32 / zoom) as usize).min(src_w - 1);
                 bytes.extend_from_slice(&src_px(sr, sc)[..bpp]);
             }
             sink.dma_write_line(line as u32, &bytes);
@@ -1678,31 +2053,43 @@ impl Gl {
     /// colour and depth at the raster position less the origin; the raster
     /// position then moves. Each run of set bits goes through the GL
     /// fragment path as a one-pixel-high rectangle.
-    pub fn bitmap_rows(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    pub fn bitmap_rows(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.ensure_init();
         if self.send_pixels_pending != 0 {
             if self.send_pixels[6] == SEND_PIXELS_TEXTURE {
-                self.tex_load(words, sink);
+                self.tex_load(words, lut, sink);
             } else {
-                self.draw_pixels(words, sink);
+                self.draw_pixels(words, lut, sink);
             }
             return;
         }
         self.bitmap_pending = 0;
         let h = self.bitmap;
-        let (bits, rows) = (h[1] as usize, h[2] as usize);
+        let bits = h[1] as usize;
+        let stride = if self.bitmap_general != 0 { bits.div_ceil(64) * 8 } else { bits.div_ceil(8) };
+        if stride == 0 { return; }
+        let rows = if self.bitmap_general != 0 {
+            (words.len() * 4 / stride).min(h[2].saturating_sub(self.bitmap_row) as usize)
+        } else {
+            h[2] as usize
+        };
         let f = |i: usize| f32::from_bits(h[i]);
         let (xorig, yorig, xmove, ymove) = (f(3), f(4), f(5), f(6));
         if self.raster_valid == 0 {
             return;
         }
         let x0 = (self.raster[0] - xorig).floor();
-        let y0 = (self.raster[1] - yorig).floor();
-        let stride = bits.div_ceil(8);
+        let y0 = (self.raster[1] - yorig).floor() + self.bitmap_row as f32;
         let byte = |i: usize| words.get(i / 4).map_or(0, |w| (w >> (24 - 8 * (i % 4))) as u8);
         let mut v = Wv { z: self.raster[2], c: self.raster_color, cb: self.raster_color, ok: 1, ..Default::default() };
+        // Format word bit 17: GL_UNPACK_LSB_FIRST (bit 0 of each byte is
+        // the leftmost pixel).
+        let lsb = h[0] & 1 << 17 != 0;
         for r in 0..rows {
-            let set = |c: usize| byte(r * stride + c / 8) >> (7 - c % 8) & 1 != 0;
+            let set = |c: usize| {
+                let b = byte(r * stride + c / 8);
+                (if lsb { b >> (c % 8) } else { b >> (7 - c % 8) }) & 1 != 0
+            };
             let mut c = 0;
             while c < bits {
                 if !set(c) {
@@ -1731,11 +2118,19 @@ impl Gl {
                 }
             }
         }
-        self.raster[0] += xmove;
-        self.raster[1] += ymove;
+        if self.bitmap_general != 0 {
+            self.bitmap_row += rows as u32;
+        } else {
+            self.raster[0] += xmove;
+            self.raster[1] += ymove;
+        }
     }
 
     fn point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
+        if self.point_smooth != 0 {
+            self.smooth_point_window(v, sink);
+            return;
+        }
         let size = self.point_size.round().max(1.0);
         let (mut a, mut b) = (v, v);
         if size <= 1.0 {
@@ -1761,6 +2156,43 @@ impl Gl {
         self.line_width = width;
     }
 
+    /// An antialiased point (GL_POINT_SMOOTH): a disc of the point size's
+    /// diameter (not rounded) centred on the point; each pixel it touches
+    /// is drawn with its coverage (4 x 4 samples) multiplying alpha, which
+    /// the application's blending turns into soft edges (OpenGL 1.1 3.3.2).
+    /// Colour index has no alpha: a pixel at least half covered is drawn.
+    /// How the GE11 computes coverage is not known.
+    fn smooth_point_window(&mut self, v: Wv, sink: &mut dyn Hq3Sink) {
+        let r = self.point_size.max(1.0) / 2.0;
+        let (x0, x1) = ((v.x - r).floor() as i32, (v.x + r).ceil() as i32);
+        let (y0, y1) = ((v.y - r).floor() as i32, (v.y + r).ceil() as i32);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let mut n = 0;
+                for k in 0..16 {
+                    let sx = px as f32 + ((k % 4) as f32 + 0.5) / 4.0 - v.x;
+                    let sy = py as f32 + ((k / 4) as f32 + 0.5) / 4.0 - v.y;
+                    n += (sx * sx + sy * sy <= r * r) as u32;
+                }
+                if n == 0 || (self.ci != 0 && n < 8) {
+                    continue;
+                }
+                let cov = n as f32 / 16.0;
+                let (mut a, mut b) = (v, v);
+                for w in [&mut a, &mut b] {
+                    w.y = py as f32 + 0.5;
+                    if self.ci == 0 {
+                        w.c[3] *= cov;
+                        w.cb[3] *= cov;
+                    }
+                }
+                a.x = px as f32 + 0.25;
+                b.x = px as f32 + 0.75;
+                self.line_window(a, b, true, sink);
+            }
+        }
+    }
+
     /// The PP1 per-fragment registers for the current state (layouts in
     /// rss.rs, provisional).
     fn load_fragment_state(&mut self, sink: &mut dyn Hq3Sink) {
@@ -1774,8 +2206,26 @@ impl Gl {
         };
         sink.rss_write(re::STENCILMODE, st, false);
         sink.rss_write(re::STENCILMASK, self.st_wmask << 8 | self.st_cmask, false);
-        sink.rss_write(re::BLENDFACTOR, if self.blend != 0 { 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 }, false);
-        let op = if self.logic != 0 { self.logic_op } else { 3 };
+        // EXT_blend_logic_op: with the GL_LOGIC_OP equation, GL_BLEND turns
+        // the logic op on rather than blending.
+        let blend_logic = self.blend != 0 && self.blend_eq == GL_LOGIC_OP;
+        let blend = self.blend != 0 && !blend_logic;
+        let eq = match self.blend_eq {
+            GL_FUNC_SUBTRACT => super::rss::BLEND_EQ_SUBTRACT,
+            GL_FUNC_REVERSE_SUBTRACT => super::rss::BLEND_EQ_REVERSE_SUBTRACT,
+            GL_MIN => super::rss::BLEND_EQ_MIN,
+            GL_MAX => super::rss::BLEND_EQ_MAX,
+            _ => super::rss::BLEND_EQ_ADD,
+        };
+        sink.rss_write(
+            re::BLENDFACTOR,
+            if blend { eq << super::rss::BLEND_EQ_SHIFT | 1 << 8 | self.blend_dst << 4 | self.blend_src } else { 0 },
+            false,
+        );
+        let k = self.blend_color.map(|c| (c * 4095.0).round() as u32);
+        sink.rss_write(re::BLENDCOLOR_RG, k[0] << 16 | k[1], false);
+        sink.rss_write(re::BLENDCOLOR_BA, k[2] << 16 | k[3], false);
+        let op = if self.logic != 0 || blend_logic { self.logic_op } else { 3 };
         sink.rss_write(re::PP1FILLMODE, (self.pp1_base() & !(0xF << 26)) | op << 26, false);
         let (lsb, msb) = self.color_write_masks();
         sink.rss_write(re::COLORMASKLSBSA, lsb, false);
@@ -1811,6 +2261,7 @@ impl Gl {
     /// follows (the display flips at the next retrace, by the kernel's
     /// BUF_SELECT write).
     pub fn swap_buffers(&mut self, sink: &mut dyn Hq3Sink) {
+        crate::pf_instant!(crate::perfetto::events::MGRAS_SWAP);
         self.ensure_init();
         self.end_raster(sink);
         if self.banks_known == 0 {
@@ -1850,6 +2301,10 @@ impl Gl {
     /// field 3 writes both pages) and for the overlay.
     fn draw_pointers(&self) -> u32 {
         let drb = self.window.drb;
+        // 12-bit pairs and colour index: both buffers are in A's pages.
+        if self.rgb12_pair() || self.ci_pair() {
+            return drb;
+        }
         let a = drb & 0x3FF;
         // A single-buffered window has no second page: B is A.
         let b = match (drb >> 10) & 0x3FF {
@@ -1913,7 +2368,13 @@ impl Gl {
             sink.note("GL clear before the kernel gave the window".into());
             return;
         }
-        let (ox, oy) = ((w.origin & 0xFFFF) as i32, (w.origin >> 16) as i32);
+        // The origin's halves are signed: a window that reaches past the
+        // screen's top or left edge (one taller than the screen with its
+        // title bar) has a negative one (traced: 0xffe00008, x 8, y -32).
+        // Read unsigned, y was 65504, the clear landed off screen and was
+        // dropped: the depth buffer kept the last window's values, and the
+        // 3D view showed only where those let it through.
+        let (ox, oy) = (super::rss::signed16(w.origin), super::rss::signed16(w.origin >> 16));
         let [mx, my] = w.masks[0];
         let (mut x0, mut x1) = ((mx >> 16) as i32 - ox, (mx & 0xFFFF) as i32 - ox);
         let (mut y0, mut y1) = ((my >> 16) as i32 - oy, (my & 0xFFFF) as i32 - oy);
@@ -1929,7 +2390,10 @@ impl Gl {
         sink.rss_write(re::AFUNCMODE, 7, false);
         sink.rss_write(re::STENCILMODE, 7, false);
         sink.rss_write(re::BLENDFACTOR, 0, false);
-        sink.rss_write(re::PP1FILLMODE, self.pp1_base(), false);
+        // The ZST buffer takes its words as they are: never a 12-bit pair's
+        // packing, a colour-index pixel type or dither.
+        let pp1 = if drb == super::rss::ZST_PAGE { PP1_RGB24_BUFFER_A } else { self.pp1_base() };
+        sink.rss_write(re::PP1FILLMODE, pp1, false);
         sink.rss_write(re::DRBPOINTERS, drb, false);
         sink.rss_write(re::COLORMASKLSBSA, lsb, false);
         sink.rss_write(re::COLORMASKLSBSB, lsb, false);
@@ -1950,17 +2414,85 @@ impl Gl {
     /// index (pixel type 6) in a colour-index context. Main pixels use our
     /// canonical storage format; overlays retain the driver's CI8 format.
     fn pp1_base(&self) -> u32 {
-        let pp1 = if self.ci != 0 { (PP1_RGB24_BUFFER_A & !0x700) | 0x600 } else { PP1_RGB24_BUFFER_A };
+        if self.rgb12_pair() {
+            let dither = if self.dither != 0 { super::rss::PP1_DITHER } else { 0 };
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.pixel_format & 0x2700 | self.pair_field() << 14 | dither;
+        }
+        if self.ci_pair() {
+            // Colour index: A, B or both halves of A's words.
+            return (PP1_RGB24_BUFFER_A & !((0x7F << 14) | 0x2700)) | self.ci_format() | self.pair_field() << 14;
+        }
+        let pp1 = if self.ci != 0 {
+            (PP1_RGB24_BUFFER_A & !0x2700) | self.ci_format()
+        } else if self.rgb36() {
+            (PP1_RGB24_BUFFER_A & !0x2700) | 0x2300
+        } else {
+            PP1_RGB24_BUFFER_A
+        };
         match self.draw_mask() {
             // The overlay: its draw field, buffer count and the driver's
             // pixel format.
             Some(m) if m & 0x70 == 0x40 => {
                 let pp1 = (pp1 & !((0x7F << 14) | (1 << 11))) | m << 14 | self.buffer_count << 11;
-                (pp1 & !0x2700) | self.pixel_format
+                (pp1 & !0x2700) | self.pixel_format & 0x2700
             }
             // A and B: draw field 3.
             Some(m) if m & 1 != 0 && m & 0xE != 0 => (pp1 & !(0x7F << 14)) | 3 << 14,
             _ => pp1,
+        }
+    }
+
+    /// An RGB context whose visual is 12 bits a pixel (INIT_FORMAT_VALUES
+    /// 0x100 or 0, traced on a HighImpact at 1280x1024: octahedra's and
+    /// electropaint's double-buffered visuals, XMAP formats 7 and 5): it
+    /// draws 12-bit pixel pairs, buffer A in a word's low half and B in
+    /// its high half (see `rss::rgb12_pair`). Its overlay drawing keeps
+    /// the overlay's own format.
+    fn rgb12_pair(&self) -> bool {
+        self.ci == 0
+            && self.pixel_format & PIXEL_FORMAT_SENT != 0
+            && super::rss::rgb12_pair(self.pixel_format & 0x2700)
+            && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// A colour-index context's PP1 pixel format (bits 13, 10:8): what
+    /// INIT_FORMAT_VALUES sent (CI12 0x400, CI8 0x500 / 0x600), CI8 before
+    /// it has.
+    fn ci_format(&self) -> u32 {
+        let f = self.pixel_format & 0x2700;
+        if self.pixel_format & PIXEL_FORMAT_SENT != 0 && super::rss::ci_pixtype(f) { f } else { 0x600 }
+    }
+
+    /// A colour-index context drawing its colour buffers (not the
+    /// overlay): both buffers are halves of A's words, as for the 12-bit
+    /// RGB pairs (`rss::ci_pixtype`).
+    fn ci_pair(&self) -> bool {
+        self.ci != 0 && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// An RGB context whose visual is 12:12:12 (INIT_FORMAT_VALUES 0x2300,
+    /// see `rss::rgb36`).
+    fn rgb36(&self) -> bool {
+        self.ci == 0
+            && self.pixel_format & PIXEL_FORMAT_SENT != 0
+            && self.pixel_format & 0x2700 == 0x2300
+            && !matches!(self.draw_mask(), Some(m) if m & 0x70 == 0x40)
+    }
+
+    /// The pair layout a 12-bit pair context draws in (its pixel type).
+    fn pair_layout(&self) -> Option<super::rss::Pair> {
+        if self.rgb12_pair() { super::rss::Pair::of(self.pixel_format & 0x2700) } else { None }
+    }
+
+    /// A 12-bit pair context's draw field: 1 A, 2 B, 3 both (DRAW_BUFFER
+    /// sends these values), 0 none.
+    fn pair_field(&self) -> u32 {
+        match self.draw_mask() {
+            Some(m) => m & 3,
+            None => {
+                let back = self.draw_bits & 0xC != 0;
+                if back != (self.swapped != 0) { 2 } else { 1 }
+            }
         }
     }
 
@@ -1971,9 +2503,35 @@ impl Gl {
             Some(m) if m & 0x70 == 0x40 => return (0, self.index_mask & 0xFF),
             _ => {}
         }
-        if self.ci != 0 { return (self.index_mask & 0xFFF, 0); }
+        if let Some(pair) = self.pair_layout() {
+            // Per buffer: its colour components and alpha (libGLcore's
+            // masks: 4:4:4 A 0x0F000FFF B 0xF0FFF000, 5:5:5 A 0x40007FFF B
+            // 0xBFFF8000), split into the LSB (23:0) and MSB (31:24) planes.
+            let cm = self.color_mask;
+            let n = pair.bits();
+            let c = (0..3).fold(0, |c, k| c | (cm >> k & 1) * (((1 << n) - 1) << (n * k)));
+            let half = |b: bool| {
+                let (a, aw) = pair.alpha(b);
+                (if b { c << pair.shift_b() } else { c }) | (cm >> 3 & 1) * (((1 << aw) - 1) << a)
+            };
+            let f = self.pair_field();
+            return ((f & 1) * half(false) | (f >> 1 & 1) * half(true), 0);
+        }
+        if self.ci != 0 {
+            // A in planes 11:0, B in 23:12 (`rss::ci_pixtype`).
+            let m = self.index_mask & 0xFFF;
+            let f = if self.ci_pair() { self.pair_field() } else { 1 };
+            return ((f & 1) * m | (f >> 1 & 1) * (m << 12), 0);
+        }
         let cm = self.color_mask;
-        ((cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000, (cm >> 3 & 1) * 0xFF)
+        // ColorMaskLSBs are planes 31:0, ColorMaskMSBs 35:32 (libGLcore:
+        // 8,8,8,8 all ones and 0; 12,12,12 all ones and 0xF).
+        if self.rgb36() {
+            // Each component: its 8-bit planes and its low nibble's.
+            let m = (0..3).fold(0u64, |m, k| m | (cm >> k & 1) as u64 * (0xFF << (8 * k) | 0xF << (24 + 4 * k)));
+            return (m as u32, (m >> 32) as u32);
+        }
+        ((cm & 1) * 0xFF | (cm >> 1 & 1) * 0xFF00 | (cm >> 2 & 1) * 0xFF_0000 | (cm >> 3 & 1) * 0xFF00_0000, 0)
     }
 
     /// glClear's colour part: the clear colour through the colour mask.
@@ -1984,7 +2542,8 @@ impl Gl {
             self.clear_block([self.clear_index & 0xFFF, 0, 0, 0], lsb, msb, drb, sink);
             return;
         }
-        let q = |c: f32| ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << 4;
+        // Fill colours are 12 bits: 12:12:12 keeps them all.
+        let q = |c: f32| if self.rgb36() { (c.clamp(0.0, 1.0) * 4095.0).round() as u32 } else { ((c.clamp(0.0, 1.0) * 255.0).round() as u32) << 4 };
         let c = self.clear_color;
         self.clear_block([q(c[0]), q(c[1]), q(c[2]), q(c[3])], lsb, msb, drb, sink);
     }
@@ -2003,7 +2562,7 @@ impl Gl {
         } else {
             let s = self.clear_stencil << 4;
             let m = self.st_wmask;
-            self.clear_block([0, 0, 0, s], 0, m, zst, sink);
+            self.clear_block([0, 0, 0, s], m << 24, 0, zst, sink);
         }
     }
 
@@ -2088,7 +2647,7 @@ impl Gl {
             }
         }
         if self.fog_after_texture() {
-            let (a, b, c) = (aw.f as f64, bw.f as f64, cw.f as f64);
+            let (a, b, c) = (aw.f[0] as f64, bw.f[0] as f64, cw.f[0] as f64);
             let mid = c + perc as f64 * (a - c);
             let dx = if span_x != 0.0 { (b - mid) / span_x as f64 } else { 0.0 };
             let ddown = (a - c - dx * major_x as f64) / major_y as f64;
@@ -2166,9 +2725,25 @@ impl Gl {
         sink.rss_write(rr::FOG_ON, 1, false);
     }
 
+    /// A GE pixel state block (PIXEL_STATE / INIT_PIXEL_STATE_ERAM, or
+    /// such a token's payload sent as pixel data): [?, ?, bytes, address,
+    /// 0, 0, count, values, count, values again].
+    pub fn pixel_state_block(&mut self, d: &[u32]) {
+        if d.len() < 7 {
+            return;
+        }
+        let (addr, n) = (d[3], d[6] as usize);
+        self.pix.note_block(addr, n.min(d.len() - 7));
+        for (k, &v) in d[7..].iter().take(n).enumerate() {
+            self.pixel_state(addr + k as u32, v);
+        }
+    }
+
     /// A GE pixel state word (PIXEL_STATE / INIT_PIXEL_STATE_ERAM) at
-    /// `addr`: the pixel zoom and the texture loader's blocks are kept.
+    /// `addr`: into the pixel pipeline's memory; the pixel zoom and the
+    /// texture loader's blocks are kept apart as well.
     fn pixel_state(&mut self, addr: u32, v: u32) {
+        self.pix.write(addr, v);
         match addr {
             0x192 => self.zoom_inv = f32::from_bits(v),
             0xDA8..=0xDAC => self.tl_rect[(addr - 0xDA8) as usize] = v,
@@ -2191,6 +2766,18 @@ impl Gl {
     /// it loaded. False for other registers.
     pub fn te_write(&mut self, r: u32, v: u32, sink: &mut dyn Hq3Sink) -> bool {
         self.ensure_init();
+        // The driver's texture placement, for following libGLcore's TRAM
+        // bookkeeping over a long run (`mgras trace <file> tex`).
+        if sink.tracing_tex()
+            && matches!(r, te_reg::TXSIZE | te_reg::TXADDR | te_reg::TXMIPMAP | te_reg::TL_ADDR | te_reg::TL_SPEC | te_reg::TL_MIPMAP)
+        {
+            let idx = match r {
+                te_reg::TXMIPMAP => format!(" [{}]", self.te_index),
+                te_reg::TL_MIPMAP => format!(" [{}]", self.te[te1::CONTEXT_REGS.iter().position(|&c| c == te_reg::TL_ADDR).unwrap_or(0)]),
+                _ => String::new(),
+            };
+            sink.trace(format!("TEX reg {r:#05x}{idx} = {v:#x}"));
+        }
         if r == te_reg::TXADDR {
             self.te_index = v;
         } else if let Some(i) = te1::CONTEXT_REGS.iter().position(|&x| x == r) {
@@ -2239,15 +2826,28 @@ impl Gl {
     /// else packed; host components are 8 or 16 bits (the pixel format's
     /// scale, 0xD0A) or floats, and become the internal format's
     /// (luminance replicated, alpha picked out, missing alpha 1).
-    fn tex_load(&mut self, words: &[u32], sink: &mut dyn Hq3Sink) {
+    fn tex_load(&mut self, words: &[u32], lut: &[u32], sink: &mut dyn Hq3Sink) {
         self.send_pixels_pending = 0;
         let [s0, t0, w, h, _] = self.tl_rect;
         let (w, h) = (w as usize, h as usize);
         if w == 0 || h == 0 || w > 4096 || h > 4096 {
             return;
         }
+        // libGLcore's loads come through the GE pixel pipeline: the
+        // texels in the internal format's components, as the TE takes
+        // them (4 bytes a texel, its components first).
+        if self.tl_dest[0] != 0 && self.pix.has_program() {
+            if let Some(lines) = self.run_tex_pipeline(lut, words, w, h) {
+                self.tex_load_lines(&lines, s0, t0, w, h, sink);
+                return;
+            }
+        }
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        let wpr = self.send_pixels[0] as usize * 4;
+        // A row is SEND_PIXELS words 0 + 1 (`send_pixels_row_words`; traced
+        // 64x64 luminance-alpha and 128-wide RGBA strips: [0x10, 0x10, ..]
+        // with 128-byte rows, [0x40, 0x40, ..] with 512-byte rows). Word 0
+        // alone halved the row: texel s took texel s / 2's bytes.
+        let wpr = self.send_pixels_row_words() * 4;
         let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
         let (pitch, bpt) = if hdr_rows == h && wpr >= w { (wpr, wpr / w) } else { (0, bytes.len() / (w * h)) };
         let pitch = if pitch == 0 { w * bpt } else { pitch };
@@ -2294,7 +2894,18 @@ impl Gl {
             ));
         }
         self.begin_raster(sink);
-        if !raw {
+        if raw {
+            // The driver set the loader registers in the context (a TRAM
+            // restore, glCopyTexSubImage's destination): send them, as an
+            // earlier load since the batch began may have left its own
+            // page in the TE (traced: TyrQuake's lightmap loads to page 7,
+            // then its warp copy to 0x37 landed on the lightmaps).
+            for r in [te_reg::TL_MODE, te_reg::TL_SPEC, te_reg::TL_MIPMAP, te_reg::TL_BORDER] {
+                if let Some(i) = te1::CONTEXT_REGS.iter().position(|&c| c == r) {
+                    sink.rss_write(r, self.te[i], false);
+                }
+            }
+        } else {
             sink.rss_write(te_reg::TL_MIPMAP, self.tl_dest[3], false);
             sink.rss_write(te_reg::TL_BORDER, self.tl_dest[4], false);
         }
@@ -2305,6 +2916,36 @@ impl Gl {
         sink.rss_write(te_reg::TL_T_BOTTOM, t0, false);
         sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
         sink.rss_write(re::XFRCONTROL, TE_LOAD_START, false);
+        // Byte components taken as they come: a TRAM restore (the texture
+        // manager reloads most textures this way, 3 bytes a texel for RGB)
+        // sends each texel's four bytes from where it starts, and a 4-byte
+        // texel at RGBA is its row as is.
+        if raw || (!float && comp == 1 && bpt == 4 && !alpha_class && n_ext == nc) {
+            let mut line = vec![0u8; w * 4];
+            for row in 0..h {
+                if bpt == 4 {
+                    let at = (row * pitch).min(bytes.len());
+                    let n = (w * 4).min(bytes.len() - at);
+                    line[..n].copy_from_slice(&bytes[at..at + n]);
+                    line[n..].fill(0);
+                } else {
+                    for (col, px) in line.chunks_exact_mut(4).enumerate() {
+                        let i = row * pitch + col * bpt;
+                        match bytes.get(i..i + 4) {
+                            Some(b) => px.copy_from_slice(b),
+                            None => {
+                                for (k, p) in px.iter_mut().enumerate() {
+                                    *p = bytes.get(i + k).copied().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                }
+                sink.dma_write_line(row as u32, &line);
+            }
+            sink.rss_write(re::XFRCONTROL, 0, false);
+            return;
+        }
         for row in 0..h {
             let mut line = Vec::with_capacity(w * 4);
             for col in 0..w {
@@ -2322,7 +2963,20 @@ impl Gl {
                 let (lum, alpha) = (src(0), if n_ext == 2 || n_ext == 4 { src(n_ext - 1) } else { 0xFF });
                 let px = match (n_ext, nc) {
                     _ if raw => [src(0), src(1), src(2), src(3)],
-                    _ if alpha_class => [alpha, 0, 0, 0],
+                    // One host component into a one-component texture is
+                    // the texel, whatever its class: GL_ALPHA data has no
+                    // other byte to take alpha from. This must not hang on
+                    // the class either, which comes from the TEXMODE1
+                    // shadow, and libGLcore writes the new texture's
+                    // TEXMODE1 after loading it (traced: a GL_LUMINANCE
+                    // load following a GL_ALPHA one still saw class 1).
+                    (1, 1) => [lum, 0, 0, 0],
+                    // The class picks alpha out of a wider host texel only
+                    // for a one-component texture: an RGBA texture's
+                    // sub-image arriving under a stale alpha class (Dear
+                    // ImGui's atlas updated after an alpha glyph atlas was
+                    // drawn) is RGBA all the same.
+                    _ if alpha_class && nc == 1 => [alpha, 0, 0, 0],
                     (n, c) if n == c => [src(0), src(1), src(2), src(3)],
                     (1 | 2, 4) => [lum, lum, lum, alpha],
                     (1 | 2, 3) => [lum, lum, lum, 0],
@@ -2333,6 +2987,58 @@ impl Gl {
                 line.extend_from_slice(&px);
             }
             sink.dma_write_line(row as u32, &line);
+        }
+        sink.rss_write(re::XFRCONTROL, 0, false);
+    }
+}
+
+impl Gl {
+    /// A texture load's rows through the GE pixel pipeline: per row, 4
+    /// bytes a texel (the pipeline's components, then zeros).
+    fn run_tex_pipeline(&self, lut: &[u32], words: &[u32], w: usize, h: usize) -> Option<Vec<Vec<u8>>> {
+        let wpr = self.send_pixels_row_words() * 4;
+        let hdr_rows = (self.send_pixels[3] + 3 * self.send_pixels[4]) as usize;
+        let bytes: Vec<u8> = words.iter().flat_map(|x| x.to_be_bytes()).collect();
+        let out_comps = super::rss::xfer_comps(self.xfrmode);
+        let fit = if hdr_rows == h && wpr > 0 { wpr } else { bytes.len() / h };
+        let (comps, esize, _) = self.pix.input_shape_fit(out_comps, Some((fit, w)));
+        let row_in = w * comps * esize;
+        let stride = if hdr_rows == h && wpr >= row_in { wpr } else { row_in };
+        if row_in == 0 || bytes.len() < stride * (h - 1) + row_in {
+            return None;
+        }
+        let ty = self.xfrmode & 0xF;
+        let mut lines = Vec::with_capacity(h);
+        for r in 0..h {
+            let v = self.pix.run_row(lut, &bytes[r * stride..r * stride + row_in], w, out_comps);
+            let n = (v.len() / w).max(1);
+            let mut line = vec![0u8; w * 4];
+            for (k, px) in v.chunks(n).take(w).enumerate() {
+                for (c, &x) in px.iter().take(4).enumerate() {
+                    let mut b = Vec::with_capacity(4);
+                    super::rss::pack_comp(ty, x, &mut b);
+                    line[k * 4 + c] = b[0];
+                }
+            }
+            lines.push(line);
+        }
+        Some(lines)
+    }
+
+    /// Texture rows (4 bytes a texel) into the level the loader points at.
+    fn tex_load_lines(&mut self, lines: &[Vec<u8>], s0: u32, t0: u32, w: usize, h: usize, sink: &mut dyn Hq3Sink) {
+        self.begin_raster(sink);
+        sink.rss_write(te_reg::TL_MIPMAP, self.tl_dest[3], false);
+        sink.rss_write(te_reg::TL_BORDER, self.tl_dest[4], false);
+        sink.rss_write(te_reg::TL_ADDR, 0, false);
+        sink.rss_write(te_reg::TL_S_SIZE, w as u32, false);
+        sink.rss_write(te_reg::TL_T_SIZE, h as u32, false);
+        sink.rss_write(te_reg::TL_S_LEFT, s0, false);
+        sink.rss_write(te_reg::TL_T_BOTTOM, t0, false);
+        sink.rss_write(re::XFRSIZE, (h as u32) << 16 | w as u32, false);
+        sink.rss_write(re::XFRCONTROL, TE_LOAD_START, false);
+        for (row, line) in lines.iter().enumerate() {
+            sink.dma_write_line(row as u32, line);
         }
         sink.rss_write(re::XFRCONTROL, 0, false);
     }
@@ -2367,6 +3073,9 @@ fn normalised_q<const N: usize>(q: [[f64; 3]; N]) -> [[f64; 3]; N] {
     q.map(|v| v.map(|c| c / m))
 }
 
+/// GL_LOGIC_OP as a blend equation (EXT_blend_logic_op).
+const GL_LOGIC_OP: u32 = 0x0BF1;
+
 /// x | y << 16 for the RE4's integer xy registers.
 fn xy(x: i32, y: i32) -> u32 {
     (x as u32 & 0xFFFF) << 16 | (y as u32 & 0xFFFF)
@@ -2384,19 +3093,27 @@ fn lerp_window(a: &Wv, b: &Wv, t: f32) -> Wv {
         v.cb[k] = l(a.cb[k], b.cb[k]);
         v.t[k] = l(a.t[k], b.t[k]);
     }
-    v.f = l(a.f, b.f);
+    v.f[0] = l(a.f[0], b.f[0]);
     v
 }
 
-/// A GL blend factor enum as the PP1 code (see rss.rs).
+/// A GL blend factor enum as the PP1 code (see `rss::blend_rgba`).
 fn blend_code(e: u32) -> u32 {
     match e {
         0 => 0,
         1 => 1,
         0x300..=0x308 => e - 0x300 + 2,
+        // EXT_blend_color's CONSTANT_COLOR .. ONE_MINUS_CONSTANT_ALPHA.
+        0x8001..=0x8004 => e - 0x8001 + 11,
         _ => 1,
     }
 }
+
+/// Blend equations (EXT_blend_minmax, EXT_blend_subtract).
+const GL_MIN: u32 = 0x8007;
+const GL_MAX: u32 = 0x8008;
+const GL_FUNC_SUBTRACT: u32 = 0x800A;
+const GL_FUNC_REVERSE_SUBTRACT: u32 = 0x800B;
 
 /// A token's float arguments: missing ones read as GL's defaults for
 /// vertices and colours (0, 0, 0, 1).

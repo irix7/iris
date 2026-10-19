@@ -49,6 +49,8 @@ pub fn composite(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: 
     let mut runs = Vec::new();
     let (screen_w, screen_h) = frame::display_size(dcb);
     let (main, _) = frame::scanout_buffers(rss, dcb);
+    // A 12-bit pair window shows the frame in both buffers.
+    let pair = frame::pair_format(dcb.xmap.main_mode(target as u32));
     for row in 0..h {
         let sy = y + row as i32;
         if !(0..screen_h as i32).contains(&sy) {
@@ -70,7 +72,116 @@ pub fn composite(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: 
                 let i = row * stride + (sx - x) as usize * 4;
                 let Some(p) = bgra.get(i..i + 4) else { break };
                 let v = p[2] as u32 | (p[1] as u32) << 8 | (p[0] as u32) << 16;
+                let v = match pair {
+                    Some(p) => p.pack_with(v | 0xFF << 24, None),
+                    None => v,
+                };
                 rss.mem.put(&main, sx as u32, fb_y, v as u64);
+            }
+        }
+    }
+    true
+}
+
+/// The window ID a colour-index frame's window has, in the main planes (a
+/// colour-index display mode) or the overlay planes (one that is on): the
+/// commonest such ID over a grid of samples inside the window, as
+/// `window_did` -- and only when it covers three quarters of the samples on
+/// the screen. A window just mapped may not have its ID in the tables yet,
+/// and the commonest ID around it is then someone else's: the frame went
+/// there, the program was told it was shown, and gltest's overlay read back
+/// 0s now and then. None, and the program puts the frame up itself.
+fn index_window_did(dcb: &Dcb, x: i32, y: i32, w: usize, h: usize, overlay: bool) -> Option<u8> {
+    let mut total = 0u32;
+    let mut counts = [0u32; 32];
+    let mut runs = Vec::new();
+    let (screen_w, screen_h) = frame::display_size(dcb);
+    for sy in 0..16 {
+        let py = y + (h as i32 * (2 * sy + 1)) / 32;
+        if !(0..screen_h as i32).contains(&py) {
+            continue;
+        }
+        if overlay {
+            dcb.vc3.overlay_did_runs(py as usize, &mut runs);
+        } else {
+            dcb.vc3.main_did_runs(py as usize, &mut runs);
+        }
+        for sx in 0..16 {
+            let px = x + (w as i32 * (2 * sx + 1)) / 32;
+            if !(0..screen_w as i32).contains(&px) {
+                continue;
+            }
+            let did = runs.iter().rev().find(|r| r.0 as i32 <= px).map_or(0, |r| r.1) as u32;
+            let index = if overlay { dcb.xmap.overlay_mode(did) != 0 } else { dcb.xmap.main_mode(did) & 0x1F < 4 };
+            total += 1;
+            if index {
+                counts[did as usize & 31] += 1;
+            }
+        }
+    }
+    let (did, n) = counts.iter().enumerate().max_by_key(|&(_, n)| *n)?;
+    (*n > 0 && *n * 4 >= total * 3).then_some(did as u8)
+}
+
+/// Paint a colour-index window's host GL frame into the framebuffer, as
+/// `composite` does an RGB one, but as indices: each pixel's index is its
+/// red byte and the low nibble of its green (`bgra`: B, G, R, A), and goes
+/// where the board keeps that window's indices -- the low 8 or 12 main
+/// planes (by the window ID's display mode), the high 12 when the ID shows
+/// buffer B (`frame::Frame::snapshot`), or the overlay planes for an overlay
+/// window -- for the colour map to show, as GL's drawing would on the board.
+/// Before this, the program read every frame back, turned it into indices
+/// and put it to the X server itself: SGI's IRIS GL on host OpenGL ran
+/// flight's full-screen colour-index window at a frame every few seconds.
+/// False when no window ID fits, or there are no overlay planes.
+#[allow(clippy::too_many_arguments)]
+pub fn composite_index(rss: &mut Rss, dcb: &Dcb, x: i32, y: i32, bgra: &[u8], stride: usize, w: usize, h: usize, overlay: bool) -> bool {
+    let (main, over) = frame::scanout_buffers(rss, dcb);
+    let buf = match (overlay, over) {
+        (false, _) => main,
+        (true, Some(o)) => o,
+        (true, None) => return false,
+    };
+    let Some(target) = index_window_did(dcb, x, y, w, h, overlay) else { return false };
+    let b_half = !overlay && dcb.xmap.buf_select() >> target & 1 != 0;
+    let (mask, shift): (u64, u32) = if overlay {
+        (0xFF, 0)
+    } else if b_half {
+        (0xFFF << 12, 12)
+    } else if dcb.xmap.main_mode(target as u32) & 0x1F == 1 {
+        (0xFF, 0)
+    } else {
+        (0xFFF, 0)
+    };
+    let mut runs = Vec::new();
+    let (screen_w, screen_h) = frame::display_size(dcb);
+    for row in 0..h {
+        let sy = y + row as i32;
+        if !(0..screen_h as i32).contains(&sy) {
+            continue;
+        }
+        if overlay {
+            dcb.vc3.overlay_did_runs(sy as usize, &mut runs);
+        } else {
+            dcb.vc3.main_did_runs(sy as usize, &mut runs);
+        }
+        if runs.is_empty() || runs[0].0 != 0 {
+            runs.insert(0, (0, 0));
+        }
+        let fb_y = (screen_h - 1 - sy as usize) as u32;
+        for (k, &(x0, did)) in runs.iter().enumerate() {
+            if did != target {
+                continue;
+            }
+            let x1 = runs.get(k + 1).map_or(screen_w as i32, |r| r.0 as i32);
+            let lo = (x0 as i32).max(x).max(0);
+            let hi = x1.min(x + w as i32).min(screen_w as i32);
+            for sx in lo..hi {
+                let i = row * stride + (sx - x) as usize * 4;
+                let Some(p) = bgra.get(i..i + 4) else { break };
+                let index = p[2] as u64 | (p[1] as u64 & 0xF) << 8;
+                let old = rss.mem.get(&buf, sx as u32, fb_y);
+                rss.mem.put(&buf, sx as u32, fb_y, (old & !mask) | (index << shift & mask));
             }
         }
     }
@@ -125,7 +236,9 @@ impl Mgras {
                 l1i_fetches: 0,
                 uncached: 0,
                 count_hz: 0,
-                gfifo_pending: 0,
+                // Both queues: the HQ3's usually drains at once, and the
+                // backlog waits in front of the raster engines.
+                gfifo_pending: self.hq_fifo.len() + self.rss_fifo.len(),
             };
             if last_rec_flush.elapsed() >= std::time::Duration::from_millis(500) {
                 if let Some(rec) = self.mem_rec.lock().clone() {
@@ -134,11 +247,13 @@ impl Mgras {
                 last_rec_flush = std::time::Instant::now();
             }
             self.trace_flush(false);
+            self.begin_frame();
             // Video timing chip display control bit 0: retrace interrupts.
             let retrace = self.front_view().dcb.vc3.regs[0x1E] & 1 != 0;
             // Vertical retrace: a pulse per frame. The handler acknowledges
             // nothing on the board, so the line must drop again by itself.
             if retrace {
+                crate::pf_instant!(crate::perfetto::events::MGRAS_RETRACE);
                 self.set_line(Line::Retrace, true);
                 std::thread::sleep(std::time::Duration::from_micros(500));
                 self.set_line(Line::Retrace, false);

@@ -40,10 +40,43 @@ pub mod host {
     pub const RASTER: u32 = 0x7C000;
     pub const RASTER_END: u32 = 0x80000;
 
-    /// Status: raster idle and host idle, command and data FIFOs at or below
-    /// their low-water marks.
-    pub const STATUS_IDLE: u32 = 0x01 | 0x02 | 0x10 | 0x40;
+    /// Status bits, read live. The HQ3 has run every command (libGLcore
+    /// waits for this before a read DMA); the whole board has (glFinish
+    /// spins on it); vertical blank; the command FIFO at or above its
+    /// high-water mark, and below its low-water mark (the kernel's FIFO
+    /// interrupt handler polls these two). Bit 6 has always read set; its
+    /// meaning is not known.
+    pub const STATUS_HQ_IDLE: u32 = 0x01;
+    pub const STATUS_BOARD_IDLE: u32 = 0x02;
     pub const STATUS_VBLANK: u32 = 0x04;
+    pub const STATUS_CFIFO_HIGH: u32 = 0x08;
+    pub const STATUS_CFIFO_LOW: u32 = 0x10;
+    pub const STATUS_FIXED: u32 = 0x40;
+
+    /// FIFOSTATUS: command FIFO words in 6:0 (0x7F tells the kernel the
+    /// board is wedged), its high-water mark in 28:22.
+    pub const FIFOSTATUS_HIGH_SHIFT: u32 = 22;
+
+    /// DMABUSY bits the kernel polls until clear (MgrasFlushHQ3Poll):
+    /// host interface, command FIFO, raster interface.
+    pub const DMABUSY_HIF: u32 = 0x02;
+    pub const DMABUSY_CFIFO: u32 = 0x04;
+    pub const DMABUSY_REIF: u32 = 0x10;
+
+    /// The FIFO interrupt (GIO interrupt 0, MgrasFIFOInterrupt) enables in
+    /// INTERRUPT_ENABLE: command FIFO at/above high water, below low water;
+    /// the same for the data FIFO. The kernel enables the two high-water
+    /// ones (0x4400E200); when the FIFO stays high it blocks the writer and
+    /// swaps the command FIFO's high-water enable for the low-water one,
+    /// and MgrasFlushHQ3 sleeps on the low-water one (its mark set to the
+    /// level it waits for, plus one).
+    pub const INTR_CFIFO_HIGH: u32 = 1 << 26;
+    pub const INTR_CFIFO_LOW: u32 = 1 << 27;
+    pub const INTR_DFIFO_HIGH: u32 = 1 << 30;
+    pub const INTR_DFIFO_LOW: u32 = 1 << 31;
+    /// Command FIFO water marks, in words (6.5.22 programs 0x20 and 0x14).
+    pub const CFIFO_HIGH_MARK: u32 = 0x50020;
+    pub const CFIFO_LOW_MARK: u32 = 0x50024;
 
     /// Flag set by the "set flag" command (0xE04): DMA/sync completion.
     pub const FLAG_DONE: u32 = 1 << 16;
@@ -197,6 +230,13 @@ mod cmd {
     /// data, or a host to board DMA), ERAM_WRITE_AT (address, count), and
     /// ERAM_WRITE_END after the last chunk. Read: a board to host DMA armed
     /// first, then ERAM_READ (address, count) feeds it.
+    /// With two GE11s (Maximum Impact) every transfer comes once per GE,
+    /// GE0 first (traced eviction, IRIX 6.5.22): reads of 0x17C8 words at
+    /// slot S, then at S - 1, each DMAing 0x17C7 words to consecutive
+    /// halves of one host buffer; the restore writes the first half to S,
+    /// ERAM_WRITE_END, the second half to S, ERAM_WRITE_END. Nothing
+    /// selects the GE; the kernel's offset says GE1's read output runs a
+    /// word late.
     pub const CP_ERAM_WRITE: u32 = 0x0FD;
     pub const CP_ERAM_WRITE_AT: u32 = 0x0FB;
     pub const CP_ERAM_WRITE_END: u32 = 0x0FA;
@@ -305,6 +345,14 @@ pub trait Hq3Sink {
     /// DMA out of the armed transfer: one line of pixel bytes.
     fn dma_read_line(&mut self, line: u32) -> Vec<u8>;
     fn set_flags(&mut self, bits: u32);
+    /// Clear flags `mask` and return which of them were set.
+    fn take_flags(&mut self, _mask: u32) -> u32 {
+        0
+    }
+    /// `mgras probe`: a forced answer for GE readback address `addr`.
+    fn readback_probe(&self, _addr: u32) -> Option<u32> {
+        None
+    }
     /// A GL batch starts (true) or ends: the RSS saves / restores the raster
     /// registers the batch loads.
     fn gl_bracket(&mut self, _enter: bool) {}
@@ -312,16 +360,31 @@ pub trait Hq3Sink {
     fn sys_mem(&mut self) -> Option<Arc<dyn BusDevice>>;
     /// Something not modelled yet (reported once).
     fn note(&mut self, what: String);
-    /// Whether the annotated trace wants HQ3 lines.
-    fn tracing(&self) -> bool {
+    /// Whether the annotated trace wants HQ3 lines (call `tracing`).
+    fn wants_trace(&self) -> bool {
         false
     }
-    /// Whether the annotated trace wants texture-load lines.
-    fn tracing_tex(&self) -> bool {
+    /// Whether the annotated trace wants texture-load lines (call
+    /// `tracing_tex`).
+    fn wants_trace_tex(&self) -> bool {
         false
     }
     /// One annotated trace line.
     fn trace(&mut self, _line: String) {}
+}
+
+/// The trace checks the HQ3 and GL code make once a command. `wants_trace*`
+/// are virtual calls, which cannot fold to a constant; these are false
+/// without `gputrace` before making the call, so the sites compile away.
+impl dyn Hq3Sink + '_ {
+    #[inline(always)]
+    pub fn tracing(&self) -> bool {
+        cfg!(feature = "gputrace") && self.wants_trace()
+    }
+    #[inline(always)]
+    pub fn tracing_tex(&self) -> bool {
+        cfg!(feature = "gputrace") && self.wants_trace_tex()
+    }
 }
 
 /// What the frontend has done, for `mgras stats`.
@@ -418,6 +481,12 @@ impl Cfifo {
     }
 }
 
+/// Pixel data command: the byte its data starts at within the first word
+/// (bits 24:22).
+fn pixel_align(cmd: u32) -> u32 {
+    (cmd >> 22) & 7
+}
+
 /// The words of a context's record in ERAM, if the slot holds it.
 fn slot_range(slot: u32) -> Option<std::ops::Range<usize>> {
     let s = slot as usize;
@@ -459,12 +528,35 @@ pub struct Hq3Engine {
     /// that came for it so far, by FIFO pixel data or host DMA, until
     /// CP_PASS_THROUGH_GE_FIFO_3 says where they go.
     eram_in: Option<Vec<u32>>,
+    /// The GE's colour tables, shared by every context (`pixpipe::Lut`).
+    lut: super::pixpipe::Lut,
+    /// GE11s on the board (2 on Maximum Impact): ERAM transfers come once
+    /// per GE (`cmd::CP_ERAM_WRITE`). The GE HLE keeps its state in GE0's.
+    ges: usize,
+    /// The ERAM write set in progress goes to this GE; none between sets.
+    eram_write_ge: Option<usize>,
+    /// Where GE0's last write set started, and its last read (address,
+    /// count): the same transfer next is GE1's.
+    eram_write_ge0: Option<usize>,
+    eram_read_ge0: Option<(usize, usize)>,
     /// glBitmap / glDrawPixels rows arriving as FIFO pixel data, and those
     /// of switched-out contexts, by slot (a switch can land halfway
     /// through a client's pixel data; with two clients drawing text, their
     /// rows mixed into broken glyphs).
     bitmap_in: Vec<u32>,
     bitmap_parked: Vec<(u32, Vec<u32>)>,
+    /// The words of an unaligned pixel data command so far.
+    pix_unaligned: Vec<u32>,
+    /// A token whose data comes as the next pixel data command (a GE
+    /// pixel state block too big for the token, PIXEL_STATE / 0x0CD with
+    /// no words; INIT_COLOR_TABLE's table), and that data so far.
+    payload_for: Option<u32>,
+    payload: Vec<u32>,
+    /// Switched-out contexts' readback state, by slot: their GE_DATA flag
+    /// and the answer waiting behind it. A GL client polls the flag after
+    /// a readback token; another client's flag clear wiped it while the
+    /// flags were the board's, and the first waited forever (two pixtests).
+    readback_parked: Vec<(u32, u32, Option<[u32; 2]>)>,
     pub eram: Box<Eram>,
     /// The geometry engine's last answer to a state readback
     /// (`__MGR_RETURN_MODE`), read at the GE readback registers once set.
@@ -474,7 +566,7 @@ pub struct Hq3Engine {
 }
 
 impl Hq3Engine {
-    pub fn new() -> Self {
+    pub fn new(ges: usize) -> Self {
         Hq3Engine {
             context_words: 0,
             context_image: [0; host::CONTEXT_SWITCH_WORDS as usize],
@@ -492,8 +584,17 @@ impl Hq3Engine {
             slot: None,
             nosave_next: false,
             eram_in: None,
+            lut: Default::default(),
+            ges: ges.clamp(1, 2),
+            eram_write_ge: None,
+            eram_write_ge0: None,
+            eram_read_ge0: None,
             bitmap_in: Vec::new(),
             bitmap_parked: Vec::new(),
+            pix_unaligned: Vec::new(),
+            payload_for: None,
+            payload: Vec::new(),
+            readback_parked: Vec::new(),
             eram: super::plain::boxed_zeroed(),
             stats: Hq3Stats::ZERO,
         }
@@ -516,6 +617,14 @@ impl Hq3Engine {
             }
         }
         self.bitmap_in.clear();
+        let flags = sink.take_flags(host::FLAG_GE_DATA);
+        let answer = self.ge_return.take();
+        if let Some(slot) = self.slot {
+            self.readback_parked.retain(|(s, _, _)| *s != slot);
+            if flags != 0 || answer.is_some() {
+                self.readback_parked.push((slot, flags, answer));
+            }
+        }
         let parser = std::mem::replace(&mut self.cfifo[0], Cfifo::EMPTY);
         match self.slot.and_then(slot_range) {
             Some(r) => {
@@ -554,6 +663,13 @@ impl Hq3Engine {
             Some(i) if !first => self.bitmap_parked.remove(i).1,
             _ => Vec::new(),
         };
+        if let Some(i) = self.readback_parked.iter().position(|(s, _, _)| *s == slot) {
+            let (_, flags, answer) = self.readback_parked.remove(i);
+            if !first {
+                self.ge_return = answer;
+                sink.set_flags(flags);
+            }
+        }
         // SAFETY (both): plain numbers, valid zeroed and for any bit pattern.
         self.gl = unsafe { std::mem::zeroed() };
         self.cfifo[0] = Cfifo::EMPTY;
@@ -646,10 +762,17 @@ impl Hq3Engine {
         let f = &mut self.cfifo[port];
         if f.need == 0 {
             if w & 0x8000_0000 != 0 {
-                // Pixel data: byte count in bits 19:0, sent as doublewords.
+                // Pixel data: byte count in bits 19:0, starting `align`
+                // (bits 24:22) bytes into the first word, sent as
+                // doublewords. libGLcore's unaligned rows (UNPACK_ALIGNMENT
+                // 1, a 13-byte row at byte 13) declare the row's words and
+                // send one more, then a pad word: taking the declared count
+                // only parsed the rest as commands and the client hung.
                 f.pixel = true;
                 f.cmd = w;
-                f.need = (((w & 0xF_FFFF) + 7) / 8) * 2;
+                f.need = (((w & 0xF_FFFF) + pixel_align(w) + 7) / 8) * 2;
+                self.pix_unaligned.clear();
+                self.payload.clear();
             } else {
                 f.pixel = false;
                 f.cmd = (w >> 8) & 0x1FFF;
@@ -664,8 +787,40 @@ impl Hq3Engine {
             return;
         }
         f.need -= 1;
-        if f.pixel {
-            if let Some(buf) = self.eram_in.as_mut() {
+        if f.pixel && pixel_align(f.cmd) != 0 {
+            // Realigned when complete.
+            self.pix_unaligned.push(w);
+            if f.need == 0 {
+                let (cmd, align) = (f.cmd, pixel_align(f.cmd) as usize);
+                let count = (cmd & 0xF_FFFF) as usize;
+                let bytes: Vec<u8> = self.pix_unaligned.iter().flat_map(|w| w.to_be_bytes()).collect();
+                let mut words: Vec<u32> = bytes[align.min(bytes.len())..(align + count).min(bytes.len())]
+                    .chunks(4)
+                    .map(|c| {
+                        let mut b = [0u8; 4];
+                        b[..c.len()].copy_from_slice(c);
+                        u32::from_be_bytes(b)
+                    })
+                    .collect();
+                if self.payload_for.is_some() {
+                    self.payload.extend_from_slice(&words);
+                } else if let Some(buf) = self.eram_in.as_mut() {
+                    buf.extend_from_slice(&words);
+                } else if self.gl.wants_bitmap_rows() {
+                    self.bitmap_in.extend_from_slice(&words);
+                }
+                words.truncate(CFIFO_KEEP);
+                let f = &mut self.cfifo[port];
+                f.len = words.len();
+                f.data[..words.len()].copy_from_slice(&words);
+                self.dispatch(port, sink);
+            }
+            return;
+        }
+        if f.pixel && !(f.need == 0 && (f.cmd & 0xF_FFFF).div_ceil(4) & 1 != 0) {
+            if self.payload_for.is_some() {
+                self.payload.push(w);
+            } else if let Some(buf) = self.eram_in.as_mut() {
                 buf.push(w);
             } else if self.gl.wants_bitmap_rows() {
                 self.bitmap_in.push(w);
@@ -689,12 +844,30 @@ impl Hq3Engine {
         }
         if f.pixel {
             self.stats.pixel_cmds += 1;
+            if let Some(t) = self.payload_for.take() {
+                let p = std::mem::take(&mut self.payload);
+                match t {
+                    0x089 => self.lut.load_table(&p),
+                    _ => self.gl.pixel_state_block(&p),
+                }
+                return;
+            }
             if self.eram_in.is_none() && self.gl.wants_bitmap_rows() {
                 // An image bigger than one pixel command (255 bytes) comes
                 // in several: wait for all of it.
+                if self.gl.wants_pixel_rows() {
+                    let n = (cmd & 0xF_FFFF).div_ceil(4) as usize;
+                    let start = self.bitmap_in.len().saturating_sub(n);
+                    let tail = &mut self.bitmap_in[start..];
+                    let mut bytes: Vec<u8> = tail.iter().flat_map(|w| w.to_be_bytes()).collect();
+                    format_pixels(self.formatter, &mut bytes[..(cmd & 0xF_FFFF) as usize]);
+                    for (w, b) in tail.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *w = u32::from_be_bytes(b.try_into().unwrap());
+                    }
+                }
                 if self.bitmap_in.len() >= self.gl.pixel_words_needed() {
                     let rows = std::mem::take(&mut self.bitmap_in);
-                    self.gl.bitmap_rows(&rows, sink);
+                    self.gl.bitmap_rows(&rows, &self.lut.0[..], sink);
                 }
             } else if self.eram_in.is_none() {
                 // libGLcore __glMgrFlushImageRegs: RSS_REG_SET (0x07F)
@@ -725,6 +898,7 @@ impl Hq3Engine {
                         }
                         match g[0] & 0x3FF {
                             0x159 => self.gl.xfrmode = g[1],
+                            0x155 => self.gl.xfr_factor = g[1],
                             0x046 => self.gl.pixel_block[0] = g[1],
                             0x047 => self.gl.pixel_block[1] = g[1],
                             _ => {}
@@ -740,6 +914,11 @@ impl Hq3Engine {
             return;
         }
         self.last_token = Some(cmd);
+        self.payload_for = match cmd {
+            0x080 | 0x0CD if data.is_empty() => Some(cmd),
+            0x089 => Some(cmd),
+            _ => None,
+        };
         if cmd >= cmd::RASTER_BASE {
             let r = cmd & 0x3FF;
             let exec = cmd & cmd::RASTER_EXECUTE != 0;
@@ -823,7 +1002,7 @@ impl Hq3Engine {
             self.stats.cp_tokens[cmd as usize] += 1;
             self.gl.end_raster(sink);
             let addr = data.first().copied().unwrap_or(0);
-            let v = self.gl.state_word(addr).unwrap_or(addr);
+            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or(addr);
             self.ge_return = Some([0, v]);
             sink.set_flags(host::FLAG_GE_DATA);
         } else if cmd == cmd::CP_RETURN_MODE {
@@ -831,7 +1010,7 @@ impl Hq3Engine {
             // Addresses the GE HLE knows answer from its state; others read
             // 0 and are reported once each, so the layout can be mapped.
             let addr = data.first().copied().unwrap_or(0);
-            let v = self.gl.state_word(addr).unwrap_or_else(|| {
+            let v = sink.readback_probe(addr).or_else(|| self.gl.state_word(addr)).unwrap_or_else(|| {
                 sink.note(format!("GE state readback at {addr:#x} ({:x?}) answered 0", data.get(1..).unwrap_or(&[])));
                 0
             });
@@ -866,7 +1045,8 @@ impl Hq3Engine {
     }
 
     /// The host DMA engine's start word. Host to board runs now: the raster
-    /// engine was armed first. Board to host waits for the raster engine.
+    /// engine was armed by commands queued ahead. Board to host waits for
+    /// the raster engine.
     fn dma_start(&mut self, word: u32, sink: &mut dyn Hq3Sink) {
         if word & 1 == 0 {
             return;
@@ -889,45 +1069,59 @@ impl Hq3Engine {
             let mut buf = std::mem::take(&mut self.bitmap_in);
             self.dma(word, DmaPeer::EramIn(&mut buf), sink);
             if buf.len() >= self.gl.pixel_words_needed() {
-                self.gl.bitmap_rows(&buf, sink);
+                self.gl.bitmap_rows(&buf, &self.lut.0[..], sink);
             } else {
                 self.bitmap_in = buf;
             }
             return;
         }
-        match sink.transfer() {
-            Some((false, _)) => self.dma(word, DmaPeer::Raster, sink),
-            _ => sink.note(format!("host DMA start {word:#x} with no write transfer armed")),
-        }
+        // No wait for the raster engine: the lines queue behind everything
+        // ahead of them, and the engine checks for an armed write transfer
+        // when they arrive (`Rss::dma_write_line`). Waiting here stalled
+        // the CPU, the HQ and the engines in turn on every texture load.
+        self.dma(word, DmaPeer::Raster, sink);
     }
 
-    /// The ERAM pass-through commands (see `cmd::CP_ERAM_*`), on GE0's
-    /// ERAM (a board with two GE11s gets the same transfer once per GE).
+    /// The ERAM pass-through commands (see `cmd::CP_ERAM_*`). A transfer
+    /// repeating GE0's last one is GE1's (two-GE boards); GE1's ERAM is
+    /// kept for the round trip but nothing reads it.
     fn eram_pass_through(&mut self, cmd: u32, data: &[u32], sink: &mut dyn Hq3Sink) {
         let arg = |i: usize| data.get(i).copied().unwrap_or(0) as usize;
         match cmd {
             cmd::CP_ERAM_WRITE => self.eram_in = Some(Vec::with_capacity(arg(0))),
             cmd::CP_ERAM_WRITE_AT => {
                 let (addr, n) = (arg(0), arg(1));
+                let ge = *self.eram_write_ge.get_or_insert_with(|| {
+                    let ge = (self.ges > 1 && self.eram_write_ge0 == Some(addr)) as usize;
+                    self.eram_write_ge0 = (ge == 0).then_some(addr);
+                    ge
+                });
                 let buf = self.eram_in.replace(Vec::new()).unwrap_or_default();
                 let n = n.min(buf.len()).min(ERAM_WORDS.saturating_sub(addr));
-                self.eram.words[0][addr..addr + n].copy_from_slice(&buf[..n]);
+                self.eram.words[ge][addr..addr + n].copy_from_slice(&buf[..n]);
                 if sink.tracing() {
-                    sink.trace(format!("ERAM write {n} words at {addr:#x} ({} came)", buf.len()));
+                    sink.trace(format!("ERAM write GE{ge} {n} words at {addr:#x} ({} came)", buf.len()));
                 }
             }
-            cmd::CP_ERAM_WRITE_END => self.eram_in = None,
+            cmd::CP_ERAM_WRITE_END => {
+                self.eram_in = None;
+                self.eram_write_ge = None;
+            }
             _ => {
                 let (addr, n) = (arg(0).min(ERAM_WORDS), arg(1));
+                let ge = (self.ges > 1 && self.eram_read_ge0 == Some((addr + 1, n))) as usize;
+                self.eram_read_ge0 = (ge == 0).then_some((addr, n));
+                // GE1's output runs a word late (see `cmd::CP_ERAM_WRITE`).
+                let addr = (addr + ge).min(ERAM_WORDS);
                 let n = n.min(ERAM_WORDS - addr);
                 let Some(word) = self.dma_read_pending.take() else {
                     sink.note(format!("ERAM read at {addr:#x} with no host DMA armed"));
                     return;
                 };
                 if sink.tracing() {
-                    sink.trace(format!("ERAM read {n} words at {addr:#x}"));
+                    sink.trace(format!("ERAM read GE{ge} {n} words at {addr:#x}"));
                 }
-                let words: Vec<u32> = self.eram.words[0][addr..addr + n].to_vec();
+                let words: Vec<u32> = self.eram.words[ge][addr..addr + n].to_vec();
                 self.dma(word, DmaPeer::EramOut(&words, 0), sink);
             }
         }
@@ -1023,6 +1217,9 @@ impl Hq3Engine {
     fn dma(&mut self, word: u32, mut peer: DmaPeer, sink: &mut dyn Hq3Sink) {
         let Some(mem) = sink.sys_mem() else { return };
         let read = word & 8 != 0;
+        #[cfg(feature = "perfetto")]
+        let def = if read { &crate::perfetto::events::MGRAS_DMA_TO_HOST } else { &crate::perfetto::events::MGRAS_DMA_TO_BOARD };
+        crate::pf_scope!(*def, word);
         let pool = ((word >> 1) & 3) as usize;
         let table = self.dma_regs[dma::TABLE_BASE + 2 * pool + 1] & !3;
         // Between transfers the kernel parks a pool's table at a dummy
@@ -1124,17 +1321,22 @@ impl Hq3Engine {
                         stream.drain(..n).collect()
                     }
                 };
+                // RGBorder (XFRMODE bit 22) is the raster engine's: it sends
+                // RGBA red first (`rss::xfer_format`).
                 format_pixels(self.formatter, &mut bytes);
                 for (k, b) in bytes.iter().take(len as usize).enumerate() {
                     let Some(pa) = phys(a + k as u32) else { return };
                     mem.write8(pa, *b);
                 }
             } else {
-                let mut bytes = Vec::with_capacity(len as usize);
-                for k in 0..len {
+                let mut bytes = vec![0u8; len as usize];
+                let mut k = 0;
+                while k < len {
+                    // One page at a time: contiguous in host memory.
+                    let n = (0x1000 - ((a + k) & 0xFFF)).min(len - k);
                     let Some(pa) = phys(a + k) else { return };
-                    let r = mem.read8(pa);
-                    bytes.push(if r.is_ok() { r.data } else { 0 });
+                    read_host(&*mem, pa, &mut bytes[k as usize..(k + n) as usize]);
+                    k += n;
                 }
                 if i == 0 && sink.tracing() {
                     sink.trace(format!("  DMA line 0 from {a:#x}: {:02x?}", &bytes[..bytes.len().min(32)]));
@@ -1148,6 +1350,29 @@ impl Hq3Engine {
                 }
             }
         }
+    }
+}
+
+/// Host memory bytes from `pa` into `out`, all within one page. RAM the bus
+/// maps directly is read a doubleword at a time; anything else (and the
+/// record/replay wrappers, whose recordings are byte reads) a byte at a
+/// time, 0 where a read fails.
+fn read_host(mem: &dyn BusDevice, pa: u32, out: &mut [u8]) {
+    let base = pa & !7;
+    if mem.mem_ptr(base).is_some() {
+        let skip = (pa - base) as usize;
+        let mut buf = vec![0u64; (skip + out.len()).div_ceil(8)];
+        if mem.read_block(base, &mut buf) == crate::traits::BUS_OK {
+            for (i, b) in out.iter_mut().enumerate() {
+                let at = skip + i;
+                *b = (buf[at / 8] >> (56 - 8 * (at % 8))) as u8;
+            }
+            return;
+        }
+    }
+    for (i, b) in out.iter_mut().enumerate() {
+        let r = mem.read8(pa + i as u32);
+        *b = if r.is_ok() { r.data } else { 0 };
     }
 }
 
@@ -1172,7 +1397,11 @@ pub(super) fn format_pixels(mode: u32, bytes: &mut [u8]) {
     let n = ((mode >> 2) & 3) as usize + 1;
     for px in bytes.chunks_exact_mut(size * n) {
         if mode & SWAP_BYTES != 0 {
-            for c in px.chunks_exact_mut(size) {
+            // Byte components swap in pairs: libGLcore byte-swaps 16-bit
+            // packed pixels (GL_UNSIGNED_SHORT_5_5_5_1 with
+            // GL_UNPACK_SWAP_BYTES) with mode 0xE4D, byte size, four a
+            // pixel.
+            for c in px.chunks_exact_mut(size.max(2)) {
                 c.reverse();
             }
         }
@@ -1339,6 +1568,7 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x063 => "GET_ERROR",
         0x066 => "DEPTH_TEST_ENABLE",
         0x067 => "DITHER_ENABLE",
+        0x06C => "POINT_SMOOTH",
         0x06E => "SOFT_DISABLE",
         0x072 => "CULL_FACE_ENABLE",
         0x073 => "CULL_FACE_DISABLE",
@@ -1360,6 +1590,7 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x096 => "COPY_COLOR_TABLE_SGI",
         0x09A => "INIT_FORMAT_VALUES",
         0x09B => "TL_NO_TABLE",
+        0x09C => "TL_SUBLOAD_END",
         0x09D => "_WRITE_DMAGESETUP",
         0x0A0 => "DISABLE_LIGHT_SOURCE",
         0x0A1 => "SPIN_AND_RETURN",
@@ -1455,4 +1686,44 @@ pub fn token_name(t: u32) -> Option<&'static str> {
         0x0C3 => "COLOR_MATERIAL_DISABLE",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{BusRead8, BUS_OK};
+
+    /// RAM the bus maps directly (`mem_ptr`), big-endian: byte `a` at `a`.
+    struct Ram(Vec<u8>);
+
+    impl BusDevice for Ram {
+        fn read8(&self, addr: u32) -> BusRead8 {
+            BusRead8::ok(self.0[addr as usize])
+        }
+        fn mem_ptr(&self, addr: u32) -> Option<*const u64> {
+            Some(self.0[addr as usize..].as_ptr() as *const u64)
+        }
+        fn read_block(&self, addr: u32, buf: &mut [u64]) -> u32 {
+            for (i, w) in buf.iter_mut().enumerate() {
+                let at = addr as usize + 8 * i;
+                *w = u64::from_be_bytes(self.0[at..at + 8].try_into().unwrap());
+            }
+            BUS_OK
+        }
+    }
+
+    /// `read_host` from directly mapped RAM gives the bytes a byte read
+    /// would, for every alignment and length within a page.
+    #[test]
+    fn read_host_matches_byte_reads() {
+        let ram = Ram((0..0x2000u32).map(|i| (i * 7 + (i >> 8)) as u8).collect());
+        for pa in [0x1000u32, 0x1001, 0x1003, 0x1007, 0x1008, 0x10F5] {
+            for len in [0usize, 1, 5, 7, 8, 9, 16, 23, 64, 0x100] {
+                let mut fast = vec![0u8; len];
+                read_host(&ram, pa, &mut fast);
+                let slow: Vec<u8> = (0..len as u32).map(|i| ram.read8(pa + i).data).collect();
+                assert_eq!(fast, slow, "pa {pa:#x} len {len}");
+            }
+        }
+    }
 }

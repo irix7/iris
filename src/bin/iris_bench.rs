@@ -151,12 +151,14 @@ fn run_host(exe: &Path, timeout_s: u64, label: &str) -> Result<Run, String> {
 /// for a minute is not mistaken for a hang, and that property is worth keeping
 /// at the command line — so this echoes every line rather than waiting for the
 /// end and printing the parsed summary.
-fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::CpuModel) -> Result<Run, String> {
+fn run_embedded(label: &str, timeout_s: u64, quick: bool, cpu: iris::config::CpuModel,
+                cache: iris::config::CacheModel) -> Result<Run, String> {
     let opts = BenchOptions {
         quick,
         label: label.to_string(),
         timeout: Duration::from_secs(timeout_s),
         cpu,
+        cache,
         ..Default::default()
     };
     bench_runner::run(&opts, |p| {
@@ -918,6 +920,10 @@ enum Cmd {
         /// a single run.
         #[arg(long, default_value_t = 1)]
         repeat: u32,
+        /// Cache model for the in-process run: auto (shadow in a jitv2
+        /// build), full or shadow. With --iris: `-- --cache shadow`.
+        #[arg(long, default_value = "auto")]
+        cache: iris::config::CacheModel,
         /// Extra arguments passed through to --iris.
         #[arg(last = true)]
         extra: Vec<String>,
@@ -1051,7 +1057,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
             Ok(())
         }
 
-        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, repeat, extra } => {
+        Cmd::Run { iris, elf, config, label, out, timeout, quick, cpu, repeat, cache, extra } => {
             let out = out.unwrap_or_else(default_out);
             let repeat = repeat.max(1);
 
@@ -1090,7 +1096,7 @@ fn dispatch(cmd: Cmd) -> Result<(), String> {
                             .unwrap_or_else(|| repo_relative("bench/run/bare.toml"));
                         run_guest(iris, &elf, &config, &label, timeout, &extra)?
                     }
-                    None => run_embedded(&label, timeout, quick, cpu)?,
+                    None => run_embedded(&label, timeout, quick, cpu, cache)?,
                 };
                 samples.push(run);
             }

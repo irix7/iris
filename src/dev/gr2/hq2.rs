@@ -186,6 +186,9 @@ pub const HQ2_2D_POLYLINE: u32 = 302;
 pub const HQ2_2D_POLYLINE_ALT: u32 = 357;
 /// Segments: stream of (x1, y1, x2, y2), padded with (1280, 1024) pairs.
 pub const HQ2_2D_SEGMENTS: u32 = 345;
+/// Points (expPolyPoint, XDrawPoints): 0; stream of (x, y), padded with
+/// (1280, 1024) pairs, clipped to LINE_CLIP.
+pub const HQ2_2D_POLYPOINT: u32 = 353;
 /// Stipple opaque flag (1 = zero bits get bg).
 pub const HQ2_2D_STIPPLE_AUX: u32 = 313;
 /// Stippled box: 0; DATA origin x, x1, origin y, y1, x2, y2.
@@ -253,8 +256,14 @@ pub enum ReadDecode {
     Ci8 { bank: u32 },
     /// GL 8-bit 3:3:2 RGB in 8-bit `bank`, widened as Rgb24.
     Rgb8 { bank: u32 },
-    /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits).
-    Depth,
+    /// GL 4-bit 1:2:1 RGB in 4-bit `bank` (bits 3:0 / 7:4), widened as Rgb24.
+    Rgb4 { bank: u32 },
+    /// GL depth: Z right-justified (libglcore shifts it up by 32 - bits),
+    /// with `sbits` stencil bits above it in the 24-bit word (a z20 s4
+    /// visual: Z 19:0, stencil 23:20). Inferred: every libglcore depth read
+    /// drops what is above Z (the DMA path shifts by 32 - 20, Fetch masks
+    /// 0xFFFFF), while its stencil Fetch masks the same word with 0xF.
+    Depth { sbits: u32 },
 }
 
 /// Where a screen-to-host read goes.
@@ -281,6 +290,8 @@ pub struct ReadImage {
     /// first-pixel slot (buf_offset); the planes for Planes2d.
     pub s2d: State2d,
     pub decode: ReadDecode,
+    /// Rows bottom first (GL mailbox reads, 0x0AD) instead of top first.
+    pub bottom_up: bool,
 }
 
 impl ReadImage {
@@ -298,7 +309,7 @@ impl ReadImage {
         let off = self.s2d.buf_offset.min(per_word - 1) as i32;
         let wpr = self.words_per_row as usize;
         for r in 0..self.rows as usize {
-            let gy = self.top - r as i32;
+            let gy = if self.bottom_up { self.top - (self.rows as i32 - 1) + r as i32 } else { self.top - r as i32 };
             for k in 0..wpr {
                 let Some(d) = dst.get_mut(r * wpr + k) else { return };
                 let mut word = 0;
@@ -332,7 +343,15 @@ impl ReadImage {
                 let [r, g, b] = re3::rgb332_to_888((vram >> (8 * (bank & 1))) & 0xff);
                 0xff00_0000 | r | (g << 8) | (b << 16)
             }
-            ReadDecode::Depth => vram & 0x00ff_ffff,
+            ReadDecode::Rgb4 { bank } => {
+                let [r, g, b] = re3::rgb121_to_888((vram >> (4 * (bank & 1))) & 0xf);
+                0xff00_0000 | r | (g << 8) | (b << 16)
+            }
+            ReadDecode::Depth { sbits } => {
+                let zbits = 24 - sbits;
+                let s = (vram >> re3::ZBUF_STENCIL_SHIFT) & ((1u32 << sbits) - 1);
+                (vram & ((1u32 << zbits) - 1)) | (s << zbits)
+            }
         }
     }
 }
@@ -376,7 +395,7 @@ pub fn token_name(index: u32) -> Option<&'static str> {
         HQ2_2D_COLOR_AUX => "2D_COLOR_AUX", HQ2_2D_COLOR_OFF => "2D_COLOR_OFF", HQ2_2D_COLOR_ON => "2D_COLOR_ON",
         313 => "2D_STIPPLE_AUX", HQ2_2D_TILE_SETUP => "2D_TILE_SETUP", 315..=318 => "2D_TILE_DATA",
         HQ2_2D_STIPPLE_BOX_POW2 | HQ2_2D_STIPPLE_BOX => "2D_STIPPLE_BOX", HQ2_2D_TILE_RECT | HQ2_2D_TILE_RECT_ODD => "2D_TILE_RECT",
-        HQ2_2D_POLYLINE => "2D_POLYLINE", HQ2_2D_POLYLINE_ALT => "2D_POLYLINE", HQ2_2D_SEGMENTS => "2D_SEGMENTS",
+        HQ2_2D_POLYLINE => "2D_POLYLINE", HQ2_2D_POLYLINE_ALT => "2D_POLYLINE", HQ2_2D_SEGMENTS => "2D_SEGMENTS", HQ2_2D_POLYPOINT => "2D_POLYPOINT",
         323 => "2D_GLYPH_8", 324 => "2D_GLYPH_16", 325 => "2D_GLYPH_32", 326 => "2D_GLYPH_64",
         HQ2_2D_LINE_MODE => "2D_LINE_MODE", HQ2_2D_LINE_CLIP => "2D_LINE_CLIP", HQ2_2D_MODE => "2D_MODE", HQ2_2D_ROP => "2D_ROP",
         HQ2_2D_CID_WRITE => "2D_CID_WRITE", HQ2_2D_BUF_SELECT => "2D_BUF_SELECT",
@@ -556,7 +575,9 @@ impl Hq2Regs {
 /// Where the interpreter's output goes: RE3 register writes and private ops.
 pub trait Re3Sink {
     fn reg(&mut self, reg: usize, val: u32);
-    fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32);
+    /// Screen-to-screen copy; `mode` 0 = raw (2D), else a GL copy
+    /// (re3::copy_mode: zoom, read bank, logic op and WID test).
+    fn copy(&mut self, sx: i32, sy: i32, w: i32, h: i32, dx: i32, dy: i32, mode: u32);
     /// Raise a finish flag (FIN1/FIN2/FIN3), as the microcode does when it
     /// completes a request the host is waiting on.
     fn finish(&mut self, flag: usize);
@@ -661,7 +682,8 @@ impl Hq2Engine {
             HQ2_2D_LINE_CLIP => 4,
             HQ2_2D_STIPPLE_RECT | HQ2_2D_STIPPLE_BOX_POW2 | HQ2_2D_STIPPLE_BOX => 7,
             HQ2_2D_STIPPLED_SPAN_A | HQ2_2D_STIPPLED_SPAN_B => STREAM,
-            HQ2_2D_POLY_SPAN | HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG => STREAM,
+            HQ2_2D_POLY_SPAN | HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG
+            | HQ2_2D_POLYPOINT => STREAM,
             HQ2_2D_SOLID_RECT => STREAM,
             HQ2_2D_TILE_RECT | HQ2_2D_TILE_RECT_ODD => 7,
             HQ2_2D_DRAW_IMAGE | HQ2_2D_DRAW_IMAGE_SMALL | HQ2_DMA_WRITE_PIXELS
@@ -850,7 +872,7 @@ impl Hq2Engine {
         }
         let group = match self.cmd {
             HQ2_2D_POLY_SPAN => 3,
-            HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT => 2,
+            HQ2_2D_POLYLINE | HQ2_2D_POLYLINE_ALT | HQ2_2D_POLYPOINT => 2,
             HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG | HQ2_2D_STIPPLED_SPAN_A | HQ2_2D_STIPPLED_SPAN_B => 4,
             _ => 0,
         };
@@ -882,6 +904,12 @@ impl Hq2Engine {
                         if let Some(f) = done.as_mut() {
                             f(format!("2D_STIPPLED_SPAN ({}, {}) w={} pattern={:#010x} opaque={} on={:#x} off={:#x}",
                                 a[1] as i32, a[2] as i32, a[3] as i32, a[4], self.stipple_opaque, self.s2d.color_on, self.s2d.color_off));
+                        }
+                    }
+                    HQ2_2D_POLYPOINT => {
+                        if !(a[1] == PAD_X && a[2] == PAD_Y) {
+                            let p = [a[1] as i32, a[2] as i32];
+                            self.line2d(p, p, true, out);
                         }
                     }
                     HQ2_2D_SEGMENTS | HQ2_2D_LINE_SEG => {
@@ -1086,8 +1114,8 @@ impl Hq2Engine {
             let row = self.img_rows_done;
             if self.cmd == HQ2_GL_DMA_WRITE || self.cmd == HQ2_GL_DMA_WRITE_ZOOM {
                 let words = self.img_row;
-                let zoomed = self.cmd == HQ2_GL_DMA_WRITE_ZOOM;
-                self.gl_pixel_row(x as i32, y as i32, row, w, rows, fmt, &words[..wpr.min(IMG_ROW_WORDS)], zoomed, out);
+                let zoom = if self.cmd == HQ2_GL_DMA_WRITE_ZOOM { gl::PixZoom::Both } else { gl::PixZoom::None };
+                self.gl_pixel_row(x as i32, y as i32, row, w, rows, fmt, &words[..wpr.min(IMG_ROW_WORDS)], zoom, out);
             } else {
                 self.image_row(x as i32, y as i32 + row as i32, w, fmt, skip, wpr.min(IMG_ROW_WORDS), out);
             }
@@ -1495,6 +1523,7 @@ impl Hq2Engine {
                     words_per_row: a[0],
                     s2d: self.s2d,
                     decode: ReadDecode::Planes2d,
+                    bottom_up: false,
                 };
                 out.read_image(&req, ReadDest::Shram(READ_IMAGE_SHRAM));
             }
@@ -1507,6 +1536,7 @@ impl Hq2Engine {
                     words_per_row: a[4],
                     s2d: self.s2d,
                     decode: ReadDecode::Planes2d,
+                    bottom_up: false,
                 };
                 out.read_image(&req, ReadDest::Gedma);
             }
@@ -1543,7 +1573,7 @@ impl Hq2Engine {
                 let (sx, sy, w, h, dx, dy) = (a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32, a[7] as i32);
                 let fg = self.s2d.fg;
                 self.setup2d(fg, out);
-                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h);
+                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h, 0);
             }
             HQ2_2D_ROP => {
                 self.s2d.fg = a[0];
@@ -1574,7 +1604,7 @@ impl Hq2Engine {
                 let (sx, sy, w, h, dx, dy) =
                     (a[2] as i32, a[3] as i32, a[4] as i32, a[5] as i32, a[6] as i32, a[7] as i32);
                 // RECTCOPY takes X-style y (top edge, top-down); VRAM is bottom-up.
-                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h);
+                out.copy(sx, SCREEN_H - sy - h, w, h, dx, SCREEN_H - dy - h, 0);
             }
             _ if self.gl_execute(cmd, out) => {}
             _ => {

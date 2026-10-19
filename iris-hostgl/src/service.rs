@@ -72,27 +72,59 @@ pub const OP_SWAP_INTERVAL: u64 = 0x1_000B;
 pub const OP_VIDEO_SYNC: u64 = 0x1_000C;
 pub const OP_GLX_STRING: u64 = 0x1_000D;
 pub const OP_GOODBYE: u64 = 0x1_000E;
+/// A command buffer the program does not wait for: answered as soon as its
+/// bytes are read, run afterwards on the GL thread (threaded.rs), in order
+/// with every later call. The library sends only buffers that read nothing
+/// outside themselves this way. Without the GL thread it is OP_BATCH; a host
+/// without it answers EINVAL, which is how the library finds out.
+pub const OP_BATCH_ASYNC: u64 = 0x1_0010;
 /// What the presenting thread has done: frames presented in v0, frames
 /// replaced before they could be in v1. Global, not per client -- one thread
 /// serves every channel -- and answerable without a context.
 pub const OP_PRESENT_STATS: u64 = 0x1_000F;
+/// The library keeps a window's front buffer apart from its back: drawing
+/// into GL_FRONT reaches the front buffer, a swap copies the back into it, and
+/// a swap with bit 1 of its seventh slot shows the front as it is. Answered 1;
+/// a host without it answers EINVAL, and the library keeps the one buffer.
+/// For this client from now on, its contexts made before as well.
+pub const OP_FRONT_BUFFERS: u64 = 0x1_0011;
+/// Answered 1: OP_SWAP takes a colour-index window's frame as indices (bits
+/// 2 and 3 of the seventh slot) for a display that keeps them. A host
+/// without it answers EINVAL, and would composite such a frame's encoded
+/// RGBA as colours -- so the library asks first, and without it has the
+/// frame handed back and puts it up itself.
+pub const OP_INDEX_FRAMES: u64 = 0x1_0013;
+/// OP_SWAP's slots for a flush's present (a front buffer, a colour-index
+/// window) the library knows the display composites: nothing comes back, so
+/// on the GL thread it is answered 1 at once and queued behind the buffers
+/// sent before it (threaded.rs), and a client's window is shown at most once
+/// a `FLUSH_GAP` -- the rest when the gap is up (see present_later). SGI's
+/// IRIS GL flushes after every primitive it draws into the front buffer, two
+/// thousand a second in flight's cockpit; each a whole frame on the screen
+/// made the cockpit draw itself over a second where the board takes a few
+/// hundred milliseconds. Without the GL thread it is OP_SWAP; a host without
+/// it answers EINVAL, and the library uses OP_SWAP.
+pub const OP_PRESENT_LATER: u64 = 0x1_0012;
+
+/// How often a client's flushes reach the screen at most: a display's frame.
+pub const FLUSH_GAP: Duration = Duration::from_micros(16_667);
 
 /// The protocol: HELLO's second result, which the library checks.
 pub const PROTOCOL: u64 = 2;
 
-const EINVAL: u64 = 22;
-const EFAULT: u64 = 14;
+pub(crate) const EINVAL: u64 = 22;
+pub(crate) const EFAULT: u64 = 14;
 
 /// A pbuffer's drawable id, which must not collide with an X window's (X ids
 /// keep their top three bits clear) -- and must not have bit 31 set: a 32-bit
 /// value travels to the guest in a 64-bit register, where the MIPS rules keep
 /// it sign-extended, and one that arrives zero-extended compares equal to
 /// nothing the guest loads from memory.
-const PBUFFER_ID: u32 = 0x4000_0000;
+pub(crate) const PBUFFER_ID: u32 = 0x4000_0000;
 /// The largest drawable, either way.
 const MAX_DIM: i32 = 8192;
 /// The largest command buffer (the library's is 128 KB).
-const MAX_BATCH: usize = 16 << 20;
+pub(crate) const MAX_BATCH: usize = 16 << 20;
 /// The frame clock the video-sync counter counts, as a real SGI's display
 /// would (GLX_SGI_video_sync).
 const FRAME_NS: u128 = 1_000_000_000 / 60;
@@ -142,6 +174,12 @@ struct Client {
     swap_async: bool,
     /// When the client said hello, for forgetting idle ones oldest first.
     since: u64,
+    /// It said OP_FRONT_BUFFERS.
+    fronts: bool,
+    /// When an OP_PRESENT_LATER of its was last shown, and the one waiting
+    /// for FLUSH_GAP to be up since, with when it is due.
+    flush_shown: Option<Instant>,
+    flush_waiting: Option<([u64; 7], Instant)>,
 }
 
 /// Where a call stopped, to be carried on by its retry.
@@ -172,6 +210,9 @@ pub struct GlService {
     /// Command buffers run, and calls in them: how much batching is saving.
     batches: u64,
     commands: u64,
+    /// FLUSH_GAP; a test sets its own, so as not to depend on how fast the
+    /// host draws.
+    pub(crate) flush_gap: Duration,
 }
 
 impl GlService {
@@ -190,6 +231,7 @@ impl GlService {
             started: Instant::now(),
             batches: 0,
             commands: 0,
+            flush_gap: FLUSH_GAP,
         }
     }
 
@@ -229,7 +271,7 @@ impl GlService {
         if self.backend.current() != Some(ctx.handle) {
             self.backend.make_current(Some(ctx.handle));
             if let Some(g) = self.groups.get(&ctx.group) {
-                draw::bind(&g.draws, c.draw, c.read);
+                draw::bind_with(&g.draws, c.draw, c.read, ctx.client.fronts, ctx.client.draw_buffer, ctx.client.read_buffer);
             }
         }
     }
@@ -245,7 +287,7 @@ impl GlService {
         let Some(c) = self.clients.get(&client) else { return };
         let Some(ctx) = c.current.and_then(|id| self.ctxs.get(&id)) else { return };
         if let Some(g) = self.groups.get(&ctx.group) {
-            draw::bind(&g.draws, c.draw, c.read);
+            draw::bind_with(&g.draws, c.draw, c.read, ctx.client.fronts, ctx.client.draw_buffer, ctx.client.read_buffer);
         }
     }
 
@@ -254,6 +296,141 @@ impl GlService {
             self.resumes.pop_front();
         }
         self.resumes.push_back(Resume { args: *args, stage });
+    }
+
+    /// OP_SWAP for the client's current context and drawable, `slots` its
+    /// seven: the frame to hand back (None: it is on the screen), and how long
+    /// the library is to wait (GLX_SGI_swap_control), or an errno.
+    fn swap(&mut self, client: u32, slots: [u64; 7]) -> Result<(Option<Vec<u8>>, u64), u64> {
+        // The fourth slot: nonzero when the program's visual has red
+        // in the low byte, so the frame comes back in that order.
+        // Then the window's top-left on the screen, valid when bit 0
+        // of the seventh is set, for a display that composites.
+        let [_, w, h, abgr, x, y, place] = slots;
+        let at = (place & 1 != 0).then_some((x as i32, y as i32));
+        let front = place & 2 != 0;
+        // Bit 2: a colour-index window's frame, its indices for a
+        // display that keeps them (bit 3: in the overlay planes).
+        let index = (place & 4 != 0).then_some(place & 8 != 0);
+        let (w, h) = ((w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
+        let c = &self.clients[&client];
+        let (window, interval, last_swap, keep_front) = (c.draw, c.swap_interval, c.last_swap, c.fronts);
+        // A frame with a screen position goes to a display that
+        // composites it: it is queued whatever the swap interval, so
+        // the wait for the GPU and the present happen off the CPU
+        // thread (the first swap of each drawable is still inline:
+        // see present::presents). Pacing is the `wait` below, slept
+        // in the guest.
+        // A colour-index frame takes the same way as an RGBA one: the
+        // first of each drawable now, to learn whether the display
+        // takes it, then queued.
+        let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
+        // Shown because the program flushed (front buffer, or a
+        // colour-index window, bit 4), not swapped: never waits.
+        let flush = front || place & 16 != 0;
+        let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
+            return Err(EINVAL);
+        };
+        let Some(d) = self.groups.get(&group).and_then(|g| g.draws.get(&window)) else { return Err(EINVAL) };
+        // GLX_SGI_swap_control: this swap is due `interval` frames
+        // after the last. The program is told how long that is. Only
+        // swaps are paced: showing the front buffer (bit 1), or a
+        // colour-index window, after a flush (bit 4) is not a swap,
+        // and neither waits nor moves the next swap's due time.
+        // Paced, SGI's IRIS GL drew flight at a few primitives a
+        // second: it flushes after each one it draws into the front
+        // buffer, and asks for swapinterval(2).
+        let now = Instant::now();
+        let mut wait = Duration::ZERO;
+        if !front && place & 16 == 0 {
+            if interval > 1 {
+                if let Some(last) = last_swap {
+                    let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
+                    wait = due.saturating_duration_since(now);
+                }
+            }
+            self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
+        }
+        let (dw, dh, samples) = (d.w, d.h, d.samples);
+        let frame = draw::swap(d, window, at, w, h, sink, abgr != 0, front, keep_front, index, flush);
+        // The window is a different size from the drawable, so the
+        // next frame is drawn at the new one. After the read, not
+        // before: the pixels presented are in the old buffer. Not on
+        // showing the front: that is a flush, after which the program
+        // still has its back buffer (gltest's window, sized by the
+        // window manager after its context was made current, lost
+        // what it had drawn).
+        if !front && (w, h) != (dw, dh) && w > 0 && h > 0 {
+            if let Some(g) = self.groups.get_mut(&group) {
+                draw::ensure(&mut g.draws, self.backend.as_mut(), window, w, h, samples);
+            }
+        }
+        self.rebind(client);
+        Ok((frame, wait.as_nanos() as u64))
+    }
+
+    /// OP_PRESENT_LATER, on the GL thread: shown now when the client's last
+    /// was shown at least FLUSH_GAP ago, otherwise when the gap is up -- this
+    /// one replacing any still waiting, since what it shows is the drawable as
+    /// it is then.
+    pub fn present_later(&mut self, client: u32, slots: [u64; 7]) {
+        let gap = self.flush_gap;
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        let now = Instant::now();
+        match c.flush_shown {
+            Some(t) if now < t + gap => c.flush_waiting = Some((slots, t + gap)),
+            _ => self.show_later(client, slots, now),
+        }
+    }
+
+    fn show_later(&mut self, client: u32, slots: [u64; 7], now: Instant) {
+        let Some(c) = self.clients.get_mut(&client) else { return };
+        c.flush_shown = Some(now);
+        c.flush_waiting = None;
+        self.select_client(client);
+        // Composited, so nothing comes back; a display that did not take it
+        // has nobody to hand it to.
+        let _ = self.swap(client, slots);
+    }
+
+    /// The client's present still waiting for FLUSH_GAP, shown now.
+    fn show_waiting(&mut self, client: u32) {
+        if let Some((slots, _)) = self.clients.get_mut(&client).and_then(|c| c.flush_waiting.take()) {
+            self.show_later(client, slots, Instant::now());
+        }
+    }
+
+    /// When the next waiting present is due, if one is.
+    pub fn next_due(&self) -> Option<Instant> {
+        self.clients.values().filter_map(|c| c.flush_waiting.map(|(_, due)| due)).min()
+    }
+
+    /// Shows every waiting present that is due.
+    pub fn show_due(&mut self) {
+        let now = Instant::now();
+        let due: Vec<u32> = self.clients.iter().filter(|(_, c)| c.flush_waiting.is_some_and(|(_, d)| d <= now)).map(|(&id, _)| id).collect();
+        for client in due {
+            self.show_waiting(client);
+        }
+    }
+
+    /// An OP_BATCH_ASYNC buffer, run on the GL thread after its call was
+    /// answered. Its bytes were read then; nothing else of the program's
+    /// memory can be, since the program has moved on. A command that tries
+    /// (the library should never send one) stops the buffer there.
+    pub fn run_detached(&mut self, client: u32, bytes: Vec<u8>) {
+        if !self.clients.contains_key(&client) {
+            return;
+        }
+        self.select_client(client);
+        // Never a real call's registers: those carry a serial.
+        let args = [OP_BATCH_ASYNC, 0, client as u64, 0, 0, 0, 0, 0];
+        if let Reply::NeedPage(f) = self.run_batch(&mut Detached, &args, client, bytes, 0, 0, Vec::new()) {
+            self.resumes.retain(|r| r.args != args);
+            if self.reported.insert(usize::MAX - 2) {
+                log::warn!("host GL: a batch sent without waiting reached for program memory at {:#x}; it was cut short there", f.page);
+            }
+        }
     }
 
     /// Phase 3: store the call's results in the guest, then answer.
@@ -410,6 +587,11 @@ impl Service for GlService {
             return Reply::Err(EINVAL);
         }
         self.select_client(client);
+        // A present still waiting is of the drawable the client is drawing
+        // to now. Only a call changes that, so it is shown first.
+        if op != OP_BATCH && op != OP_BATCH_ASYNC {
+            self.show_waiting(client);
+        }
 
         // The retry of a call that stopped part-way.
         if let Some(i) = self.resumes.iter().position(|r| r.args == *args) {
@@ -432,7 +614,7 @@ impl Service for GlService {
             };
         }
         match op {
-            OP_BATCH => {
+            OP_BATCH | OP_BATCH_ASYNC => {
                 let [buf, len] = slots!(2);
                 if len == 0 {
                     return Reply::Ok(0, 0);
@@ -461,7 +643,8 @@ impl Service for GlService {
                 };
                 let g = self.groups.entry(group).or_insert_with(|| Group { owner: client, members: 0, draws: HashMap::new() });
                 g.members += 1;
-                self.ctxs.insert(id, Ctx { handle, owner: client, group, viewport_set: false, client: ClientSide::default() });
+                let fronts = self.clients.get(&client).is_some_and(|c| c.fronts);
+                self.ctxs.insert(id, Ctx { handle, owner: client, group, viewport_set: false, client: ClientSide { fronts, ..Default::default() } });
                 Reply::Ok(id as u64, 0)
             }
             OP_MAKECURRENT => {
@@ -472,6 +655,7 @@ impl Service for GlService {
                 let first = !c.viewport_set;
                 c.viewport_set = true;
                 let (handle, group) = (c.handle, c.group);
+                let (fronts, draw_mode, read_mode) = (c.client.fronts, c.client.draw_buffer, c.client.read_buffer);
                 if !self.backend.make_current(Some(handle)) {
                     return Reply::Err(EINVAL);
                 }
@@ -487,7 +671,7 @@ impl Service for GlService {
                 if !g.draws.contains_key(&read) {
                     draw::ensure(&mut g.draws, self.backend.as_mut(), read, w, h, 0);
                 }
-                draw::bind(&g.draws, draw, read);
+                draw::bind_with(&g.draws, draw, read, fronts, draw_mode, read_mode);
                 let samples = g.draws[&draw].samples;
                 // SAFETY: plain state in the context just made current.
                 unsafe {
@@ -586,56 +770,26 @@ impl Service for GlService {
                 self.backend.make_current(None);
                 Reply::Ok(0, 0)
             }
-            OP_SWAP => {
-                // The fourth slot: nonzero when the program's visual has red
-                // in the low byte, so the frame comes back in that order.
-                // Then the window's top-left on the screen, valid when bit 0
-                // of the seventh is set, for a display that composites.
-                let [buf, w, h, abgr, x, y, place] = slots!(7);
-                let at = (place & 1 != 0).then_some((x as i32, y as i32));
-                let (buf, w, h) = (buf, (w as i32).clamp(0, MAX_DIM), (h as i32).clamp(0, MAX_DIM));
-                let c = &self.clients[&client];
-                let (window, interval, last_swap) = (c.draw, c.swap_interval, c.last_swap);
-                // A frame with a screen position goes to a display that
-                // composites it: it is queued whatever the swap interval, so
-                // the wait for the GPU and the present happen off the CPU
-                // thread (the first swap of each drawable is still inline:
-                // see present::presents). Pacing is the `wait` below, slept
-                // in the guest.
-                let sink = if c.swap_async || at.is_some() { draw::Sink::Queued } else { draw::Sink::Now };
-                let Some(group) = c.current.and_then(|id| self.ctxs.get(&id)).map(|c| c.group) else {
-                    return Reply::Err(EINVAL);
-                };
-                let Some(d) = self.groups.get(&group).and_then(|g| g.draws.get(&window)) else { return Reply::Err(EINVAL) };
-                // GLX_SGI_swap_control: this swap is due `interval` frames
-                // after the last. The program is told how long that is.
-                let now = Instant::now();
-                let mut wait = Duration::ZERO;
-                if interval > 1 {
-                    if let Some(last) = last_swap {
-                        let due = last + Duration::from_nanos((FRAME_NS * interval as u128).min(MAX_WAIT_NS) as u64);
-                        wait = due.saturating_duration_since(now);
-                    }
-                }
-                self.clients.get_mut(&client).unwrap().last_swap = Some(now + wait);
-                let (dw, dh, samples) = (d.w, d.h, d.samples);
-                let frame = draw::swap(d, window, at, w, h, sink, abgr != 0);
-                // The window is a different size from the drawable, so the
-                // next frame is drawn at the new one. After the read, not
-                // before: the pixels presented are in the old buffer.
-                if (w, h) != (dw, dh) && w > 0 && h > 0 {
-                    if let Some(g) = self.groups.get_mut(&group) {
-                        draw::ensure(&mut g.draws, self.backend.as_mut(), window, w, h, samples);
-                    }
-                }
-                self.rebind(client);
-                let wait = wait.as_nanos() as u64;
-                match frame {
+            OP_SWAP | OP_PRESENT_LATER => {
+                let slots = slots!(7);
+                let buf = slots[0];
+                match self.swap(client, slots) {
+                    Err(e) => Reply::Err(e),
                     // 1 tells the library the frame is already on screen.
-                    None => Reply::Ok(1, wait),
-                    Some(_) if buf == 0 => Reply::Err(EFAULT),
-                    Some(frame) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
+                    Ok((None, wait)) => Reply::Ok(1, wait),
+                    Ok((Some(_), _)) if buf == 0 => Reply::Err(EFAULT),
+                    Ok((Some(frame), wait)) => self.finish(mem, args, vec![(buf, frame)], Reply::Ok(0, wait)),
                 }
+            }
+            OP_INDEX_FRAMES => Reply::Ok(1, 0),
+            OP_FRONT_BUFFERS => {
+                if let Some(c) = self.clients.get_mut(&client) {
+                    c.fronts = true;
+                }
+                for ctx in self.ctxs.values_mut().filter(|c| c.owner == client) {
+                    ctx.client.fronts = true;
+                }
+                Reply::Ok(1, 0)
             }
             OP_DESTROY => {
                 let [id] = slots!(1);
@@ -756,8 +910,20 @@ impl Drop for GlService {
     }
 }
 
+/// The program's memory as a detached batch sees it: out of reach.
+struct Detached;
+
+impl GuestMemory for Detached {
+    fn read(&mut self, addr: u64, _buf: &mut [u8]) -> Result<(), Fault> {
+        Err(Fault { page: addr & !(iris_hostcall::PAGE - 1), write: false })
+    }
+    fn write(&mut self, addr: u64, _data: &[u8]) -> Result<(), Fault> {
+        Err(Fault { page: addr & !(iris_hostcall::PAGE - 1), write: true })
+    }
+}
+
 /// `n` 8-byte big-endian argument slots at guest address `at`.
-fn read_slots<const N: usize>(mem: &mut dyn GuestMemory, at: u64) -> Result<[u64; N], Fault> {
+pub(crate) fn read_slots<const N: usize>(mem: &mut dyn GuestMemory, at: u64) -> Result<[u64; N], Fault> {
     let bytes = read_guest(mem, at, N * 8)?;
     let mut out = [0u64; N];
     for (i, v) in out.iter_mut().enumerate() {
