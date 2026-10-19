@@ -17,6 +17,11 @@ fn main() {
     // `mut` is only used by the pcap interface prompt below.
     #[cfg_attr(not(feature = "pcap"), allow(unused_mut))]
     let (mut cfg, scale) = load_config();
+    if let Some(dir) = cfg.state_dir.as_deref() {
+        // crash_diag reads this lazily on the crash path, so setting it after
+        // load_config is early enough.
+        std::env::set_var("IRIS_CRASH_LOG", std::path::Path::new(dir).join("iris-crash.log"));
+    }
 
     // If PCAP networking is selected but no interface was configured, prompt the
     // user to choose one now — on the main thread, before the machine starts —

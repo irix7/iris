@@ -53,8 +53,12 @@ pub fn install() {
     }
 }
 
-/// Path we append crash reports to.
-const LOG_PATH: &str = "iris-crash.log";
+/// Path we append crash reports to. Instance mode sets `IRIS_CRASH_LOG`.
+fn log_path() -> std::path::PathBuf {
+    std::env::var_os("IRIS_CRASH_LOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("iris-crash.log"))
+}
 
 /// Deliberately crash, to prove the handlers are wired up. Driven by
 /// `IRIS_CRASH_SELFTEST` from `main`:
@@ -156,7 +160,7 @@ fn timestamp() -> String {
 fn append_to_log(bytes: &[u8]) {
     use std::io::Write;
     if let Ok(mut f) =
-        std::fs::OpenOptions::new().create(true).append(true).open(LOG_PATH)
+        std::fs::OpenOptions::new().create(true).append(true).open(log_path())
     {
         let _ = f.write_all(bytes);
         let _ = f.flush();
@@ -165,7 +169,7 @@ fn append_to_log(bytes: &[u8]) {
 
 #[cfg(windows)]
 mod windows {
-    use super::{append_to_log, LOG_PATH};
+    use super::{append_to_log, log_path};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use core::fmt::Write as _;
@@ -339,7 +343,7 @@ mod windows {
         // Breadcrumb in case stderr is a pipe nobody is tailing.
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            format!("iris: wrote crash report to {LOG_PATH}\n").as_bytes(),
+            format!("iris: wrote crash report to {}\n", log_path().display()).as_bytes(),
         );
         EXCEPTION_CONTINUE_SEARCH
     }
