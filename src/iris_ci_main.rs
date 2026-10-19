@@ -11,17 +11,19 @@
 //!   returns just the captured stdout + exit status.
 //! - `iris-ci put localfile.tar` copies a host file into the guest with
 //!   the right `dd bs=512 count=N` recipe baked in — no foot-gun.
-//! - `iris-ci script tests/scenario.iris` runs a sequence of commands
-//!   and prints per-step status + duration.
+//! - `iris-ci script tests/scenario.iris` (alias `batch`) runs a sequence of
+//!   commands over one connection and prints per-step status + duration.
 //!
 //! Returns 0 on success, 1 on socket error, 2 on iris error response,
 //! 3 on local error (file not found etc).
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -191,7 +193,14 @@ enum Cmd {
     Push { url: String, name: String },
 
     /// Run a sequence of iris-ci commands from a file (one per line, # comments).
-    Script { path: PathBuf },
+    /// Every step shares one control-socket connection.
+    #[command(visible_alias = "batch")]
+    Script {
+        path: PathBuf,
+        /// Keep going after a failed step (default: stop at the first failure).
+        #[arg(long)]
+        keep_going: bool,
+    },
 
     /// Persist the emulated DS1386 NVRAM/RTC state to a file (default nvram.bin).
     RtcSave {
@@ -244,12 +253,12 @@ fn main() {
         .clone()
         .or_else(|| std::env::var_os("IRIS_SOCKET").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET));
-    let opts = Opts {
+    let opts = Opts::new(
         socket,
-        json: cli.json,
-        quiet: cli.quiet,
-        consumer: std::env::var("IRIS_CI_CONSUMER").unwrap_or(cli.consumer),
-    };
+        cli.json,
+        cli.quiet,
+        std::env::var("IRIS_CI_CONSUMER").unwrap_or(cli.consumer),
+    );
 
     let exit = match dispatch(&opts, cli.cmd) {
         Ok(()) => 0,
@@ -260,11 +269,18 @@ fn main() {
         Err(Error::Connection(e)) => {
             // A read timeout is not a failure to connect, and saying so sends
             // the reader looking at the wrong end. The socket was fine; the
-            // command outlived the read deadline.
+            // command outlived the read deadline. A closed socket is likewise
+            // not a connect failure.
             match e.kind() {
                 std::io::ErrorKind::WouldBlock
                 | std::io::ErrorKind::TimedOut => eprintln!(
                     "iris-ci: timed out waiting for {} to answer: {}",
+                    opts.socket.display(), e),
+                std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe => eprintln!(
+                    "iris-ci: connection to {} closed: {}",
                     opts.socket.display(), e),
                 _ => eprintln!(
                     "iris-ci: connect {}: {}", opts.socket.display(), e),
@@ -329,7 +345,7 @@ fn dispatch(opts: &Opts, cmd: Cmd) -> Result<()> {
         Cmd::Pull { url, name } => cmd_pull(opts, &url, &name),
         Cmd::Push { url, name } => cmd_push(opts, &url, &name),
 
-        Cmd::Script { path } => cmd_script(opts, &path),
+        Cmd::Script { path, keep_going } => cmd_script(opts, &path, keep_going),
 
         Cmd::RtcSave { path } => {
             let args = match path {
@@ -366,6 +382,33 @@ struct Opts {
     json: bool,
     quiet: bool,
     consumer: String,
+    /// The open control-socket connection, if one has been made. A `script`
+    /// runs every step through the same `Opts`, so the whole file reuses it;
+    /// a command that loses the socket drops it and the next send reconnects.
+    conn: Rc<RefCell<Option<Conn>>>,
+}
+
+impl Opts {
+    fn new(socket: PathBuf, json: bool, quiet: bool, consumer: String) -> Self {
+        Self {
+            socket,
+            json,
+            quiet,
+            consumer,
+            conn: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Same socket and live connection, with different output flags.
+    fn with_output(&self, json: bool, quiet: bool) -> Self {
+        Self {
+            socket: self.socket.clone(),
+            json,
+            quiet,
+            consumer: self.consumer.clone(),
+            conn: Rc::clone(&self.conn),
+        }
+    }
 }
 
 // ---- socket client -----------------------------------------------------------
@@ -394,12 +437,6 @@ fn read_timeout_for(timeout_ms: u64) -> Duration {
 
 /// Send one JSON command, return the parsed response data on `ok:true`,
 /// or an Error on connection failure or `ok:false`.
-///
-/// Protocol detail: the server (`src/ci.rs::handle_client`) keeps the
-/// connection open and reads requests in a loop, expecting the client to
-/// close. We send our single request, then read exactly one newline-
-/// terminated response line, then drop the stream — the server's reader
-/// loop sees EOF and exits cleanly.
 fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
     send_until(opts, cmd, args, DEFAULT_READ_TIMEOUT)
 }
@@ -410,19 +447,112 @@ fn send(opts: &Opts, cmd: &str, args: Value) -> Result<Value> {
 /// fixed client-side read timeout silently caps every command that uses it.
 /// At 300s that made any guest command over five minutes fail with EAGAIN
 /// while the guest carried on working, and `--timeout` appeared to do nothing.
+///
+/// Protocol detail: the server (`src/ci.rs::handle_client_lines`) keeps the
+/// connection open and reads requests in a loop, expecting the client to
+/// close. The connection is opened once and then carried in `Opts`, so a
+/// multi-command script costs one connect rather than one per command. If the
+/// socket dies, the slot is cleared and the next command reconnects.
 fn send_until(opts: &Opts, cmd: &str, mut args: Value, read_timeout: Duration) -> Result<Value> {
     if matches!(cmd, "serial-read" | "wait-serial") {
         if let Some(o) = args.as_object_mut() {
             o.entry("consumer").or_insert_with(|| Value::String(opts.consumer.clone()));
         }
     }
-    let addr = opts.socket.to_string_lossy();
+
+    let mut slot = opts.conn.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(connect(&opts.socket)?);
+    }
+    let conn = slot.as_mut().expect("connection just opened");
+    conn.reader.get_ref().set_read_timeout(read_timeout)?;
+
+    match exchange(conn, cmd, args) {
+        Ok(data) => Ok(data),
+        Err(e) => {
+            // A dead or timed-out socket must not poison the rest of a batch:
+            // forget it so the next command opens a fresh one.
+            if matches!(e, Error::Connection(_)) {
+                *slot = None;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// A live connection to the CI control socket.
+///
+/// The reader is buffered; the writer is a clone of the same socket, because
+/// `BufReader` owns the stream it reads.
+struct Conn {
+    reader: BufReader<Stream>,
+    writer: Stream,
+}
+
+/// Either transport the server listens on. The variants exist so the read
+/// deadline can be set on the concrete stream type.
+enum Stream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+impl Stream {
+    fn set_read_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.set_read_timeout(Some(timeout)),
+            #[cfg(unix)]
+            Stream::Unix(s) => s.set_read_timeout(Some(timeout)),
+        }
+    }
+}
+
+fn connect(socket: &std::path::Path) -> Result<Conn> {
+    let addr = socket.to_string_lossy();
     if iris::config::ci_socket_is_tcp(&addr) {
-        send_tcp(&iris::config::ci_socket_tcp_addr(&addr), cmd, args, read_timeout)
+        let s = TcpStream::connect(iris::config::ci_socket_tcp_addr(&addr))?;
+        let writer = s.try_clone()?;
+        Ok(Conn {
+            reader: BufReader::new(Stream::Tcp(s)),
+            writer: Stream::Tcp(writer),
+        })
     } else {
         #[cfg(unix)]
         {
-            send_unix(&opts.socket, cmd, args, read_timeout)
+            let s = UnixStream::connect(socket)?;
+            let writer = s.try_clone()?;
+            Ok(Conn {
+                reader: BufReader::new(Stream::Unix(s)),
+                writer: Stream::Unix(writer),
+            })
         }
         #[cfg(not(unix))]
         {
@@ -434,34 +564,23 @@ fn send_until(opts: &Opts, cmd: &str, mut args: Value, read_timeout: Duration) -
     }
 }
 
-fn send_tcp(addr: &str, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
-    let s = TcpStream::connect(addr)?;
-    s.set_read_timeout(Some(read_timeout)).ok();
-    let mut writer = s.try_clone()?;
-    let mut reader = BufReader::new(s);
-    exchange(&mut reader, &mut writer, cmd, args)
-}
-
-#[cfg(unix)]
-fn send_unix(socket: &PathBuf, cmd: &str, args: Value, read_timeout: Duration) -> Result<Value> {
-    let s = UnixStream::connect(socket)?;
-    s.set_read_timeout(Some(read_timeout)).ok();
-    let mut writer = s.try_clone()?;
-    let mut reader = BufReader::new(s);
-    exchange(&mut reader, &mut writer, cmd, args)
-}
-
-fn exchange(reader: &mut impl BufRead, writer: &mut impl Write, cmd: &str, args: Value) -> Result<Value> {
+fn exchange(conn: &mut Conn, cmd: &str, args: Value) -> Result<Value> {
     let req = json!({"cmd": cmd, "args": args});
     let line = format!("{}\n", serde_json::to_string(&req).expect("json"));
-    writer.write_all(line.as_bytes())?;
-    writer.flush()?;
+    conn.writer.write_all(line.as_bytes())?;
+    conn.writer.flush()?;
     let mut buf = String::new();
-    reader.read_line(&mut buf)?;
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        return Err(Error::Iris("empty response".into()));
+    conn.reader.read_line(&mut buf)?;
+    // A response is one newline-terminated line. EOF, or EOF mid-line, means
+    // the server went away; report it as a lost connection so a batch drops
+    // the socket and the next step reconnects.
+    if buf.is_empty() || !buf.ends_with('\n') {
+        return Err(Error::Connection(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "server closed the connection",
+        )));
     }
+    let trimmed = buf.trim();
     let resp: Value = serde_json::from_str(trimmed).map_err(|e| {
         Error::Iris(format!("bad response: {}: {}", e, trimmed))
     })?;
@@ -1105,10 +1224,10 @@ fn tokenize(line: &str) -> std::result::Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
+fn cmd_script(opts: &Opts, path: &std::path::Path, keep_going: bool) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Local(format!("read {}: {}", path.display(), e)))?;
-    let mut overall_failed = false;
+    let mut failed = 0usize;
     for (lineno, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1126,18 +1245,13 @@ fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[line {}] parse error: {}", lineno + 1, e);
-                overall_failed = true;
-                break;
+                return Err(Error::Local("script aborted on parse error".into()));
             }
         };
 
-        // Inherit our --socket / --json / --quiet from the outer invocation.
-        let sub_opts = Opts {
-            socket: opts.socket.clone(),
-            json: opts.json || cli.json,
-            quiet: opts.quiet || cli.quiet,
-            consumer: opts.consumer.clone(),
-        };
+        // Inherit our --socket / --json / --quiet from the outer invocation,
+        // and share the live connection with every other step.
+        let sub_opts = opts.with_output(opts.json || cli.json, opts.quiet || cli.quiet);
 
         let pretty = format_step(line);
         let t = Instant::now();
@@ -1151,13 +1265,15 @@ fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
             }
             Err(e) => {
                 eprintln!("[FAIL {:>6.0?}] {}: {:?}", elapsed, pretty, e);
-                overall_failed = true;
-                break;
+                failed += 1;
+                if !keep_going {
+                    return Err(Error::Local("script aborted on error".into()));
+                }
             }
         }
     }
-    if overall_failed {
-        return Err(Error::Local("script aborted on error".into()));
+    if failed > 0 {
+        return Err(Error::Local(format!("script: {} step(s) failed", failed)));
     }
     Ok(())
 }
@@ -1165,4 +1281,130 @@ fn cmd_script(opts: &Opts, path: &std::path::Path) -> Result<()> {
 /// Truncate long script lines for display.
 fn format_step(line: &str) -> String {
     if line.len() <= 72 { line.to_string() } else { format!("{}…", &line[..71]) }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+
+    /// A stand-in CI server: accept connections and answer lines with `reply`
+    /// until `requests` lines have been served, then report how many
+    /// connections it had to accept.
+    fn fake_server(
+        path: PathBuf,
+        requests: usize,
+        reply: &'static str,
+    ) -> (mpsc::Receiver<usize>, std::thread::JoinHandle<()>) {
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut accepted = 0usize;
+            let mut served = 0usize;
+            while served < requests && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted += 1;
+                        let mut writer = stream.try_clone().unwrap();
+                        let reader = BufReader::new(stream);
+                        for line in reader.lines() {
+                            match line {
+                                Ok(line) if line.trim().is_empty() => continue,
+                                Ok(_) => {}
+                                Err(_) => break,
+                            }
+                            writer.write_all(reply.as_bytes()).unwrap();
+                            served += 1;
+                            if served == requests {
+                                break;
+                            }
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            tx.send(accepted).unwrap();
+        });
+        (rx, handle)
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "iris-ci-batch-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_script_reuses_one_connection() {
+        let dir = temp_dir("reuse");
+        let sock = dir.join("iris.sock");
+        let script = dir.join("steps.iris");
+        std::fs::write(&script, "ping\nping\nping\n").unwrap();
+
+        let (rx, server) = fake_server(sock.clone(), 3, "{\"ok\":true,\"data\":null}\n");
+        let opts = Opts::new(sock, false, true, "test".into());
+        dispatch(
+            &opts,
+            Cmd::Script { path: script, keep_going: false },
+        )
+        .unwrap();
+        drop(opts);
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            1,
+            "a three-step script should use one connection"
+        );
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_script_stops_at_the_first_failure_unless_keep_going() {
+        let dir = temp_dir("abort");
+        let sock = dir.join("iris.sock");
+        let script = dir.join("steps.iris");
+        std::fs::write(&script, "ping\nping\n").unwrap();
+
+        // Default: the first error ends the run, so only one request is sent.
+        let (rx, server) = fake_server(
+            sock.clone(),
+            1,
+            "{\"ok\":false,\"error\":\"boom\"}\n",
+        );
+        let opts = Opts::new(sock.clone(), false, true, "test".into());
+        assert!(dispatch(
+            &opts,
+            Cmd::Script { path: script.clone(), keep_going: false },
+        )
+        .is_err());
+        drop(opts);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+        server.join().unwrap();
+
+        // --keep-going: both steps run, still over the one connection.
+        let _ = std::fs::remove_file(&sock);
+        let (rx, server) = fake_server(sock, 2, "{\"ok\":false,\"error\":\"boom\"}\n");
+        let opts = Opts::new(dir.join("iris.sock"), false, true, "test".into());
+        assert!(dispatch(
+            &opts,
+            Cmd::Script { path: script, keep_going: true },
+        )
+        .is_err());
+        drop(opts);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

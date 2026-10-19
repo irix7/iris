@@ -499,6 +499,18 @@ hashes are given where a change is easiest to understand by reading the commit.
   nothing is pending and wakes on any pending line, masked or not
   (`clanker/perf/idle-pause-masked-interrupt-must-wake.md`).
 
+### CI and automation
+
+- **`iris-ci` batch mode: a whole script runs over one control-socket
+  connection.** `script FILE` (also spelled `batch FILE`) used to open a fresh
+  connection for every command, so a five-step differential test paid five
+  connects and the server paid five handler threads, even though
+  `ci::handle_client_lines` already accepts any number of requests per
+  connection. Every step now shares one connection; a lost or timed-out socket
+  is dropped and the next step reconnects. `--keep-going` runs past a failed
+  step instead of stopping at the first, and the run still exits non-zero
+  (`#80`).
+
 ### iris-gui text and languages
 
 - **GUI text was rewritten, and moved into translatable catalogs.** Labels,
