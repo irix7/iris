@@ -29,8 +29,11 @@ pub(crate) struct NfsVirtualHost {
 impl NfsVirtualHost {
     pub(crate) fn new(ip: Ipv4Addr, nfs_cfg: NfsConfig) -> Self {
         // Locally administered, distinct from the NAT gateway's, so the guest
-        // keeps the virtual NFS host as its own ARP entry. (0xBF53 ≈ "BF-NFS".)
-        let mac = [0x02, 0x00, 0xDE, 0xAD, 0xBF, 0x53];
+        // keeps the virtual NFS host as its own ARP entry. The last two octets
+        // come from the configured IP, so two bridged instances with distinct
+        // NFS subnets do not share an L2 address.
+        let o = ip.octets();
+        let mac = [0x02, 0x00, 0xDE, 0xAD, o[2], o[3]];
         let server = super::nfsudp::NfsServer::new(nfs_cfg.shared_dir.clone(), nfs_cfg.version);
         Self { ip, mac, server, ip_id: 1, reasm: Reassembler::default() }
     }
