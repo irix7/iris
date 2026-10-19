@@ -25,6 +25,11 @@ on:
         type: boolean
         required: false
         default: true
+      profile_irix:
+        description: "Also run the IRIX boot profile and benchmark (needs IRIS_IRIX_IMAGE_URL)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -55,35 +60,43 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Short SHA
+        id: short
+        run: echo "sha=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
       - name: Install profiling dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libasound2-dev linux-tools-common linux-tools-generic linux-cloud-tools-generic
+          sudo apt-get install -y pkg-config libasound2-dev linux-tools-common linux-tools-generic
           # perf needs kernel headers matching the runner kernel
-          sudo apt-get install -y linux-headers-$(uname -r) 2>/dev/null || true
+          sudo apt-get install -y "linux-headers-$(uname -r)" 2>/dev/null || true
+          # Hosted runners restrict perf by default; profile-only job.
+          sudo sysctl -w kernel.perf_event_paranoid=1
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Build emulator with debug info
-        env:
-          FEATURES: ${{ matrix.engine == 'jitv2' && 'jitv2' || '' }}
         run: |
-          cargo build --release --bin iris ${{ env.FEATURES && format('--features {0}', env.FEATURES) }}
-          cargo build --release --bin iris-bench ${{ env.FEATURES && format('--features {0}', env.FEATURES) }}
+          FEATURES=()
+          if [ "${{ matrix.engine }}" = "jitv2" ]; then FEATURES=(--features jitv2); fi
+          cargo build --release --bin iris "${FEATURES[@]}"
+          cargo build --release --bin iris-bench "${FEATURES[@]}"
 
       - name: Build host baseline (native)
-        run: |
-          make -C bench hostbench
+        run: make -C bench hostbench
 
       - name: Run benchmark under perf
         env:
-          QUICK_FLAG: ${{ matrix.quick && '--quick' || '' }}
+          INPUT_QUICK: ${{ inputs.quick }}
         run: |
           set -o pipefail
-          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
+          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}"
           mkdir -p "$OUT_DIR"
+
+          QUICK_FLAG="--quick"
+          if [ "$INPUT_QUICK" = "false" ]; then QUICK_FLAG=""; fi
 
           # Run with perf record -g (call graphs) at 99Hz (lower overhead than default)
           # Use --call-graph dwarf for better Rust symbol resolution
@@ -101,72 +114,57 @@ jobs:
 
       - name: Generate flamegraph
         run: |
-          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
-          # Install inferno for flamegraph generation
+          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}"
           cargo install inferno --locked 2>/dev/null || true
           export PATH="$HOME/.cargo/bin:$PATH"
 
-          # Collapse perf data
           perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
-
-          # Generate SVG flamegraph
           inferno-flamegraph "$OUT_DIR/collapsed.txt" > "$OUT_DIR/flamegraph.svg"
-
-          # Also generate a "diff-ready" folded format for later comparison
           cp "$OUT_DIR/collapsed.txt" "$OUT_DIR/folded.txt"
-
-      - name: Generate speedscope JSON (alternative viewer)
-        run: |
-          OUT_DIR="profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}"
-          # speedscope uses a different format; use speedscope's converter
-          pipx install speedscope 2>/dev/null || pip install --user speedscope 2>/dev/null || true
-          export PATH="$HOME/.local/bin:$PATH"
-
-          # Convert collapsed to speedscope format
-          perf script -i "$OUT_DIR/perf.data" -j | \
-            python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-# speedscope expects a specific format; we'll use the built-in converter if available
-" 2>/dev/null || true
 
       - name: Upload profile artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}
+          name: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}
           path: |
-            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/flamegraph.svg
-            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/folded.txt
-            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/summary.txt
-            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/run.log
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}/flamegraph.svg
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}/folded.txt
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}/summary.txt
+            profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}/run.log
           retention-days: 30
 
       - name: Upload perf.data (for local analysis)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: perfdata-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}
-          path: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ github.sha::8 }}/perf.data
+          name: perfdata-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}
+          path: profile-${{ matrix.cpu }}-${{ matrix.engine }}-${{ steps.short.outputs.sha }}/perf.data
           retention-days: 7
 
-  # Optional: Profile IRIX boot if guest image URL is configured
+  # Optional: profile an IRIX boot. Needs the IRIS_IRIX_IMAGE_URL secret and
+  # the profile_irix workflow_dispatch input; job-level `if` cannot read secrets.
   profile-irix:
     name: Profile IRIX Boot
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    if: env.IRIS_IRIX_IMAGE_URL != ''
+    if: ${{ inputs.profile_irix }}
     needs: profile
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Short SHA
+        id: short
+        run: echo "sha=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libasound2-dev linux-tools-common linux-tools-generic
+          sudo sysctl -w kernel.perf_event_paranoid=1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -178,32 +176,42 @@ data = json.load(sys.stdin)
           IRIS_IRIX_IMAGE_URL: ${{ secrets.IRIS_IRIX_IMAGE_URL }}
         run: |
           set -e
-          echo "Downloading IRIX image from Cloudflare..."
+          : "${IRIS_IRIX_IMAGE_URL:?set the IRIS_IRIX_IMAGE_URL secret}"
+          echo "Downloading IRIX image..."
           wget -q --show-progress -O irix-disk.chd "$IRIS_IRIX_IMAGE_URL"
           ls -lh irix-disk.chd
 
       - name: Profile IRIX boot under perf
         run: |
-          OUT_DIR="profile-irix-boot-${{ github.sha::8 }}"
+          set -e
+          OUT_DIR="profile-irix-boot-${{ steps.short.outputs.sha }}"
           mkdir -p "$OUT_DIR"
+          SOCKET="$OUT_DIR/iris.sock"
 
-          # Run with perf for 60 seconds of boot
-          timeout 120 perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
+          perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
             ./target/release/iris \
               --cpu r4400 \
-              --disk irix-disk.chd \
-              --headless \
+              --scsi1 irix-disk.chd \
               --ci \
-              2>&1 | tee "$OUT_DIR/boot.log" || true
+              --ci-socket "$SOCKET" \
+              --serial-log "$OUT_DIR/boot.log" \
+              > "$OUT_DIR/emu.stdout" 2>&1 &
+          EMU_PID=$!
 
-          # Check if we reached shell
-          if grep -q "login:" "$OUT_DIR/boot.log"; then
-            echo "Reached login prompt"
-          fi
+          for _ in $(seq 1 60); do
+            [ -S "$SOCKET" ] && break
+            sleep 2
+          done
+          [ -S "$SOCKET" ] || { echo "CI socket never appeared" >&2; exit 1; }
+
+          ./target/release/iris-ci --socket "$SOCKET" boot --timeout 600
+          grep -q "login:" "$OUT_DIR/boot.log" && echo "Reached login prompt"
+          ./target/release/iris-ci --socket "$SOCKET" quit || true
+          wait "$EMU_PID" || true
 
       - name: Generate IRIX boot flamegraph
         run: |
-          OUT_DIR="profile-irix-boot-${{ github.sha::8 }}"
+          OUT_DIR="profile-irix-boot-${{ steps.short.outputs.sha }}"
           cargo install inferno --locked 2>/dev/null || true
           export PATH="$HOME/.cargo/bin:$PATH"
           perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
@@ -213,25 +221,32 @@ data = json.load(sys.stdin)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: profile-irix-boot-${{ github.sha::8 }}
+          name: profile-irix-boot-${{ steps.short.outputs.sha }}
           path: |
-            profile-irix-boot-${{ github.sha::8 }}/flamegraph.svg
-            profile-irix-boot-${{ github.sha::8 }}/collapsed.txt
-            profile-irix-boot-${{ github.sha::8 }}/boot.log
+            profile-irix-boot-${{ steps.short.outputs.sha }}/flamegraph.svg
+            profile-irix-boot-${{ steps.short.outputs.sha }}/collapsed.txt
+            profile-irix-boot-${{ steps.short.outputs.sha }}/boot.log
+            profile-irix-boot-${{ steps.short.outputs.sha }}/emu.stdout
           retention-days: 30
 
-  # Run IRIX benchmark suite after boot
+  # Run the IRIX benchmark suite after boot. Needs the same secret and input
+  # as profile-irix, but no perf: instrumenting the host would distort the
+  # guest timings this job exists to measure.
   bench-irix:
     name: IRIX Benchmarks
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    if: env.IRIS_IRIX_IMAGE_URL != ''
+    if: ${{ inputs.profile_irix }}
     needs: profile
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.event.inputs.ref || github.sha }}
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Short SHA
+        id: short
+        run: echo "sha=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
@@ -251,108 +266,75 @@ data = json.load(sys.stdin)
           IRIS_IRIX_IMAGE_URL: ${{ secrets.IRIS_IRIX_IMAGE_URL }}
         run: |
           set -e
-          echo "Downloading IRIX image from Cloudflare..."
+          : "${IRIS_IRIX_IMAGE_URL:?set the IRIS_IRIX_IMAGE_URL secret}"
+          echo "Downloading IRIX image..."
           wget -q --show-progress -O irix-disk.chd "$IRIS_IRIX_IMAGE_URL"
           ls -lh irix-disk.chd
 
-      - name: Start IRIX emulator with CI socket
+      - name: Start IRIX and wait for a shell
         run: |
-          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          set -e
+          OUT_DIR="irix-bench-${{ steps.short.outputs.sha }}"
           mkdir -p "$OUT_DIR"
           SOCKET="$OUT_DIR/iris.sock"
 
-          # Start emulator in background with CI socket
-          # --ci-display keeps REX3 mapped for X11
           ./target/release/iris \
             --cpu r4400 \
-            --disk irix-disk.chd \
+            --scsi1 irix-disk.chd \
             --ci \
             --ci-socket "$SOCKET" \
-            --ci-display \
-            2>&1 | tee "$OUT_DIR/emu.log" &
+            --serial-log "$OUT_DIR/emu.log" \
+            > "$OUT_DIR/emu.stdout" 2>&1 &
           EMU_PID=$!
-          echo $EMU_PID > "$OUT_DIR/emu.pid"
+          echo "$EMU_PID" > "$OUT_DIR/emu.pid"
 
-          # Wait for CI socket to appear
-          for i in {1..60}; do
-            if [ -S "$SOCKET" ]; then
-              echo "CI socket ready"
+          for _ in $(seq 1 60); do
+            [ -S "$SOCKET" ] && break
+            sleep 2
+          done
+          [ -S "$SOCKET" ] || { echo "CI socket never appeared" >&2; exit 1; }
+
+          ./target/release/iris-ci --socket "$SOCKET" boot --timeout 600
+          ./target/release/iris-ci --socket "$SOCKET" login
+          # The guest runs its own X server; the host needs no display.
+          ./target/release/iris-ci --socket "$SOCKET" run "startx >/tmp/startx.log 2>&1 &"
+          for _ in $(seq 1 30); do
+            if ./target/release/iris-ci --socket "$SOCKET" run "test -S /tmp/.X11-unix/X0" >/dev/null 2>&1; then
               break
             fi
             sleep 2
           done
 
-          # Wait for login prompt
-          echo "Waiting for login prompt..."
-          for i in {1..300}; do
-            if grep -q "login:" "$OUT_DIR/emu.log"; then
-              echo "Login prompt detected"
-              break
-            fi
-            sleep 2
-          done
-
-      - name: Auto-login and start X (if configured)
+      - name: Run IRIX benchmark suite
         run: |
-          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          set -o pipefail
+          OUT_DIR="irix-bench-${{ steps.short.outputs.sha }}"
           SOCKET="$OUT_DIR/iris.sock"
 
-          # Login as root (no password on fresh install)
-          # Send: root\n\n
-          ./target/release/iris-ci --socket "$SOCKET" send "root" $'\n' || true
-          sleep 2
-          ./target/release/iris-ci --socket "$SOCKET" send "" $'\n' || true
-          sleep 5
-
-          # Check if we have a shell
-          ./target/release/iris-ci --socket "$SOCKET" send "echo 'SHELL_READY'" $'\n' || true
-          sleep 2
-
-          # Try to start X if not already running
-          ./target/release/iris-ci --socket "$SOCKET" send "startx &" $'\n' || true
-          sleep 10
-
-      - name: Run IRIX benchmark suite under perf
-        run: |
-          OUT_DIR="irix-bench-${{ github.sha::8 }}"
-          mkdir -p "$OUT_DIR"
-          SOCKET="$OUT_DIR/iris.sock"
-
-          # Build host baseline for IRIX benchmarks (native)
           make -C bench hostbench
-
-          # Run IRIX benchmarks under perf
-          # This runs the steps in bench/irix/steps.toml via iris-ci
-          perf record -g --call-graph dwarf -F 99 -o "$OUT_DIR/perf.data" \
-            ./target/release/iris-bench irix \
-              --socket "$SOCKET" \
-              --out "$OUT_DIR" \
-              2>&1 | tee "$OUT_DIR/irix-bench.log" || true
-
-      - name: Generate IRIX bench flamegraph
-        run: |
-          OUT_DIR="irix-bench-${{ github.sha::8 }}"
-          cargo install inferno --locked 2>/dev/null || true
-          export PATH="$HOME/.cargo/bin:$PATH"
-          perf script -i "$OUT_DIR/perf.data" | inferno-collapse-perf > "$OUT_DIR/collapsed.txt"
-          inferno-flamegraph "$OUT_DIR/collapsed.txt" > "$OUT_DIR/flamegraph.svg"
+          ./target/release/iris-bench irix \
+            --socket "$SOCKET" \
+            --out "$OUT_DIR" \
+            2>&1 | tee "$OUT_DIR/irix-bench.log"
 
       - name: Upload IRIX bench results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: irix-bench-${{ github.sha::8 }}
+          name: irix-bench-${{ steps.short.outputs.sha }}
           path: |
-            irix-bench-${{ github.sha::8 }}/flamegraph.svg
-            irix-bench-${{ github.sha::8 }}/collapsed.txt
-            irix-bench-${{ github.sha::8 }}/irix-bench.log
-            irix-bench-${{ github.sha::8 }}/emu.log
+            irix-bench-${{ steps.short.outputs.sha }}/*.json
+            irix-bench-${{ steps.short.outputs.sha }}/irix-bench.log
+            irix-bench-${{ steps.short.outputs.sha }}/emu.log
+            irix-bench-${{ steps.short.outputs.sha }}/emu.stdout
           retention-days: 30
 
       - name: Stop emulator
         if: always()
         run: |
-          OUT_DIR="irix-bench-${{ github.sha::8 }}"
+          OUT_DIR="irix-bench-${{ steps.short.outputs.sha }}"
+          SOCKET="$OUT_DIR/iris.sock"
+          ./target/release/iris-ci --socket "$SOCKET" quit || true
           if [ -f "$OUT_DIR/emu.pid" ]; then
-            kill $(cat "$OUT_DIR/emu.pid") 2>/dev/null || true
+            kill "$(cat "$OUT_DIR/emu.pid")" 2>/dev/null || true
           fi
