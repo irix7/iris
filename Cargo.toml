@@ -158,13 +158,10 @@ tcache = []
 # Panics at the exact diverging access instead of letting corruption surface as
 # a guest crash much later. Very slow; diagnostic only.
 tcache_verify = ["tcache"]
-# Accurate cache (issue #35): select the functional two-level cache model
-# (mips_cache_v2) for the R4400 and R5000 and raise Virtual Coherency
-# Exceptions (VCEI/VCED). OFF by default — every CPU runs the observation-only
-# shadow (mips_cache_shadow), whose loads, stores and fetches bypass the cache
-# arrays and never raise VCE. The R10000 keeps its shadow either way. Accurate
-# is 3-4x slower on memory-bound kernels; it exists for the cpu-tests
-# write-back cache checks and for a future guest that needs them.
+# Retired (issue #35): the cache model is a runtime choice now
+# (`[machine] cache = auto|full|shadow` / `--cache`), so this flag does
+# nothing. Kept so command lines that still pass `--features accurate-cache`
+# keep working.
 accurate-cache = []
 # Cache parity/ECC injection and the Cache Error exception, for SGI's IDE
 # cache diagnostics (dcache1, icache1, scache1): Status.CE forcing the ECC

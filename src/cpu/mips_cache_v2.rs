@@ -2571,15 +2571,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
             if l2_hit {
                 // R4K only: check for Virtual Coherency Exception (VCEI).
-                // R5K dropped VCE — no pidx tracking needed. The raise is
-                // compiled out unless `accurate-cache` is on: the default
-                // shadow never selects this model, and this guarantees the
-                // functional model cannot raise VCE in a default build either.
-                #[cfg(feature = "accurate-cache")]
+                // R5K dropped VCE — no pidx tracking needed.
                 if !Self::IS_R5K {
-                if self.pidx(index_addr) != l2_tag.pidx() {
-                    return exec_exception_const(EXC_VCEI);
-                }
+                    if self.pidx(index_addr) != l2_tag.pidx() {
+                        return exec_exception_const(EXC_VCEI);
+                    }
                 }
             } else {
                 // L2 miss — fill from memory into L2 first.
@@ -2789,7 +2785,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
         let l2_ptag = self.l2_ptag(phys_addr);
         if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
-            #[cfg(feature = "accurate-cache")]
             if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
                 return Err(BUS_VCE);
             }
@@ -3117,11 +3112,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
             let l2_ptag = self.l2_ptag(phys_addr);
             if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
-                // Check for Virtual Coherency Exception (R4K only; R5K dropped
-                // VCE). Compiled out unless `accurate-cache` is on.
-                #[cfg(feature = "accurate-cache")]
+                // Check for Virtual Coherency Exception (R4K only; R5K dropped VCE).
                 if !Self::IS_R5K {
-                if self.pidx(virt_addr) != l2_tag.pidx() { return BUS_VCE; }
+                    if self.pidx(virt_addr) != l2_tag.pidx() { return BUS_VCE; }
                 }
                 true
             } else {
