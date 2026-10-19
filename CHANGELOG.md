@@ -78,6 +78,11 @@ hashes are given where a change is easiest to understand by reading the commit.
   `iris/lightning,iris/jitv2,iris/gpujit,iris/idle-pause,hostgl` and the CLI
   with `lightning,jitv2,gpujit,idle-pause,hostgl`. All building and packaging
   lives in `scripts/dist/`, which the workflows call and you can run locally.
+- **Release download links name the asset GitHub actually stores.** GitHub
+  rewrites `+` to `.` in an uploaded asset name, so `vX.Y.Z+irix7` releases
+  publish `IRIS-...-X.Y.Z.irix7...` files. The generated notes now link that
+  spelling; before, every download link on `v0.1.0+irix7` and `v0.1.1+irix7`
+  returned 404.
 - **macOS ships one universal app** (`IRIS-gui-macos-universal-*.dmg` and
   `.zip`) and a universal CLI tarball, signed and notarized when the
   repository has Apple credentials. The bundle ID is now
