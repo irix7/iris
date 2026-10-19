@@ -13228,6 +13228,200 @@
           "efficiency": 0.0174
         }
       ]
+    },
+    {
+      "source": "irix7/iris",
+      "commit": "4f04cffa81eefcc68a9c8a90cf51932d36c0a92d",
+      "ref": "main",
+      "date": "2026-10-09T01:22:17Z",
+      "title": "ci: capture HAL2 audio through the wav/null backend (#73)",
+      "host": {
+        "raw": "linux x86_64 / AMD EPYC 7763 64-Core Processor / 4 cores",
+        "cpu": "AMD EPYC 7763 64-Core Processor",
+        "cores": 4
+      },
+      "cells": [
+        {
+          "name": "r4400-interp",
+          "cpu": "R4400",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 46.9,
+          "dmips": 66.1,
+          "whet": 2358.0,
+          "linpack": 8.6,
+          "efficiency": 0.005,
+          "time_share": {
+            "codec/lz": {
+              "share_pct": 17.9,
+              "mips": 52.5
+            },
+            "img/dct8x8": {
+              "share_pct": 6.6,
+              "mips": 37.4
+            },
+            "codec/huffman": {
+              "share_pct": 5.2,
+              "mips": 45.0
+            },
+            "img/sharpen5x5": {
+              "share_pct": 5.2,
+              "mips": 54.2
+            },
+            "vid/motion_est": {
+              "share_pct": 4.9,
+              "mips": 45.5
+            },
+            "codec/rle": {
+              "share_pct": 2.3,
+              "mips": 55.2
+            },
+            "fpu/linpack": {
+              "share_pct": 2.0,
+              "mips": 50.1
+            },
+            "img/composite": {
+              "share_pct": 1.9,
+              "mips": 40.8
+            }
+          }
+        },
+        {
+          "name": "r4400-jitv2",
+          "cpu": "R4400",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 575.8,
+          "dmips": 554.9,
+          "whet": 1161.0,
+          "linpack": 47.22,
+          "efficiency": 0.0522,
+          "time_share": {
+            "codec/huffman": {
+              "share_pct": 7.2,
+              "mips": 228.3
+            },
+            "mem/latency_l2": {
+              "share_pct": 3.6,
+              "mips": 273.7
+            },
+            "fpu/divsqrt": {
+              "share_pct": 3.5,
+              "mips": 227.0
+            },
+            "fpu/scalar_s": {
+              "share_pct": 3.5,
+              "mips": 190.5
+            },
+            "int/branch": {
+              "share_pct": 3.3,
+              "mips": 580.4
+            },
+            "img/dct8x8": {
+              "share_pct": 3.3,
+              "mips": 368.9
+            },
+            "img/rgb2ycbcr": {
+              "share_pct": 3.2,
+              "mips": 1004.3
+            },
+            "fpu/scalar_d": {
+              "share_pct": 3.2,
+              "mips": 194.1
+            }
+          }
+        },
+        {
+          "name": "r5000-interp",
+          "cpu": "R5000",
+          "features": "tlbvmap",
+          "accuracy": 100.0,
+          "mips": 46.1,
+          "dmips": 66.0,
+          "whet": 2316.0,
+          "linpack": 8.33,
+          "efficiency": 0.005,
+          "time_share": {
+            "codec/lz": {
+              "share_pct": 18.1,
+              "mips": 51.3
+            },
+            "img/dct8x8": {
+              "share_pct": 6.6,
+              "mips": 36.7
+            },
+            "img/sharpen5x5": {
+              "share_pct": 5.3,
+              "mips": 52.7
+            },
+            "codec/huffman": {
+              "share_pct": 5.3,
+              "mips": 44.1
+            },
+            "vid/motion_est": {
+              "share_pct": 5.2,
+              "mips": 42.4
+            },
+            "codec/rle": {
+              "share_pct": 2.3,
+              "mips": 53.3
+            },
+            "img/composite": {
+              "share_pct": 2.0,
+              "mips": 37.6
+            },
+            "fpu/linpack": {
+              "share_pct": 2.0,
+              "mips": 48.6
+            }
+          }
+        },
+        {
+          "name": "r5000-jitv2",
+          "cpu": "R5000",
+          "features": "jitv2 tcache tlbvmap",
+          "accuracy": 100.0,
+          "mips": 340.2,
+          "dmips": 744.5,
+          "whet": 3654.0,
+          "linpack": 67.95,
+          "efficiency": 0.0337,
+          "time_share": {
+            "codec/lz": {
+              "share_pct": 25.1,
+              "mips": 39.8
+            },
+            "vid/yuv2rgb": {
+              "share_pct": 7.2,
+              "mips": 37.4
+            },
+            "img/composite": {
+              "share_pct": 7.1,
+              "mips": 212.3
+            },
+            "codec/huffman": {
+              "share_pct": 6.7,
+              "mips": 36.9
+            },
+            "vid/motion_est": {
+              "share_pct": 5.2,
+              "mips": 103.0
+            },
+            "codec/rle": {
+              "share_pct": 2.9,
+              "mips": 45.4
+            },
+            "codec/crc32": {
+              "share_pct": 2.0,
+              "mips": 35.8
+            },
+            "mem/latency_l2": {
+              "share_pct": 1.9,
+              "mips": 356.7
+            }
+          }
+        }
+      ]
     }
   ]
 }
