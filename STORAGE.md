@@ -125,6 +125,7 @@ debugging the wrapper itself.
 ./target/release/iris-ci diff base mutated   # per-device + chunk + cow-sector deltas
 ./target/release/iris-ci tree
 ./target/release/iris-ci script tests/scenario.iris   # batch-run a sequence of cmds
+./target/release/iris-ci batch tests/scenario.iris    # same, explicit spelling
 ./target/release/iris-ci cdrom-load 4 disc2.iso       # swap a CD at runtime
 ./target/release/iris-ci rtc-save                     # persist NVRAM
 ./target/release/iris-ci quit --sync-chd              # fold CHD diffs, then exit
@@ -133,6 +134,11 @@ debugging the wrapper itself.
 Run `iris-ci --help` for the full list, or `iris-ci <subcmd> --help` for any
 subcommand. Every operation has a typed clap arg — no JSON quoting, no
 hand-managed timeouts.
+
+`script FILE` (also spelled `batch FILE`) runs one command per line through a
+single control-socket connection, so a multi-step scenario costs one connect
+rather than one per line. It prints per-step status and stops at the first
+failure; `--keep-going` runs the remaining steps and still exits non-zero.
 
 For automation that doesn't want to depend on `iris-ci`, the underlying socket
 protocol is newline-delimited JSON; `cmd` and `args` per request, `{ok, data,
