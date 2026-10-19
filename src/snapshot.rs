@@ -118,6 +118,22 @@ pub fn enabled_features() -> Vec<String> {
     f
 }
 
+/// Root of the process's snapshot store. One Machine per process (see
+/// `docs/parallel-instances.md`), so a process-global root is the storage
+/// layer's single source of truth: instance mode sets `<state_dir>/saves`.
+static STORE_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Set the snapshot store root. The first Machine in the process wins; the
+/// one-Machine-per-process invariant makes a later value a programming error.
+pub fn set_store_root(root: std::path::PathBuf) {
+    let _ = STORE_ROOT.set(root);
+}
+
+/// `saves` unless instance mode installed a state-directory root.
+pub fn store_root() -> std::path::PathBuf {
+    STORE_ROOT.get().cloned().unwrap_or_else(|| std::path::PathBuf::from("saves"))
+}
+
 /// Top-level snapshot manifest. Lives at `saves/<name>/snapshot.toml`. Written
 /// first on save and read first on load so the rest of the pipeline can fail
 /// fast with a clear error before reading half a snapshot.

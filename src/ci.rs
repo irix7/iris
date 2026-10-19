@@ -476,7 +476,8 @@ fn cmd_list(_args: &Value) -> Response {
     // Walk saves/ recursively, return every directory that contains a
     // snapshot.toml (current format) OR a cpu.toml (legacy v0). Names are
     // returned slash-joined relative to saves/.
-    let root = std::path::Path::new("saves");
+    let root_buf = crate::snapshot::store_root();
+    let root = root_buf.as_path();
     if !root.is_dir() {
         return Response::data(serde_json::json!({ "snapshots": [] }));
     }
@@ -520,7 +521,7 @@ fn cmd_info(args: &Value) -> Response {
         Some(n) => n,
         None => return Response::err("info: missing 'name' arg"),
     };
-    let dir = std::path::Path::new("saves").join(name);
+    let dir = crate::snapshot::store_root().join(name);
     if !dir.is_dir() {
         return Response::err(format!("info: snapshot '{}' not found", name));
     }
@@ -570,7 +571,7 @@ fn cmd_delete(args: &Value) -> Response {
     if name.is_empty() || name.contains("..") {
         return Response::err("delete: invalid name");
     }
-    let dir = std::path::Path::new("saves").join(name);
+    let dir = crate::snapshot::store_root().join(name);
     if !dir.is_dir() {
         return Response::err(format!("delete: snapshot '{}' not found", name));
     }
@@ -908,7 +909,8 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
 fn collect_live_chunks() -> std::io::Result<std::collections::HashSet<crate::chunk_store::ChunkHash>> {
     use std::collections::HashSet;
     let mut live: HashSet<crate::chunk_store::ChunkHash> = HashSet::new();
-    let root = std::path::Path::new("saves");
+    let root_buf = crate::snapshot::store_root();
+    let root = root_buf.as_path();
     if !root.is_dir() {
         return Ok(live);
     }
@@ -942,7 +944,7 @@ fn cmd_gc() -> Response {
         Ok(l) => l,
         Err(e) => return Response::err(format!("gc: collect live: {}", e)),
     };
-    let store = crate::chunk_store::ChunkStore::new("saves");
+    let store = crate::chunk_store::ChunkStore::new(crate::snapshot::store_root());
     let total_before = store.total_size().unwrap_or(0);
     match store.gc(&live) {
         Ok((removed, bytes)) => {
@@ -987,8 +989,8 @@ fn cmd_diff(args: &Value) -> Response {
         return Response::err("diff: invalid name");
     }
 
-    let dir_a = std::path::PathBuf::from("saves").join(&a);
-    let dir_b = std::path::PathBuf::from("saves").join(&b);
+    let dir_a = crate::snapshot::store_root().join(&a);
+    let dir_b = crate::snapshot::store_root().join(&b);
     if !dir_a.is_dir() {
         return Response::err(format!("diff: snapshot '{}' not found", a));
     }
@@ -1124,7 +1126,8 @@ fn cmd_diff(args: &Value) -> Response {
 /// doesn't exist locally) hang off a synthetic `(none)` root.
 fn cmd_tree() -> Response {
     use std::collections::BTreeMap;
-    let root = std::path::Path::new("saves");
+    let root_buf = crate::snapshot::store_root();
+    let root = root_buf.as_path();
     if !root.is_dir() {
         return Response::data(serde_json::json!({"tree": "(no saves directory)"}));
     }
@@ -1211,7 +1214,7 @@ fn cmd_pull(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("pull: missing 'name' arg"),
     };
-    let saves = std::path::PathBuf::from("saves");
+    let saves = crate::snapshot::store_root();
     if !saves.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&saves) {
             return Response::err(format!("pull: create saves/: {}", e));
@@ -1239,7 +1242,7 @@ fn cmd_push(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("push: missing 'name' arg"),
     };
-    match crate::registry::push(&url, &name, std::path::Path::new("saves")) {
+    match crate::registry::push(&url, &name, &crate::snapshot::store_root()) {
         Ok(report) => Response::data(serde_json::json!({
             "name": name,
             "url": url,
