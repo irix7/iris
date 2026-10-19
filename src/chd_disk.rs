@@ -327,6 +327,15 @@ impl ChdCd {
     }
 }
 
+/// Process-wide diff directory installed by instance mode. `IRIS_CHD_DIFF_DIR`
+/// still wins for explicit embedder overrides.
+static DIFF_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Put future CHD diff sidecars under `dir` unless the environment overrides.
+pub fn set_diff_dir(dir: PathBuf) {
+    let _ = DIFF_DIR.set(dir);
+}
+
 /// The `.diff.chd` sidecar path for a base CHD (honors `IRIS_CHD_DIFF_DIR`).
 /// Public so the GUI can check for / locate a disk's overlay for commit/rollback.
 pub fn diff_path_for(parent: &Path) -> PathBuf {
@@ -339,8 +348,11 @@ pub fn diff_path_for(parent: &Path) -> PathBuf {
     // IRIS_CHD_DIFF_DIR to a writable container path; when present, put the diff
     // there, named by the parent's stem plus a hash of its full path so two
     // like-named CHDs in different folders don't collide.
-    if let Some(dir) = std::env::var_os("IRIS_CHD_DIFF_DIR") {
-        let dir = PathBuf::from(dir);
+    if let Some(dir) = std::env::var_os("IRIS_CHD_DIFF_DIR")
+        .map(PathBuf::from)
+        .or_else(|| DIFF_DIR.get().cloned())
+    {
+        let dir = dir;
         let _ = std::fs::create_dir_all(&dir);
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();

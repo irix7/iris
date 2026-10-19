@@ -522,7 +522,13 @@ impl Machine {
             // iris holding {base}.overlay can coexist with any number of `--ci`
             // processes; cleanup happens on machine drop below.
             let result = if ci_enabled && dev.overlay && !cdrom {
-                let ci_overlay = ScsiDeviceConfig::ci_overlay_path(key);
+                // Instance mode anchors the CI overlay under the instance state
+                // directory; otherwise keep upstream's per-process path, which
+                // honours IRIS_COW_OVERLAY_DIR.
+                let ci_overlay = match cfg.state_dir.as_deref() {
+                    Some(state) => format!("{state}/overlays/scsi{id}.overlay"),
+                    None => ScsiDeviceConfig::ci_overlay_path(key),
+                };
                 hpc3.add_scsi_device_with_overlay(controller, id as usize, &path, cdrom, discs, dev.overlay, &ci_overlay)
             } else {
                 hpc3.add_scsi_device(controller, id as usize, &path, cdrom, discs, dev.overlay)
@@ -980,6 +986,11 @@ impl Machine {
             .map(|d| std::path::Path::new(d).join("saves"))
             .unwrap_or_else(|| std::path::PathBuf::from("saves"));
         crate::snapshot::set_store_root(snapshot_root.clone());
+        if let Some(state) = cfg.state_dir.as_deref() {
+            let _ = std::fs::create_dir_all(std::path::Path::new(state).join("overlays"));
+            let _ = std::fs::create_dir_all(std::path::Path::new(state).join("diffs"));
+            crate::chd_disk::set_diff_dir(std::path::Path::new(state).join("diffs"));
+        }
 
         Self {
             cpu,
