@@ -21,13 +21,13 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
   Two 512 MB banks provide 1 GB of RAM
   (see [Indigo2 IP28](docs/indigo2-ip28.md)).
 
-Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
+Prebuilt releases are available in [irix7/iris GitHub Releases](https://github.com/irix7/iris/releases).
 
 ## About this fork
 
 This repository (`irix7/iris`) is a fork of
 [`techomancer/iris`](https://github.com/techomancer/iris) — the upstream SGI
-Indy / Indigo2 emulator, and the source of the prebuilt releases linked above.
+Indy / Indigo2 emulator.
 Upstream remains the canonical project. The fork is maintained by **Jupiter
 Belic**; anyone reusing its work elsewhere should follow the attribution rules
 in [AGENTS.md](AGENTS.md).
@@ -120,7 +120,7 @@ boots to a usable system: shell, networking, X11, the works.
 ## Getting started
 
 Download Windows, macOS, and Linux builds from
-[techomancer/iris releases](https://github.com/techomancer/iris/releases).
+[irix7/iris releases](https://github.com/irix7/iris/releases).
 The CLI and iris-gui are developed in this repository. Dani Sarfati contributed
 the GUI and its Mac App Store distribution support.
 

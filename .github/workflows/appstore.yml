@@ -506,7 +506,7 @@ jobs:
           scripts/dist/macos-bundle.sh --appstore --no-sign \
             --binary iris-gui-universal --out . \
             --bundle-id "${{ env.BUNDLE_ID }}" \
-            --version "$VER" --short-version "$VER" --build-version "$BUNDLE_VER" \
+            --version "$VER" --short-version "${VER%%+*}" --build-version "$BUNDLE_VER" \
             --provisioning-profile "$RUNNER_TEMP/embedded.provisionprofile"
           rm -f "$RUNNER_TEMP/embedded.provisionprofile"
           cat IRIS.app/Contents/Info.plist

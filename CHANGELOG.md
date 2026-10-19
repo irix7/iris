@@ -2,6 +2,11 @@
 
 All notable user-facing and developer-facing changes to iris.
 
+Fork releases carry the fork identity as SemVer build metadata:
+`X.Y.Z+irix7` (tag `vX.Y.Z+irix7`). The codepath and packaged binaries use
+that string; App Store and macOS bundle versions strip the `+irix7` suffix
+because Apple requires a numeric dotted version.
+
 Binary builds are published as a daily `nightly` pre-release
 (`nightly.YYYY.MM.DD`) and as releases for `vX.Y.Z` tags. Builds before
 October 2026 were tagged `v<YYYY-MM-DD-HH-MM>`. This file is grouped by month,

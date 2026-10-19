@@ -2,7 +2,7 @@
 # Print the version a distribution build is stamped with.
 #
 #   version.sh nightly [YYYY-MM-DD]   nightly.YYYY.MM.DD (UTC today by default)
-#   version.sh release vX.Y.Z         X.Y.Z  (accepts the tag or the bare version)
+#   version.sh release vX.Y.Z[+irix7] X.Y.Z[+irix7]  (accepts the tag or bare version)
 #   version.sh appstore [vX.Y.Z]      X.Y.Z of the given tag, or of the newest
 #                                     vX.Y.Z tag reachable from HEAD
 #   version.sh dev                    dev.<short commit>
@@ -13,7 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-RELEASE_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
+RELEASE_RE='^[0-9]+\.[0-9]+\.[0-9]+(\+irix7)?$'
 
 usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -32,9 +32,9 @@ case "$channel" in
         fi
         ;;
     release)
-        [ $# -gt 0 ] || { echo "release needs a tag (vX.Y.Z)" >&2; exit 2; }
+        [ $# -gt 0 ] || { echo "release needs a tag (vX.Y.Z[+irix7])" >&2; exit 2; }
         v="${1#refs/tags/}"; v="${v#v}"
-        [[ "$v" =~ $RELEASE_RE ]] || { echo "'$1' is not a vX.Y.Z release tag" >&2; exit 2; }
+        [[ "$v" =~ $RELEASE_RE ]] || { echo "'$1' is not a vX.Y.Z[+irix7] release tag" >&2; exit 2; }
         echo "$v"
         ;;
     appstore)
@@ -42,7 +42,7 @@ case "$channel" in
             exec "$0" release "$1"
         fi
         tag=$(git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
-              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(\+irix7)?$' | head -1 || true)
         [ -n "$tag" ] || { echo "no vX.Y.Z tag is reachable from HEAD; tag a release first or pass a version" >&2; exit 1; }
         exec "$0" release "$tag"
         ;;
