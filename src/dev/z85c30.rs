@@ -1228,6 +1228,9 @@ impl CiSerialBackend {
     pub fn reset(&self) {
         self.host_to_guest.lock().clear();
         self.guest_to_host.lock().clear();
+        if let Some(f) = self.log.lock().as_mut() {
+            let _ = f.flush();
+        }
     }
 }
 
@@ -1502,6 +1505,23 @@ mod tests {
         dst.channel_a.0.lock().reg_ptr = scc_regs::RR3;
         assert_eq!(dst.read_a_control() & (1 << 1), 1 << 1,
             "B's Tx IP occupies bits 2..0 of A's RR3");
+    }
+
+    #[test]
+    fn ci_serial_log_is_buffered_and_flushed_on_reset() {
+        let path = std::env::temp_dir().join(format!(
+            "iris-ci-serial-log-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let backend = CiSerialBackend::new();
+        let log = crate::dev::serial_log::SerialLog::create(
+            &path, crate::dev::serial_log::SerialLogTimestamps::Off).unwrap();
+        backend.set_log(log);
+        for b in b"line one\r\nline two" { backend.send_byte(*b); }
+        // Nothing is guaranteed on disk before the flush point.
+        backend.reset();
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got, b"line one\r\nline two");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

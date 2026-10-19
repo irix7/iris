@@ -85,6 +85,31 @@ impl Drop for CiServer {
     }
 }
 
+/// Prepare a Unix CI socket path for bind without stealing a live instance's
+/// socket. A stale file is removed; a path that accepts a connection is a live
+/// server and the bind is refused.
+#[cfg(unix)]
+fn prepare_socket_path(path: &str) -> Result<(), String> {
+    if ci_socket_is_tcp(path) {
+        return Ok(());
+    }
+    if !std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(format!(
+            "CI socket {path} is live (another iris is listening); refusing to steal it"
+        )),
+        Err(_) => std::fs::remove_file(path)
+            .map_err(|e| format!("could not remove stale CI socket {path}: {e}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn prepare_socket_path(_path: &str) -> Result<(), String> { Ok(()) }
+
+/// Remove our own socket on shutdown/quit. Unlike [`prepare_socket_path`],
+/// this is called only after the server has stopped, so the file is stale.
 fn cleanup_socket_path(path: &str) {
     if ci_socket_is_tcp(path) {
         return;
@@ -319,7 +344,7 @@ pub fn start_server(
 
 #[cfg(unix)]
 fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    cleanup_socket_path(path);
+    prepare_socket_path(path)?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("failed to bind {}: {}", path, e))?;
     eprintln!("iris: --ci control socket listening at {}", path);
