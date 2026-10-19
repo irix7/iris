@@ -34,6 +34,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$VERSION" ] || die "--version is required"
 V="$VERSION"
+# GitHub rewrites "+" to "." in uploaded asset names (the upload URL carries
+# the name in a query string, where "+" means a space), so the download table
+# must link to the name the release actually carries. Builds still stamp and
+# name their files with the SemVer string; only the published link differs.
+FV="${V//+/.}"
 
 assets() {
     local a
@@ -85,12 +90,12 @@ cat <<EOF
 
 | Platform | Emulator with GUI | Command line only |
 |---|---|---|
-| Windows x64 | $(dl Installer "IRIS-Setup-windows-x64-${V}.exe") · $(dl "Portable zip" "IRIS-gui-windows-x64-${V}.zip") | $(dl zip "IRIS-cli-windows-x64-${V}.zip") |
-| Windows arm64 | $(dl Installer "IRIS-Setup-windows-arm64-${V}.exe") · $(dl "Portable zip" "IRIS-gui-windows-arm64-${V}.zip") | $(dl zip "IRIS-cli-windows-arm64-${V}.zip") |
-| macOS, Apple silicon and Intel | $(dl dmg "IRIS-gui-macos-universal-${V}.dmg") · $(dl zip "IRIS-gui-macos-universal-${V}.zip") | $(dl tar.gz "IRIS-cli-macos-universal-${V}.tar.gz") |
-| Linux x64 | $(dl AppImage "IRIS-gui-linux-x64-${V}.AppImage") · $(dl deb "IRIS-gui-linux-x64-${V}.deb") · $(dl rpm "IRIS-gui-linux-x64-${V}.rpm") · $(dl "Arch pkg" "IRIS-gui-linux-x64-${V}.pkg.tar.zst") | $(dl tar.gz "IRIS-cli-linux-x64-${V}.tar.gz") |
-| Linux arm64 | $(dl AppImage "IRIS-gui-linux-arm64-${V}.AppImage") · $(dl deb "IRIS-gui-linux-arm64-${V}.deb") · $(dl rpm "IRIS-gui-linux-arm64-${V}.rpm") · $(dl "Arch pkg" "IRIS-gui-linux-arm64-${V}.pkg.tar.zst") | $(dl tar.gz "IRIS-cli-linux-arm64-${V}.tar.gz") |
-| Linux riscv64 | $(dl deb "IRIS-gui-linux-riscv64-${V}.deb") · $(dl rpm "IRIS-gui-linux-riscv64-${V}.rpm") · $(dl tar.gz "IRIS-gui-linux-riscv64-${V}.tar.gz") | $(dl tar.gz "IRIS-cli-linux-riscv64-${V}.tar.gz") |
+| Windows x64 | $(dl Installer "IRIS-Setup-windows-x64-${FV}.exe") · $(dl "Portable zip" "IRIS-gui-windows-x64-${FV}.zip") | $(dl zip "IRIS-cli-windows-x64-${FV}.zip") |
+| Windows arm64 | $(dl Installer "IRIS-Setup-windows-arm64-${FV}.exe") · $(dl "Portable zip" "IRIS-gui-windows-arm64-${FV}.zip") | $(dl zip "IRIS-cli-windows-arm64-${FV}.zip") |
+| macOS, Apple silicon and Intel | $(dl dmg "IRIS-gui-macos-universal-${FV}.dmg") · $(dl zip "IRIS-gui-macos-universal-${FV}.zip") | $(dl tar.gz "IRIS-cli-macos-universal-${FV}.tar.gz") |
+| Linux x64 | $(dl AppImage "IRIS-gui-linux-x64-${FV}.AppImage") · $(dl deb "IRIS-gui-linux-x64-${FV}.deb") · $(dl rpm "IRIS-gui-linux-x64-${FV}.rpm") · $(dl "Arch pkg" "IRIS-gui-linux-x64-${FV}.pkg.tar.zst") | $(dl tar.gz "IRIS-cli-linux-x64-${FV}.tar.gz") |
+| Linux arm64 | $(dl AppImage "IRIS-gui-linux-arm64-${FV}.AppImage") · $(dl deb "IRIS-gui-linux-arm64-${FV}.deb") · $(dl rpm "IRIS-gui-linux-arm64-${FV}.rpm") · $(dl "Arch pkg" "IRIS-gui-linux-arm64-${FV}.pkg.tar.zst") | $(dl tar.gz "IRIS-cli-linux-arm64-${FV}.tar.gz") |
+| Linux riscv64 | $(dl deb "IRIS-gui-linux-riscv64-${FV}.deb") · $(dl rpm "IRIS-gui-linux-riscv64-${FV}.rpm") · $(dl tar.gz "IRIS-gui-linux-riscv64-${FV}.tar.gz") | $(dl tar.gz "IRIS-cli-linux-riscv64-${FV}.tar.gz") |
 
 Not sure which to pick? On Windows take the installer, on macOS the dmg, on Linux the AppImage.
 
