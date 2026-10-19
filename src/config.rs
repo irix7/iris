@@ -301,6 +301,17 @@ pub fn derive_instance(
     if cfg.nat_subnet.is_none() {
         cfg.nat_subnet = Some(format!("192.168.{}.0/24", id % 256));
     }
+    // Per-VM telnet on the next port after monitor/serialA/serialB/CI-tcp.
+    // An explicit forward to guest 23 wins; bridged guests use their own
+    // telnetd instead.
+    if !cfg.port_forward.iter().any(|f| f.guest_port == 23) {
+        cfg.port_forward.push(PortForwardConfig {
+            proto: ForwardProto::Tcp,
+            host_port: ident.port_base.saturating_add(4),
+            guest_port: 23,
+            bind: ForwardBind::Localhost,
+        });
+    }
 
     cfg
 }
@@ -2584,6 +2595,8 @@ mod instance_tests {
         assert!(a.serial_log.as_deref().unwrap().contains("iris-instance-1"));
         assert!(a.test_device_dump.as_deref().unwrap().contains("iris-instance-1"));
         assert!(a.jitv2.cache_dir.contains("iris-instance-1"));
+        assert!(a.port_forward.iter().any(|f| f.guest_port == 23 && f.host_port == 9014));
+        assert!(b.port_forward.iter().any(|f| f.guest_port == 23 && f.host_port == 9024));
     }
 
     #[test]
