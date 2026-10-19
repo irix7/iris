@@ -105,6 +105,8 @@ pub struct Machine {
     disks: Vec<DiskRef>,
     /// Configured nvram file path, recorded in snapshot manifests.
     nvram_path: String,
+    /// Root of this machine's snapshot store (`saves` unless instance mode).
+    snapshot_root: std::path::PathBuf,
     /// Host-forced Newport resolution from `[graphics] resolution` at construction.
     display_resolution: crate::dev::ng1::vc2_timings::NewportResolution,
     /// Whether Newport is active (not headless and Newport is selected).
@@ -1203,6 +1205,11 @@ impl Machine {
 
         crate::thread_affinity::init(perf);
 
+        let snapshot_root = cfg.state_dir.as_deref()
+            .map(|d| std::path::Path::new(d).join("saves"))
+            .unwrap_or_else(|| std::path::PathBuf::from("saves"));
+        crate::snapshot::set_store_root(snapshot_root.clone());
+
         Self {
             cpu,
             _phys: phys,
@@ -1220,6 +1227,7 @@ impl Machine {
             scratch_path,
             disks: disk_provenance,
             nvram_path: nvram_provenance,
+            snapshot_root,
             display_resolution,
             newport_active,
             fullhouse: !guinness,
@@ -1823,7 +1831,7 @@ impl Machine {
         // knows which dirty sectors to import back. The files were just
         // consumed by load_snapshot but they're tiny and re-reading from
         // page cache is cheap (~µs).
-        let overlay_dir = std::path::PathBuf::from("saves").join(name);
+        let overlay_dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&overlay_dir);
         let overlay_sets = snap.read_toml("cow.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
         let overlay_sets1 = snap.read_toml("cow1.toml").map(|v| parse_cow_table(&v)).unwrap_or_default();
@@ -2047,7 +2055,7 @@ impl Machine {
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
+        let dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&dir);
         snap.ensure_dir().map_err(|e| e.to_string())?;
 
@@ -2156,7 +2164,7 @@ impl Machine {
         // bank is treated as dirty and correctness is preserved at the cost of
         // the optimisation.
         if sv >= 3 {
-            let store = ChunkStore::new("saves");
+            let store = ChunkStore::new(&self.snapshot_root);
             let mut chunks = ChunksManifest::default();
             let incremental = !cfg!(feature = "jitv2");
             let prev = self.last_chunk_hashes.clone();
@@ -2289,7 +2297,7 @@ impl Machine {
         // Reset to clean state before loading
         self.power_on_devices();
 
-        let dir = std::path::PathBuf::from("saves").join(name);
+        let dir = self.snapshot_root.join(name);
         let snap = Snapshot::new(&dir);
 
         // Validate the manifest before reading anything else. Legacy snapshots
@@ -2465,7 +2473,7 @@ impl Machine {
         // Bulk memory: v3+ comes from the content-addressable chunk store
         // shared across snapshots; v2 reads raw bank{N}.bin files.
         if schema_version >= 3 {
-            let store = ChunkStore::new("saves");
+            let store = ChunkStore::new(&self.snapshot_root);
             let chunks = snap.read_chunks_manifest()
                 .map_err(|e| format!("read chunks.bin: {}", e))?;
             for (i, hashes) in chunks.bank_chunks.iter().enumerate() {
