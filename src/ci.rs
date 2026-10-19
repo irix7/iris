@@ -74,6 +74,31 @@ impl Drop for CiServer {
     }
 }
 
+/// Prepare a Unix CI socket path for bind without stealing a live instance's
+/// socket. A stale file is removed; a path that accepts a connection is a live
+/// server and the bind is refused.
+#[cfg(unix)]
+fn prepare_socket_path(path: &str) -> Result<(), String> {
+    if ci_socket_is_tcp(path) {
+        return Ok(());
+    }
+    if !std::path::Path::new(path).exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(format!(
+            "CI socket {path} is live (another iris is listening); refusing to steal it"
+        )),
+        Err(_) => std::fs::remove_file(path)
+            .map_err(|e| format!("could not remove stale CI socket {path}: {e}")),
+    }
+}
+
+#[cfg(not(unix))]
+fn prepare_socket_path(_path: &str) -> Result<(), String> { Ok(()) }
+
+/// Remove our own socket on shutdown/quit. Unlike [`prepare_socket_path`],
+/// this is called only after the server has stopped, so the file is stale.
 fn cleanup_socket_path(path: &str) {
     if ci_socket_is_tcp(path) {
         return;
@@ -145,7 +170,7 @@ pub fn start_server(
 
 #[cfg(unix)]
 fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    cleanup_socket_path(path);
+    prepare_socket_path(path)?;
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("failed to bind {}: {}", path, e))?;
     eprintln!("iris: --ci control socket listening at {}", path);
@@ -1284,5 +1309,29 @@ fn cmd_push(args: &Value) -> Response {
             "bytes_transferred": report.bytes_transferred,
         })),
         Err(e) => Response::err(format!("push: {}", e)),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_ci_socket_is_not_stolen() {
+        let dir = std::env::temp_dir().join(format!("iris-ci-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("iris.sock");
+        let path_s = path.to_str().unwrap();
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let err = prepare_socket_path(path_s).unwrap_err();
+        assert!(err.contains("live"), "{err}");
+        assert!(path.exists(), "a live socket must be left alone");
+        drop(listener);
+
+        prepare_socket_path(path_s).expect("a stale socket is replaced");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
