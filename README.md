@@ -314,7 +314,7 @@ But that doesn't mean we don't do proper software engineering. So lets keep PRs 
 
 ## Benchmarks
 
-On this host the JIT (jitv2) runs the R4400 guest at 576 MIPS versus 47 MIPS interpreted (12.3x speedup).
+On this host the JIT (jitv2) runs the R4400 guest at 644 MIPS versus 126 MIPS interpreted (5.1x speedup).
 
 See **[BENCHMARKS.md](BENCHMARKS.md)** for the full benchmark suite documentation: bare-metal kernels, IRIX workloads, CI workflows, data pipeline, and generated charts.
 
@@ -324,10 +324,10 @@ Latest run (4 cells):
 
 | cell | CPU | accuracy | MIPS | DMIPS | LINPACK MFLOPS | Whetstone k/s |
 |---|---|---:|---:|---:|---:|---:|
-| `r4400-interp` | R4400 | 100.0% | 46.9 | 66.1 | 8.6 | 2358.0 |
-| `r4400-jitv2` | R4400 | 100.0% | 575.8 | 554.9 | 47.2 | 1161.0 |
-| `r5000-interp` | R5000 | 100.0% | 46.1 | 66.0 | 8.3 | 2316.0 |
-| `r5000-jitv2` | R5000 | 100.0% | 340.2 | 744.5 | 68.0 | 3654.0 |
+| `r4400-interp` | R4400 | 100.0% | 126.4 | 168.8 | 20.6 | 6001.0 |
+| `r4400-jitv2` | R4400 | 100.0% | 644.2 | 531.2 | 36.9 | 1308.0 |
+| `r5000-interp` | R5000 | 100.0% | 61.7 | 92.3 | 10.9 | 2919.0 |
+| `r5000-jitv2` | R5000 | 100.0% | 405.1 | 881.0 | 57.9 | 9295.0 |
 
 Charts (auto-regenerated from CI history):
 
