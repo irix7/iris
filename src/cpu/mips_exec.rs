@@ -12112,13 +12112,26 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                 // one ordered queue.
                 guard.drain_guest_timers();
                 #[cfg(feature = "idle-pause")]
-                if crate::cpu::idle_park::idle_park_enabled() && idle_state.update(&guard.core) {
-                    drop(guard);
-                    {
-                        let mut guard = executor.lock();
-                        idle_state.park(&mut guard.core, &running);
+                if crate::cpu::idle_park::idle_park_enabled() {
+                    match idle_state.update(&guard.core) {
+                        crate::cpu::idle_park::IdleDecision::Park => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.park(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::Pace => {
+                            drop(guard);
+                            {
+                                let mut guard = executor.lock();
+                                idle_state.pace(&mut guard.core, &running);
+                            }
+                            guard = executor.lock();
+                        }
+                        crate::cpu::idle_park::IdleDecision::None => {}
                     }
-                    guard = executor.lock();
                 }
                 // --- end idle park ---
                 // --- perf sampling (comment out to disable) ---

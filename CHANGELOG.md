@@ -18,6 +18,22 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Idle / headless runs
+
+- **Headless idle spin no longer pegs host CPU (#83).** A headless/CI guest whose
+  idle path is a tight backward-branch spin with interrupts masked (`IE=0` or
+  `IM=0`, so `idle-pause` cannot park) used to burn a host core indefinitely
+  during bare-metal bring-up. The idle detector now recognises the repeated
+  state and **paces** it instead: sleeps in bounded slices while advancing guest
+  cycles at the 10 ns/cycle host-pacing rate, so CP0 Count/Compare and any
+  armed guest timer keep tracking wall-clock time. Each slice re-checks the
+  interrupt word and `running`, so a monitor command, soft reset, or a newly
+  unmasked interrupt ends it at once, and it never sleeps past the next
+  guest-time deadline. Host CPU drops from ~100 % to a small fraction of one
+  core; the monitor, soft reset, CP0 timer/clock and serial console stay
+  responsive. The existing `WAIT`/`IE=1` idle-park path is unchanged.
+  (`src/cpu/idle_park.rs`, `src/cpu/mips_exec.rs`)
+
 ### Instances / parallel runs
 
 - **Instance mode: `--instance`, `--state-dir`, `--port-base` and
