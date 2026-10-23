@@ -689,6 +689,10 @@ impl Device for Seeq8003 {
                 // SeeqState lock acquisition and loop straight back to the wait.
                 if matches!(tx_result, TxPumpResult::Nothing)
                     && matches!(rx_result, RxPumpResult::Nothing) {
+                    // Clear `busy` before skipping the apply stage: otherwise a
+                    // single earlier frame leaves it set forever and the thread
+                    // never waits again, pinning a host core while idle.
+                    busy = false;
                     continue;
                 }
 
