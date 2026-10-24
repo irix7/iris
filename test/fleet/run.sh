@@ -5,8 +5,9 @@
 # serial socket, the way an agent driving a fleet does. It asserts the things
 # parallel agentic runs depend on:
 #
-#   * `--instance i` derives disjoint state dirs, CI sockets, monitor ports,
-#     guest MACs and NAT subnets (via the `--print-instance` surface).
+#   * `--instance i` derives disjoint state dirs, CI sockets, ownership locks,
+#     monitor ports, guest MACs and NAT subnets (via the `--print-instance`
+#     surface).
 #   * N instances boot together, each reachable on its own CI socket.
 #   * Each instance's PROM command monitor answers over its serial console
 #     (serial-send + serial-wait round trip), and the instances can be driven
@@ -48,7 +49,7 @@ fail() { echo "fleet: FAIL: $*" >&2; exit 1; }
 
 # ── 1. derivation must be disjoint ───────────────────────────────────────────
 # --print-instance is the discoverability surface agents use to find endpoints.
-declare -A DIR SOCK MON MAC SUBNET
+declare -A DIR SOCK MON MAC SUBNET LOCK
 for ((i=0;i<N;i++)); do
   out="$("$IRIS" --config "$CONFIG" --instance "$i" --print-instance)"
   DIR[$i]="$(sed -n 's/^state_dir: //p'   <<<"$out")"
@@ -56,12 +57,14 @@ for ((i=0;i<N;i++)); do
   MON[$i]="$(sed -n 's/^monitor: //p'     <<<"$out")"
   MAC[$i]="$(sed -n 's/^mac: //p'         <<<"$out")"
   SUBNET[$i]="$(sed -n 's/^nat_subnet: //p' <<<"$out")"
-  [[ -n "${SOCK[$i]}" && -n "${MON[$i]}" && -n "${MAC[$i]}" && -n "${SUBNET[$i]}" ]] \
+  LOCK[$i]="$(sed -n 's/^lock: //p'       <<<"$out")"
+  [[ -n "${SOCK[$i]}" && -n "${MON[$i]}" && -n "${MAC[$i]}" && -n "${SUBNET[$i]}" && -n "${LOCK[$i]}" ]] \
     || fail "--print-instance $i did not report all endpoints:"$'\n'"$out"
 done
 for ((i=0;i<N;i++)); do for ((j=i+1;j<N;j++)); do
   [[ "${DIR[$i]}"    != "${DIR[$j]}"    ]] || fail "instances $i/$j share a state dir"
   [[ "${SOCK[$i]}"   != "${SOCK[$j]}"   ]] || fail "instances $i/$j share a CI socket"
+  [[ "${LOCK[$i]}"   != "${LOCK[$j]}"   ]] || fail "instances $i/$j share an ownership lock"
   [[ "${MON[$i]}"    != "${MON[$j]}"    ]] || fail "instances $i/$j share the monitor port"
   [[ "${MAC[$i]}"    != "${MAC[$j]}"    ]] || fail "instances $i/$j share a MAC"
   [[ "${SUBNET[$i]}" != "${SUBNET[$j]}" ]] || fail "instances $i/$j share a NAT subnet"
