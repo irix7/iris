@@ -331,6 +331,7 @@ pub fn derive_instance(
     let mut cfg = base.clone();
 
     cfg.state_dir = Some(ident.state_dir.to_string_lossy().into_owned());
+    cfg.instance_id = Some(id);
 
     if cfg.nvram == default_nvram() {
         cfg.nvram = paths.nvram().to_string_lossy().into_owned();
@@ -424,6 +425,7 @@ pub fn instance_report(cfg: &MachineConfig, ident: &InstanceIdentity) -> String 
     format!(
         "instance: {}\n\
          state_dir: {}\n\
+         lock: {}\n\
          nvram: {}\n\
          nveeprom: {}\n\
          snapshots: {}\n\
@@ -441,6 +443,7 @@ pub fn instance_report(cfg: &MachineConfig, ident: &InstanceIdentity) -> String 
          nat_subnet: {}\n",
         ident.id,
         ident.state_dir.display(),
+        paths.instance_lock().display(),
         cfg.nvram,
         cfg.nveeprom,
         paths.snapshots_dir().display(),
@@ -1604,6 +1607,17 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_dir: Option<String>,
 
+    /// The fleet instance id when `--instance` / `--state-dir` / `--port-base`
+    /// engaged [`derive_instance`]. Runtime-only: it is derived, never read
+    /// from TOML, and names the instance in the ownership lock file.
+    #[serde(skip)]
+    pub instance_id: Option<u32>,
+
+    /// `--replace`: stop the instance that owns this state directory's lock (or
+    /// the live CI socket) before starting. Runtime-only.
+    #[serde(skip)]
+    pub replace: bool,
+
     /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. Every machine
     /// today has four (`MachineProfile::memory_banks`); the rest must be 0.
     /// On the Indy and Indigo2 a bank is 0 (absent), 8, 16, 32, 64 or 128 MB
@@ -1841,6 +1855,12 @@ pub fn ci_socket_tcp_addr(path: &str) -> String {
         path.to_string()
     }
 }
+
+/// The port of a `host:port` / `tcp:host:port` address, when it parses.
+fn tcp_port(addr: &str) -> Option<u16> {
+    addr.rsplit_once(':')?.1.parse().ok()
+}
+
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
@@ -1925,6 +1945,8 @@ impl Default for MachineConfig {
             nvram: default_nvram(),
             nveeprom: default_nveeprom(),
             state_dir: None,
+            instance_id: None,
+            replace: false,
             banks: default_banks(),
             scsi: default_scsi(),
             scale: default_scale(),
@@ -2103,6 +2125,42 @@ impl MachineConfig {
         self.banks[..n].to_vec()
     }
 
+    /// Listener ports that must not collide with one another. Serial ports are
+    /// not bound in `--ci` mode (the in-process CI serial backend replaces
+    /// them), so they are omitted there.
+    fn validate_listener_ports(&self) -> Result<(), String> {
+        let mut ports: Vec<(&str, u16)> = vec![(
+            "monitor_port",
+            self.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT),
+        )];
+        if !self.ci {
+            let [a, b] = self.serial_ports();
+            ports.push(("serial_port_a", a));
+            ports.push(("serial_port_b", b));
+        }
+        if self.ci && ci_socket_is_tcp(&self.ci_socket) {
+            if let Some(port) = tcp_port(&ci_socket_tcp_addr(&self.ci_socket)) {
+                ports.push(("ci_socket", port));
+            }
+        }
+        if let Some(port) = self.gdb_port {
+            ports.push(("gdb_port", port));
+        }
+        for (i, (name_a, a)) in ports.iter().enumerate() {
+            if *a == 0 {
+                continue; // 0 asks the OS for an ephemeral port
+            }
+            for (name_b, b) in &ports[i + 1..] {
+                if a == b {
+                    return Err(format!(
+                        "{name_a} and {name_b} both use TCP port {a}; each listener needs its own port"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate bank sizes, returns a description of any errors.
     /// The graphics board: `[graphics] board`, or the machine's default
     /// when it is not set (Solid IMPACT on the Octane, Newport elsewhere).
@@ -2177,6 +2235,7 @@ impl MachineConfig {
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
+        self.validate_listener_ports()?;
         let bank_count = self.machine.profile.memory_banks();
         for (i, &sz) in self.banks.iter().enumerate().skip(bank_count) {
             if sz != 0 {
@@ -2617,6 +2676,14 @@ pub struct Cli {
     /// subnet as `key: value` lines, then exit. Implies instance mode.
     #[arg(long = "print-instance", default_value_t = false)]
     pub print_instance: bool,
+
+    /// Replace the instance that owns this state directory's lock (or the live
+    /// CI socket at --ci-socket), instead of failing. Only the recorded owner
+    /// is stopped: its CI socket is asked to quit, or the recorded PID is
+    /// signalled after its start time has been verified. Never kills an
+    /// unrelated process that reused the PID.
+    #[arg(long, default_value_t = false)]
+    pub replace: bool,
 }
 
 impl Cli {
@@ -2666,6 +2733,7 @@ impl Cli {
         if self.ci         { cfg.ci         = true; }
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
+        if self.replace    { cfg.replace    = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
         if let Some(mode) = self.serial_log_timestamps { cfg.serial_log_timestamps = mode; }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
@@ -3315,6 +3383,8 @@ mod instance_tests {
         let a = derived(1);
         let b = derived(2);
         assert_ne!(a.state_dir, b.state_dir);
+        assert_eq!(a.instance_id, Some(1));
+        assert_eq!(b.instance_id, Some(2));
         assert_ne!(a.nvram, b.nvram);
         assert_ne!(a.nveeprom, b.nveeprom);
         assert_ne!(a.ci_socket, b.ci_socket);
@@ -3443,6 +3513,7 @@ mod instance_tests {
         let report = instance_report(&c, &ident);
         assert!(report.contains("instance: 3\n"), "{report}");
         assert!(report.contains("state_dir: iris-instance-3\n"), "{report}");
+        assert!(report.contains("lock: iris-instance-3/iris.lock\n"), "{report}");
         assert!(report.contains("nvram: iris-instance-3/nvram.bin\n"), "{report}");
         assert!(report.contains("snapshots: iris-instance-3/saves\n"), "{report}");
         assert!(report.contains("chunk_store: iris-instance-3/saves/.cas\n"), "{report}");
@@ -3461,5 +3532,28 @@ mod instance_tests {
     fn default_export_omits_state_dir() {
         let out = toml::to_string(&MachineConfig::default()).unwrap();
         assert!(!out.contains("state_dir"), "{out}");
+        assert!(!out.contains("instance_id"), "{out}");
+        assert!(!out.contains("replace"), "{out}");
+    }
+
+    #[test]
+    fn listener_ports_must_be_distinct() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.clear();
+        cfg.monitor_port = Some(9100);
+        cfg.serial_port_a = Some(9100);
+        let err = cfg.validate().expect_err("monitor and serial A cannot share a port");
+        assert!(err.contains("monitor_port") && err.contains("serial_port_a"), "{err}");
+        assert!(err.contains("9100"), "{err}");
+    }
+
+    #[test]
+    fn ci_mode_does_not_reserve_the_serial_ports_it_never_binds() {
+        let mut cfg = MachineConfig::default();
+        cfg.scsi.clear();
+        cfg.ci = true;
+        cfg.monitor_port = Some(9100);
+        cfg.serial_port_a = Some(9100);
+        cfg.validate().expect("CI serial is in-process; the TCP port is unused");
     }
 }

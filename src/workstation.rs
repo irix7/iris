@@ -409,6 +409,7 @@ pub(crate) fn register_system_controller(
                             // does not kill the host process.
                             #[cfg(not(feature = "developer"))]
                             if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+                                crate::instance::cleanup_for_exit();
                                 std::process::exit(0);
                             }
                         }

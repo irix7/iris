@@ -483,6 +483,7 @@ impl Machine {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("iris: fatal: {}: {}", label, e);
+                        crate::instance::cleanup_for_exit();
                         std::process::exit(1);
                     }
                 };
@@ -497,6 +498,7 @@ impl Machine {
                             eprintln!("iris: warning: {msg}; continuing without {label}");
                         } else {
                             eprintln!("iris: fatal: {msg}");
+                            crate::instance::cleanup_for_exit();
                             std::process::exit(1);
                         }
                     }
@@ -553,6 +555,7 @@ impl Machine {
                     continue;
                 }
                 eprintln!("iris: fatal: {msg}");
+                crate::instance::cleanup_for_exit();
                 std::process::exit(1);
             }
         }
@@ -1164,6 +1167,7 @@ impl Machine {
                     Err(_) => break,
                 }
             }
+            crate::instance::cleanup_for_exit();
             std::process::exit(0);
         });
 
