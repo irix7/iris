@@ -20,8 +20,19 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-IRIS="${1:-${IRIS:-$REPO/target/debug/iris}}"
-IRIS_CI="${2:-${IRIS_CI:-$REPO/target/debug/iris-ci}}"
+# Prefer the Nix dev shell's launcher (issue #104): it carries the build's own
+# library search path, so this test needs no LD_LIBRARY_PATH of its own. Before
+# `nix develop` has run, or on a plain host, fall back to the cargo build (CI
+# passes target/debug/iris explicitly).
+default_bin() {
+  if [ -x "$REPO/target/launcher/bin/$1" ]; then
+    echo "$REPO/target/launcher/bin/$1"
+  else
+    echo "$REPO/target/debug/$1"
+  fi
+}
+IRIS="${1:-${IRIS:-$(default_bin iris)}}"
+IRIS_CI="${2:-${IRIS_CI:-$(default_bin iris-ci)}}"
 # The emulator runs from $WORK (snapshots live under cwd-relative `saves/`), so
 # resolve relative binary arguments against the caller's cwd first.
 IRIS="$(cd "$(dirname "$IRIS")" && pwd)/$(basename "$IRIS")"
@@ -31,17 +42,6 @@ JOURNAL_N="${JOURNAL_N:-200000}"
 
 [[ -x "$IRIS" ]]    || { echo "journal: no iris binary at $IRIS" >&2; exit 2; }
 [[ -x "$IRIS_CI" ]] || { echo "journal: no iris-ci binary at $IRIS_CI" >&2; exit 2; }
-
-# Inside `nix develop` the binaries link nix-store libs that are not on the
-# default loader path. No-op on a plain host (CI installs libasound directly).
-if [ -n "${NIX_LDFLAGS:-}" ]; then
-  p=$(printf '%s' "$NIX_LDFLAGS" | tr ' ' '\n' | sed -n 's/^-L//p' | paste -sd:)
-  export LD_LIBRARY_PATH="$p${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-fi
-gccdir=$(dirname "$(gcc -print-file-name=libstdc++.so.6 2>/dev/null)" 2>/dev/null)
-if [ -n "$gccdir" ] && [ -e "$gccdir/libstdc++.so.6" ]; then
-  export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$gccdir"
-fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/iris-journal.XXXXXX")"
 cleanup() {

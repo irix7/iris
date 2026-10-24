@@ -24,8 +24,19 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-IRIS="${1:-${IRIS:-$REPO/target/debug/iris}}"
-IRIS_CI="${2:-${IRIS_CI:-$REPO/target/debug/iris-ci}}"
+# Prefer the Nix dev shell's launcher (issue #104): it carries the build's own
+# library search path, so this test needs no LD_LIBRARY_PATH of its own. Before
+# `nix develop` has run, or on a plain host, fall back to the cargo build (CI
+# passes target/debug/iris explicitly).
+default_bin() {
+  if [ -x "$REPO/target/launcher/bin/$1" ]; then
+    echo "$REPO/target/launcher/bin/$1"
+  else
+    echo "$REPO/target/debug/$1"
+  fi
+}
+IRIS="${1:-${IRIS:-$(default_bin iris)}}"
+IRIS_CI="${2:-${IRIS_CI:-$(default_bin iris-ci)}}"
 # Each instance runs from its own state dir, so relative binary arguments
 # must be resolved against the caller's cwd first.
 IRIS="$(cd "$(dirname "$IRIS")" && pwd)/$(basename "$IRIS")"
