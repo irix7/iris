@@ -57,8 +57,9 @@ Consequences for this plan:
 | #261 `irq: an InterruptController trait` | atomchild411 | The merge adopts it wholesale; the fork's `PdmaCallback` and `fifo_full_cb` closures are abandoned in its favour. |
 | #253 `idle-pause: wake for an interrupt masked by a raised spl` | slaapliedje | The fork's `IdleDecision::Pace` is a follow-up to their fix; credit it. |
 
-PR 3 is the only unit that removes another contributor's design, so it should
-start as an issue addressed to `atomchild411` rather than a surprise patch.
+Unit 4 (storage) is the only one that removes another contributor's design, so
+it should start as an issue addressed to `atomchild411` rather than a surprise
+patch.
 
 ## Closed — upstream already solved these differently
 
@@ -82,14 +83,37 @@ Each entry gives the canonical commits (the `main` side where a work branch and
 ### 1. serial: `TCP_NODELAY` on the TCP console
 
 - `8514e6c` — **the nodelay half only**, against upstream's `accept_waiting`.
-- 1 file: `src/dev/z85c30.rs`. Two lines plus a comment.
+- 1 file: `src/dev/z85c30.rs`, 5 lines.
+- **Prepared:** branch `upstream/serial-nodelay`, commit `38a47fd`. Applies and
+  compiles on `upstream/main`.
 
-### 2. scsi: bulk DMA advances the channel address
+### 2. ci: wait for the login prompt instead of sleeping
 
-- `1492b44`
-- 1 file: `src/dev/hpc3.rs`.
+- `4b0b4a0`
+- 1 file: `src/iris_ci_main.rs`, +7/−2.
+- Replaces a fixed 2 s sleep in `cmd_login` with a bounded wait for IRIX's
+  `TERM =` prompt. Upstream already has `wait_with_deadline`, and its
+  `cmd_login` is identical to the fork's pre-image, so the patch is clean.
+- **Prepared:** branch `upstream/ci-login-prompt`, commit `855316c`.
 
-### 3. storage: the layered block-node interface (`#49` → `#51`)
+### 3. ci: bound connections and reap idle handlers
+
+- `687b76d`
+- 1 file: `src/ci.rs`, +32/−2.
+- Caps in-flight CI connections at 32 and gives each handler a 300 s read
+  timeout, so abandoned clients cannot accumulate threads and descriptors.
+- **Prepared:** branch `upstream/ci-bound-connections`, commit `86d209f`.
+
+### Not standalone: scsi bulk DMA
+
+`1492b44` ("make bulk DMA advance the channel address") reads like a
+one-file bug fix, but upstream's `DmaClient` trait has no `read_block`/
+`write_block` at all — bulk DMA is the fork's `d90dcc2`. So it is a fix to
+fork-only code and must travel **with the bulk-DMA introduction** as one PR,
+not on its own. It also conflicts with upstream's `hpc3` structure, which now
+uses `IrqLine` rather than the fork's `PdmaCallback`.
+
+### 4. storage: the layered block-node interface (`#49` → `#51`)
 
 - `df7f6c7` (`#49`), `1801c06` (`#50`), `d9c1953` (`#51`)
 - 8 files: `src/block_node.rs` (new), `src/chd_disk.rs`, `src/cow_disk.rs`,
@@ -105,12 +129,12 @@ reference. Do not bundle feature changes into this PR.
 Squash the three commits into one: upstream sees one change ("replace the
 backend enum with a layered block node"), and it must stay bisectable.
 
-### 4. disks: advisory-lock read-write base images
+### 5. disks: advisory-lock read-write base images
 
 - `ab0be92`
 - 1 file: `src/block_node.rs`. **Depends on 3.**
 
-### 5. HAL2: capture, backpressure and pacing
+### 6. HAL2: capture, backpressure and pacing
 
 - `47ce24f` (`#60`), `ffe3e04` (`#62`), `50093f0` (`#61`), `63ce732` (`#59`),
   `3f274b6` (`#72`), `4f04cff` (`#73`), `5ea051c`
@@ -121,7 +145,7 @@ Land the trait/backpressure commits first; the wav/null capture and the CI job
 follow. `c3dac87` (`#44`, snapshot support) does **not** belong here — it goes
 with 6/7.
 
-### 6. snapshot: registered state descriptions (`#45` → `#46` → `#48` → `#69`)
+### 7. snapshot: registered state descriptions (`#45` → `#46` → `#48` → `#69`)
 
 - `e86b001` (`#45`), `ed9bcce` (`#46`), `12e53f0` (`#48`), `559f3d9` (`#69`)
 - `src/state_desc.rs` (new), `src/snapshot.rs`, `src/traits.rs`,
@@ -132,7 +156,7 @@ with 6/7.
 Open these as four PRs, not one: `#45` is the seam, `#46` adds versioning, `#48`
 is an independent chunk-store optimisation, `#69` is mechanical adoption.
 
-### 7. cpu: record/replay journal (`#47`)
+### 8. cpu: record/replay journal (`#47`)
 
 - `2f5b89e`
 - `src/cpu/journal.rs` (new), `src/cpu/mips_exec.rs`, `src/ci.rs`,
@@ -140,7 +164,7 @@ is an independent chunk-store optimisation, `#69` is mechanical adoption.
 
 Depends on 6 only if the journal uses `StateDesc`.
 
-### 8. rex3-jit: hot/cold compile queue (`#58`)
+### 9. rex3-jit: hot/cold compile queue (`#58`)
 
 - `951da79`
 - 4 files: `src/dev/ng1/rex3_jit_queue.rs` (new),
@@ -149,7 +173,7 @@ Depends on 6 only if the journal uses `StateDesc`.
 Strictly better than upstream's single channel plus retry-on-full: the draw
 path is never dropped for a full queue, warm-up blocks instead.
 
-### 9. gr2: FIN2/FIN3 sequence tokens (`#57`, `#67`)
+### 10. gr2: FIN2/FIN3 sequence tokens (`#57`, `#67`)
 
 - `b8976a0` (`#57`), `a47c451` (rollback), `310c511` (`#67`), `817513e`
 - `src/dev/gr2/*`, `src/machine.rs`
@@ -157,7 +181,7 @@ path is never dropped for a full queue, warm-up blocks instead.
 `310c511` also wants the fork's `dma_space_cb` seam on REX3/GR2 (see the closed
 table), so either include that or land `#67` with a different wake path.
 
-### 10. vino: descriptor engine rewrite (`#56`, `#71`, `#70`)
+### 11. vino: descriptor engine rewrite (`#56`, `#71`, `#70`)
 
 - `0f15003` (`#56`), `f84d43a` (`#71`), `dfc1f0b` (`#70`), `f446354` (plan doc)
 - `src/dev/vino.rs`, `docs/vino-descriptor-plan.md`
@@ -166,15 +190,15 @@ Highest risk and highest payoff. Upstream still patches the old
 `dma_emit_dword`; the fork splits pixel production from descriptor fetch. Needs
 its own review cycle and live 5.3/6.5 capture validation.
 
-### 11. CI serial harness hardening
+### 12. CI serial harness hardening
 
-- `59b1458`, `df49429`, `687b76d`, `4b0b4a0`
-- `src/ci.rs`, `src/dev/z85c30.rs`, `src/iris_ci_main.rs`
+- `59b1458`, `df49429`
+- `src/ci.rs`, `src/dev/z85c30.rs`
 
 Generic, but written against the fork's serial plumbing. Split one behaviour
-per PR.
+per PR. (`687b76d` and `4b0b4a0` are already units 2 and 3 above.)
 
-### 12. Discussion first: the CPU clock model
+### 13. Discussion first: the CPU clock model
 
 - `800f785` (`#43` guest-time timer queue), `e8b264e` (`#42` cycle-derived
   clock), `8df2ad0` (`#35` accurate-cache), `e6050b7`
@@ -183,7 +207,7 @@ This changes a contract `HACKING.md` states differently upstream (host
 wall-clock vs retired cycles). Open an issue with the reasoning and the idle-park
 interaction before writing a PR; it touches every timing-sensitive test.
 
-### 13. jitv2 track — separate campaign
+### 14. jitv2 track — separate campaign
 
 - `0ebca99`, `e0cf094`, `2a7889a`, `89671d8`, `f8394e6`, `b8a2393`, `f1513f1`,
   `f830864`, `8c6265a`
@@ -191,7 +215,7 @@ interaction before writing a PR; it touches every timing-sensitive test.
 Conflicts with upstream's own jitv2 work (`13ffcc2` and neighbours). Rebase and
 re-measure each against upstream `main` after 6–11 land.
 
-### 14. perf bundles — split before sending
+### 15. perf bundles — split before sending
 
 - `9d1988a` (26 files), `d90dcc2` (13 files)
 
