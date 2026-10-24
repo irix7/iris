@@ -715,6 +715,8 @@ Instances (parallel agentic runs)
   --state-dir <PATH>          Override the derived instance state directory
   --port-base <PORT>          Base for the derived port block (default 9000 + N*10)
   --print-instance            Print the derived endpoints as `key: value` and exit
+  --replace                   Stop the instance that owns this state directory's
+                              lock (or the live CI socket), then start
 
   -h, --help                  Print help
 ```
@@ -752,6 +754,47 @@ iris --instance 0 --ci &
 iris --instance 1 --ci &
 iris --instance 2 --print-instance   # print the derived endpoints, don't boot
 ```
+
+### Instance ownership and cleanup
+
+Every CLI start takes an exclusive lock on `iris.lock` in its state
+directory: `iris-instance-<N>/iris.lock` in instance mode, or `iris.lock` in
+the working directory for a plain single-instance run. The file records the
+owner's PID, instance id, state directory, CI socket, monitor port and process
+start time. A second start in the same state directory fails with the owner's
+PID instead of silently sharing NVRAM, ports or a CI socket:
+
+```
+iris: another iris instance is already using this state (lock iris.lock):
+pid 12345 (instance 0), iris, state dir iris-instance-0.
+Use a different --instance or --state-dir, or --replace to stop it.
+```
+
+The advisory file lock, not the PID in the file, is what decides liveness: the
+kernel releases it when the process dies, including after a crash or
+`SIGKILL`. A leftover `iris.lock` with a dead PID is therefore reclaimed
+automatically, as is a stale CI socket file. `--replace` stops the recorded
+owner before starting: it asks the owner's CI socket to `quit` (a clean
+`Machine::stop`, so NVRAM and the Indigo2 EEPROM are written), and only if that
+is impossible sends `SIGTERM` to the recorded PID after checking that the
+process start time still matches. It never signals a PID that now belongs to
+some other program.
+
+Startup also checks the listeners the machine is about to bind — monitor,
+serial A/B when not in `--ci` mode, the GDB stub, and the CI socket (a TCP
+port, or a Unix path probed for a live/stale server) — and fails with a clear
+error if another program holds one. The serial TCP ports are not checked in
+`--ci` mode because that mode uses its in-process CI serial backend instead of
+binding them.
+
+`SIGINT`, `SIGTERM` and `SIGHUP` remove the CI socket and lock file and exit
+with the usual signal status. They do **not** stop the guest: stopping it takes
+locks and writes NVRAM, which is not safe from a signal handler. Quit through
+the monitor or `iris-ci quit` (or let `--replace` do it) when you need a clean
+shutdown. On Windows there is no Unix-socket file to remove; the lock file is
+truncated on a normal exit and left in place rather than unlinked, and the OS
+releases the lock when the process dies. A stale record is harmless: the next
+start recognises the free lock and overwrites it.
 
 ---
 

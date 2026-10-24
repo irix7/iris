@@ -36,6 +36,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Instances / parallel runs
 
+- **Instance ownership lock and stale-instance handling (#103).** Every CLI
+  start now takes an exclusive advisory lock on `iris.lock` in its state
+  directory (`iris.lock` in the working directory for a plain run) before
+  opening disks, NVRAM or listeners. The lock, not the PID in the file, decides
+  liveness: a crash or `SIGKILL` leaves a stale file the next start reclaims. A
+  second start fails with the owner's PID, instance id and state dir, and
+  `--replace` stops that owner first — preferring a clean `quit` over its CI
+  socket (which saves NVRAM/EEPROM) and only sending `SIGTERM` after checking
+  the recorded process start time, so a recycled PID is never signalled.
+  Startup also probes the monitor, serial (outside `--ci`), GDB and TCP CI
+  listeners and removes a stale Unix CI socket before the Machine is built.
+  `SIGINT`/`SIGTERM`/`SIGHUP` remove the CI socket and lock and re-raise the
+  signal; they do not stop the guest. `tests/instance_lifecycle.rs` covers
+  start/quit/restart, refusal, replacement, stale files, signal cleanup and a
+  busy port. (`src/instance.rs`, `src/state.rs`, `src/main.rs`, `src/ci.rs`)
 - **Instance mode: `--instance`, `--state-dir`, `--port-base` and
   `--print-instance`.** Running several IRIS VMs from one host used to mean hand
   writing N configs that did not collide on NVRAM, snapshots, ports, the CI
