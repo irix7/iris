@@ -1137,6 +1137,18 @@ pub fn format_unix_utc(unix_secs: i64) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, s / 3600, s / 60 % 60, s % 60)
 }
 
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ` for a Unix time in seconds and microseconds
+/// (UTC). Used by `--serial-log-timestamps`; always six fractional digits so
+/// the width is stable and the stamp is easy to grep.
+pub fn format_unix_utc_iso_micros(unix_secs: i64, micros: u32) -> String {
+    let (y, m, d) = civil_from_days(unix_secs.div_euclid(86_400));
+    let s = unix_secs.rem_euclid(86_400);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+        y, m, d, s / 3600, s / 60 % 60, s % 60, micros.min(999_999)
+    )
+}
+
 fn is_leap_year(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
 
 fn days_in_month(y: i64, m: i64) -> i64 {
@@ -1320,6 +1332,28 @@ mod scsi_keys {
     }
 }
 
+/// What `--serial-log` writes before each line.
+///
+/// `Off` is a byte-for-byte transcript: nothing is added to or removed from
+/// the guest's serial output, so existing transcript comparisons keep working.
+/// The other modes prefix every line with a stable, greppable stamp and are
+/// therefore an event stream, not a raw capture — do not use them on binary
+/// serial traffic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
+pub enum SerialLogTimestamps {
+    /// Raw transcript: no added bytes (default).
+    #[default]
+    Off,
+    /// Monotonic guest time, from retired CPU cycles at 10 ns/cycle.
+    Guest,
+    /// Wall clock, UTC, ISO 8601 with microseconds.
+    Wall,
+    /// Guest time followed by wall clock.
+    Both,
+}
+
 /// Top-level machine configuration.
 ///
 /// Field order matters for TOML export: the `toml` serializer requires every
@@ -1471,10 +1505,17 @@ pub struct MachineConfig {
     pub lock_aspect_ratio: bool,
 
     /// Optional file path that will receive every byte emitted on ttyd1
-    /// (the IRIX serial console) in `--ci` mode. Append-only. Useful for
-    /// keeping a continuously-updated transcript of the install or test run.
+    /// (the IRIX serial console), in both `--ci` and ordinary runs.
+    /// Append-only: existing contents are preserved. Useful for keeping a
+    /// continuously-updated transcript of the install or test run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_log: Option<String>,
+
+    /// Prefix each `serial_log` line with a timestamp. `off` (default) keeps
+    /// the raw transcript bytes; `guest`, `wall` or `both` make the log a
+    /// line-oriented event stream instead.
+    #[serde(default)]
+    pub serial_log_timestamps: SerialLogTimestamps,
 
     // --- table / array-of-table fields: must be emitted after all scalars ---
 
@@ -1641,6 +1682,7 @@ impl Default for MachineConfig {
             ci_socket: default_ci_socket(),
             ci_display: false,
             serial_log: None,
+            serial_log_timestamps: SerialLogTimestamps::Off,
             vino: VinoConfig::default(),
             network: NetworkSection::default(),
             mouse_scroll_pixels_per_line: default_scroll_pixels_per_line(),
@@ -2081,10 +2123,16 @@ pub struct Cli {
     #[arg(long = "ci-display", default_value_t = false)]
     pub ci_display: bool,
 
-    /// With --ci, append every byte the guest emits on ttyd1 (IRIX serial
-    /// console) to this file. Useful for live tailing during an install.
+    /// Append every byte the guest emits on ttyd1 (IRIX serial console) to
+    /// this file. Works with or without --ci; append-only. Flushed at each
+    /// newline, so a completed line is visible to `tail -f` while iris runs.
     #[arg(long = "serial-log", value_name = "FILE")]
     pub serial_log: Option<String>,
+
+    /// With --serial-log, prefix each line: off (default, raw transcript),
+    /// guest (monotonic guest seconds), wall (UTC ISO 8601), or both.
+    #[arg(long = "serial-log-timestamps", value_name = "MODE", value_enum)]
+    pub serial_log_timestamps: Option<SerialLogTimestamps>,
 
     /// Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28).
     /// IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50.
@@ -2162,6 +2210,7 @@ impl Cli {
         if let Some(p) = &self.ci_socket { cfg.ci_socket = p.clone(); }
         if self.ci_display { cfg.ci_display = true; }
         if let Some(p) = &self.serial_log { cfg.serial_log = Some(p.clone()); }
+        if let Some(m) = self.serial_log_timestamps { cfg.serial_log_timestamps = m; }
         if let Some(mhz) = self.clock_fixed_mhz { cfg.clock.fixed_mhz = Some(mhz); }
         // NB: --ci does NOT imply --headless. REX3 stays alive so screenshots
         // work; main.rs simply skips the host window when ci && !ci_display.
@@ -2318,6 +2367,30 @@ mod export_tests {
         assert_eq!(back.scsi[&1].path, cfg.scsi[&1].path);
         assert_eq!(back.scsi[&4].cdrom, true);
         println!("--- exported toml ---\n{s}");
+    }
+
+    #[test]
+    fn serial_log_timestamps_parse_and_round_trip() {
+        let cfg: MachineConfig = toml::from_str("serial_log_timestamps = \"both\"\n").expect("parse");
+        assert_eq!(cfg.serial_log_timestamps, SerialLogTimestamps::Both);
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        let back: MachineConfig = toml::from_str(&s).expect("deserialize");
+        assert_eq!(back.serial_log_timestamps, SerialLogTimestamps::Both);
+        assert!(toml::from_str::<MachineConfig>("serial_log_timestamps = \"loud\"").is_err());
+        assert_eq!(
+            MachineConfig::default().serial_log_timestamps,
+            SerialLogTimestamps::Off,
+            "the default must stay a raw transcript"
+        );
+    }
+
+    #[test]
+    fn iso_wall_stamp_is_stable() {
+        assert_eq!(
+            format_unix_utc_iso_micros(1_700_000_000, 123_456),
+            "2023-11-14T22:13:20.123456Z"
+        );
+        assert_eq!(format_unix_utc_iso_micros(0, 0), "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]

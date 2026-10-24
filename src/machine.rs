@@ -80,6 +80,9 @@ pub struct Machine {
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
     ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    /// `--serial-log` sink, shared with the SCC backend; held here so
+    /// `stop` can flush a partial final line.
+    serial_log: Option<Arc<crate::dev::serial_log::SerialLog>>,
     /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
     /// name as the fallback path if the in-memory checkpoint is absent.
     last_restore: Option<String>,
@@ -541,6 +544,28 @@ impl Machine {
         let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
         ioc.ps2().set_layout(cfg.keyboard);
 
+        // One log sink for the serial console, shared by the CI backend and
+        // the TCP tee. It is opened here so both paths use the same buffering
+        // and timestamp policy, and is kept on `Machine` to flush at stop.
+        let serial_log = match cfg.serial_log.as_deref() {
+            Some(path) => {
+                match crate::dev::serial_log::SerialLog::open(
+                    std::path::Path::new(path),
+                    cfg.serial_log_timestamps,
+                ) {
+                    Ok(log) => {
+                        eprintln!("iris: serial console mirroring to {}", path);
+                        Some(log)
+                    }
+                    Err(e) => {
+                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
         // drives directly. Channel A (tty2) keeps its default TCP backend.
@@ -548,12 +573,8 @@ impl Machine {
         // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::dev::z85c30::CiSerialBackend::new());
-            if let Some(path) = cfg.serial_log.as_deref() {
-                if let Err(e) = b.set_log_file(path) {
-                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                } else {
-                    eprintln!("iris: serial console mirroring to {}", path);
-                }
+            if let Some(log) = &serial_log {
+                b.set_log(log.clone());
             }
             ioc.scc().set_backend_b(b.clone());
             Some(b)
@@ -562,17 +583,11 @@ impl Machine {
             // 127.0.0.1:8881 (or `serial_port_b`).  If --serial-log was passed, wrap it in a
             // TeeBackend so guest-emitted bytes get mirrored to the file
             // in addition to whatever client is attached to the TCP socket.
-            if let Some(path) = cfg.serial_log.as_deref() {
+            if let Some(log) = &serial_log {
                 let inner = ioc.scc().backend_b();
-                match crate::dev::z85c30::TeeBackend::new(inner, path) {
-                    Ok(tee) => {
-                        ioc.scc().set_backend_b(Arc::new(tee));
-                        eprintln!("iris: serial console mirroring to {}", path);
-                    }
-                    Err(e) => {
-                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                    }
-                }
+                ioc.scc().set_backend_b(Arc::new(
+                    crate::dev::z85c30::TeeBackend::new(inner, log.clone()),
+                ));
             }
             None
         };
@@ -1020,6 +1035,10 @@ impl Machine {
         // The executor now sits at its final address inside `MipsCpu`, so
         // `hot.cycles` is stable: point the guest-time queue's clock at it.
         guest_timers.set_clock(cpu.cycles_ptr());
+        // The serial log's guest timestamp uses the same counter.
+        if let Some(log) = &serial_log {
+            log.set_guest_cycles(cpu.cycles_ptr());
+        }
 
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
@@ -1210,6 +1229,7 @@ impl Machine {
             event_rx: Some(event_rx),
             timer_manager,
             ci_serial,
+            serial_log,
             last_restore: None,
             last_restore_checkpoint: None,
             last_chunk_hashes: None,
@@ -1375,6 +1395,8 @@ impl Machine {
         self.hpc3.stop();
         self.mc.stop();
         if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
+        // A graceful stop must not lose the final partial line.
+        if let Some(log) = &self.serial_log { log.flush(); }
     }
 
     /// The address this Machine's own monitor is serving on, or None when it
@@ -2545,6 +2567,12 @@ impl Drop for Machine {
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
+        // Likewise the serial log's guest timestamp, and give the file one
+        // last flush before the sink is dropped.
+        if let Some(log) = &self.serial_log {
+            log.clear_guest_cycles();
+            log.flush();
+        }
         // Release the monitor port and this Machine's device handles, so the next
         // Machine in the same process (iris-gui Stop -> Start) gets the monitor.
         self.monitor.shutdown();
