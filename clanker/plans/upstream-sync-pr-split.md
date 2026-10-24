@@ -3,6 +3,10 @@
 **Status:** plan, 2026-10-24. Written after merging `upstream/main` (41 commits)
 into `irix7/iris` `main`. Nothing here has been sent upstream yet.
 
+**Tracked as [#85](https://github.com/irix7/iris/issues/85)**, one child issue
+per unit (#86-#101). Update the issue rather than this file when a unit's state
+changes; the doc is the reasoning, the tracker is the status.
+
 This is a proposal for slicing the fork's 133 commits into pull requests
 against upstream. It is derived from the merge's conflict surface and from each
 commit's file list — not from a line-by-line audit of all 133. Treat the
