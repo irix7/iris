@@ -323,6 +323,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [fetchverify-stale-code-detector.md](testing/fetchverify-stale-code-detector.md) | design | `fetchverify`: catching stale code that lockstep cannot see |
 | [installed-probe-test-is-load-flaky.md](testing/installed-probe-test-is-load-flaky.md) | history | `installed_probe_round_trips_to_the_compile_side` is load-flaky |
 | [loading-code-before-post-ram-is-unmapped.md](testing/loading-code-before-post-ram-is-unmapped.md) | rule | Loading code before POST: RAM is unmapped, and the write is silent |
+| [monitor-prompt-is-line-start.md](testing/monitor-prompt-is-line-start.md) | rule | The monitor prompt is `CRLF > SPACE`, not any `> ` |
 | [running-cpu-tests-on-real-hardware.md](testing/running-cpu-tests-on-real-hardware.md) | howto | Running cpu-tests on a real SGI Indy |
 | [scc-serial-output-from-bare-metal-code.md](testing/scc-serial-output-from-bare-metal-code.md) | rule | Getting serial output out of bare-metal guest code |
 | [sgi-volume-directory-layout-verified-on-real-media.md](testing/sgi-volume-directory-layout-verified-on-real-media.md) | rule | SGI volume directory: layout verified against real media |
