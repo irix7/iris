@@ -12,7 +12,7 @@
 //!
 //! - a bounded **cold** lane for warm-up/prefetch. It is best-effort: when it is
 //!   full a request is rejected, the caller drops the `Queued` marker, and a
-//!   later draw retries (see `rules/testing/rex-jit-queue-retry.md`).
+//!   later draw retries (see `clanker/rex3/rex-jit-queue-retry.md`).
 //! - an **hot** lane for whatever the draw path is asking for at dispatch time.
 //!   The worker drains it before the cold lane and it is never rejected for a
 //!   full queue, so live draw work cannot be starved by prefetch.

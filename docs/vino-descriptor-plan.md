@@ -8,7 +8,7 @@ single `#[ignore]`d end-to-end target test that encodes the acceptance criterion
 
 Companion primary sources, read before touching this:
 
-- `rules/irix/vino-capture-on-6.5-progress.md` — the cont. 1–16 campaign log
+- `clanker/video/vino-capture-on-6.5-progress.md` — the cont. 1–16 campaign log
   (the disassembly of `vino.o` `0x77c0` / `0x60b4` / `0x7640`).
 - `docs/research/b10-vino-descriptor-sync.md` — the MAME/Dolphin/ares
   comparison that motivates the split.
@@ -229,4 +229,4 @@ Its failure *is* the work item.
   `descriptor_fetch`, `shift_descriptors`, `page_index_w`, `pump_field`,
   `read_channel_reg`.
 - IRIS disassembly `vino.o` `0x77c0` / `0x60b4` / `0x7640` — recorded in
-  `rules/irix/vino-capture-on-6.5-progress.md`.
+  `clanker/video/vino-capture-on-6.5-progress.md`.

@@ -267,7 +267,7 @@ impl CyclesPtr {
 /// a CP0 Compare write, not every dispatch) trail at the end.
 ///
 /// `#[repr(C)]`: JIT v2 compiled code addresses fields directly via a pinned
-/// base pointer + fixed byte offset (`mov [base+disp]`, rules/jitv2/jit-v2-design.md
+/// base pointer + fixed byte offset (`mov [base+disp]`, clanker/jitv2/jit-v2-design.md
 /// §5 — "memory-resident registers", no copy-in/copy-out shadow struct like v1's
 /// `JitContext`). That requires deterministic, ABI-stable field layout, which
 /// `repr(Rust)` does not guarantee. Offsets must be computed via
@@ -2558,6 +2558,18 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
 
     core.pc = vector_base + offset;
 
+    // A vector is a region entry, but only the 32-bit refill vector sits on
+    // a page's word 0, the one landing a page crossing marks as compile-
+    // worthy. The XTLB refill (0x080, every refill once UX is set, as on the
+    // O2) and the general vector (0x180, reached by syscalls only through
+    // their own trigger) were never requested, so every TLB refill ran in
+    // the interpreter. Once compiled, a trigger at a runnable entry costs
+    // nothing: dispatch just runs it.
+    #[cfg(feature = "jitv2")]
+    {
+        core.jit_trigger = true;
+    }
+
     // Jumping to a handler vector ends any delay slot in progress: the vector's
     // first instruction is never in one. `bd` was already consumed above (into
     // Cause.BD / EPC), so clearing here cannot lose information.
@@ -2567,7 +2579,7 @@ pub fn deliver_exception_at(core: &mut MipsCore, status: u32, fault_pc: u64, bd:
     // which left `bin/jitv2_verify.rs`'s bare-`MipsCore` call — no wrapper — able
     // to enter a handler with `in_delay_slot` still set. Same
     // "every caller must remember" shape as the CP0-Status resync bug; see
-    // rules/testing/cp0-status-writes-must-resync-privilege-state.md.
+    // clanker/cpu/cp0-status-writes-must-resync-privilege-state.md.
     core.in_delay_slot = false;
 }
 

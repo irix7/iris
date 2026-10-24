@@ -590,6 +590,12 @@ pub trait MipsCache: Send + Sync {
     /// outlives this cache.
     unsafe fn set_tcache_window(&self, _base: *mut u8) {}
 
+    /// Whether `fetch` of cacheable RAM only reads: no line fill, no LRU or
+    /// tag change, no exception. Then a caller that does not need the
+    /// instruction (jitv2 entering compiled code) may leave the fetch out.
+    /// Default `false`: a model that keeps instruction-cache state does.
+    fn fetch_is_pure(&self) -> bool { false }
+
     /// tcache: pointer to this cache's inline mapped-region bitmap, for
     /// `MappedMemory::set_bitmap_sink2`. Null when the cache has no such field.
     fn tcache_bitmap_ptr(&self) -> *mut u64 { std::ptr::null_mut() }
@@ -871,6 +877,9 @@ impl<const MIPS4: bool> MipsCache for PassthroughCacheOf<MIPS4> {
     const DC_WAYS: usize = 1;
     const L2_SIZE: usize = 0;
     const L2_LINE: usize = 0;
+
+    /// A fetch is a bus read: no cache state to keep.
+    fn fetch_is_pure(&self) -> bool { true }
 
     fn fetch(&self, _virt_addr: u64, phys_addr: u64) -> FetchInstrResult {
         let r = self.downstream.read32(phys_addr as u32);
@@ -1409,6 +1418,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     // Model discriminator: folds to a literal, so it replaces #[cfg(feature = "r5k")].
     // Keyed on MODEL, not on associativity — see `mod model`.
     const IS_R5K: bool = MODEL == model::R5000;
+    /// Virtual coherency exceptions (VCEI/VCED) are an R4000/R4400 feature. The
+    /// R5000 dropped the secondary-index check altogether; the R10000 keeps the
+    /// index in its secondary tags but resolves a mismatch in hardware.
+    const HAS_VCE: bool = MODEL == model::R4400;
 
     /// IP28 bring-up watch: physical window to trace, from IRIS_IP28_WATCH.
     /// Folds to a constant `None` on every model but the R10000, so the
@@ -1859,6 +1872,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         *word = (*word & !mask) | ((val as u64) << (set & 63));
     }
 
+    /// The line an R10000 index op names in this direct-mapped model: the
+    /// index within one way (half the cache), with bit 0 of the address as
+    /// the way, which becomes the top index bit.
+    #[inline]
+    fn r10k_way_index(addr: u64, line_shift: u32, lines_shift: u32) -> usize {
+        let half = 1usize << (lines_shift - 1);
+        (((addr >> line_shift) as usize) & (half - 1)) | ((addr as usize & 1) << (lines_shift - 1))
+    }
+
+    /// The same for an R10000 Index_Load/Store_Data: a doubleword slot in a
+    /// data array of `slots` doublewords.
+    #[inline]
+    fn r10k_way_slot(addr: u64, slots: usize) -> usize {
+        let half = slots / 2;
+        ((addr as usize >> 3) & (half - 1)) | ((addr as usize & 1) * half)
+    }
+
     fn pidx(&self, virt_addr: u64) -> u32 {
         ((virt_addr >> L2_PIDX_VADDR_SHIFT) & L2_PIDX_VADDR_MASK as u64) as u32
     }
@@ -2033,6 +2063,46 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
         // Finally invalidate the L2 line itself
         self.l2.set_tag(idx, L2Tag::default());
+    }
+
+    /// R10000: a secondary hit under a different virtual index than the line
+    /// was last used under. Where an R4400 raises a virtual coherency
+    /// exception, the R10000 writes back and drops the primary copies made
+    /// under the old index, records the new one, and carries on. Without
+    /// this, an R10000 kernel that never expects VCE (OpenBSD) dies on the
+    /// first page it maps at two colours.
+    fn realias_l2_line(&self, l2_idx: usize, new_pidx: u32) {
+        let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
+        let phys_base = l2_tag_to_phys(l2_tag, (l2_idx << Self::L2_LINE_SHIFT) as u64);
+        let old = l2_tag.pidx();
+
+        let l1i_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::IC_LINE_SHIFT);
+        let ic_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.ic);
+        for i in 0..l1i_lines_per_l2 {
+            let ic_idx = (ic_base_idx + i) & Self::IC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::IC_LINE_SHIFT);
+            let ic_tag: L1ITag = self.ic.get_tag(ic_idx);
+            if ic_tag.matches_phys(phys_addr) {
+                self.invalidate_l1i_line(ic_idx, false);
+            }
+        }
+
+        let l1d_lines_per_l2 = 1 << (Self::L2_LINE_SHIFT - Self::DC_LINE_SHIFT);
+        let dc_base_idx = self.l2_idx_to_l1_base_idx(l2_idx, old, &self.dc);
+        for i in 0..l1d_lines_per_l2 {
+            let dc_idx = (dc_base_idx + i) & Self::DC_NUM_LINES_MASK;
+            let phys_addr = phys_base + ((i as u64) << Self::DC_LINE_SHIFT);
+            let dc_tag: L1DTag = self.dc.get_tag(dc_idx);
+            if dc_tag.matches_line(phys_addr) {
+                self.writeback_l1d_line(dc_idx, false);
+                self.invalidate_l1d_line(dc_idx, false, false);
+            }
+        }
+
+        // Re-read: the writebacks above may have changed the line's state.
+        let mut t: L2Tag = self.l2.get_tag(l2_idx);
+        t.set_pidx(new_pidx);
+        self.l2.set_tag(l2_idx, t);
     }
 
     /// Invalidate L2 line by physical address, if present and tag matches.
@@ -2571,11 +2641,13 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
 
             if l2_hit {
                 // R4K only: check for Virtual Coherency Exception (VCEI).
-                // R5K dropped VCE — no pidx tracking needed.
-                if !Self::IS_R5K {
-                    if self.pidx(index_addr) != l2_tag.pidx() {
+                // R5K dropped VCE — no pidx tracking needed; the R10000
+                // resolves the mismatch itself.
+                if !Self::IS_R5K && self.pidx(index_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE {
                         return exec_exception_const(EXC_VCEI);
                     }
+                    self.realias_l2_line(l2_idx, self.pidx(index_addr));
                 }
             } else {
                 // L2 miss — fill from memory into L2 first.
@@ -2786,7 +2858,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         let l2_ptag = self.l2_ptag(phys_addr);
         if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
             if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
-                return Err(BUS_VCE);
+                if Self::HAS_VCE {
+                    return Err(BUS_VCE);
+                }
+                self.realias_l2_line(l2_idx, self.pidx(virt_addr));
             }
             Ok(true)
         } else {
@@ -3112,9 +3187,11 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             let l2_tag: L2Tag = self.l2.get_tag(l2_idx);
             let l2_ptag = self.l2_ptag(phys_addr);
             if l2_tag.cs() != L2_CS_INVALID && l2_tag.ptag() == l2_ptag {
-                // Check for Virtual Coherency Exception (R4K only; R5K dropped VCE).
-                if !Self::IS_R5K {
-                    if self.pidx(virt_addr) != l2_tag.pidx() { return BUS_VCE; }
+                // Check for Virtual Coherency Exception (R4K only; R5K dropped
+                // VCE; the R10000 resolves the mismatch itself)
+                if !Self::IS_R5K && self.pidx(virt_addr) != l2_tag.pidx() {
+                    if Self::HAS_VCE { return BUS_VCE; }
+                    self.realias_l2_line(l2_idx, self.pidx(virt_addr));
                 }
                 true
             } else {
@@ -3516,6 +3593,9 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     const FIR: u32 = FIR;
     const TLB_ENTRIES: usize = TLB_ENTRIES;
     const R10K_CACHE_OPS: bool = MODEL == model::R10000;
+    // 44 implemented virtual address bits on the R10000, as the shadow
+    // model already says; XContext's layout follows them.
+    const VA_BITS: u32 = if MODEL == model::R10000 { 44 } else { 40 };
     const NAME: &'static str = match MODEL {
         model::R5000 => "R5000",
         model::R10000 => "R10000",
@@ -4007,20 +4087,17 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 C_R10K_CBARRIER if sel == CACH_PI => return 0,
                 C_R10K_ILD if matches!(sel, CACH_PI | CACH_PD | CACH_SD) => {
                     let is_l2 = sel == CACH_SD;
-                    // The index is a byte offset into the data array. Bit 0
-                    // selects the way on real silicon; this model is
-                    // direct-mapped, and bit 0 falls below the u64 slot index,
-                    // so it drops out without any special case.
-                    let slot = (virt_addr as usize) >> 3;
+                    // The index is a byte offset into one way's data, and bit
+                    // 0 selects the way: the same folding as the tag ops
+                    // below, so data and tags name the same line.
                     if is_l2 && HAS_L2 {
-                        return self.l2.data()[slot & (L2_DATA - 1)];
+                        return self.l2.data()[Self::r10k_way_slot(virt_addr, L2_DATA)];
                     }
-                    return self.dc.data()[slot & (DC_DATA - 1)];
+                    return self.dc.data()[Self::r10k_way_slot(virt_addr, DC_DATA)];
                 }
                 C_R10K_ISD if matches!(sel, CACH_SI | CACH_SD) => {
-                    let slot = (virt_addr as usize) >> 3;
                     if HAS_L2 {
-                        self.l2.data_mut()[slot & (L2_DATA - 1)] = phys_addr;
+                        self.l2.data_mut()[Self::r10k_way_slot(virt_addr, L2_DATA)] = phys_addr;
                     }
                     return 0;
                 }
@@ -4061,8 +4138,24 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
         // `phys_addr` too, except for C_IST, where `phys_addr` carries
         // TagHi:TagLo). Hit ops and Create_Dirty_Exclusive need the
         // translated `phys_addr`.
+        // R10000 index ops (Index_WB_Inv, Index_Load_Tag, Index_Store_Tag)
+        // address one way: the low bits index within it and bit 0 picks the
+        // way. This model is direct-mapped at the full size, so way 1 is the
+        // upper half. Ignoring bit 0 sent both ways of a whole-cache flush to
+        // the lower half and never flushed the upper one: dirty lines there
+        // outlived the flush and were later written back over reused pages.
+        let r10k_index = Self::R10K_CACHE_OPS && matches!(operation, C_IWBINV | C_ILT | C_IST);
         let idx = if is_l2 {
-            self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            if r10k_index {
+                // Index ops carry the index address in virt_addr (untranslated).
+                Self::r10k_way_index(virt_addr, Self::L2_LINE_SHIFT, Self::L2_NUM_LINES_SHIFT)
+            } else {
+                self.l2.get_index(if operation == C_IST { virt_addr } else { phys_addr })
+            }
+        } else if r10k_index && is_icache {
+            Self::r10k_way_index(virt_addr, Self::IC_LINE_SHIFT, Self::IC_NUM_LINES_SHIFT)
+        } else if r10k_index {
+            Self::r10k_way_index(virt_addr, Self::DC_LINE_SHIFT, Self::DC_NUM_LINES_SHIFT)
         } else if is_icache {
             let set = self.ic.get_index(virt_addr);
             if Self::IS_R5K { set | (((virt_addr >> 14) as usize & 1) << Self::IC_NUM_LINES_SHIFT) } else { set }
@@ -4186,9 +4279,6 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
                 let tag_lo = phys_addr as u32;  // R4000-family tags are 32-bit
 
                 if is_l2 {
-                    if MODEL == model::R10000 {
-                        eprintln!("ip28: C_IST(SD) idx={idx:#x} taglo={tag_lo:#010x} phys={phys_addr:#018x}");
-                    }
                     // L2 TagLo format:  [31:13] ptag   [12:10] state   [9:7] PIdx
                     let ptag = (tag_lo >> 13) & L2_PTAG_MASK;
                     let state = (tag_lo >> 10) & 0x7;
@@ -5296,6 +5386,69 @@ mod tests {
 
     // Flush a single L2 set to memory.  `phys` is any address within the L2 line.
     // Only valid when L2 is present (r4k or r5k+r5ksc).
+    /// A whole-cache flush the way an R10000 kernel does it -- every index of
+    /// one way, then of the other, bit 0 picking the way -- reaches every line,
+    /// including those this direct-mapped model keeps in its upper half.
+    #[test]
+    fn r10000_index_flush_reaches_both_ways() {
+        let mem = Arc::new(Memory::new(MEM_MB));
+        let cache: R10000Cache = make_cache_of(mem.clone());
+        // Upper half of the L1D (VA bit 14) and of the 1 MB L2 (PA bit 19).
+        let cases = [(0x9800_0000_0000_6040u64, 0x2040u32), (0x9800_0000_0008_2080, 0x8_2080)];
+        for (i, &(va, pa)) in cases.iter().enumerate() {
+            let _ = cache.write::<4>(va, pa as u64, 0xa5a5_0000 + i as u64);
+        }
+        for va in (0..16 * 1024u64).step_by(32) {
+            for way in 0..2 {
+                cache.cache_op(C_IWBINV | CACH_PD, 0x8000_0000 | va | way, 0);
+            }
+        }
+        for va in (0..512 * 1024u64).step_by(128) {
+            for way in 0..2 {
+                let a = 0x8000_0000 | va | way;
+                cache.cache_op(C_IWBINV | CACH_SD, a, a);
+            }
+        }
+        for (i, &(_, pa)) in cases.iter().enumerate() {
+            assert_eq!(mem_read(&mem, pa), 0xa5a5_0000 + i as u32, "line at {pa:#x} not flushed");
+        }
+    }
+
+    /// One physical line used under two virtual colours (index bits 12-13
+    /// differ): the R4400 raises a virtual coherency exception on the
+    /// secondary hit; the R10000 resolves it itself, and a store under one
+    /// colour is what a load under the other sees.
+    #[test]
+    fn the_r10000_resolves_a_colour_mismatch_where_the_r4400_raises_vce() {
+        let pa = 0x8040u64;
+        let (va1, va2) = (0x0010_0040u64, 0x0010_3040u64);
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r4k: R4400Cache = make_cache_of(mem.clone());
+        assert_eq!(r4k.read::<4>(va1, pa).status, BUS_OK);
+        assert_eq!(r4k.read::<4>(va2, pa).status, BUS_VCE, "the R4400 raises VCE");
+
+        let mem = Arc::new(Memory::new(MEM_MB));
+        mem_write(&mem, pa as u32, 0x1111_2222);
+        let r10k: R10000Cache = make_cache_of(mem.clone());
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x1111_2222);
+        let r = r10k.read::<4>(va2, pa);
+        assert_eq!((r.status, r.data), (BUS_OK, 0x1111_2222), "the R10000 carries on");
+        assert_eq!(r10k.write::<4>(va2, pa, 0x3333_4444), BUS_OK);
+        assert_eq!(r10k.read::<4>(va1, pa).data, 0x3333_4444, "the old colour's copy was dropped");
+    }
+
+    /// The R10000 implements 44 virtual address bits; XContext's fields are
+    /// laid out around them, so the full model must say so too.
+    #[test]
+    fn the_r10000_full_model_has_44_va_bits() {
+        assert_eq!(<R10000Cache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<crate::cpu::mips_cache_shadow::R10000ShadowCache as CpuModel>::VA_BITS, 44);
+        assert_eq!(<R4400Cache as CpuModel>::VA_BITS, 40);
+        assert_eq!(<R5000Cache as CpuModel>::VA_BITS, 40);
+    }
+
     fn flush_l2_to_mem(cache: &R4400Cache, phys: u32) {
         let l2_set = (phys as usize >> R4400Cache::L2_LINE_SHIFT as usize) & (R4400Cache::L2_SIZE / R4400Cache::L2_LINE - 1);
         let lp = (l2_set * R4400Cache::L2_LINE) as u64;

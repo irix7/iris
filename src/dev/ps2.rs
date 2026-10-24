@@ -8,12 +8,7 @@ use crate::traits::{Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, toml_bool, hex_u8};
 use crate::devlog::LogModule;
 use crate::config::KeyboardLayout;
-
-/// Callback trait for PS/2 interrupts
-pub trait Ps2Callback: Send + Sync {
-    /// Set the interrupt line state
-    fn set_interrupt(&self, active: bool);
-}
+use crate::irq::IrqLine;
 
 enum Ps2Source {
     Keyboard,
@@ -48,6 +43,11 @@ struct Ps2State {
     mouse_id: u8,
     // Last two sample rates written, to detect knock sequences
     sample_rate_history: [u8; 2],
+    /// The mouse command whose data byte comes next (0xF3 rate, 0xE8
+    /// resolution), and what they last set: Status Request reports both.
+    mouse_param_cmd: u8,
+    mouse_rate: u8,
+    mouse_res: u8,
     /// Set-3 key modes: bit 0 permits typematic makes, bit 1 permits breaks.
     key_modes: [u8; 256],
     held_keys: [bool; 256],
@@ -56,7 +56,8 @@ struct Ps2State {
 /// Combined PS/2 Keyboard and Mouse Controller
 pub struct Ps2Controller {
     state: Mutex<Ps2State>,
-    callback: Option<Arc<dyn Ps2Callback>>,
+    /// The controller's interrupt: up while a byte waits to be read.
+    irq: Option<IrqLine>,
     running: AtomicBool,
     /// Host keyboard shape (`KeyboardLayout as u8`). Host config, not guest
     /// state, so it is not in snapshots.
@@ -65,7 +66,7 @@ pub struct Ps2Controller {
 
 impl Ps2Controller {
     /// Create a new PS/2 Controller
-    pub fn new(callback: Option<Arc<dyn Ps2Callback>>) -> Self {
+    pub fn new(irq: Option<IrqLine>) -> Self {
         Self {
             state: Mutex::new(Ps2State {
                 rx_queue: VecDeque::new(),
@@ -80,10 +81,13 @@ impl Ps2Controller {
                 last_read: 0xAA, // pretend we finished BAT at startup
                 mouse_id: 0,
                 sample_rate_history: [0, 0],
+                mouse_param_cmd: 0,
+                mouse_rate: 100,
+                mouse_res: 2,
                 key_modes: [3; 256],
                 held_keys: [false; 256],
             }),
-            callback,
+            irq,
             running: AtomicBool::new(false),
             layout: AtomicU8::new(KeyboardLayout::Ansi as u8),
         }
@@ -96,11 +100,11 @@ impl Ps2Controller {
 
     /// Update interrupt state based on queue status
     fn update_interrupt(&self) {
-        if let Some(cb) = &self.callback {
+        if let Some(line) = &self.irq {
             let state = self.state.lock();
             let len = state.rx_queue.len();
             drop(state);
-            cb.set_interrupt(len > 0);
+            line.set(len > 0);
         }
     }
 
@@ -140,6 +144,16 @@ impl Ps2Controller {
                 dlog!(LogModule::Ps2, "PS2: Mouse Set Sample Rate value <- {:02x} (history: [{:02x}, {:02x}])",
                     val, state.sample_rate_history[0], state.sample_rate_history[1]);
                 state.rx_queue.push_back((0xFA, Ps2Source::MouseCmd));
+                if state.mouse_param_cmd == 0xE8 {
+                    // Resolution, not a rate: it must not count towards a knock.
+                    state.mouse_res = val & 3;
+                    state.command_state = CommandState::Idle;
+                    state.next_write_is_mouse = false;
+                    drop(state);
+                    self.update_interrupt();
+                    return;
+                }
+                state.mouse_rate = val;
                 // Track sample rate history to detect knock sequences.
                 let prev = state.sample_rate_history[1];
                 state.sample_rate_history[1] = state.sample_rate_history[0];
@@ -164,6 +178,8 @@ impl Ps2Controller {
                         state.mouse_enabled = false;
                         state.mouse_id = 0;
                         state.sample_rate_history = [0, 0];
+                        state.mouse_rate = 100;
+                        state.mouse_res = 2;
                         state.rx_queue.push_back((0xAA, Ps2Source::MouseCmd)); // BAT Success
                         state.rx_queue.push_back((0x00, Ps2Source::MouseCmd)); // ID
                         state.next_write_is_mouse = false;
@@ -176,6 +192,8 @@ impl Ps2Controller {
                         // the negotiated device mode — a real IntelliMouse stays in 4-byte
                         // mode through Set Defaults. Only 0xFF (Reset) clears it.
                         state.sample_rate_history = [0, 0];
+                        state.mouse_rate = 100;
+                        state.mouse_res = 2;
                         state.next_write_is_mouse = false;
                     }
                     0xF5 => {
@@ -197,11 +215,25 @@ impl Ps2Controller {
                     }
                     0xF3 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Sample Rate <- {:02x}", val); }
+                        state.mouse_param_cmd = 0xF3;
                         state.command_state = CommandState::MouseData;
                     }
                     0xE8 => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Set Resolution <- {:02x}", val); }
+                        state.mouse_param_cmd = 0xE8;
                         state.command_state = CommandState::MouseData;
+                    }
+                    0xE9 => {
+                        // Status Request: ACK, then three bytes. Drivers that
+                        // probe for touchpads (OpenBSD's pms: E8 00 x4, then E9)
+                        // wait for all of them.
+                        if dbg { dlog!(LogModule::Ps2, "PS2: Mouse Status Request <- {:02x}", val); }
+                        let status = if state.mouse_enabled { 0x20 } else { 0x00 };
+                        let (res, rate) = (state.mouse_res, state.mouse_rate);
+                        state.rx_queue.push_back((status, Ps2Source::MouseCmd));
+                        state.rx_queue.push_back((res, Ps2Source::MouseCmd));
+                        state.rx_queue.push_back((rate, Ps2Source::MouseCmd));
+                        state.next_write_is_mouse = false;
                     }
                     _ => {
                         if dbg { dlog!(LogModule::Ps2, "PS2: Mouse unsupported <- {:02x}", val); }
@@ -1134,6 +1166,9 @@ impl Resettable for Ps2Controller {
         state.last_read = 0xAA;
         state.mouse_id = 0;
         state.sample_rate_history = [0, 0];
+        state.mouse_param_cmd = 0;
+        state.mouse_rate = 100;
+        state.mouse_res = 2;
         state.key_modes = [3; 256];
         state.held_keys = [false; 256];
     }
@@ -1143,7 +1178,7 @@ impl Saveable for Ps2Controller {
     fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
         use crate::state_desc::{FieldKind, StateDesc};
         Some(
-            StateDesc::new("ps2", 2)
+            StateDesc::new("ps2", 3)
                 // Version 2 adds the set-3 per-key modes and held-key state.
                 // A version-1 payload predates them, so restore the reset
                 // defaults; every key was typematic-and-break before.
@@ -1158,6 +1193,19 @@ impl Saveable for Ps2Controller {
                         "held_keys".into(),
                         toml::Value::Array(vec![toml::Value::Boolean(false); 256]),
                     );
+                    Ok(toml::Value::Table(t))
+                })
+                // Version 3 adds the mouse's rate/resolution and the ID that
+                // the last 0xE8/0xE9/0xF2 reached, which the Status Request
+                // (0xE9) reply reports. A version-2 payload predates them.
+                .migrate(2, |v| {
+                    let mut t = v
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| "ps2: state is not a table".to_string())?;
+                    t.insert("mouse_param_cmd".into(), hex_u8(0));
+                    t.insert("mouse_rate".into(), hex_u8(100));
+                    t.insert("mouse_res".into(), hex_u8(2));
                     Ok(toml::Value::Table(t))
                 })
                 .field(
@@ -1354,6 +1402,27 @@ impl Saveable for Ps2Controller {
                     |v| { self.state.lock().mouse_id = toml_u8(v).unwrap_or(0); Ok(()) },
                 )
                 .field(
+                    "mouse_param_cmd",
+                    FieldKind::U8,
+                    3,
+                    |t| { t.insert("mouse_param_cmd".into(), hex_u8(self.state.lock().mouse_param_cmd)); },
+                    |v| { self.state.lock().mouse_param_cmd = toml_u8(v).unwrap_or(0); Ok(()) },
+                )
+                .field(
+                    "mouse_rate",
+                    FieldKind::U8,
+                    3,
+                    |t| { t.insert("mouse_rate".into(), hex_u8(self.state.lock().mouse_rate)); },
+                    |v| { self.state.lock().mouse_rate = toml_u8(v).unwrap_or(100); Ok(()) },
+                )
+                .field(
+                    "mouse_res",
+                    FieldKind::U8,
+                    3,
+                    |t| { t.insert("mouse_res".into(), hex_u8(self.state.lock().mouse_res)); },
+                    |v| { self.state.lock().mouse_res = toml_u8(v).unwrap_or(2); Ok(()) },
+                )
+                .field(
                     "sample_rate_history",
                     FieldKind::U8Array,
                     1,
@@ -1390,6 +1459,18 @@ impl Saveable for Ps2Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The interrupt is up exactly while a byte waits to be read.
+    #[test]
+    fn the_irq_line_follows_the_receive_queue() {
+        let (probe, line) = crate::irq::LevelProbe::line();
+        let ps2 = Ps2Controller::new(Some(line));
+        ps2.start();
+        ps2.write_data(0xF4); // enable scanning: answered with an ACK
+        assert!(probe.level(), "the ACK is waiting");
+        assert_eq!(ps2.read_data(), 0xFA);
+        assert!(!probe.level(), "and once read, the line drops");
+    }
 
     #[test]
     fn set3_make_break_suppresses_host_repeat_and_preserves_release() {
@@ -1457,6 +1538,9 @@ mod tests {
             s.scanning_enabled = true;
             s.mouse_enabled = true;
             s.last_read = 0x12;
+            s.mouse_param_cmd = 0xE8;
+            s.mouse_rate = 40;
+            s.mouse_res = 3;
         }
         let v1 = src.save_state();
 
@@ -1542,6 +1626,33 @@ mod tests {
         ps2.write_command(0xA8); // re-enable AUX port
         ps2.push_mouse_input(0, 5, 5, 0);
         assert!(ps2.state.lock().rx_queue.len() > 0, "mouse packet should be queued once AUX port re-enabled");
+    }
+
+    /// Status Request (0xE9): an ACK, then three bytes (status, resolution,
+    /// sample rate). OpenBSD's pms probes for a touchpad with `E8 00` four
+    /// times and then `E9`, and waits for all three. Setting the resolution
+    /// must not count as a sample-rate write towards the IntelliMouse knock.
+    #[test]
+    fn mouse_status_request_reports_resolution_and_rate() {
+        let ps2 = Ps2Controller::new(None);
+        ps2.start();
+        let mouse = |b: u8| {
+            ps2.write_command(0xD4);
+            ps2.write_data(b);
+            ps2.read_data()
+        };
+        for b in [0xE8, 0x03, 0xF3, 40] {
+            assert_eq!(mouse(b), 0xFA);
+        }
+        assert_eq!(mouse(0xE9), 0xFA);
+        assert_eq!([ps2.read_data(), ps2.read_data(), ps2.read_data()], [0x00, 3, 40]);
+        // The knock (rates 200, 100, 80) still selects IntelliMouse with
+        // resolution writes in between.
+        for b in [0xF3, 200, 0xE8, 0x00, 0xF3, 100, 0xE8, 0x00, 0xF3, 80] {
+            assert_eq!(mouse(b), 0xFA);
+        }
+        assert_eq!(mouse(0xF2), 0xFA, "Get Device ID");
+        assert_eq!(ps2.read_data(), 3, "IntelliMouse");
     }
 
     /// Set-3 make codes for the JIS keys, against xkeyboard-config

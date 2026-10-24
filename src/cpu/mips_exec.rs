@@ -197,7 +197,7 @@ fn is_qnan_d(bits: u64) -> bool {
 /// Every ADD/SUB/MUL/DIV/SQRT/RECIP/RSQRT/MADD-family handler's exception
 /// checks are computed from operand/result bit patterns alone — never from
 /// the host FPU's own exception flags (see
-/// `rules/jitv2/fpu-flags-are-computed-not-read.md` for why: Cranelift
+/// `clanker/jitv2/fpu-flags-are-computed-not-read.md` for why: Cranelift
 /// `call_indirect` and even plain LTO/codegen-units=1 optimization can't be
 /// trusted to preserve host FPU status-register state across the boundary
 /// between "clear it" and "read it back"). `is_snan_s/d` here catches what
@@ -1306,7 +1306,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     #[cfg(feature = "developer")]
     pending_memory_writes: Vec<MemoryWrite>,
     traceback: TracebackBuffer,
-    /// Per-instruction execution trace recorder (rules/jitv2's lockstep
+    /// Per-instruction execution trace recorder (clanker/jitv2's lockstep
     /// verification tooling, `src/cpu/trace.rs`). `None` when not recording —
     /// checked on every step() (one branch on a `None` tag), so armed cost
     /// is a file write, disarmed cost is a predictable branch. Developer-only:
@@ -1385,7 +1385,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// Per-instruction execution frequency counters (feature = "instr_stats").
     #[cfg(feature = "instr_stats")]
     pub instr_stats: crate::cpu::mips_instr_stats::InstrStats,
-    /// JIT v2 engine state: physical-code-page pool + allocator (rules/jitv2/jit-v2-design.md §2.4).
+    /// JIT v2 engine state: physical-code-page pool + allocator (clanker/jitv2/jit-v2-design.md §2.4).
     /// Lives independently of the executor (`Arc<Mutex<...>>`, constructed by
     /// `Machine` and shared in) — NOT owned by the executor's own struct
     /// literal — specifically so the compile thread (which needs to call
@@ -1575,7 +1575,7 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
 /// read differently between `jitcheck`'s two separately-timed passes with no
 /// JIT bug involved. Deliberately not learned/inferred — an address only
 /// belongs here once a live divergence has been manually confirmed benign
-/// (see rules/jitv2/ for the investigation trail). Extend this list as more
+/// (see clanker/jitv2/ for the investigation trail). Extend this list as more
 /// such registers are found; do not add speculative entries.
 #[cfg(feature = "developer")]
 pub(crate) const HW_READ_FIXUP_ADDRS: &[u64] = &[
@@ -1701,7 +1701,7 @@ fn mips_executor_status_cb<T: Tlb, C: CpuModel>(ctx: *mut core::ffi::c_void, _ol
 /// `opt_level=speed` optimizer folds it back into the same value (verified:
 /// byte-identical output).
 ///
-/// See `rules/jitv2/callout-arg0-is-core-ptr.md` for the full measurements.
+/// See `clanker/jitv2/callout-arg0-is-core-ptr.md` for the full measurements.
 ///
 /// # Safety
 /// `ctx` must be arg 0 as produced by `codegen::callout_core_arg` — a real,
@@ -2353,7 +2353,7 @@ fn round_f32_to_int_mode(x: f32, rm: u8) -> f32 {
 /// codegen restructuring exposed a case where the JIT observed 0 flags
 /// immediately after a conversion the interpreter, with different
 /// instruction spacing, correctly saw as Invalid/Inexact. See
-/// rules/testing/fpu-exception-model-vs-r4400.md.
+/// clanker/cpu/fpu-exception-model-vs-r4400.md.
 ///
 /// `x` must already be rounded to an integral value via
 /// `round_f32_to_int_mode`/`round_f64_to_int_mode` — this only classifies
@@ -3541,7 +3541,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     }
 
     /// JIT v2: re-derive `self.pcp` if the fetch just landed on a different physical
-    /// page than the one currently tracked (rules/jitv2/jit-v2-design.md §2.1 — PCPs
+    /// page than the one currently tracked (clanker/jitv2/jit-v2-design.md §2.1 — PCPs
     /// are keyed by physical frame, never by VA). Cheap on the common case: same-page
     /// sequential/loop execution never touches the pool or its lookup map, only the
     /// nanotlb hit path above and a single PFN comparison here.
@@ -4227,12 +4227,12 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// `step_preamble!` only runs via a fallback exit calling `step_int()`
     /// directly — exactly when something (a gate miss, a pending interrupt
     /// caught inline) actually needs the interpreter's real preamble.
-    /// Full dispatch-gate rationale: rules/jitv2/jit-v2-design.md §13.
+    /// Full dispatch-gate rationale: clanker/jitv2/jit-v2-design.md §13.
     #[cfg(feature = "jitv2")]
     pub fn step_jit(&mut self) -> ExecStatus {
         let pc = self.core.pc;
 
-        let fetch = self.fetch_instr(pc);
+        let fetch = self.jit_entry_fetch(pc);
         // Retired AFTER fetch_instr, not before: fetch_instr's own
         // nanotlb_translate is what runs jitv2_track_pcp, the thing that
         // sets `core.jit_trigger = true` on a fresh page's first arrival.
@@ -4330,8 +4330,35 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         result
     }
 
+    /// `step_jit`'s fetch at `pc`. Entering compiled code needs the page
+    /// (`self.pcp`) and the offset, not the instruction, and every other way
+    /// out of the gate (`step_int`, an exception from it) fetches for itself.
+    /// So when the cache's fetch changes nothing (`MipsCache::fetch_is_pure`)
+    /// and no breakpoint can match (a `lightning` build), only the
+    /// translation runs: it is what raises a fetch's TLB exceptions and moves
+    /// `self.pcp` onto a new page. A cacheable page then needs no cache
+    /// access; an uncached one goes to the bus as before, its translation
+    /// already in the slot. Profiled, the cache fetch was most of the cost of
+    /// entering compiled code, which calls, syscalls and a GL driver's inner
+    /// loop all do constantly.
+    #[cfg(feature = "jitv2")]
+    #[inline(always)]
+    fn jit_entry_fetch(&mut self, pc: u64) -> FetchInstrResult {
+        if !(cfg!(feature = "lightning") && self.cache.fetch_is_pure()) {
+            return self.fetch_instr(pc);
+        }
+        let t = self.nanotlb_translate::<{ AccessType::Fetch as u8 }>(pc);
+        if t.is_exception() {
+            FetchInstrResult::exception(t.status)
+        } else if t.is_cached() {
+            FetchInstrResult::hit(std::ptr::null())
+        } else {
+            self.fetch_instr(pc)
+        }
+    }
+
     /// Begin recording a per-instruction execution trace to `path`
-    /// (`src/cpu/trace.rs`, rules/jitv2's lockstep verification tooling).
+    /// (`src/cpu/trace.rs`, clanker/jitv2's lockstep verification tooling).
     /// Overwrites any existing file at `path`. No-op-safe to call while
     /// already recording — starts a fresh file, silently dropping (not
     /// flushing) whatever writer was active before, so callers that want a
@@ -4923,10 +4950,22 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     ///
     /// `C::MIPS4` is the model discriminator — R5000 is the MIPS IV part,
     /// R4400 the MIPS III one — matching how the rest of this file selects
-    /// per-model behaviour.
+    /// per-model behaviour. The R10000 is MIPS IV too and has a third table
+    /// (`R10000 UM` Table 4-1), selected by `C::R10K_CACHE_OPS`.
     #[inline]
     pub(crate) fn decode_cache_attr(c: u32) -> u32 {
-        if C::MIPS4 {
+        if C::R10K_CACHE_OPS {
+            // R10000 UM Table 4-1: MIPS IV like the R5000, but its own table.
+            // 4 and 5 are the coherent algorithms, not reserved: the O2's
+            // IRIX runs KSEG0 with K0=5, and reading that as uncached sent
+            // every kernel fetch, load and store to the bus. 7 (uncached
+            // accelerated) only gathers stores; a load is a plain uncached one.
+            match c & 0x7 {
+                3     => TR_CACHEABLE,
+                4 | 5 => TR_CACHEABLE_COH,
+                _     => TR_UNCACHED, // 2 and 7; 0, 1, 6 reserved
+            }
+        } else if C::MIPS4 {
             // VR5000 Table 6-6.
             match c & 0x7 {
                 0 | 1 => TR_CACHEABLE, // write-through -> write-back (see above)
@@ -8081,7 +8120,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
 
     /// After a FPU arithmetic op has computed its result but *before* it is
     /// committed: fold in caller-computed exception flags (never read from
-    /// the host FPU — see `rules/jitv2/fpu-flags-are-computed-not-read.md`),
+    /// the host FPU — see `clanker/jitv2/fpu-flags-are-computed-not-read.md`),
     /// update FCSR cause bits, and either commit the result (calling
     /// `write_result`) and raise EXC_FPE if any enabled exception fired, or
     /// — if trapping — leave the destination register and the sticky Flag
@@ -8114,7 +8153,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// since only the caller knows the result's type/width. Implements the
     /// R4000/VR5000 manuals' full Table 9-1/7-1 Underflow rule (both manuals
     /// are word-for-word identical here — see
-    /// rules/testing/fpu-exception-model-vs-r4400.md): a denormalized result
+    /// clanker/cpu/fpu-exception-model-vs-r4400.md): a denormalized result
     /// is never delivered by hardware. With FS clear, or with FS set but
     /// Underflow/Inexact trapping enabled, it is an Unimplemented Operation
     /// (E) instead — E has no Enable/Flag bit and always traps, and per the
@@ -8210,7 +8249,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// Flags [6:2] for ADD/SUB/MUL (S or D): Invalid if either operand is a
     /// signalling NaN (the case `fpu_check_denorm_operand_s/d`'s qNaN check
     /// doesn't catch), else 0 — feeds `fpu_update_fcsr`/`_full`. See
-    /// `rules/jitv2/fpu-flags-are-computed-not-read.md`.
+    /// `clanker/jitv2/fpu-flags-are-computed-not-read.md`.
     #[inline]
     fn fpu_arith_flags_snan_only_s(fs_bits: u32, ft_bits: u32) -> u32 {
         if is_snan_s(fs_bits) || is_snan_s(ft_bits) { FCSR_FV } else { 0 }
@@ -9424,7 +9463,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
     /// the caller, one way or another — never falls through.
     #[cfg(feature = "jitv2")]
     /// Synchronous compile-and-run for `jitv2_inline_compile = true`.
-    /// Full rationale: rules/jitv2/jit-v2-design.md §13.4.
+    /// Full rationale: clanker/jitv2/jit-v2-design.md §13.4.
     fn jitv2_compile_inline(&mut self, req: crate::cpu::jitv2::CompileRequest, trigger: bool) -> ExecStatus {
         let page = unsafe { &mut *self.pcp };
         // Check arena growth BEFORE compiling — flush_from_cpu_thread
@@ -10314,7 +10353,7 @@ impl LockstepSnapshot {
         // round-to-integer idiom (software %/÷ by constants) is acutely
         // sensitive to this: one ULP of rounding difference flips the integer.
         // The FR-pointer analogue of this is documented in
-        // `rules/jitv2/codegen-gotchas.md`.
+        // `clanker/jitv2/codegen-gotchas.md`.
         crate::platform::set_fpu_mode((self.fcsr & 0x3) as u8);
         // That FR-pointer analogue, closed: the direct `cp0_status` write above equally
         // bypasses the path that re-derives `translate_fn` and the fpr accessors, so a
@@ -10433,7 +10472,7 @@ fn lockstep_classify(raw: u32) -> LockstepClass {
 }
 
 /// True if `next_raw` is one of the fusable load/store opcodes (LB/LBU/LH/LHU/
-/// LW/LD/SB/SH/SW/SD — see rules/perf/ notes on the addr-calc+load/store
+/// LW/LD/SB/SH/SW/SD — see clanker/perf/ notes on the addr-calc+load/store
 /// fusion) using `addr_reg` as its base register (`rs` field). Any offset is
 /// fine — the fused handler reads the load/store's own offset field exactly
 /// like the unfused path does; only ADDU/SUBU/ADDIU are fusable producers
@@ -12021,7 +12060,7 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             //let mut last_time = std::time::Instant::now();
             // --- end perf sampling ---
 
-            // Idle detection + park state (see rules/perf/idle-pause-work.md). Compiled
+            // Idle detection + park state (see clanker/perf/idle-pause-work.md). Compiled
             // in only with the `idle-pause` feature (off by default; opt in with
             // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
             // spinning the host CPU at runtime (for benchmarking/debug).

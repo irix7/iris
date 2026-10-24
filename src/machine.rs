@@ -759,15 +759,8 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Gfx as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 
@@ -776,15 +769,8 @@ impl Machine {
         } else {
             let r = Arc::new(Rex3::new(heartbeat.clone(), fasttick_count.clone(), decoded_count.clone(), Arc::clone(&l1i_hit_count), Arc::clone(&l1i_fetch_count), Arc::clone(&uncached_fetch_count)));
             let wiring = GIO_SLOT_MAP[profile_idx(guinness)][GioSlot::Exp0 as usize];
-            let ioc_clone = ioc.clone();
-            r.set_vblank_callback(Arc::new(move |active| {
-                if active { crate::pf_instant!(crate::perfetto::events::REX3_VBLANK); }
-                ioc_clone.set_interrupt(wiring.retrace, active);
-            }));
-            let ioc_ff = ioc.clone();
-            r.set_fifo_full_callback(Arc::new(move |active| {
-                ioc_ff.set_interrupt(wiring.fifo_full, active);
-            }));
+            r.set_vblank_irq(ioc.irq_line(wiring.retrace));
+            r.set_fifo_full_irq(ioc.irq_line(wiring.fifo_full));
             Some(r)
         };
 
@@ -831,14 +817,17 @@ impl Machine {
             crate::config::GraphicsBoard::SolidImpact
             | crate::config::GraphicsBoard::HighImpact
             | crate::config::GraphicsBoard::MaxImpact => {
-                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, ioc.clone(), heartbeat.clone(), fasttick_count.clone()))
+                Some(crate::dev::mgras::Mgras::new(cfg.graphics.board, {
+                    use crate::dev::ioc::IocInterrupt::{GioSgFifo, GioSgGraphics, GioSgRetrace};
+                    [ioc.irq_line(GioSgFifo), ioc.irq_line(GioSgGraphics), ioc.irq_line(GioSgRetrace)]
+                }, heartbeat.clone(), fasttick_count.clone()))
             }
             _ => None,
         };
 
         // N64 development board (Ultra64) — GIO slot 0 at 0x1F400000
         let ultra64: Option<Arc<crate::dev::ultra64::Ultra64>> = if cfg.ultra64.enabled {
-            match crate::dev::ultra64::Ultra64::new(ioc.clone()) {
+            match crate::dev::ultra64::Ultra64::new(ioc.irq_line(crate::dev::ioc::IocInterrupt::GioExp0)) {
                 Ok(dev) => Some(Arc::new(dev)),
                 Err(e)  => {
                     eprintln!("ultra64: failed to initialize ({e}); running without N64 dev board");
@@ -851,15 +840,7 @@ impl Machine {
 
         // VINO (Video-In, No Out) — GIO64 at 0x1F080000
         let vino = crate::dev::vino::Vino::new();
-        {
-            struct VinoIrqAdapter { ioc: crate::dev::ioc::Ioc }
-            impl crate::dev::vino::VinoIrq for VinoIrqAdapter {
-                fn set_interrupt(&self, active: bool) {
-                    self.ioc.set_interrupt(crate::dev::ioc::IocInterrupt::VideoVsync, active);
-                }
-            }
-            vino.set_irq(Arc::new(VinoIrqAdapter { ioc: ioc.clone() }));
-        }
+        vino.set_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::VideoVsync));
 
         // 2. Create Physical Bus with devices
         // `cfg` is shadowed by MipsCpuConfig further down; grab this first.
@@ -912,7 +893,7 @@ impl Machine {
 
         // Connect Physical to MC (for VDMA)
         mc.set_phys(phys.clone());
-        mc.set_ioc(ioc.clone());
+        mc.set_dma_irq(ioc.irq_line(crate::dev::ioc::IocInterrupt::McDma));
 
         // Wire MEMCFG callback: when MC writes MEMCFG0/1, remap banks in Physical.
         // SAFETY: Physical is pinned in Arc; remap_banks(&mut self) is only invoked

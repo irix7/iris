@@ -78,7 +78,7 @@ pub struct Codegen {
     /// that invalidates such a measurement: `developer` flips `opt_level` to
     /// `none` and injects a per-instruction trace callout, so its emitted
     /// code is not the code production runs (see
-    /// `rules/jitv2/block-fragmentation-blocks-cse.md`, where this cost a
+    /// `clanker/jitv2/block-fragmentation-blocks-cse.md`, where this cost a
     /// whole wrong conclusion once). `zz_corpus_sizes` consequently reported
     /// `total_bytes=0` in exactly the build it was supposed to measure. It's
     /// one `u32` written once per compile off the hot path, so gating it
@@ -385,7 +385,7 @@ struct GprForward {
 /// difference in these two counters between a mask-on compile and a
 /// conservative (pre-#37) one over the same region: a callout that declares
 /// no GPR access turns an `emit_loads_emitted` into an `emit_loads_avoided`.
-/// See `rules/jitv2/measure-the-callout-mask-gain.md`.
+/// See `clanker/jitv2/measure-the-callout-mask-gain.md`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ForwardStats {
     /// GPR reads whose value came from the cache, i.e. no `load` emitted.
@@ -615,7 +615,7 @@ static CODEGEN_OPT_LEVEL_SPEED: std::sync::atomic::AtomicBool = std::sync::atomi
 /// (`split_plain`) exactly as it does within one block — so merging the
 /// per-word blocks buys nothing on its own, and isn't done. Only the
 /// preamble's frequency matters. This corrects the ranking in
-/// `rules/jitv2/block-fragmentation-blocks-cse.md`, which inferred
+/// `clanker/jitv2/block-fragmentation-blocks-cse.md`, which inferred
 /// "fragmentation" from block-boundary-separated duplicate loads without
 /// testing whether a boundary alone blocks forwarding.
 ///
@@ -708,7 +708,7 @@ impl Codegen {
     /// won't show up in emitted code there without `IRIS_OPT_SPEED=1`. The
     /// deferral itself is still exercised, which is what a correctness boot
     /// is for.) See
-    /// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`.
+    /// `clanker/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`.
     pub fn interrupt_run() -> u32 {
         if cfg!(feature = "jitv2_lockstep") {
             return 1;
@@ -2666,7 +2666,7 @@ impl Codegen {
         // match back to the FuncId that actually owned them).
         // `IRIS_JIT_DISASM=1` dumps every compiled region's machine code to
         // stdout — the tool for answering "what did codegen actually emit?"
-        // without guessing (see rules/jitv2/callout-arg0-is-core-ptr.md, where
+        // without guessing (see clanker/jitv2/callout-arg0-is-core-ptr.md, where
         // it found a 2152-reload spill storm that byte counts alone had
         // mis-attributed). Cranelift only fills `CompiledCode::vcode` when
         // asked *before* compiling, hence the flag here rather than at the
@@ -2946,7 +2946,7 @@ fn emit_pending_interrupt_preamble(ctx: &mut EmitCtx, exit_block: Block, word_of
     // barrier that stops `opt_level=speed` from forwarding GPR stores to the
     // next instruction's loads of the same register — the one real lever this
     // preamble holds over emitted-code quality (see
-    // rules/jitv2/weaken-the-interrupt-load-not-the-frequency.md).
+    // clanker/jitv2/weaken-the-interrupt-load-not-the-frequency.md).
     //
     // A plain load is correct here, with no fence needed:
     // - `MemFlagsData::trusted()` sets aligned|notrap but NOT
@@ -4664,7 +4664,7 @@ impl<'a, 'b> EmitCtx<'a, 'b> {
 ///
 /// `addr` is baked as an immediate — a call target is the one place a
 /// constant beats a load, because the operand has to reach a register anyway
-/// (see `rules/jitv2/`; measured 1137 -> 916 bytes on a 40-call microbench).
+/// (see `clanker/jitv2/`; measured 1137 -> 916 bytes on a 40-call microbench).
 fn emit_mem_helper_call(ctx: &mut EmitCtx, addr: i64, vaddr: Value, third: Value) -> Value {
     let ptr_ty = ctx.module.target_config().pointer_type();
     let callee = ctx.builder.ins().iconst(ptr_ty, addr);
@@ -5615,7 +5615,7 @@ fn emit_ctc1(ctx: &mut EmitCtx, _fr_mode: FrMode) {
 
 /// After an FP arithmetic op has computed its result but *before* it is
 /// committed: fold in caller-computed exception flags (never read from the
-/// host FPU — see `rules/jitv2/fpu-flags-are-computed-not-read.md`), update
+/// host FPU — see `clanker/jitv2/fpu-flags-are-computed-not-read.md`), update
 /// `core.fpu_fcsr`'s Cause bits (rewritten every instruction, never OR'd —
 /// R4000/VR5000 manuals: "the results of only one instruction"), and either
 /// commit the result via `write_result` and raise `EXC_FPE` if any enabled
@@ -6012,7 +6012,7 @@ fn emit_fpu_update_fcsr_arith(
 /// IR counterparts of `mips_exec.rs`'s `fpu_arith_flags_*` free functions —
 /// same bit-pattern checks, no host FPU status read, feeding `flags` into
 /// `emit_fpu_update_fcsr`/`emit_fpu_update_fcsr_arith`. See
-/// `rules/jitv2/fpu-flags-are-computed-not-read.md`.
+/// `clanker/jitv2/fpu-flags-are-computed-not-read.md`.
 const FCSR_FV_I64: i64 = 0x0000_0040;
 const FCSR_FZ_I64: i64 = 0x0000_0020;
 
@@ -6471,7 +6471,7 @@ fn emit_regjump(ctx: &mut EmitCtx, instrs: &[CompiledInstr; ENTRIES_PER_PAGE], r
 /// (offset 0x68) was the single hottest address in the whole region: **79
 /// loads, 0 stores** — 33% of all GPR-range loads, all of them reading a
 /// constant. See
-/// `rules/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`, where
+/// `clanker/jitv2/interrupt-check-frequency-gates-gpr-forwarding.md`, where
 /// these showed up as "loads with nothing to forward from" before the cause
 /// was understood.
 fn emit_read_gpr(ctx: &mut EmitCtx, reg: u32) -> Value {
@@ -6784,7 +6784,7 @@ fn emit_vbase(ctx: &mut EmitCtx) -> Value {
 ///   next physical page's word 0, recorded as `StopReason::ForeignPageSlot`.
 ///   Indexing `instrs` here is not merely wrong, it panics; that is the bug
 ///   this helper exists to make unrepresentable (see
-///   `rules/jitv2/nested-delay-slot-across-page-boundary.md`).
+///   `clanker/jitv2/nested-delay-slot-across-page-boundary.md`).
 /// - **Forbidden.** `Classify::Excluded` (with fallback admission off) or
 ///   `Classify::RegionBoundary` — `visit` returns `false` without marking, and
 ///   the caller records `StopReason::Excluded` on its own edge.
@@ -6929,7 +6929,7 @@ fn emit_absolute_pc_exit_block_body(
     // which are the hot branch/jump transfer paths. Paid deliberately: the
     // alternative is a correctness hazard on a real, non-debug path.
     //
-    // See rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md — the
+    // See clanker/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md — the
     // upstream guarantee this used to rely on was removed on 2026-09-02 and
     // immediately broke `emit_foreign_page_annulled_not_taken_exit`, which had
     // been silently inheriting `in_delay_slot = 1`.
@@ -7013,7 +7013,7 @@ fn emit_foreign_page_annulled_not_taken_exit(ctx: &mut EmitCtx, word: WordOffset
     // (head). That bracket is now lockstep/developer-only — its other
     // reader, `deliver_exception`, takes BD as an argument — so this exit
     // owns the state it depends on. Exactly the fragility
-    // `rules/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` flagged
+    // `clanker/jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md` flagged
     // for the mirror-image case. Caught by
     // `nested_likely_at_last_word_not_taken_annuls_foreign_slot_like_interpreter`
     // and `beql_not_taken_at_0xffc_skips_slot_and_lands_on_fallthrough_directly`.
@@ -10802,7 +10802,7 @@ mod tests {
 
     /// `is_inlinable` must reject on *both* of its conditions, not just the
     /// bounds one. The bounds half is what panicked
-    /// (`rules/jitv2/nested-delay-slot-across-page-boundary.md`); the
+    /// (`clanker/jitv2/nested-delay-slot-across-page-boundary.md`); the
     /// `visited` half is the stronger guarantee the four slot sites were
     /// missing — an unvisited word never went through
     /// `compile_region_uncommitted`'s upfront emitter-rejection loop (it
@@ -10971,7 +10971,7 @@ mod tests {
     /// un-blessed continuation block, and that write's `sync` clears the
     /// cache regardless of the mask — so a load cannot show the gain. This
     /// asymmetry is exactly what only a reload count, not a `SpillPlan`,
-    /// could reveal; see `rules/jitv2/measure-the-callout-mask-gain.md`.
+    /// could reveal; see `clanker/jitv2/measure-the-callout-mask-gain.md`.
     ///
     /// Not run under `jitv2_lockstep`/`developer`: those builds bracket every
     /// instruction with conservative tracer hooks, so no callout ever declares

@@ -97,7 +97,7 @@ jobs:
       # Doubles as a determinism check on the suite itself: a kernel whose
       # result depends on uninitialised memory or on the host's byte order
       # produces a different table on a different runner. Every one of those has
-      # already happened once — rules/testing/benchmark-suite-gotchas.md.
+      # already happened once — clanker/testing/benchmark-suite-gotchas.md.
       - name: bench — golden checksums up to date
         run: |
           make -C bench golden
@@ -189,7 +189,7 @@ jobs:
       # The JIT is a compile-time cargo feature; the CPU is not — the run
       # steps below pass `--cpu`. The R5000 cell is the R5000 without a
       # secondary cache: r5ksc / r5ksc_triton are refused at compile time
-      # (src/lib.rs, rules/testing/r5k-l1i-cache-bugs.md), and CPU/FPU
+      # (src/lib.rs, clanker/cpu/r5k-l1i-cache-bugs.md), and CPU/FPU
       # correctness (what cpu-tests exercises) doesn't depend on it.
       #
       # jitv2 is the only MIPS JIT (the v1 tiered compiler was removed in
@@ -351,7 +351,7 @@ jobs:
       # emulator bug with a confirmed counter-example — see
       # cpu-tests/docs/findings.md. The shadow — like jitv2's implied tcache —
       # has no write-back, so cache/hit_inv_discards fails its 2 checks in every
-      # cell by design — see rules/testing/tcache-discards-dirty-data-semantics.md.
+      # cell by design — see clanker/cpu/tcache-discards-dirty-data-semantics.md.
       # Otherwise the engines match check-for-check.
       #
       # The opt-in `accurate-cache` build keeps the functional model and so
@@ -413,7 +413,7 @@ jobs:
   # emulator's cache. The one guest-visible difference is the test this cell
   # exists to prove: cache/hit_inv_discards needs private dirty lines, which
   # the shadow (and jitv2's tcache) do not keep, so it fails its 2 checks in
-  # every default cell — rules/testing/tcache-discards-dirty-data-semantics.md.
+  # every default cell — clanker/cpu/tcache-discards-dirty-data-semantics.md.
   # The functional model keeps them and must pass.
   accurate-cache:
     name: accurate-cache / ${{ matrix.cpu }}

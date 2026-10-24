@@ -1,6 +1,6 @@
 //! GR2 graphics (Indy XZ / Indigo2 XZ / Indigo2 Extreme).
 //!
-//! Block layout (rules/gr2/DESIGN.md):
+//! Block layout (clanker/gr2/DESIGN.md):
 //!   hq2.rs     HQ2 registers + HLE command interpreter (HQ2 thread)
 //!   re3.rs     RE3 registers, VRAM, drawing (RE3 thread)
 //!   ge7.rs     GE7 windows + microcode storage (inert)
@@ -170,8 +170,8 @@ pub struct Gr2 {
     /// `executed_seq` as it consumes words. FIN2/FIN3 and GEDMA readiness are
     /// `executed_seq >= target_seq`, where the target names the command the
     /// caller waits on; the latched FIN2/FIN3 level flags and the old
-    /// `fin3_pending` count are gone. See rules/gr2/fin3-must-track-pending-finish.md
-    /// and rules/gr2/fin2-wait-must-stall.md.
+    /// `fin3_pending` count are gone. See clanker/gr2/fin3-must-track-pending-finish.md
+    /// and clanker/gr2/fin2-wait-must-stall.md.
     hq_queued_seq: AtomicU64,
     hq_executed_seq: AtomicU64,
     re3_queued_seq: AtomicU64,
@@ -191,7 +191,7 @@ pub struct Gr2 {
     /// graphics error and detached Xsgi. While set, a version read with FIN2
     /// clear stalls (bus busy) as long as the HQ2 still has work, so the
     /// kernel sees FIN2 as soon as the HQ2 gets there. See
-    /// rules/gr2/fin2-wait-must-stall.md.
+    /// clanker/gr2/fin2-wait-must-stall.md.
     fin2_wait: AtomicU32,
     /// The FIN2 wait's sequence target: the queue depth at the ack (the
     /// command about to be queued), or the executed sequence for a restored
@@ -215,7 +215,7 @@ pub struct Gr2 {
     /// (the kernel's VDMA) drains; head / tail count words since reset.
     /// A read with the ring empty waits (bus busy) while the HQ2 still has
     /// work, since the kernel starts the VDMA right after queuing the
-    /// request. See rules/gr2/gedma-read-port.md.
+    /// request. See clanker/gr2/gedma-read-port.md.
     gedma_out: [AtomicU32; GEDMA_OUT_WORDS],
     gedma_out_head: AtomicU32,
     gedma_out_tail: AtomicU32,

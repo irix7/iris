@@ -75,7 +75,7 @@ Each arm is repeated `--reps` times. Per boot it records:
    login marker, runs `j2 corpus <--corpus>` over the monitor TCP port, then
    quits. Capture the corpus from a boot that does the workload you intend to
    measure; the entry sets it records are a **superset** the next run draws on
-   (`rules/jitv2/corpus-capture-from-the-pcp-cache.md`).
+   (`clanker/jitv2/corpus-capture-from-the-pcp-cache.md`).
 
 ## Running it
 

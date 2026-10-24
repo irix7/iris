@@ -1,7 +1,7 @@
 //! Kernel idle-loop detection and in-place CPU thread parking.
 //!
 //! Shared by the interpreter run loop (`mips_exec.rs`) and the JIT dispatch
-//! loop (`jit/dispatch.rs`). See `rules/perf/idle-pause-work.md`.
+//! loop (`jit/dispatch.rs`). See `clanker/perf/idle-pause-work.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -124,6 +124,19 @@ impl IdleParkState {
             return IdleDecision::None;
         }
 
+        // A pending interrupt that is masked now is still about to be
+        // taken: a loop that raises and drops the spl (IRIX's splhi leaves
+        // only IP6 unmasked on IP22) is mostly seen in its masked stretch,
+        // and takes the line at splx a few instructions on. Parking there
+        // would wait for something that only running can bring, so pace
+        // instead: bounded sleeps keep the host core free without waiting on
+        // a wake condition the guest is about to create.
+        if ip != 0 {
+            self.ring_len = 0;
+            self.ring_pos = 0;
+            return IdleDecision::Pace;
+        }
+
         let ie = core.interrupts_enabled();
         let h = Self::hash_state(core);
         if self.ring[..self.ring_len].contains(&h) {
@@ -199,7 +212,8 @@ impl IdleParkState {
         PARKED.store(false, Ordering::SeqCst);
     }
 
-    /// Park in ≤1 ms slices until an interrupt is pending or the CPU stops.
+    /// Park in ≤1 ms slices until an interrupt is pending (masked or not)
+    /// or the CPU stops.
     ///
     /// The Count==Compare deadline is a `hot.cycles` threshold, so parking
     /// must stop once the threshold is crossed and let step()'s preamble
@@ -228,8 +242,12 @@ impl IdleParkState {
             PARKED.store(true, Ordering::SeqCst);
             let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
             let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
-            let im = core.cp0_status & STATUS_IM_MASK;
-            if (ip & im) != 0 {
+            // Any line, masked or not: the mask is the guest's of the moment
+            // `update` sampled - the middle of a raised spl, often - and a
+            // line it masks there it takes once it drops the spl, which it
+            // can only do running. (Waiting for `ip & im` slept through the
+            // timer for good in such a loop: an IRIX 6.5 hang.)
+            if ip != 0 {
                 break;
             }
             // Stop once the soonest guest deadline — Compare or a queued PIT
@@ -296,6 +314,18 @@ pub fn park_wait(core: &mut MipsCore) {
     PARKED.store(false, Ordering::SeqCst);
 }
 
+/// Is the CPU thread parked now? (Tests wait for it, not a guessed sleep.)
+#[cfg(test)]
+pub(crate) fn parked() -> bool {
+    PARKED.load(Ordering::SeqCst)
+}
+
+/// Tests that park take this first: there is one parked-thread slot
+/// (`PARKER`, as there is one CPU thread), so two parking at once would wake
+/// each other's threads and miss their own.
+#[cfg(test)]
+pub(crate) static PARK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
 pub fn idle_park_enabled() -> bool {
     std::env::var_os("IRIS_NO_IDLE").is_none()
 }
@@ -338,6 +368,26 @@ mod tests {
         assert!(
             matches!(st.update(&core), IdleDecision::Pace),
             "IM == 0 with a repeated state should pace, not park"
+        );
+    }
+
+    #[test]
+    fn update_declines_to_park_while_a_masked_interrupt_is_pending() {
+        // IRIX's splhi on IP22 leaves only IP6 (the bus error) unmasked, and
+        // a loop that raises and drops the spl is sampled mostly in its
+        // masked stretch. With the timer's IP4 already pending there, the
+        // guest takes it a few instructions later at splx: nothing to wait
+        // for, so no park.
+        use crate::cpu::mips_core::CAUSE_IP4;
+        let (mut st, core) = repeated_idle_state(STATUS_IE | (1 << (STATUS_IM_SHIFT + 6)));
+        core.hot.interrupts.store(CAUSE_IP4 as u64, Ordering::SeqCst);
+        assert!(
+            matches!(st.update(&core), IdleDecision::Pace),
+            "a pending interrupt is about to be taken"
+        );
+        assert!(
+            matches!(st.update(&core), IdleDecision::Pace),
+            "... however often the state repeats"
         );
     }
 
@@ -547,6 +597,7 @@ mod wake_tests {
     /// returning on the CPU thread. `raise_after` picks where in a slice the
     /// interrupt lands.
     fn delivery_latency(raise_after: Duration) -> Duration {
+        let _one = PARK_TEST_LOCK.lock();
         let mut core = MipsCore::default();
         core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
         core.cp0_compare = 1; // park returns immediately while this is zero
@@ -578,6 +629,44 @@ mod wake_tests {
             .map(|i| delivery_latency(Duration::from_micros(2_100 + i * 200)))
             .max()
             .unwrap()
+    }
+
+    #[test]
+    fn a_masked_interrupt_ends_the_park() {
+        // Parked with only IP6 unmasked (the spl raised), the timer's IP4
+        // arrives: masked now, but taken as soon as the guest drops the spl,
+        // which it can only do running. Before the fix `park` waited for
+        // `ip & im` and slept through it for good; the deadline turns that
+        // hang into a failure.
+        use crate::cpu::mips_core::CAUSE_IP4;
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 6));
+        core.cp0_compare = 1;
+        let ptr = InterruptsPtr(&core.hot.interrupts as *const AtomicU64);
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let raiser = std::thread::spawn(move || {
+            let p = ptr;
+            let t0 = Instant::now();
+            while !parked() && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::yield_now();
+            }
+            unsafe { &*p.0 }.fetch_or(CAUSE_IP4 as u64, Ordering::SeqCst);
+            wake();
+            // the deadline: release a park that never returns
+            if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                stop.store(false, Ordering::SeqCst);
+                wake();
+                return false;
+            }
+            true
+        });
+        IdleParkState::default().park(&mut core, &running);
+        let _ = tx.send(());
+        assert!(raiser.join().unwrap(),
+            "park slept through a pending interrupt masked only by the spl");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use crate::irq::IrqLine;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::thread;
@@ -273,7 +274,9 @@ struct Wd33c93aState {
     // interrupt line low. This allows SELECT_ATN to push 0x11 then 0x8E as two
     // separate interrupts, matching real hardware behaviour.
     irq_fifo: VecDeque<(u8, Option<u8>, bool)>, // (status, phase, deferred) — deferred=true: worker drops lock before delivery
-    callback: Option<Arc<dyn ScsiCallback>>,
+    /// The chip's INT, as the board wires it. On the HPC3, dropping it also
+    /// settles the paired PDMA channel's half of the shared SCSI line.
+    irq: Option<IrqLine>,
     // Debug tracking: last values returned for register reads
     last_read_asr: Option<u8>,
     last_read_reg: Option<(u8, u8)>, // (register, value)
@@ -284,11 +287,6 @@ struct Wd33c93aState {
     deferred_int: Arc<AtomicBool>,
 }
 
-pub trait ScsiCallback: Send + Sync {
-    /// Set the SCSI interrupt line. Calling with false also clears any paired
-    /// PDMA completion bit (implementors handle this internally).
-    fn set_interrupt(&self, level: bool);
-}
 
 // Safety: `Cell<T>` is never `Sync` regardless of `T` (interior mutability
 // without synchronization) — needed here because `cpu_cycles` (a `Cell`,
@@ -299,6 +297,12 @@ pub trait ScsiCallback: Send + Sync {
 // `Arc` across threads. Every other field is already genuinely `Sync` on
 // its own.
 unsafe impl Sync for Wd33c93a {}
+
+/// What the Indy's targets report in INQUIRY. The CD-ROM matches the Sony
+/// CDU-76S the Indy shipped with: IRIX's mediad uses the vendor and product
+/// strings for feature detection (volume control, eject).
+pub const INDY_CDROM: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"Sony    ", b"CDU-76S         ", b"1.0 ");
+pub const INDY_DISK: crate::scsi::ScsiIdentity = crate::scsi::ScsiIdentity::new(b"SGI     ", b"IRIS EMUL DISK  ", b"1.0 ");
 
 pub struct Wd33c93a {
     state: Arc<Mutex<Wd33c93aState>>,
@@ -323,17 +327,17 @@ pub struct Wd33c93a {
 }
 
 impl Wd33c93a {
-    pub fn new(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>) -> Self {
-        Self::new_with_config(dma, callback, heartbeat, true)
+    pub fn new(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>) -> Self {
+        Self::new_with_config(dma, irq, heartbeat, true)
     }
 
-    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
-        Self::new_with_id(dma, callback, heartbeat, deferred_int, 0)
+    pub fn new_with_config(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool) -> Self {
+        Self::new_with_id(dma, irq, heartbeat, deferred_int, 0)
     }
 
     /// Same as `new_with_config`, but tags every log line with `id` (the
     /// HPC3 SCSI controller number) — see `Wd33c93aState.id`'s doc comment.
-    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, callback: Option<Arc<dyn ScsiCallback>>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
+    pub fn new_with_id(dma: Option<Arc<dyn DmaClient>>, irq: Option<IrqLine>, heartbeat: Arc<AtomicU64>, deferred_int: bool, id: u8) -> Self {
         let deferred_int_arc = Arc::new(AtomicBool::new(deferred_int));
         Self {
             state: Arc::new(Mutex::new(Wd33c93aState {
@@ -356,7 +360,7 @@ impl Wd33c93a {
                 xfer_direction_in: false,
                 pending_cdb: Vec::new(),
                 irq_fifo: VecDeque::new(),
-                callback,
+                irq,
                 last_read_asr: None,
                 last_read_reg: None,
                 last_cmd: 0,
@@ -407,7 +411,7 @@ impl Wd33c93a {
         if is_cdrom && path.is_empty() {
             let mut state = self.state.lock();
             if id < 8 {
-                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom());
+                state.devices[id] = Some(crate::scsi::ScsiDevice::new_empty_cdrom(INDY_CDROM));
             }
             return Ok(());
         }
@@ -451,9 +455,18 @@ impl Wd33c93a {
 
         let disc_list = if is_cdrom { discs } else { vec![] };
 
+        let dev = ScsiDevice::new(
+            backend,
+            size,
+            is_cdrom,
+            path.to_string(),
+            disc_list,
+            if is_cdrom { INDY_CDROM } else { INDY_DISK },
+        );
+
         let mut state = self.state.lock();
         if id < 8 {
-            state.devices[id] = Some(ScsiDevice::new(backend, size, is_cdrom, path.to_string(), disc_list));
+            state.devices[id] = Some(dev);
         }
         Ok(())
     }
@@ -1596,7 +1609,7 @@ impl Wd33c93aState {
         if new_int != old_int {
             wdt!("INT_LINE {} (asr={:02x})",
                 if new_int != 0 { "ASSERT" } else { "DEASSERT" }, self.asr);
-            if let Some(cb) = &self.callback { cb.set_interrupt(new_int != 0); }
+            if let Some(irq) = &self.irq { irq.set(new_int != 0); }
         }
     }
 
@@ -2069,7 +2082,8 @@ impl Wd33c93aState {
 
         // Determine data_len based on command
         let data_len = match cdb[0] {
-            scsi_cmd::INQUIRY | scsi_cmd::REQUEST_SENSE | scsi_cmd::MODE_SENSE_6 => {
+            scsi_cmd::REQUEST_SENSE => ScsiDataLength::Fixed(crate::scsi::request_sense_alloc_len(&cdb)),
+            scsi_cmd::INQUIRY | scsi_cmd::MODE_SENSE_6 => {
                 ScsiDataLength::Fixed(cdb[4] as usize)
             }
             scsi_cmd::READ_BUFFER => {
@@ -2550,7 +2564,7 @@ mod data_out_phase_tests {
             let mut s = dev.state.lock();
             s.devices[2] = Some(ScsiDevice::new(
                 Box::new(crate::block_node::RawNode::from_file(file, 1 << 20)),
-                1 << 20, false, path.display().to_string(), Vec::new()));
+                1 << 20, false, path.display().to_string(), Vec::new(), INDY_DISK));
             s.advanced_mode = true;
             s.target_id = 2;
             s.regs[regs::DESTINATION_ID as usize] = 2;

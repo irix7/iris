@@ -74,7 +74,7 @@ pub enum ShaderState {
     Disabled(CompiledShader),
     /// Cranelift declined this shape. Never retried. Not an error: the line
     /// emitter has no host-pixel support, for instance — see
-    /// rules/rex3/line-plus-host-not-jittable.md.
+    /// clanker/rex3/line-plus-host-not-jittable.md.
     Failed,
 }
 
@@ -358,7 +358,7 @@ impl RexJit {
     /// Request a **cold** background compile: best-effort prefetch. No-op if
     /// already known. A full cold lane rejects the request, the `Queued` marker
     /// is dropped, and a later draw retries — the drop-and-retry contract of
-    /// `rules/testing/rex-jit-queue-retry.md`.
+    /// `clanker/rex3/rex-jit-queue-retry.md`.
     pub fn request_compile_cold(&self, dm0: u32, dm1: u32, cm: u32) {
         self.enqueue_compile(dm0, dm1, cm, |q, req| q.send_cold(req));
     }

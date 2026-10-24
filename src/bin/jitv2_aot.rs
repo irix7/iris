@@ -266,7 +266,7 @@ fn run<M: iris::cpu::mips_cache_v2::CpuModel>(
 
         // Union, not `requested` alone: a requested bit is cleared once a
         // compile covers it, so it reads empty on a settled page. See
-        // `rules/jitv2/corpus-capture-from-the-pcp-cache.md`.
+        // `clanker/jitv2/corpus-capture-from-the-pcp-cache.md`.
         let entry_words: Vec<u16> = (0..ENTRIES_PER_PAGE)
             .filter(|&o| dump.is_requested(o) || dump.is_compiled(o))
             .map(|o| o as u16)

@@ -189,7 +189,7 @@ blob must contain a **superset** of what a later run asks for, or it is a miss.
 
 - **Corpus-driven (implemented).** Read the observed entry set from a `.pcp`
   capture (`requested` ∪ `compiled`; `requested` alone is not cumulative — see
-  `rules/jitv2/corpus-capture-from-the-pcp-cache.md`). No guessing; the only
+  `clanker/jitv2/corpus-capture-from-the-pcp-cache.md`). No guessing; the only
   assumption is that the next run reaches a subset of the captured set. This is
   the same union-on-miss convergence the runtime cache already relies on, and
   it is what `jitv2_aot` does.

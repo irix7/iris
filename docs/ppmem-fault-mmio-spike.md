@@ -9,7 +9,7 @@ Companion artefacts:
 - prototype: `src/faultmmio.rs`, gated behind the off-by-default `faultmmio`
   feature (`Cargo.toml`). It is **not** wired into `Physical`, `jitv2` or any
   execution path; enabling it changes nothing about how the emulator runs.
-- invariant: §7 below, and `rules/ppmem/fault-mmio-restartability.md`.
+- invariant: §7 below, and `clanker/devices/fault-mmio-restartability.md`.
 
 Prior art this builds on: `docs/ppmem-design.md` §11 (the tabled idea),
 `docs/research/b03-softtlb-fastmem-decode.md` (QEMU / Dolphin / MAME /
