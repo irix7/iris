@@ -324,6 +324,7 @@ Test harnesses: cpu-tests and bench, JIT equivalence tests, CI flakiness, disk h
 | [equiv-test-install-jit-hooks-unconditionally.md](testing/equiv-test-install-jit-hooks-unconditionally.md) | rule | `run_multipage` must install JIT hooks on the interpreter arm too |
 | [equiv-test-isa-level-must-match-jit.md](testing/equiv-test-isa-level-must-match-jit.md) | rule | `equiv_test`'s reference interpreter must sit at the JIT's ISA level |
 | [fetchverify-stale-code-detector.md](testing/fetchverify-stale-code-detector.md) | design | `fetchverify`: catching stale code that lockstep cannot see |
+| [gui-under-xvfb-starves-cpu.md](testing/gui-under-xvfb-starves-cpu.md) | howto | GUI reproduction under Xvfb/llvmpipe starves the emulator CPU thread |
 | [installed-probe-test-is-load-flaky.md](testing/installed-probe-test-is-load-flaky.md) | history | `installed_probe_round_trips_to_the_compile_side` is load-flaky |
 | [instance-lock-lifecycle.md](testing/instance-lock-lifecycle.md) | rule | The instance lock is the file lock, not the PID file |
 | [loading-code-before-post-ram-is-unmapped.md](testing/loading-code-before-post-ram-is-unmapped.md) | rule | Loading code before POST: RAM is unmapped, and the write is silent |
