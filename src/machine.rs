@@ -2778,6 +2778,36 @@ mod controller_lifetime_tests {
             .unwrap()
     }
 
+    /// #102: `machine-start`'s acknowledgement names the transition it
+    /// performed, from a never-started machine through `Starting` to
+    /// `Running`. A second start is a no-op, and a start after `machine-stop`
+    /// takes the same route from `Halted`. The process-level test in
+    /// `tests/monitor_ready.rs` covers the monitor command and readiness.
+    #[test]
+    fn start_guest_acknowledges_the_lifecycle_transition() {
+        let mut machine = build_machine();
+        assert_eq!(machine.status().state, GuestState::Idle);
+        assert!(!machine.status().monitor_ready(), "no monitor before Machine::start");
+
+        let ack = machine.start_guest().expect("start from idle");
+        assert_eq!(ack.text(), "idle -> starting -> running");
+        assert_eq!(machine.status().state, GuestState::Running);
+        assert!(machine.status().cpu_running);
+
+        // Duplicate start: no second start and no error.
+        let ack = machine.start_guest().expect("duplicate start");
+        assert!(!ack.changed());
+        assert_eq!(ack.text(), "running (no change)");
+
+        let ack = machine.stop_guest();
+        assert_eq!(ack.text(), "running -> halted");
+        assert_eq!(machine.status().state, GuestState::Halted);
+
+        let ack = machine.start_guest().expect("start after halt");
+        assert_eq!(ack.text(), "halted -> starting -> running");
+        machine.stop();
+    }
+
     /// iris-gui drops a Machine on Stop while the monitor keeps its
     /// SystemController. Every command through that controller afterwards used
     /// to dereference freed memory (SIGSEGV in `save_snapshot`).
