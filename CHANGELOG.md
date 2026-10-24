@@ -456,6 +456,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **2026-10-02 — IMPACT opaque line stipples** (`2231d58`): stipple gaps draw
   in the background colour instead of remaining transparent.
 
+### Graphics (REX3)
+
+- **RGBMODE and command-FIFO conformance tests (#107).** Two behaviours the
+  OS REX3 driver relies on are now pinned against the emulator's register
+  interface. A 24bpp fill with `PLANES=RGB` but `DRAWMODE1.RGBMODE` clear
+  writes only the colour index into the red byte, while bit 15 composes all
+  three channels — proven in the interpreter and in the Cranelift engine. The
+  emulated GFIFO is 65536 entries deep (65535 live), not the hardware's 32;
+  `STATUS.GFIFOLEVEL` reports only its last 32 slots, overflow reports
+  `BUS_BUSY` rather than losing the write, and the `GFIFO_INT` threshold
+  interrupt is not modelled. A 64-fill burst with no status poll is also
+  covered. The deliberate divergences are written up in
+  [docs/Indy/rex3.md](docs/Indy/rex3.md#where-iris-diverges-from-real-hardware).
+
 ### IP28, memory, and battery-backed state
 
 - **Embedded IP28 PROM fallback.** `src/prombinip28.rs` embeds the 512 KB
