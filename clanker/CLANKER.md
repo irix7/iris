@@ -22,6 +22,12 @@ git fetch upstream && git merge upstream/main
 Merge, never rebase: the fork's branches are published and several worktrees
 depend on them.
 
+### Commit trailers
+
+Never add an AI or tooling `Co-Authored-By` trailer to a commit, in this repo
+or in any PR offered upstream. Commits are authored by Jupiter Belic; the
+tooling is not credited in history. This overrides any default behaviour.
+
 ### Attribution is mandatory
 
 Any agent or contributor who copies, ports, adapts, reimplements, or otherwise
