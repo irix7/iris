@@ -377,7 +377,7 @@ headless.
 | `rtc save [file]` | Save the RTC NVRAM |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
-| `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
+| `pit status` / `pit debug <on\|off>` | 8254 timer state, clock chain and timing-reference capability / trace **[DEV]** |
 | `hal2 status` | HAL2 audio state |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot) |
@@ -388,6 +388,12 @@ headless.
 
 `nveeprom save` (Indigo2) and `rtc save` (Indy) persist PROM changes before
 a forced termination; a normal stop saves them automatically.
+
+`pit status` states the timer's time base explicitly: it counts the guest
+cycle clock, the same clock CP0 Count is derived from, so it is not an
+independent or host-referenced clock. An unclocked counter (counter 2 not
+programmed as a rate generator) is shown with `armed=false` and `null=true`.
+See [docs/Indy/ioc-8254-timer.md](docs/Indy/ioc-8254-timer.md).
 
 ### Networking
 

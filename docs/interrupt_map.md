@@ -256,6 +256,10 @@ registers INT3 doesn't have** (fullhouse-only, no guinness equivalent):
 | PIT ch 0-2/ctl | `+0x30-0x3C` | 12-15 | —                 | u8     |
 | **EXT_IO**   | `0x1FBD9900` (= `IOC_BASE + 0x100`, own address, *not* in the INT2 block) | — | `HPC3_EXT_IO_ADDR` | **u16**, read as `uint` |
 
+The embedded timer at `+0x30` is an Intel 8254; its clock chain, read paths
+and timing behaviour have their own note:
+[IOC 8254 timer](Indy/ioc-8254-timer.md).
+
 `IP22BOFF(x) = x | 0x3` (`kern/sys/IP22.h`) is a `_MIPSEB` byte-lane adjustment for
 byte-wide registers on the big-endian PROM/kernel build — every `LIO_*_OFFSET` constant in
 IRIX source has its low 2 bits set (e.g. `PORT_CONFIG_OFFSET = IP22BOFF(0x1c) = 0x1F`) for
