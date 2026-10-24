@@ -351,6 +351,7 @@ Toolchain, dependency upgrades, platform build issues.
 | [chd-disks-need-features-chd-at-build-time.md](build/chd-disks-need-features-chd-at-build-time.md) | history | CHD disk images require `--features chd` at build time |
 | [dependency-upgrade-gotchas.md](build/dependency-upgrade-gotchas.md) | howto | Dependency upgrade gotchas (2026-08 sweep) |
 | [mmap-rs-fixed-address-aliasing.md](build/mmap-rs-fixed-address-aliasing.md) | design | Host memory aliasing: what mmap-rs actually supports (and where it doesn't) |
+| [nix-launcher.md](build/nix-launcher.md) | howto | The Nix launcher: library path from the closure, not from the shell |
 
 ## plans/
 
