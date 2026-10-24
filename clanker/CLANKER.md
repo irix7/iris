@@ -193,6 +193,34 @@ Binaries: `iris` (the emulator), `iris-ci` (CI/automation socket client),
 (`jitv2`), and `iris-gui` in the workspace. Feature flags are documented in
 `FEATURES.md`.
 
+### The Nix dev shell (this rig)
+
+The build environment on the fork's development rig is the Nix flake
+(`flake.nix`). Run cargo from inside the dev shell rather than bare, or the
+native headers/libs (ALSA, X11/Wayland, GL, v4l, libclang for bindgen) and the
+pinned toolchain are missing:
+
+```
+nix develop --command cargo check -p iris
+nix develop --command cargo test -p iris
+```
+
+Entering the shell also installs `target/launcher/bin/iris` (and `iris-ci`): a
+wrapper that carries the shell's own library search path and finds the
+cargo-built binary relative to itself. Use it for `--ci` runs and in scripts —
+it needs no `LD_LIBRARY_PATH` — and the raw binary for `gdb`/`perf`.
+`nix run .#smoke` checks it from an empty environment;
+`clanker/build/nix-launcher.md` has the details and the flake gotchas.
+
+The dev shell pins rustup at the host's shared rig toolchain
+(`RUSTUP_HOME`/`CARGO_HOME` under `/mnt/europa/sgi-toolchain-scratch`), which
+`rust-toolchain.toml` names (`nightly-2026-10-02`). On another host, drop the
+flake's `shellHook` and let rustup honour `rust-toolchain.toml` itself. If the
+rig toolchain stops launching with "required file not found", a nix GC has
+collected the glibc its ELF interpreter points at: repoint `cargo`/`rustc` with
+`patchelf --set-interpreter <a surviving glibc>/lib/ld-linux-x86-64.so.2`, and
+set `TMPDIR` off any full root filesystem.
+
 ## Testing and benchmarking
 
 - `cargo test --workspace` — unit tests (per-device snapshot round trips, CPU,
