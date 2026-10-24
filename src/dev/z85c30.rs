@@ -3,7 +3,6 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU8, AtomicBool, Ordering};
 use std::collections::VecDeque;
 use std::io::{self, Write, Read};
-use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -15,6 +14,7 @@ use std::io::Write as IoWrite;
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u8, u8_slice_to_toml, load_u8_slice, hex_u8};
 use crate::devlog::LogModule;
+use crate::dev::serial_log::SerialLog;
 
 pub mod scc_regs {
     pub const WR0: u8 = 0; // Command/Pointer
@@ -371,22 +371,18 @@ impl SerialBackend for NullBackend {
 /// working unchanged.
 pub struct TeeBackend {
     inner: Arc<dyn SerialBackend>,
-    log: Mutex<std::fs::File>,
+    log: Arc<SerialLog>,
 }
 
 impl TeeBackend {
-    pub fn new(inner: Arc<dyn SerialBackend>, path: &str) -> io::Result<Self> {
-        let log = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { inner, log: Mutex::new(log) })
+    pub fn new(inner: Arc<dyn SerialBackend>, log: Arc<SerialLog>) -> Self {
+        Self { inner, log }
     }
 }
 
 impl SerialBackend for TeeBackend {
     fn send_byte(&self, byte: u8) {
-        let mut f = self.log.lock();
-        let _ = f.write_all(&[byte]);
-        let _ = f.flush();
-        drop(f);
+        self.log.write(&[byte]);
         self.inner.send_byte(byte);
     }
     fn recv_byte(&self) -> io::Result<u8> {
@@ -1224,12 +1220,11 @@ pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     console: Mutex<ConsoleRing>,
     cv: Condvar,
-    /// Optional file mirror: every byte that flows through ttyd1 in either
-    /// direction is appended here. Host-injected bytes are echoed by IRIX
-    /// anyway, so writing only guest output already captures the full
-    /// transcript without duplication.
-    log: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
-    log_bytes: std::sync::atomic::AtomicU64,
+    /// Optional file mirror: every guest output byte is appended through the
+    /// shared [`SerialLog`]. Host-injected bytes are echoed by IRIX anyway,
+    /// so writing only guest output already captures the full transcript
+    /// without duplication.
+    log: Mutex<Option<Arc<SerialLog>>>,
 }
 
 impl CiSerialBackend {
@@ -1239,19 +1234,13 @@ impl CiSerialBackend {
             console: Mutex::new(ConsoleRing::new()),
             cv: Condvar::new(),
             log: Mutex::new(None),
-            log_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Open a log file that will receive every guest output byte. Append-only;
-    /// existing contents are preserved. Errors are returned to the caller.
-    pub fn set_log_file(&self, path: &str) -> io::Result<()> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        *self.log.lock() = Some(std::io::BufWriter::new(f));
-        Ok(())
+    /// Attach the shared log sink. The caller opens the file (and chooses the
+    /// timestamp mode) once, so the CI and TCP paths write identical bytes.
+    pub fn set_log(&self, log: Arc<SerialLog>) {
+        *self.log.lock() = Some(log);
     }
 
     /// Inject bytes from host to guest (the harness typing on the console).
@@ -1346,8 +1335,8 @@ impl CiSerialBackend {
             ring.generation = ring.generation.wrapping_add(1);
             ring.cursors.clear();
         }
-        if let Some(f) = self.log.lock().as_mut() {
-            let _ = f.flush();
+        if let Some(log) = self.log.lock().as_ref() {
+            log.flush();
         }
         self.cv.notify_all();
     }
@@ -1364,15 +1353,8 @@ impl SerialBackend for CiSerialBackend {
     fn host_speed(&self) -> bool { true }
     fn send_byte(&self, byte: u8) {
         self.console.lock().push(byte);
-        let n = self.log_bytes.fetch_add(1, Ordering::Relaxed);
-        if let Some(f) = self.log.lock().as_mut() {
-            // BufWriter flushes when its buffer fills; flush at line ends and
-            // every 4 KiB so a live `tail -f`/CI reader sees output promptly.
-            // One syscall per character made --serial-log throttle the guest.
-            let _ = f.write_all(&[byte]);
-            if matches!(byte, b'\n' | b'?' | b'>' | b'#') || n % 4096 == 4095 {
-                let _ = f.flush();
-            }
+        if let Some(log) = self.log.lock().as_ref() {
+            log.write(&[byte]);
         }
         self.cv.notify_all();
     }
@@ -1664,17 +1646,41 @@ mod tests {
     }
 
     #[test]
-    fn ci_serial_log_is_buffered_and_flushed_on_reset() {
+    fn tee_backend_mirrors_a_completed_line_to_the_log() {
+        let path = std::env::temp_dir().join(format!(
+            "iris-tee-serial-log-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let log = SerialLog::open(
+            &path, crate::config::SerialLogTimestamps::Off).unwrap();
+        let tee = TeeBackend::new(Arc::new(NullBackend), log.clone());
+        for b in b"ttyd1: up\n" {
+            tee.send_byte(*b);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"ttyd1: up\n");
+        drop(tee);
+        drop(log);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ci_serial_log_flushes_lines_and_reset_flushes_a_partial_line() {
         let path = std::env::temp_dir().join(format!(
             "iris-ci-serial-log-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
+        let log = SerialLog::open(&path, crate::config::SerialLogTimestamps::Off)
+            .unwrap();
         let backend = CiSerialBackend::new();
-        backend.set_log_file(path.to_str().unwrap()).unwrap();
-        for b in b"line one\r\nline two" { backend.send_byte(*b); }
-        // Nothing is guaranteed on disk before the flush point.
+        backend.set_log(log.clone());
+        for b in b"line one\r\nline two" {
+            backend.send_byte(*b);
+        }
+        // A completed line is on disk while the backend is still open; the
+        // partial second line is not.
+        assert_eq!(std::fs::read(&path).unwrap(), b"line one\r\n");
         backend.reset();
-        let got = std::fs::read(&path).unwrap();
-        assert_eq!(got, b"line one\r\nline two");
+        assert_eq!(std::fs::read(&path).unwrap(), b"line one\r\nline two");
+        drop(backend);
+        drop(log);
         let _ = std::fs::remove_file(path);
     }
 

@@ -18,6 +18,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Serial console
+
+- **`--serial-log` is usable as a boot-orchestration signal (#105).** The log
+  is flushed at every completed line, and a partial line is flushed after
+  about 100 ms, so a harness can tail it without waiting for process exit.
+  `--serial-log-timestamps off|guest|wall|both` optionally prefixes each line
+  with monotonic guest seconds and/or a UTC ISO-8601 wall clock; `off` (the
+  default) remains a byte-for-byte transcript, so transcript comparisons are
+  unchanged. Guest time is the emulator's synthetic clock (retired cycles at
+  10 ns each), not wall time. (`src/dev/serial_log.rs`)
+
 ### Idle / headless runs
 
 - **Headless idle spin no longer pegs host CPU (#83).** A headless/CI guest whose

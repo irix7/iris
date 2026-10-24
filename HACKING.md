@@ -176,6 +176,7 @@ Every device that has real work to do runs on its own thread:
 | `seeq-enet`, `seeq-nat` | ethernet DMA pump; the NAT engine and its built-in services |
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
+| `serial-log-flush` | partial-line flush for `--serial-log` (one per open log; exits with it) |
 | `VINO-DMA` | video capture (only with a video source) |
 | graphics: `REX3-Processor` / `GR2-HQ2`, `GR2-RE3` / `MGRAS-HQ3`, `MGRAS RSS` ×1-4 | consumers of the graphics FIFOs (section 7) |
 | `REX3-Refresh`, `GR2-Display`, MGRAS refresh | scanout and composition; the refresh thread owns the GL context |
