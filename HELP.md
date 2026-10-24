@@ -452,6 +452,33 @@ nc 127.0.0.1 8881
 serial status    # dump SCC channel A/B register and FIFO state
 ```
 
+### Capturing the console to a file
+
+`--serial-log FILE` (config key `serial_log`) appends every byte the guest
+emits on ttyd1 to `FILE`, with or without `--ci`. The default is a
+byte-for-byte transcript: nothing is added, so it can be compared with a
+capture from another build. Completed lines are flushed as they are written,
+and a line that stops mid-way (a shell prompt, a progress bar) is flushed
+after about 100 ms, so `tail -f` sees output while iris is still running. A
+graceful stop flushes the file and dropping the machine closes it; a killed
+process can lose at most the final partial line.
+
+Add `--serial-log-timestamps MODE` (or `serial_log_timestamps` in the config)
+to turn the log into a line-oriented event stream:
+
+| Mode | Prefix |
+|---|---|
+| `off` | none; raw transcript (default) |
+| `guest` | `[   12.345678] ` — seconds since the CPU started, from retired guest cycles (10 ns each) |
+| `wall` | `[2026-10-24T12:34:56.789012Z] ` — UTC wall clock with microseconds |
+| `both` | both prefixes, guest first |
+
+Guest time is the emulator's synthetic time base, not wall time: it stops
+when the guest is paused and runs faster or slower than real time depending
+on the host. Use `wall` when a boot transcript must line up with host logs;
+use `guest` for deterministic, host-independent ordering. Timestamp modes
+insert bytes, so do not use them on binary serial traffic.
+
 ---
 
 ## Keyboard (standalone `iris` window)
@@ -525,6 +552,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
+# serial_log_timestamps = "off"  # off (raw), guest, wall or both
 
 # Bare-metal testing (cpu-tests/, bench/)
 # load_elf = "test.elf"
@@ -699,6 +727,8 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
+  --serial-log-timestamps MODE
+                              Prefix each line: off (default), guest, wall, both
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)

@@ -584,7 +584,9 @@ Commands without a dedicated tool (graphics, devices, `j2`) go through
   boot and log in, run guest commands, copy files in and out, screenshots,
   snapshots, CD changes ([STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci)).
 - **Serial console**: ports 8880 (channel A) and 8881 (channel B, the IRIX
-  console); `serial_log` writes the console to a file ([HELP.md](HELP.md#serial-ports)).
+  console); `serial_log` writes the console to a file, flushed at each
+  completed line, with optional guest/wall timestamps
+  ([HELP.md](HELP.md#capturing-the-console-to-a-file)).
 - **Environment variables** for traces, JIT diagnostics and logging are
   listed in [FEATURES.md](FEATURES.md#environment-and-diagnostic-controls).
 - **Crashes on Windows**: `crash_diag.rs` logs otherwise silent process
