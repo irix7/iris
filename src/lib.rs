@@ -219,6 +219,7 @@ pub mod video_source;
 pub mod ultra_proto;
 pub mod crash_diag;
 pub mod state;
+pub mod instance;
 mod nv_storage;
 pub mod hwwatch;
 #[macro_use]

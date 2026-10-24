@@ -122,6 +122,13 @@ impl StatePaths {
         }
     }
 
+    /// Instance ownership lock. Neutral: `iris.lock` in the working directory,
+    /// beside the default NVRAM and snapshot store. Under a root:
+    /// `<root>/iris.lock`.
+    pub fn instance_lock(&self) -> PathBuf {
+        self.at("iris.lock")
+    }
+
     /// COW raw-disk overlay directory. Today this resolves via
     /// `IRIS_COW_OVERLAY_DIR`, else beside/under `/tmp`; `None` keeps that
     /// resolution. Under a root: `<root>/overlays`.
@@ -172,6 +179,7 @@ mod tests {
         assert_eq!(p.chunk_store_dir(), PathBuf::from("saves").join(".cas"));
         assert_eq!(p.test_device_dump(), PathBuf::from("iris-testdev-dump.json"));
         assert_eq!(p.crash_log(), PathBuf::from("iris-crash.log"));
+        assert_eq!(p.instance_lock(), PathBuf::from("iris.lock"));
         // Serial logging is off by default, so there is no path to report.
         assert_eq!(p.serial_log(), None);
 
@@ -203,6 +211,7 @@ mod tests {
         assert_eq!(p.test_device_dump(), root.join("iris-testdev-dump.json"));
         assert_eq!(p.crash_log(), root.join("iris-crash.log"));
         assert_eq!(p.ci_socket(), root.join("iris.sock"));
+        assert_eq!(p.instance_lock(), root.join("iris.lock"));
         assert_eq!(p.cow_overlay_dir(), Some(root.join("overlays")));
         assert_eq!(p.chd_diff_dir(), Some(root.join("diffs")));
     }
@@ -226,6 +235,7 @@ mod tests {
         assert_ne!(a.test_device_dump(), b.test_device_dump());
         assert_ne!(a.crash_log(), b.crash_log());
         assert_ne!(a.ci_socket(), b.ci_socket());
+        assert_ne!(a.instance_lock(), b.instance_lock());
         assert_ne!(a.cow_overlay_dir(), b.cow_overlay_dir());
         assert_ne!(a.chd_diff_dir(), b.chd_diff_dir());
     }

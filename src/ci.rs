@@ -12,7 +12,7 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::config::{ci_socket_is_tcp, ci_socket_tcp_addr};
 
@@ -116,6 +116,170 @@ fn cleanup_socket_path(path: &str) {
     }
     #[cfg(unix)]
     let _ = std::fs::remove_file(path);
+}
+
+// ----------------------------------------------------------------------------
+// Client-side probes
+// ----------------------------------------------------------------------------
+
+/// What answers on a CI endpoint, without disturbing it unless asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    /// Nothing is listening: the path does not exist, or the connect was
+    /// refused. A leftover Unix socket file in this state is stale.
+    Free,
+    /// An iris CI server answered `ping`. `pid` is its process id when the
+    /// build reports one; older builds answer without data.
+    Live { pid: Option<u32> },
+    /// Something accepts connections there but does not speak the iris CI
+    /// protocol. Never treat this as an instance we may stop.
+    Foreign,
+}
+
+/// How long a probe waits for a CI server to answer. A live local server
+/// answers in microseconds; this only bounds a wedged or foreign listener.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Either transport the CI socket supports on this platform.
+enum CiStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl CiStream {
+    fn set_read_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            CiStream::Tcp(s) => s.set_read_timeout(Some(timeout)),
+            #[cfg(unix)]
+            CiStream::Unix(s) => s.set_read_timeout(Some(timeout)),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        match self {
+            CiStream::Tcp(s) => s.set_write_timeout(Some(timeout)),
+            #[cfg(unix)]
+            CiStream::Unix(s) => s.set_write_timeout(Some(timeout)),
+        }
+    }
+}
+
+impl Read for CiStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            CiStream::Tcp(s) => s.read(buf),
+            #[cfg(unix)]
+            CiStream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for CiStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            CiStream::Tcp(s) => s.write(buf),
+            #[cfg(unix)]
+            CiStream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            CiStream::Tcp(s) => s.flush(),
+            #[cfg(unix)]
+            CiStream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+fn connect_ci(path: &str, timeout: Duration) -> std::io::Result<CiStream> {
+    if ci_socket_is_tcp(path) {
+        let addr = ci_socket_tcp_addr(path);
+        let mut last_err = None;
+        for sock in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&sock, timeout) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    return Ok(CiStream::Tcp(s));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "address resolved to nothing")
+        }))
+    } else {
+        #[cfg(unix)]
+        {
+            UnixStream::connect(path).map(CiStream::Unix)
+        }
+        #[cfg(not(unix))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unix CI sockets are not supported on this platform",
+            ))
+        }
+    }
+}
+
+/// Send one request over a fresh connection and return its `data` field.
+fn ci_request(path: &str, cmd: &str, timeout: Duration) -> Result<Value, String> {
+    let mut stream = connect_ci(path, timeout).map_err(|e| format!("{}: {}", path, e))?;
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    let req = serde_json::json!({ "cmd": cmd, "args": {} });
+    let line = format!("{}\n", req);
+    stream
+        .write_all(line.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("{}: {}", path, e))?;
+    let mut reader = BufReader::new(stream);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .map_err(|e| format!("{}: {}", path, e))?;
+    if response.trim().is_empty() {
+        return Err(format!("{}: closed the connection without a response", path));
+    }
+    let value: Value = serde_json::from_str(response.trim())
+        .map_err(|e| format!("{}: bad response: {}", path, e))?;
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let msg = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        return Err(format!("{}: {}", cmd, msg));
+    }
+    Ok(value.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// Probe a CI endpoint without asking it to do anything.
+pub fn probe_socket(path: &str) -> SocketState {
+    match ci_request(path, "ping", PROBE_TIMEOUT) {
+        Ok(data) => SocketState::Live {
+            pid: data.get("pid").and_then(Value::as_u64).map(|p| p as u32),
+        },
+        Err(_) => match connect_ci(path, PROBE_TIMEOUT) {
+            Ok(_) => SocketState::Foreign,
+            Err(_) => SocketState::Free,
+        },
+    }
+}
+
+/// Ask a live CI server to shut down cleanly (`quit` stops the machine first,
+/// so NVRAM and the Indigo2 EEPROM are written).
+pub fn request_quit(path: &str) -> Result<(), String> {
+    match ci_request(path, "quit", Duration::from_secs(5)) {
+        Ok(_) => Ok(()),
+        // A server may close before its reply is read. That still counts as a
+        // successful quit if the endpoint is gone afterwards.
+        Err(e) => match probe_socket(path) {
+            SocketState::Free => Ok(()),
+            _ => Err(e),
+        },
+    }
 }
 
 impl CiServer {
@@ -309,7 +473,7 @@ fn handle_client_tcp(server: Arc<CiServer>, stream: TcpStream) {
 
 fn dispatch(server: &CiServer, req: &Request) -> Response {
     match req.cmd.as_str() {
-        "ping" => Response::ok(),
+        "ping" => Response::data(serde_json::json!({ "pid": std::process::id() })),
         "quit" => cmd_quit(server, &req.args),
         "start" => cmd_start(server),
         "save" => cmd_save(server, &req.args),
@@ -449,6 +613,7 @@ fn cmd_quit(server: &CiServer, args: &Value) -> Response {
         // IRIS_NO_EXIT_ON_POWEROFF=1 so a `quit` over the CI socket does
         // not kill the embedder.
         if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+            crate::instance::cleanup_for_exit();
             std::process::exit(0);
         }
     });
@@ -1374,6 +1539,98 @@ mod tests {
 
         prepare_socket_path(path_s).expect("a stale socket is replaced");
         assert!(!path.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn temp_socket(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "iris-ci-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), dir.join("iris.sock"))
+    }
+
+    #[test]
+    fn a_ping_reports_the_server_pid() {
+        let (dir, path) = temp_socket("ping");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("\"ping\""), "{line}");
+            stream.write_all(b"{\"ok\":true,\"data\":{\"pid\":1234}}\n").unwrap();
+        });
+        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Live { pid: Some(1234) });
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_listener_that_does_not_speak_ci_is_foreign() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (dir, path) = temp_socket("foreign");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_server = stop.clone();
+        let server = thread::spawn(move || {
+            while !stop_server.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.write_all(b"not the iris protocol\n");
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Foreign);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dead_socket_file_is_free() {
+        let (dir, path) = temp_socket("dead");
+        let listener = UnixListener::bind(&path).unwrap();
+        drop(listener);
+        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Free);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tcp_ping_reports_the_server_pid() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            stream.write_all(b"{\"ok\":true,\"data\":{\"pid\":4321}}\n").unwrap();
+        });
+        assert_eq!(probe_socket(&addr), SocketState::Live { pid: Some(4321) });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn quit_asks_the_server_to_shut_down() {
+        let (dir, path) = temp_socket("quit");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.contains("\"quit\""), "{line}");
+            stream.write_all(b"{\"ok\":true,\"data\":null}\n").unwrap();
+        });
+        request_quit(path.to_str().unwrap()).unwrap();
+        server.join().unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
