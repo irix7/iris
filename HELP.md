@@ -794,7 +794,9 @@ the monitor or `iris-ci quit` (or let `--replace` do it) when you need a clean
 shutdown. On Windows there is no Unix-socket file to remove; the lock file is
 truncated on a normal exit and left in place rather than unlinked, and the OS
 releases the lock when the process dies. A stale record is harmless: the next
-start recognises the free lock and overwrites it.
+start recognises the free lock and overwrites it. `--replace` can only stop an
+instance that answers on its CI socket there; there is no portable way to
+signal a recorded process.
 
 ---
 
