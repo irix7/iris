@@ -459,13 +459,13 @@ fn signal_owner(lock_path: &Path, owner: &InstanceRecord) -> Result<(), LockErro
 
     #[cfg(unix)]
     {
-        eprintln!(
-            "iris: stopping pid {} with SIGTERM (no live CI socket, so the guest is not shut down \
-             cleanly and unsaved NVRAM is lost)",
-            owner.pid
-        );
         let rc = unsafe { libc::kill(owner.pid as libc::pid_t, libc::SIGTERM) };
         if rc == 0 {
+            eprintln!(
+                "iris: stopped pid {} with SIGTERM (it has no live CI socket, so the guest was \
+                 not shut down cleanly and unsaved NVRAM is lost)",
+                owner.pid
+            );
             return Ok(());
         }
         let err = std::io::Error::last_os_error();
