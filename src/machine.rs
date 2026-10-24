@@ -636,6 +636,7 @@ impl Machine {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("iris: fatal: SCSI ID {}: {}", id, e);
+                        crate::instance::cleanup_for_exit();
                         std::process::exit(1);
                     }
                 };
@@ -650,6 +651,7 @@ impl Machine {
                             eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
                         } else {
                             eprintln!("iris: fatal: {msg}");
+                            crate::instance::cleanup_for_exit();
                             std::process::exit(1);
                         }
                     }
@@ -743,6 +745,7 @@ impl Machine {
                     continue;
                 }
                 eprintln!("iris: fatal: {msg}");
+                crate::instance::cleanup_for_exit();
                 std::process::exit(1);
             }
         }
@@ -1426,6 +1429,7 @@ impl Machine {
                                 // does not kill the host process.
                                 #[cfg(not(feature = "developer"))]
                                 if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
+                                    crate::instance::cleanup_for_exit();
                                     std::process::exit(0);
                                 }
                             }
@@ -1491,6 +1495,7 @@ impl Machine {
                     Err(_) => break,
                 }
             }
+            crate::instance::cleanup_for_exit();
             std::process::exit(0);
         });
 

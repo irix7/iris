@@ -52,6 +52,7 @@ For instance id `N` (0-based), unless the base config already set a value:
 | Artefact | Derived value |
 |---|---|
 | state dir | `iris-instance-{N}` (overridable with `--state-dir`) |
+| ownership lock | `<state_dir>/iris.lock` |
 | NVRAM / EEPROM | `<state_dir>/nvram.bin`, `<state_dir>/nveeprom.bin` |
 | snapshot store | `<state_dir>/saves` (with chunk store `<state_dir>/saves/.cas`) |
 | COW overlay dir | `<state_dir>/overlays` |
@@ -78,6 +79,9 @@ Landed:
 - **#2** `StatePaths` seam (`src/state.rs`).
 - **#3** `InstanceIdentity` / `derive_instance` and the CLI flags
   (`src/config.rs`, `src/main.rs`).
+- **#103** instance ownership: a locked `iris.lock` per state directory,
+  liveness by lock rather than PID, `--replace`, listener preflight, and
+  signal/exit cleanup (`src/instance.rs`, `tests/instance_lifecycle.rs`).
 
 Open, in dependency order (see the GitHub issues for acceptance criteria):
 
@@ -101,8 +105,49 @@ Known gaps while the work is in flight:
   not silently.
 - `port_base` saturates at `u16::MAX`, so a very large fleet (id beyond ~5653)
   would share a block.
+- The ownership lock is taken by the `iris` CLI. `iris-gui` embeds `Machine`
+  directly and does not take it, so a GUI session and a CLI session using the
+  same state directory can still collide; the GUI start preflight is the only
+  guard there today.
+
+## Ownership and cleanup
+
+One state directory is owned by one live process. The marker is
+`<state_dir>/iris.lock` (plain `iris.lock` in the working directory for a
+single-instance run), held with a non-blocking exclusive advisory lock for the
+process lifetime. The kernel releases the lock on process death, so a crash or
+`SIGKILL` leaves a file the next start reclaims instead of a state directory
+that is permanently "in use". The JSON record inside it names the PID, instance
+id, state directory, CI socket, monitor port and process start time; a refused
+start prints the record, and `--replace` uses the start time to avoid signalling
+a PID that has been recycled by an unrelated process.
+
+`--replace` prefers a clean `quit` over the recorded CI socket, which runs
+`Machine::stop` and saves NVRAM/EEPROM. Only when no CI socket answers as the
+recorded owner does it send `SIGTERM`, after validating the process start
+marker. A live listener that does not speak the CI protocol is never touched.
+
+Startup checks the listeners it is about to bind (monitor, serial A/B outside
+`--ci`, the GDB stub, a TCP CI socket) before constructing the Machine. A Unix
+CI socket is probed over the CI protocol instead: a stale file is removed, a
+live iris is refused unless `--replace` says otherwise, and a foreign listener
+is left alone.
+
+`SIGINT`, `SIGTERM` and `SIGHUP` unlink the CI socket and lock file and
+re-raise the signal, but deliberately do not stop the guest — `Machine::stop`
+takes locks and writes NVRAM, which is not async-signal-safe. Quit through the
+monitor or `iris-ci quit` for a clean shutdown.
 
 ## Testing
+
+`tests/instance_lifecycle.rs` spawns the real binary in a temporary working
+directory and covers start → quit → restart, a refused second start,
+`--replace` over the CI socket, a stale socket and lock, `SIGTERM` cleanup, and a
+busy monitor port. It needs no IRIX media and runs in the Rust workflow:
+
+```sh
+cargo test -p iris --test instance_lifecycle
+```
 
 `test/fleet/run.sh` is the end-to-end check: it boots two instances and drives
 each over its own CI serial socket (the Indy PROM command monitor), asserting

@@ -254,6 +254,13 @@ iris --instance 1 --ci &             # second VM, no port or socket clash
 iris --instance 2 --print-instance   # print the derived endpoints and exit
 ```
 
+Each state directory is owned by one live process through a locked
+`iris.lock`. A second start there fails with the owner's PID instead of
+silently sharing NVRAM or a CI socket; `--replace` stops that recorded owner
+(cleanly over its CI socket when it can) before starting. See
+[HELP.md](HELP.md#instance-ownership-and-cleanup) for signal and stale-file
+behaviour.
+
 Today the derivation applies NVRAM/EEPROM paths, the monitor/serial/CI ports,
 the CI socket, the MAC and the NAT subnet. Wiring the remaining artefacts
 (snapshot store, COW/CHD overlays, JIT cache, logs and the test dump) under the

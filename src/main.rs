@@ -23,6 +23,38 @@ fn main() {
         std::env::set_var("IRIS_CRASH_LOG", std::path::Path::new(dir).join("iris-crash.log"));
     }
 
+    // One live iris per state directory. The lock is taken before any disk,
+    // NVRAM or listener is opened: a second run fails here with the owner's
+    // PID and state dir instead of half-starting. The guard lives for the
+    // whole process; `cleanup_for_exit` covers the `process::exit` paths that
+    // skip Drop.
+    let mut instance_lock = match iris::instance::InstanceLock::acquire(
+        iris::instance::lock_path(&cfg),
+        iris::instance::InstanceRecord::current(&cfg),
+        cfg.replace,
+    ) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("iris: {e}");
+            std::process::exit(1);
+        }
+    };
+    let ci_socket = cfg.ci.then_some(cfg.ci_socket.as_str());
+    iris::instance::register_exit_cleanup(instance_lock.path(), ci_socket);
+    iris::instance::install_signal_cleanup(instance_lock.path(), ci_socket);
+    if let Some(pid) = instance_lock.replaced_pid() {
+        eprintln!("iris: replaced instance pid {pid} (lock {})", instance_lock.path().display());
+    }
+    // Fail before opening disks or NVRAM when a listener is already held. In
+    // --replace mode the old owner has been stopped above, so a conflict here
+    // belongs to some other program and is reported, not touched.
+    if let Err(e) = iris::instance::check_endpoints(&cfg) {
+        eprintln!("iris: {e}");
+        instance_lock.cleanup();
+        std::process::exit(1);
+    }
+    let _instance_lock = instance_lock;
+
     // If PCAP networking is selected but no interface was configured, prompt the
     // user to choose one now — on the main thread, before the machine starts —
     // and write the choice into the config. Done here (not in the network
@@ -78,6 +110,7 @@ fn main() {
             Ok(summary) => eprint!("iris: loaded {}\n{}", path, summary),
             Err(e) => {
                 eprintln!("iris: --load-elf {}: {}", path, e);
+                iris::instance::cleanup_for_exit();
                 std::process::exit(1);
             }
         }
@@ -130,6 +163,7 @@ fn main() {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("iris: failed to start CI server: {}", e);
+                iris::instance::cleanup_for_exit();
                 std::process::exit(1);
             }
         }
@@ -196,6 +230,7 @@ fn start_perfetto((path, cats, clock): (Option<String>, Option<String>, Option<S
             Ok(msg) => eprintln!("{msg}"),
             Err(e) => {
                 eprintln!("iris: {e}");
+                iris::instance::cleanup_for_exit();
                 std::process::exit(1);
             }
         }
@@ -203,6 +238,7 @@ fn start_perfetto((path, cats, clock): (Option<String>, Option<String>, Option<S
     #[cfg(not(feature = "perfetto"))]
     {
         eprintln!("iris: --perfetto {path}: this build has no perfetto support (rebuild with --features perfetto)");
+        iris::instance::cleanup_for_exit();
         std::process::exit(1);
     }
 }
