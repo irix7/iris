@@ -155,7 +155,10 @@ failure; `--keep-going` runs the remaining steps and still exits non-zero.
 
 For automation that doesn't want to depend on `iris-ci`, the underlying socket
 protocol is newline-delimited JSON; `cmd` and `args` per request, `{ok, data,
-error}` per response. See `src/ci.rs` for the dispatch table.
+error}` per response. See `src/ci.rs` for the dispatch table. `ping` returns
+`{"pid": <server pid>}`; `quit` stops the machine (saving NVRAM) and exits.
+`iris --replace` uses both to stop the instance that owns a state directory's
+lock before taking it over.
 
 
 ## Scratch volume — file injection without networking

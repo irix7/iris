@@ -161,7 +161,7 @@ the first `[section]`, because TOML tables continue until the next header.
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
 | `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
 | `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. A partial line is held until its newline and written on stop. |
-| `state_dir` | `unset` | Instance state directory recorded by `--instance`/`--state-dir` (see [docs/parallel-instances.md](docs/parallel-instances.md)); derived automatically, not usually set by hand. |
+| `state_dir` | `unset` | Instance state directory recorded by `--instance`/`--state-dir` (see [docs/parallel-instances.md](docs/parallel-instances.md)); derived automatically, not usually set by hand. The directory also holds the instance ownership lock, `iris.lock`, which is taken by the CLI rather than configured. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]
@@ -425,6 +425,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--state-dir` | Override the derived instance state directory (default: `iris-instance-<N>`). Implies instance mode. |
 | `--port-base` | Base port for the derived monitor/serial/CI block (default `9000 + N*10`). Implies instance mode. |
 | `--print-instance` | Print the derived instance endpoints/paths as `key: value` lines and exit. Implies instance mode. |
+| `--replace` | Stop the instance that owns this state directory's lock, or the live CI socket at `--ci-socket`, then start. The owner is asked to `quit` over its CI socket when possible (clean stop, NVRAM saved); otherwise its recorded PID is sent `SIGTERM` only after its process start time has been checked. Never signals a recycled PID, and never touches a listener that does not speak the iris CI protocol. |
 | `--clock-fixed-mhz` | Override CP0 Count MHz (default 33 on IP22/IP24, 97.5 on IP28). IRIX reports twice this rate as CPU MHz, e.g. --clock-fixed-mhz 50. |
 | `--help`, `-h` | Display parser help. |
 
@@ -435,6 +436,19 @@ Board aliases include `xl`, `gr2`, `gr2_xz`, `gr2-xz`, `gr2_extreme`,
 IMPACT names and `solid`, `high`, `max`; canonical values are in the table.
 See [debug.md](debug.md) for monitor commands and [STORAGE.md](STORAGE.md) for iris-ci; they are runtime tools,
 not Cargo build features.
+
+### Instance ownership
+
+A CLI start owns its state directory through an exclusive advisory lock on
+`iris.lock`: `<state_dir>/iris.lock` in instance mode, `iris.lock` in the
+working directory otherwise. The lock, not the PID written inside it, decides
+liveness — the kernel releases it on process death, so a crash or `SIGKILL`
+leaves a stale file the next start reclaims. The record holds the PID, instance
+id, state directory, CI socket, monitor port and process start time; a refused
+start prints them. `--replace` stops that recorded owner, preferring a clean
+`quit` over its CI socket. `SIGINT`/`SIGTERM`/`SIGHUP` remove the CI socket and
+lock without stopping the guest; see
+[HELP.md](HELP.md#instance-ownership-and-cleanup) for the full behaviour.
 
 ## iris-gui persisted settings inventory
 

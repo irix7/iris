@@ -208,6 +208,35 @@ Use [STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci) for Unix/TCP setup,
 commands, serial capture, and scripts. `--ci` keeps offscreen graphics alive
 unless `--headless` is explicitly selected.
 
+### Parallel instances (`--instance`)
+
+Run several VMs from one host with `--instance N` (ids are 0-based). Each id
+derives a private state directory (`iris-instance-{N}`, overridable with
+`--state-dir`), a port block from `--port-base` (default `9000 + N*10`, clear
+of the legacy 8880/8881/8888 defaults), a CI socket, a stable guest MAC and a
+distinct NAT `/24`:
+
+```sh
+iris --instance 0 --ci &             # first VM, CI socket under ./iris-instance-0
+iris --instance 1 --ci &             # second VM, no port or socket clash
+iris --instance 2 --print-instance   # print the derived endpoints and exit
+```
+
+Each state directory is owned by one live process through a locked
+`iris.lock`. A second start there fails with the owner's PID instead of
+silently sharing NVRAM or a CI socket; `--replace` stops that recorded owner
+(cleanly over its CI socket when it can) before starting. See
+[HELP.md](HELP.md#instance-ownership-and-cleanup) for signal and stale-file
+behaviour.
+
+Today the derivation applies NVRAM/EEPROM paths, the monitor/serial/CI ports,
+the CI socket, the MAC and the NAT subnet. Wiring the remaining artefacts
+(snapshot store, COW/CHD overlays, JIT cache, logs and the test dump) under the
+state directory, plus a fleet launcher and serial session isolation, are the
+open tickets in [docs/parallel-instances.md](docs/parallel-instances.md). With
+no instance flag nothing changes, and there is deliberately **one VM per
+process**.
+
 ### Scratch volume — file injection without networking
 
 Host-to-guest file transfer through a raw scratch disk is described in
