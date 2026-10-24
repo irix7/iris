@@ -101,6 +101,14 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
+  instance installs no front-end renderer, so nothing filled the readback
+  buffer and every screenshot came out black. The command now waits for the
+  frame it requested instead of sleeping a fixed 150 ms, and composites the
+  guest screen from the display caches when no renderer is present. With a
+  GUI renderer attached it still returns the readback the renderer produced
+  (host status bar and overlay included). (`src/ci.rs`, `src/gfx_display.rs`)
+
 - **Monitor startup is observable, and `machine-start` is idempotent (#102).**
   A harness that sent `machine-start` before the monitor was listening lost the
   command and had to send it again; there was no way to tell "not started" from
