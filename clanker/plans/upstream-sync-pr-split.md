@@ -22,6 +22,44 @@ The merge that produced this plan is the compatibility proof for everything
 below. A PR that cannot be rebased onto upstream `main` and pass those two runs
 is not ready.
 
+## What upstream asks for
+
+`README.md` ends with a **Contribution policy**:
+
+> We have no problems with LLM generated code. In fact most of IRIS is made with
+> LLMs. But that doesn't mean we don't do proper software engineering. So lets
+> keep PRs small and reasonable to review. One issue/fix per PR, preferably in
+> one commit, since LLM code churn doesn't help with clarity. Lets keep this
+> bisectable too.
+
+Observed practice matches it. Of the last 25 merged PRs, nearly all are a
+single commit touching one to four files; median time from open to merge is
+hours; only a handful of closed PRs were closed unmerged. External
+contributors (`atomchild411`, `pbartfai`, `AlexanderNyr`, `slaapliedje`) are
+merged routinely. There is no `CONTRIBUTING.md` and no PR template, so the
+policy above is the whole contract.
+
+Consequences for this plan:
+
+- **Squash each unit to one commit.** Multi-commit series are the exception
+  upstream.
+- Send the units below, not the stacks: the storage and snapshot work is
+  already split into independently reviewable pieces.
+- "One issue/fix per PR" rules out bundling the perf sweeps; split first.
+
+## Coordination with the contributors we build on
+
+| Upstream PR | Author | Our relation |
+|---|---|---|
+| #266 `z85c30: the TCP serial console takes more than one client` | atomchild411 | PR 1 adds `TCP_NODELAY` on top of their `accept_waiting`. |
+| #265 `scsi: targets any controller can open, with the machine's identity` | atomchild411 | PR 3 replaces the `DiskBackend` foundation their identity work sits on. |
+| #279, #283 allocation-length truncation | atomchild411, techomancer | PR 3 must keep both working; the merge already ported them onto `BlockNode`. |
+| #261 `irq: an InterruptController trait` | atomchild411 | The merge adopts it wholesale; the fork's `PdmaCallback` and `fifo_full_cb` closures are abandoned in its favour. |
+| #253 `idle-pause: wake for an interrupt masked by a raised spl` | slaapliedje | The fork's `IdleDecision::Pace` is a follow-up to their fix; credit it. |
+
+PR 3 is the only unit that removes another contributor's design, so it should
+start as an issue addressed to `atomchild411` rather than a surprise patch.
+
 ## Closed — upstream already solved these differently
 
 Do not re-open these. The merge deliberately took upstream's side, and the
@@ -63,6 +101,9 @@ This is the expensive one: upstream is actively building *on* `DiskBackend`
 upstream's `ScsiIdentity` and `alloc_len_10`/`request_sense_alloc_len` work on
 top of the new trait. The merge already has that reconciliation — use it as the
 reference. Do not bundle feature changes into this PR.
+
+Squash the three commits into one: upstream sees one change ("replace the
+backend enum with a layered block node"), and it must stay bisectable.
 
 ### 4. disks: advisory-lock read-write base images
 
