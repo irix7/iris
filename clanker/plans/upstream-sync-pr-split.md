@@ -84,7 +84,7 @@ Each entry gives the canonical commits (the `main` side where a work branch and
 
 - `8514e6c` — **the nodelay half only**, against upstream's `accept_waiting`.
 - 1 file: `src/dev/z85c30.rs`, 5 lines.
-- **Prepared:** branch `upstream/serial-nodelay`, commit `38a47fd`. Applies and
+- **Prepared:** branch `pr/serial-nodelay`, commit `38a47fd`. Applies and
   compiles on `upstream/main`.
 
 ### 2. ci: wait for the login prompt instead of sleeping
@@ -94,7 +94,7 @@ Each entry gives the canonical commits (the `main` side where a work branch and
 - Replaces a fixed 2 s sleep in `cmd_login` with a bounded wait for IRIX's
   `TERM =` prompt. Upstream already has `wait_with_deadline`, and its
   `cmd_login` is identical to the fork's pre-image, so the patch is clean.
-- **Prepared:** branch `upstream/ci-login-prompt`, commit `855316c`.
+- **Prepared:** branch `pr/ci-login-prompt`, commit `855316c`.
 
 ### 3. ci: bound connections and reap idle handlers
 
@@ -102,7 +102,7 @@ Each entry gives the canonical commits (the `main` side where a work branch and
 - 1 file: `src/ci.rs`, +32/−2.
 - Caps in-flight CI connections at 32 and gives each handler a 300 s read
   timeout, so abandoned clients cannot accumulate threads and descriptors.
-- **Prepared:** branch `upstream/ci-bound-connections`, commit `86d209f`.
+- **Prepared:** branch `pr/ci-bound-connections`, commit `86d209f`.
 
 ### Not standalone: scsi bulk DMA
 
