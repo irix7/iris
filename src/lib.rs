@@ -176,6 +176,7 @@ pub mod ppmem;
 #[cfg(feature = "faultmmio")]
 pub mod faultmmio;
 pub mod machine;
+pub mod machine_state;
 pub mod platform;
 pub mod physical;
 pub mod monitor;

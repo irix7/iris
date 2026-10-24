@@ -61,6 +61,21 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **Monitor startup is observable, and `machine-start` is idempotent (#102).**
+  A harness that sent `machine-start` before the monitor was listening lost the
+  command and had to send it again; there was no way to tell "not started" from
+  "started and stopped". `machine-start` now acknowledges the transition it
+  performed (`halted -> starting -> running`, or `running (no change)` for a
+  duplicate), and the new `machine-status [json]` reports one lifecycle state
+  (`idle`, `starting`, `running`, `halted`) plus whether the monitor is
+  accepting commands. `--ci` still leaves the CPU parked, but the control
+  socket is now created only after the monitor has bound, so connecting is
+  itself a readiness check; `iris-ci status --wait-ready N` polls it and
+  `iris-ci status` reports the same fields. A fixed sleep is no longer needed,
+  and a monitor that failed to bind is distinguishable from a guest that never
+  started. Both surfaces read `Machine::status`, so the acknowledgement, the
+  monitor command and the CI socket cannot disagree.
+
 - **`iris-ci` batch mode: a whole script runs over one control-socket
   connection.** `script FILE` (also spelled `batch FILE`) used to open a fresh
   connection for every command, so a five-step differential test paid five
