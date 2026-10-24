@@ -174,6 +174,7 @@ Newport (REX3): drawing semantics, HOSTRW, GFIFO, the REX3 JIT, trace and record
 | [line-plus-host-not-jittable.md](rex3/line-plus-host-not-jittable.md) | rule | Lines with COLORHOST/ALPHAHOST: legal, but Cranelift refuses them |
 | [prefetch-primes-the-pio-read-pipeline.md](rex3/prefetch-primes-the-pio-read-pipeline.md) | rule | PREFETCH primes the PIO read pipeline — the `0xdeadbeef` GO is the primer |
 | [rex-jit-queue-retry.md](rex3/rex-jit-queue-retry.md) | rule | Retry rejected REX JIT compile requests |
+| [rgbmode-and-fifo-conformance.md](rex3/rgbmode-and-fifo-conformance.md) | rule | RGBMODE is load-bearing, the GFIFO is 65536 deep, and `power_on` nulls `ctx.host` |
 | [rex3-fline-fractional-bresenham.md](rex3/rex3-fline-fractional-bresenham.md) | open | REX3 F_LINE fractional Bresenham — fixes and open A_LINE follow-up |
 | [rex3-hostr-row-wrap-under-stopony.md](rex3/rex3-hostr-row-wrap-under-stopony.md) | rule | REX3 HOSTR row-wrap under STOPONY: two independent word-boundary bugs |
 | [shade-dda-clamp-open-question.md](rex3/shade-dda-clamp-open-question.md) | open | Shade DDA clamping: clamped accumulator, or clamped output? — OPEN, 2026-09-15 |
