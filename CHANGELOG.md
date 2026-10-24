@@ -22,6 +22,91 @@ hashes are given where a change is easiest to understand by reading the commit.
   the guest screen from the display caches when no renderer is present. With
   a GUI renderer attached it still returns the readback that renderer
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
+### SGI O2 (IP32)
+
+- **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
+  section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
+  rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
+  Ethernet on the NAT gateway, serial ports, PS/2, audio, clocks), GBE
+  display. Runs IRIX 6.5.22 to the desktop with OpenGL through the rendering
+  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; not in
+  iris-gui yet.
+- **Disks come from `[scsi.N]`.** The O2 reads the same SCSI tables as the
+  Indy and Indigo2, with `controller` naming the bus (0 internal, 1
+  external): changer lists, scratch volumes, CHD images, copy-on-write
+  overlays and the `--scsi1`/`--cdrom4` options now work on it, disc changes
+  reach its CD-ROMs, and an image that will not open stops the run as it
+  does elsewhere. `o2.disks` is deprecated and folded into `[scsi.N]` on
+  load. The monitor's `scsi` and `cow` commands (`scsi1`/`cow1` for the
+  external bus) work on the O2's Adaptec controllers: status, disc changes,
+  overlay commit and reset, and the chip's registers.
+- **One configuration.** The O2 is set up with the shared keys: `prom`,
+  `nvram` (the PROM's flash), `banks` (the kit in each DIMM pair),
+  `serial_port_a`/`serial_port_b`/`serial_log`, `headless`, `[clock]
+  fixed_mhz` (CP0 Count, half the CPU clock), `[network]` with `mac` and the
+  new `mode = "off"`, `[[port_forward]]`, `nat_subnet` and `[nfs]`. `[o2]`
+  keeps `mouse`, `control_port` and `arcs_fpu`; its old keys are folded into
+  the shared ones on load, with a note. The second serial port is served too,
+  and the flash is kept between runs by default.
+- **Scripting and inspection.** The O2's devices have monitor commands, and
+  `o2 <command>` (also on `[o2] control_port`) takes screen shots, types,
+  moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
+- **`glReadPixels` reads the frame buffer.** IRIX's OpenGL reads pixels back
+  through a rendering-engine transfer from the frame buffer into a linear
+  buffer; the engine placed that transfer by the wrong registers and copied
+  nothing, so every read returned zeros.
+- **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
+  `boot -f bootp():FILE`.
+- **Memory through CRIME's no-ECC alias.** Physical 0x00_8000_0000 is a
+  second view of memory, not MACE's PCI window. IRIX maps some pages there,
+  and they read as all ones: `netstat -ni` spun forever, so Netscape never
+  opened, and `/dev/mem` and `/dev/kmem` returned 0xffffffff for about one
+  page in six. IRIX on an R5000 O2 panicked with "init died" for the same
+  reason; it now boots to the desktop.
+
+### Memory configuration
+
+- **`banks` has eight entries.** Every machine today uses the first four and
+  the rest must be 0; a config may list fewer, and files are written back with
+  four. Room for machines with more banks.
+
+### SCSI configuration
+
+- **One id on both controllers.** A `[scsi.N]` key is a slot: 1–7 on
+  controller 0, 16 + id on controller 1, so `[scsi.1]` and `[scsi.17]` put a
+  disk at id 1 on each of an Indigo2's or O2's controllers. `controller = 1`
+  in a low key still works, and two tables naming one target are refused.
+  Snapshot manifests record disks by slot, so an Indigo2 snapshot with a disk
+  on controller 1 taken before this change does not match its configuration.
+- **One `scsi` command for every controller.** The monitor's `scsi` and `cow`
+  subcommands and the run-time disc changes are implemented once, in
+  `src/scsi_monitor.rs`, over a controller's target table; the WD33C93A and
+  the Adaptec 7880 lend theirs and keep only their own subcommands (`regs`,
+  and the WD's `wdt`, `defer`, `debug`). `scsi status` now lists disks too.
+
+### Newport (REX3)
+
+- **Conformance tests for RGBMODE and the command FIFO.** A 24-bit RGB fill
+  needs `DRAWMODE1` bit 15 as well as the RGB plane selection; fills issued
+  back to back are accepted without polling because the emulated FIFO is much
+  deeper than the hardware's and back-pressures rather than dropping writes at
+  its brim. Both behaviours, and the deliberate divergences from a real REX3
+  (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
+  threshold interrupt), are now pinned by tests and recorded in
+  `docs/Indy/rex3.md`.
+### Monitor and CI
+
+- **`machine-start` is idempotent and acknowledges the transition, and
+  `machine-status` reports guest state and monitor readiness.** The monitor
+  command now prints `idle -> starting -> running` (or `running (no change)`),
+  `machine-stop` acknowledges symmetrically, and `machine-status [json]` gives
+  a caller one place to ask whether the guest is `idle`, `starting`, `running`
+  or `halted` and whether the monitor has bound its port. The CI socket gains
+  the same `status` command, `iris-ci status [--wait-ready SECS]` polls it
+  instead of sleeping, and `--ci` creates the control socket only after
+  `Machine::start` has bound the monitor, so a successful connection is
+  itself a readiness signal. Tests cover a command sent before the monitor is
+  ready, duplicate starts, start after halt/reset, and invalid transitions.
 
 ### NAT gateway
 

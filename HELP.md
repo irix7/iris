@@ -62,6 +62,10 @@ On IP22/IP24, each bank is at most 128 MB. IP28 also supports 256 MB and
 [IP28 512 MB banks](clanker/devices/ip28-512mb-banks.md). The table below describes
 the IP22/IP24 extended layouts.
 
+`banks` has room for eight entries; every machine today uses four, and the
+rest must be 0. On the O2 each entry is the kit in a DIMM pair (32, 64, 128 or
+256 MB), largest first: `[256, 256, 256, 256]` is 1 GB.
+
 `banks` in `iris.toml` / iris-gui is applied only when you **Start** the VM.
 Changing RAM while IRIX is running updates the config but not the live guest —
 **Stop → change banks → Start**.
@@ -500,15 +504,16 @@ ignored. The checked-in `iris.toml` is a commented example of everything in this
 ```toml
 # ── Top-level scalars (must come before any [section]) ───────────────────────
 
-prom     = "prom.bin"       # PROM image; the embedded one is used if missing
-nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy). Use one per install.
+prom     = "prom.bin"       # PROM image; the embedded one is used if missing (the O2 has none: its 4.18 image)
+nvram    = "nvram.bin"      # DS1386 NVRAM/RTC file (Indy); the PROM's flash (O2). Use one per install.
 nveeprom = "nveeprom.bin"   # 93CS56 NVRAM EEPROM file (Indigo2 only)
 
 # RAM bank sizes in MB: 0 (absent), 8, 16, 32, 64, 128; IP28 also 256/512.
+# O2: the kit in each DIMM pair (32/64/128/256), largest first. Up to eight entries.
 banks = [128, 128, 0, 0]
 
 scale = 1                   # window scale, kept across guest mode changes; --2x overrides
-headless = false            # no window, no REX3 (audio unaffected)
+headless = false            # no window, no graphics; the O2 boots on its serial console (audio unaffected)
 no_audio = false            # no HAL2 / cpal (graphics unaffected)
 lock_aspect_ratio = true    # false = free resize with letterboxing
 mouse_scroll_pixels_per_line = 40
@@ -535,7 +540,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ── Machine ──────────────────────────────────────────────────────────────────
 
 [machine]
-profile = "indy_ip24"       # "indigo2_ip22" (--ip22) or "indigo2_ip28"
+profile = "indy_ip24"       # "indigo2_ip22" (--ip22), "indigo2_ip28", or "o2_ip32" (an [o2] section: docs/o2-ip32.md)
 cpu     = "r4400"           # "r5000" or "r10000" (--cpu); use R10000 on IP28
 
 [graphics]
@@ -553,12 +558,15 @@ resolution = "guest"        # or "1024x768", "1280x960", "1280x1024"
 
 # ── SCSI ─────────────────────────────────────────────────────────────────────
 
-# Valid IDs: 1–7. For a hard disk, set cdrom = false.
+# Valid IDs: 1–7. For a hard disk, set cdrom = false. On a machine with two
+# controllers (Indigo2, O2) [scsi.N] is id N on controller 0 and [scsi.16+N]
+# is id N on controller 1, so one id can be used on both; `controller = 1`
+# in a [scsi.N] table does the same for that one device.
 [scsi.1]
 path    = "scsi1.raw"       # raw or .chd image
 cdrom   = false
 overlay = false             # true = copy-on-write overlay in scsi1.raw.overlay
-# controller = 0            # Indigo2 only: 0 or 1
+# controller = 0            # Indigo2 and O2 have two: 0 or 1 (the O2's 1 is its external bus); or write [scsi.17]
 
 # A CD-ROM. path may be empty to start with an empty tray.
 [scsi.4]
@@ -650,7 +658,11 @@ kernel step on each other's block size setting.
 | 6  | Additional disk or tape |
 | 7  | Additional disk |
 
-The controller itself is ID 0.
+The controller itself is ID 0. On the Indigo2 and the O2, which have two
+controllers, `[scsi.N]` keys 1–7 are ids on controller 0 and keys 17–23 are
+ids 1–7 on controller 1 (16 slots per controller); `controller = 1` in a low
+key's table is the older spelling and still works. The monitor's `scsi1`
+addresses the second controller.
 
 ---
 

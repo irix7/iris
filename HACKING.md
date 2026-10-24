@@ -48,6 +48,37 @@ the devices together, starts and stops them, and takes snapshots.
 Indigo2 "Fullhouse": IOC variant, one or two SCSI controllers, NVRAM chip,
 EISA/INT2 cascade, PROM fallback, memory layout).
 
+The front ends do not use `Machine` directly. `main.rs`, the window
+(`ui.rs`), the CI socket (`ci.rs`), the monitor's system commands and
+iris-gui hold a `Box<dyn Workstation>` from `workstation::build`
+(`src/workstation.rs`). The trait's required methods are what every machine
+has (start and stop, the screen, the keyboard and mouse, the serial console,
+the monitor, the stored lifecycle state); its provided methods are either
+shared logic every machine wants the same way (`status`, and the idempotent
+`start_guest`/`stop_guest` behind `machine-start`/`machine-stop`, see
+`src/machine_state.rs`) or optional facilities (snapshots, CHD folding, the
+scratch volume, disc changes, the NAT controls) that default to "not
+supported on this machine". `Machine` implements all of it. A machine built
+around a different chipset implements the same trait and gets the window,
+iris-ci, iris-gui and the monitor's `reset`/`save`/`load`/`machine-status`
+with it.
+
+The monitor's system controller, the machine-events thread and the CI server
+reach the machine through one shared `MachineSlot` per machine, which the
+machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
+after iris-gui's Stop) gets "machine is not running" instead of freed memory.
+
+SCSI storage follows the same pattern one level down. `src/scsi.rs` is the
+target (disk, CD-ROM, DaynaPort) any controller can hold, and
+`src/scsi_monitor.rs` implements the monitor's `scsi` and `cow` subcommands and
+the run-time disc changes once, over a controller's target table lent through
+its `ScsiTargets` trait. The WD33C93A (Indy, Indigo2) and the Adaptec 7880 (O2)
+lend theirs and keep only chip-specific subcommands (`regs`; the WD's `wdt`,
+`defer`, `debug`), and `DiscChanger` is implemented once for every
+`ScsiTargets`. Configuration is shared the same way: both machines attach
+their devices from the `[scsi.N]` tables, where the key is a slot
+(controller × 16 + id, see `config::scsi_slot`).
+
 ## 2. Data path and endianness
 
 **Word-transparent architecture.** Host `u32`/`u64` values are bit

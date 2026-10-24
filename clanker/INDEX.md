@@ -35,6 +35,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [instr_stats_insmap_generalization.md](cpu/instr_stats_insmap_generalization.md) | design | instr_stats generalized into a decode+exec instruction map (insmap) |
 | [intrfast-self-overwrite-investigation.md](cpu/intrfast-self-overwrite-investigation.md) | open | intrfast (0x08016xxx) gets overwritten with data mid-boot — investigation in progress |
 | [movci-is-cp1-by-behaviour-not-encoding.md](cpu/movci-is-cp1-by-behaviour-not-encoding.md) | rule | MOVF/MOVT are CP1 accesses with an integer encoding |
+| [mp-llsc-is-a-host-compare-exchange.md](cpu/mp-llsc-is-a-host-compare-exchange.md) | design | MP LL/SC: SC is a host compare-exchange on the data, not a line-ownership tracker |
 | [nanotlb-asid-mutation-flush.md](cpu/nanotlb-asid-mutation-flush.md) | rule | nanotlb must be flushed on ASID mutation, not just on privilege transition |
 | [nutlb-erl-guard-defeats-permission-test.md](cpu/nutlb-erl-guard-defeats-permission-test.md) | history | nutlb: the ERL guard bit defeats the permission test entirely |
 | [r5000-taglo-is-the-r4400-pstate.md](cpu/r5000-taglo-is-the-r4400-pstate.md) | rule | R5000 L1 TagLo uses the R4400 PState encoding |
@@ -91,7 +92,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 
 ## devices/
 
-Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS/2, audio host backends.
+Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS/2, audio host backends, the O2 (IP32).
 
 | Note | Kind | Title |
 |---|---|---|
@@ -100,6 +101,9 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [hpc3-rx-channel-refused-while-active.md](devices/hpc3-rx-channel-refused-while-active.md) | rule | A receive channel that refuses while reporting itself active |
 | [indigo2-eeprom-byte-lane-gap.md](devices/indigo2-eeprom-byte-lane-gap.md) | rule | Indigo2 motherboard EEPROM: PROM writes via byte access, HPC3 only handled 32-bit |
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
+| [o2-readback-transfer-registers.md](devices/o2-readback-transfer-registers.md) | rule | O2 glReadPixels: the frame-buffer-to-linear transfer, GL vertices, edge type, src steps and linStride as IRIX uses them |
+| [ip32-o2-bringup-log.md](devices/ip32-o2-bringup-log.md) | history | The O2 (IP32) bring-up log: PROM, POST, CRIME/MACE/GBE, SCSI, PCI, the OSes |
+| [o2-no-ecc-alias-is-memory.md](devices/o2-no-ecc-alias-is-memory.md) | rule | O2: physical 0x00_8000_0000 is CRIME's no-ECC memory alias, folded onto RAM by the CPU (netstat/Netscape hang, /dev/mem all ones) |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |

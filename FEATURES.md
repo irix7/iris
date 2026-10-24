@@ -138,17 +138,17 @@ the first `[section]`, because TOML tables continue until the next header.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory. |
-| `nvram` | `"nvram.bin"` | DS1386 backing file; GUI defaults to an absolute user-config path. |
+| `prom` | `"prom.bin"` | PROM path; IP24, IP22, and IP28 each have an embedded fallback. Indigo2 also tries `070-1367-012.bin` (IP22) or `070-1477-002.bin` (IP28) in the working directory; the O2, which has no embedded PROM, tries `ip32prom.rev4.18.bin`. |
+| `nvram` | `"nvram.bin"` | DS1386 backing file on the Indy; the PROM's flash (its environment) on the O2. GUI defaults to an absolute user-config path. |
 | `nveeprom` | `"nveeprom.bin"` | Motherboard EEPROM file; GUI anchors it in its user-config directory. |
-| `banks` | `[128,128,0,0]` | Four RAM bank sizes in MB; see profile constraints below. |
+| `banks` | `[128,128,0,0]` | RAM bank sizes in MB, up to eight entries (every machine today has four; the rest must be 0). On the O2 each entry is a DIMM pair's kit (32, 64, 128 or 256), largest first. See profile constraints below. |
 | `scale` | `1` | Standalone window scale: 1–4. GUI uses its separate vm_scale. |
-| `headless` | `false` | Disable the standalone window and Newport graphics; audio is independent. |
+| `headless` | `false` | Disable the standalone window and graphics; the O2 then boots on its serial console. Audio is independent. |
 | `no_audio` | `false` | Disable HAL2 audio emulation. |
 | `gdb_port` | `unset` | Start the GDB TCP stub; debugging is unavailable in lightning builds. |
 | `monitor_port` | `8888 when unset` | Monitor listener on loopback. |
-| `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2). |
-| `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); GUI halt uses this port. |
+| `serial_port_a` | `8880 when unset` | SCC channel A listener (tty2); the O2's first serial port, its console when headless. |
+| `serial_port_b` | `8881 when unset` | SCC channel B listener (tty1/console); the O2's second serial port. GUI halt uses this port. |
 | `load_elf` | `unset` | Load a static big-endian MIPS ELF32 binary before starting the CPU. |
 | `test_device` | `false` | Map the bare-metal test device in GIO slot 0. |
 | `test_device_dump` | `iris-testdev-dump.json when unset` | Test-device machine-state JSON output. |
@@ -159,14 +159,14 @@ the first `[section]`, because TOML tables continue until the next header.
 | `ci_display` | `false` | Keep host graphics window visible in CI mode. |
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
-| `serial_log` | `unset` | Append guest channel-B output; used by CI and GUI serial capture. |
+| `serial_log` | `unset` | Append guest channel-B output (the O2's first serial port); used by CI and GUI serial capture. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
 ### [machine]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28. |
+| `machine.profile` | `indy_ip24` | indy_ip24, indigo2_ip22, indigo2_ip28, o2_ip32 (configured by `[o2]`, see [the O2 guide](docs/o2-ip32.md)). |
 | `machine.cpu` | `r4400` | r4400, r5000, r10000; CPU/ISA choice is independent of build features. |
 
 ### [graphics]
@@ -190,18 +190,21 @@ the first `[section]`, because TOML tables continue until the next header.
 | `scsi.<ID>.overlay` | `false` | Raw-image COW sidecar; CHD uses its own diff sidecar. |
 | `scsi.<ID>.scratch` | `false` | Host-managed raw scratch volume; cannot be CD-ROM/overlay. |
 | `scsi.<ID>.size_mb` | `64 when unset` | Size of a newly created scratch image; existing files are unchanged. |
-| `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted only on indigo2_ip22. |
+| `scsi.<ID>.controller` | `0` | 0 or 1; controller 1 is accepted on indigo2_ip22 and o2_ip32 (on the O2 it is the external bus). A key of 16 + ID names controller 1 directly and does not need it. |
 
-IDs are 1–7. If `scsi` is entirely omitted, core defaults attach SCSI #1
-as `scsi1.raw` and SCSI #4 as `cdrom4.iso`. An explicit map replaces that
-default map; missing IDs are unattached. `kind = "daynaport"` needs no image.
+IDs are 1–7. The key is a slot: `[scsi.N]` with N 1–7 is id N on controller 0
+(or on `controller`, when set), and N = 16 + id is that id on controller 1,
+so both controllers can carry the same id; two tables naming one target are
+rejected. If `scsi` is entirely omitted, core defaults attach SCSI #1 as
+`scsi1.raw` and SCSI #4 as `cdrom4.iso`. An explicit map replaces that
+default map; missing slots are unattached. `kind = "daynaport"` needs no image.
 An explicit non-disk kind takes precedence over the legacy cdrom flag.
 
 ### [network]
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `network.mode` | `nat` | nat or pcap; PCAP needs build support and host capture permissions. |
+| `network.mode` | `nat` | nat, pcap or off (no Ethernet; O2 only for now). PCAP needs build support and host capture permissions, and is not available on the O2 yet. |
 | `network.pcap_interface` | `auto-pick when unset` | Interface name or numeric list index; PCAP only. |
 | `network.nfs_pcap_ip` | `unset` | Virtual LAN IP for the built-in NFS responder in PCAP mode. |
 | `network.mac` | `08:00:69:12:34:56 when unset` | ec0 MAC; injected only into blank PROM battery-backed MAC slots. |
@@ -271,7 +274,7 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 
 | Key | Default | Values and behavior |
 |---|---|---|
-| `clock.fixed_mhz` | `33 on IP22/IP24; 97.5 on IP28 when unset` | CP0 Count MHz; IRIX CPU inventory reports twice this rate. |
+| `clock.fixed_mhz` | `33 on IP22/IP24; 97.5 on IP28; 90 on the O2 when unset` | CP0 Count MHz; IRIX's CPU inventory and the O2's PROM report twice this rate. |
 
 ### [rtc_offset]
 
@@ -290,14 +293,41 @@ Omit `[nfs]` to disable the share; the default forward list is empty.
 |---|---|---|
 | `ultra64.enabled` | `false` | Enable the GIO N64 development board; requires an external gopher64 peer. |
 
+### [o2]
+
+Used with `machine.profile = "o2_ip32"`. An O2 is configured by the shared
+keys: `prom` (its PROM image, not embedded; `ip32prom.rev4.18.bin` is tried
+when `prom` is left at its default), `nvram` (the PROM's flash, which holds
+its environment), `banks` (the kit in each of the four DIMM pairs: 32, 64,
+128 or 256 MB, largest first), `serial_port_a`/`serial_port_b`/`serial_log`,
+`headless` (serial console instead of the graphics console and keyboard),
+`[clock] fixed_mhz` (CP0 Count; the CPU runs at twice it, so 90 MHz is a
+180 MHz O2), `[network]` including `mac` and `mode = "off"` for an unplugged
+Ethernet, `[[port_forward]]`, `nat_subnet`, `[nfs]` and `[scsi.N]`
+(`controller` is the bus). See [the O2 guide](docs/o2-ip32.md). The old
+O2-only spellings (`o2.prom`, `o2.flash`, `o2.ram_mb`, `o2.dimms`,
+`o2.disks`, `o2.serial_port`, `o2.serial_log`, `o2.graphics`, `o2.cpu_mhz`,
+`o2.net`, `o2.forwards`) are deprecated: they are folded into those keys when
+the file is loaded, with a note, and never written back.
+
+| Key | Default | Values and behavior |
+|---|---|---|
+| `o2.mouse` | `true` | PS/2 mouse on the second port (with the graphics console). |
+| `o2.control_port` | unset | TCP port on 127.0.0.1 serving the `o2` monitor commands for scripts. |
+| `o2.arcs_fpu` | `false` | Test aid: lend a kernel the FPU while it runs inside the PROM. |
+
 ### Hardware constraints and precedence
 
-Bank values are 0, 8, 16, 32, 64, or 128 MB; only IP28 accepts 256/512 MB.
+Bank values are 0, 8, 16, 32, 64, or 128 MB; only IP28 accepts 256/512 MB. On
+the O2 a bank is a DIMM pair's kit, 32, 64, 128 or 256 MB, fitted from pair A
+largest first. `banks` has eight entries; every machine today uses the first
+four and the rest must be 0.
 IP22/IP24 four-bank IRIX 6.5 behavior remains separate from IP28's verified
 two-bank 1 GB layout. Extreme requires IP22. All non-Newport boards require
 `heads=1` and `resolution="guest"`. IP28 IRIX needs IMPACT; its PROM has an
 embedded fallback.
-The config validator currently permits SCSI controller 1 only on IP22.
+The config validator permits SCSI controller 1 only on IP22 and the O2, the
+machines with two controllers.
 
 Standalone CLI options update the loaded config where supplied; boolean enable
 switches do not provide a general way to clear every saved true setting.
@@ -431,6 +461,9 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_IP28_TLBW` | wired enables extra IP28 Wired/TLB-write tracing. | [src/cpu/mips_exec.rs](src/cpu/mips_exec.rs) |
 | `IRIS_IP28_WATCH` | IP28 physical-address/window access trace filter. | [src/cpu/mips_cache_v2.rs](src/cpu/mips_cache_v2.rs) |
 | `IRIS_IP28_WATCHGPR` | Guest GPR index whose writes are traced in IP28 bring-up. | [src/cpu/mips_core.rs](src/cpu/mips_core.rs) |
+| `IRIS_IP32_HOT` | Any presence counts O2 register accesses (MACE, GBE, rendering engine) for finding a driver polling a bit nothing sets; costs speed. | [src/ip32.rs](src/ip32.rs) |
+| `IRIS_IP32_MEC_TRACE` | Any presence traces O2 Ethernet frames (sent, received, dropped) on stderr. | [src/dev/mec.rs](src/dev/mec.rs) |
+| `IRIS_IP32_RE_TRACE` | Number of O2 rendering-engine primitives to record for `o2 retrace PATH`. | [src/dev/o2gfx.rs](src/dev/o2gfx.rs) |
 | `IRIS_JIT_CACHE` | 1 or on enables persistent JIT page reuse. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CACHE_DIR` | Persistent JIT cache base directory. | [src/cpu/jitv2/pcache.rs](src/cpu/jitv2/pcache.rs) |
 | `IRIS_JIT_CLIF` | Any presence prints Cranelift input IR. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
@@ -442,6 +475,9 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 | `IRIS_MEM_HELPERS` | Any presence enables the experimental JIT memory-helper path. | [src/cpu/jitv2/codegen.rs](src/cpu/jitv2/codegen.rs) |
 | `IRIS_MGRAS_REC` | Record IMPACT bus operations from power-on to this path. | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
 | `IRIS_MGRAS_TRACE` | Trace IMPACT accesses from power-on to this path (`gputrace` builds). | [src/dev/mgras/mod.rs](src/dev/mgras/mod.rs) |
+| `IRIS_O2_AUDIO_CAPTURE` | O2 host audio capture output path (what the host plays). | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
+| `IRIS_O2_AUDIO_DUMP` | File to record the O2's audio output at the guest's rate, before resampling. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
+| `IRIS_O2_AUDIO_TRACE` | Any presence traces every O2 audio register access and codec operation on stderr. | [src/dev/mace_audio.rs](src/dev/mace_audio.rs) |
 | `IRIS_REX3_REC` | Record REX3 bus operations from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_rec.rs](src/dev/ng1/rex3_rec.rs) |
 | `IRIS_REX3_TRACE` | Trace REX3 GFIFO and CPU accesses from board start to this path (`gputrace` builds). | [src/dev/ng1/rex3_trace.rs](src/dev/ng1/rex3_trace.rs) |
 | `IRIS_NO_EXIT_ON_POWEROFF` | Any presence prevents process exit on guest power-off/CI quit; set by GUI. | [src/ci.rs](src/ci.rs) |
