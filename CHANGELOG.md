@@ -18,6 +18,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Timers and timekeeping
+
+- **The IOC 8254 PIT is readable, advances with guest cycles, and says so
+  (#106).** Counter 0's count was already interpolated from the guest cycle
+  clock, but it only runs when counter 2 supplies its clock (as on the chip),
+  and the read-back command was silently ignored. The counter latch and
+  read-back commands (count and status) are now implemented, a counter that
+  stops is frozen at its last running value rather than its reload, and
+  `pit status` names the time base and the modelled capabilities. The PIT is
+  **not** an independent reference: CP0 Count derives from the same
+  `hot.cycles` clock, so calibrating Count against it is circular. Resolution
+  and the hardware clock chain are documented in
+  [docs/Indy/ioc-8254-timer.md](docs/Indy/ioc-8254-timer.md).
+
 ### Serial console
 
 - **`--serial-log` is usable as a boot-orchestration signal (#105).** The log

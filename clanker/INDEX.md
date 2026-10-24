@@ -107,6 +107,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [ip28-512mb-banks.md](devices/ip28-512mb-banks.md) | howto | IP28 512 MB banks |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
+| [pit-is-not-an-independent-time-base.md](devices/pit-is-not-an-independent-time-base.md) | rule | The 8254 PIT is not an independent time base |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [serial-log-guest-time-and-flush.md](devices/serial-log-guest-time-and-flush.md) | design | Serial log guest stamps use synthetic cycle time, not wall time |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
