@@ -58,3 +58,23 @@ before adding a kernel.
 buffer cache, IRIX's own tools, X on REX3), driven over `iris-ci`.
 
 
+## The Nix launcher
+
+On a Nix host the dev shell installs `target/launcher/bin/iris`, which carries
+the build's own library search path (see
+[HELP.md](HELP.md#running-from-the-nix-dev-shell)). `test/journal/run.sh` and
+`test/fleet/run.sh` use it when it exists, so neither test needs an
+`LD_LIBRARY_PATH` of its own.
+
+Check the launcher from an empty environment, the way a CI job would start it:
+
+```sh
+tools/iris-launcher-smoke.sh                  # or: nix run .#smoke
+tools/iris-launcher-smoke.sh result/bin/iris  # a packaged build
+```
+
+It runs `--help` and `--print-instance` under `env -i` with an explicitly empty
+`LD_LIBRARY_PATH`, from a directory with no `iris.toml`, and fails if either
+cannot start. `nix flake check` runs the same idea hermetically against a stub
+binary, so a library missing from the flake's `runtimeLibs` — or an `RPATH` that
+does not name it — turns the check red without needing a cargo build.

@@ -486,7 +486,11 @@ and offline-tool controls are included so they are not mistaken for GUI settings
 `RUST_LOG` configures the host Rust logger; `IRIS_DEBUG_LOG` configures device
 logging. Standard host variables (`HOME`, `XDG_CACHE_HOME`, `LOCALAPPDATA`,
 `PATH`, `USER`, `WAYLAND_DISPLAY`, `APPIMAGE`, `PROCESSOR_IDENTIFIER`) affect
-platform paths/launch behavior, not guest hardware. Build-time metadata uses
+platform paths/launch behavior, not guest hardware. `LD_LIBRARY_PATH` belongs
+to the host's dynamic loader, not to iris: the emulator reads no variable to
+find its libraries, and only a Nix build needs the launcher described in
+[HELP.md](HELP.md#running-from-the-nix-dev-shell) to point the loader at the
+store. Build-time metadata uses
 `IRIS_GIT_REV`, `APP_VERSION`, and `CARGO_MANIFEST_DIR`; GUI premiere export
 sets `IRIS_GUI_FEATURES`. `IRIS_SHADOW_CACHEOPS` is retired: use devlog `l2c`
 instead. Shell capture/packaging scripts can also have their own job variables.

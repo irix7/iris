@@ -27,6 +27,46 @@ release.
 
 ---
 
+## Running from the Nix dev shell
+
+`flake.nix` is the build environment on a Nix host. Entering it (`nix develop`)
+also installs a launcher at `target/launcher/bin/iris`, which sets the loader's
+search path to the libraries the shell provides. Use the launcher as the
+program name for anything automated:
+
+```
+cargo build --release --features lightning,gpujit
+target/launcher/bin/iris --ci --config iris.toml
+```
+
+It is a wrapper, not a second emulator: it finds `target/release/iris` (or
+`target/debug/iris`) and execs it with the shell's library path, so it starts
+from a clean environment — no `LD_LIBRARY_PATH` of your own, no shell history to
+reconstruct. The shell exports `IRIS_LAUNCHER` to that path, and
+`IRIS_LAUNCHER_BIN` points the launcher at a build somewhere else, such as
+another target directory. `test/journal/run.sh` and `test/fleet/run.sh` use the
+launcher when it exists.
+
+The raw binary stays where cargo puts it, and that is what to use when the
+wrapper would be in the way — under `gdb`, `perf`, or when reading its dynamic
+dependencies directly:
+
+```
+gdb --args target/release/iris --config iris.toml
+```
+
+`cargo build --release` then `nix build --impure .#launcher` copies the current
+build into the store with the same search path baked into the ELF `RPATH`, so
+`result/bin/iris` runs with no wrapper and no environment at all.
+`nix run .#smoke` checks a launcher from an empty environment with an empty
+`LD_LIBRARY_PATH` (see [TESTING.md](TESTING.md)).
+
+None of this is part of iris's own interface. On a normal host, `cargo build
+--release` produces a binary that the loader resolves the usual way, and iris
+reads no environment variable in order to find its libraries.
+
+---
+
 ## Performance vs inventory (MHz vs MIPS)
 
 IRIX **System Manager** and `hinv` report a **CPU MHz** line (e.g. 166 MHz). That

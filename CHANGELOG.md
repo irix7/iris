@@ -230,6 +230,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Build / features
 
+- **A launcher replaces the hand-maintained `LD_LIBRARY_PATH` on the Nix dev
+  host (#104).** A cargo build inside `nix develop` links store paths that the
+  loader does not search, so every `iris --ci` command needed a copied list of
+  them in `LD_LIBRARY_PATH` — and a store-path change broke the list quietly.
+  Entering the dev shell now installs `target/launcher/bin/iris` (and
+  `iris-ci`), a wrapper that carries the shell's own closure and finds the
+  binary relative to itself, so it runs from an empty environment and moves
+  with the checkout; `test/journal/run.sh` and `test/fleet/run.sh` use it and
+  no longer derive a search path of their own. The raw cargo binary stays for
+  `gdb`, `perf` and `ldd`. `cargo build --release` followed by
+  `nix build --impure .#launcher` packages the same binary with that search
+  path in its ELF `RPATH` (`result/bin/iris`), and `nix run .#smoke` /
+  `tools/iris-launcher-smoke.sh` run `--help` and `--print-instance` under
+  `env -i` with an empty `LD_LIBRARY_PATH`. `nix flake check` adds a hermetic
+  check that fails when a library is missing from the flake's `runtimeLibs` or
+  from the packaged `RPATH`. iris itself still reads no environment variable to
+  find its libraries, so a plain cargo build on any other host is unchanged.
+
 - **The Nix flake (`flake.nix`) is the documented build environment.** Run
   cargo from inside `nix develop` (or `nix develop --command cargo ...`); the
   dev shell supplies the native ALSA/X11/GL/v4l/libclang libraries and pins the

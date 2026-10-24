@@ -142,6 +142,14 @@ cargo run --release
 The project pins a nightly toolchain (`rust-toolchain.toml`); rustup picks it up
 automatically.
 
+On a Nix host `flake.nix` is the build environment. `nix develop` also installs
+a launcher at `target/launcher/bin/iris` that carries the shell's library search
+path, so automated runs and the test scripts need no `LD_LIBRARY_PATH` of their
+own; the cargo-built binary stays available for `gdb` and friends. A plain cargo
+build is all that is needed anywhere else, and iris reads no environment
+variable to find its libraries. Details:
+[HELP.md](HELP.md#running-from-the-nix-dev-shell).
+
 For the complete core/GUI build-feature lists, configuration keys, CLI
 options, defaults, conflicts, and environment controls, see
 [FEATURES.md](FEATURES.md). It also contains build examples, CPU details,

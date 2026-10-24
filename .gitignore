@@ -36,6 +36,10 @@ pcp_dump_pfn_*.bin
 # want a portable lock.
 flake.lock
 
+# `nix build` output symlinks: the launcher package and the flake checks.
+/result
+/result-*
+
 # Agent/parallel-build artifacts (cargo target dirs and test temp).
 .tmp/
 target-fleet/
