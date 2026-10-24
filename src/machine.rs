@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig};
+use crate::machine_state::{GuestState, MachineStatus, TransitionAck};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
 use crate::dev::eeprom_93c56::Eeprom93c56;
@@ -112,6 +113,11 @@ pub struct Machine {
     /// instead of freed memory.
     controller_slot: Option<MachineSlot>,
     controller_registered: bool,
+    /// Where the machine is in its start/stop lifecycle. Never `Running`:
+    /// `status` derives that from the CPU's own running flag, so an
+    /// execution-control command cannot leave it stale. See
+    /// [`crate::machine_state`].
+    lifecycle: GuestState,
 }
 
 /// In-memory snapshot of the just-restored guest state. Populated at the end
@@ -990,6 +996,7 @@ impl Machine {
             fullhouse: !guinness,
             controller_slot: None,
             controller_registered: false,
+            lifecycle: GuestState::Idle,
         }
     }
 
@@ -1041,7 +1048,71 @@ impl Machine {
         r
     }
 
+    /// The guest's current state and whether the monitor is accepting
+    /// commands. Every surface that reports state — `machine-status`, the
+    /// `machine-start` acknowledgement, and the CI socket's `status` — goes
+    /// through here, so they cannot disagree.
+    pub fn status(&self) -> MachineStatus {
+        let cpu_running = self.cpu.is_running();
+        MachineStatus {
+            // Running is read from the CPU, not stored: `start`/`stop` and
+            // breakpoints change the CPU's flag without a machine-level
+            // transition, and a stale lifecycle copy would be a second,
+            // wrong answer.
+            state: if cpu_running { GuestState::Running } else { self.lifecycle },
+            cpu_running,
+            monitor_addr: self.monitor.bound_addr(),
+        }
+    }
+
+    /// Start the CPU and peripherals on behalf of `machine-start`.
+    ///
+    /// Idempotent: a running machine is left alone and the acknowledgement says
+    /// so. A machine that is `Starting` only needs the CPU released; an `Idle`
+    /// or `Halted` one also restarts its peripherals. The returned
+    /// [`TransitionAck`] is what the monitor prints.
+    pub fn start_guest(&mut self) -> Result<TransitionAck, String> {
+        let from = self.status().state;
+        if from == GuestState::Running {
+            return Ok(TransitionAck { from, via: None, to: from });
+        }
+
+        let via = if from == GuestState::Starting {
+            None
+        } else {
+            self.lifecycle = self
+                .lifecycle
+                .transition(GuestState::Starting)
+                .map_err(|e| e.to_string())?;
+            Some(GuestState::Starting)
+        };
+        // Peripherals are idempotently startable; do it even from `Starting`
+        // in case a previous stop left one of them down.
+        self.restart_peripherals();
+        self.cpu.start();
+        let to = self.status().state;
+        Ok(TransitionAck { from, via, to })
+    }
+
+    /// Stop the CPU and peripherals on behalf of `machine-stop`.
+    ///
+    /// Idempotent: stopping a halted machine changes nothing. Returns the
+    /// transition for the monitor's acknowledgement.
+    pub fn stop_guest(&mut self) -> TransitionAck {
+        let from = self.status().state;
+        self.stop();
+        let to = self.status().state;
+        TransitionAck { from, via: None, to }
+    }
+
     pub fn start(&mut self) {
+        // Publish "starting" before the monitor binds, so a caller that polls
+        // readiness can tell "not started" (Idle) from "startup under way".
+        // Halted -> Starting covers the GUI's Stop then Start; a stored
+        // Running state is impossible (status derives it from the CPU).
+        if let Ok(starting) = self.lifecycle.transition(GuestState::Starting) {
+            self.lifecycle = starting;
+        }
         // Start peripherals
         self.mc.start();
         self.hpc3.start();
@@ -1143,6 +1214,11 @@ impl Machine {
         self.hpc3.stop();
         self.mc.stop();
         if let Some(u64) = &self._phys.ultra64 { u64.stop(); }
+        // Idle -> Halted is not a lifecycle transition: a machine that was
+        // never started has nothing to halt, and the monitor is not up to ask.
+        if self.lifecycle != GuestState::Idle {
+            self.lifecycle = GuestState::Halted;
+        }
     }
 
     /// The address this Machine's own monitor is serving on, or None when it
@@ -2209,7 +2285,7 @@ pub struct SystemController {
 
 
 impl SystemController {
-    fn with_machine<F: FnOnce(&mut Machine) -> Result<(), String>>(&self, f: F) -> Result<(), String> {
+    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> Result<R, String>) -> Result<R, String> {
         with_machine_slot(&self.machine, f)?
     }
 }
@@ -2223,8 +2299,9 @@ impl Device for SystemController {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![
-            ("machine-stop".to_string(),  "Stop CPU and all peripherals".to_string()),
-            ("machine-start".to_string(), "Start CPU and all peripherals".to_string()),
+            ("machine-start".to_string(), "Start CPU and all peripherals (idempotent; prints the state transition)".to_string()),
+            ("machine-stop".to_string(),  "Stop CPU and all peripherals (idempotent; prints the state transition)".to_string()),
+            ("machine-status".to_string(), "machine-status [json] — Guest state (idle/starting/running/halted) and monitor readiness".to_string()),
             ("reset".to_string(),         "Reset all hardware to power-on state".to_string()),
             ("save".to_string(),          "save <name> — Save snapshot to saves/<name>/".to_string()),
             ("load".to_string(),          "load <name> — Load snapshot from saves/<name>/".to_string()),
@@ -2236,16 +2313,28 @@ impl Device for SystemController {
     fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
         match cmd {
             "machine-stop" => {
-                let _ = writeln!(writer, "Stopping machine...");
-                self.with_machine(|m| { m.stop(); Ok(()) })
+                let ack = self.with_machine(|m| Ok(m.stop_guest()))?;
+                let _ = writeln!(writer, "machine-stop: {}", ack.text());
+                Ok(())
             }
             "machine-start" => {
-                let _ = writeln!(writer, "Starting machine...");
-                self.with_machine(|m| {
-                    m.restart_peripherals();
-                    m.cpu.start();
-                    Ok(())
-                })
+                let ack = self.with_machine(|m| m.start_guest())?;
+                let _ = writeln!(writer, "machine-start: {}", ack.text());
+                Ok(())
+            }
+            "machine-status" => {
+                let json = match args {
+                    [] => false,
+                    ["json"] => true,
+                    _ => return Err("Usage: machine-status [json]".to_string()),
+                };
+                let status = self.with_machine(|m| Ok(m.status()))?;
+                if json {
+                    let _ = writeln!(writer, "{}", status.to_json());
+                } else {
+                    let _ = writeln!(writer, "{}", status.text());
+                }
+                Ok(())
             }
             "reset" => {
                 let _ = writeln!(writer, "Resetting machine...");
@@ -2316,6 +2405,36 @@ mod controller_lifetime_tests {
             .unwrap()
             .join()
             .unwrap()
+    }
+
+    /// #102: `machine-start`'s acknowledgement names the transition it
+    /// performed, from a never-started machine through `Starting` to
+    /// `Running`. A second start is a no-op, and a start after `machine-stop`
+    /// takes the same route from `Halted`. The process-level test in
+    /// `tests/monitor_ready.rs` covers the monitor command and readiness.
+    #[test]
+    fn start_guest_acknowledges_the_lifecycle_transition() {
+        let mut machine = build_machine();
+        assert_eq!(machine.status().state, GuestState::Idle);
+        assert!(!machine.status().monitor_ready(), "no monitor before Machine::start");
+
+        let ack = machine.start_guest().expect("start from idle");
+        assert_eq!(ack.text(), "idle -> starting -> running");
+        assert_eq!(machine.status().state, GuestState::Running);
+        assert!(machine.status().cpu_running);
+
+        // Duplicate start: no second start and no error.
+        let ack = machine.start_guest().expect("duplicate start");
+        assert!(!ack.changed());
+        assert_eq!(ack.text(), "running (no change)");
+
+        let ack = machine.stop_guest();
+        assert_eq!(ack.text(), "running -> halted");
+        assert_eq!(machine.status().state, GuestState::Halted);
+
+        let ack = machine.start_guest().expect("start after halt");
+        assert_eq!(ack.text(), "halted -> starting -> running");
+        machine.stop();
     }
 
     /// iris-gui drops a Machine on Stop while the monitor keeps its
