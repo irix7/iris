@@ -3,6 +3,10 @@
 **Status:** plan, 2026-10-24. Written after merging `upstream/main` (41 commits)
 into `irix7/iris` `main`. Nothing here has been sent upstream yet.
 
+**Superseded in classification by [divergence-policy.md](divergence-policy.md)**
+(2026-10-25): that document decides what is sent, reverted or kept fork-only.
+The ordering detail below for storage and snapshots is still the reference.
+
 **Tracked as [#85](https://github.com/irix7/iris/issues/85)**, one child issue
 per unit (#86-#101). Update the issue rather than this file when a unit's state
 changes; the doc is the reasoning, the tracker is the status.
