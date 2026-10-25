@@ -2452,6 +2452,38 @@ impl Workstation for Machine {
     fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { Machine::get_ci_serial(self) }
     fn inject_serial_console(&self, bytes: &[u8]) { Machine::inject_serial_console(self, bytes) }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn load_elf(&self, path: &str) -> Result<String, String> { Machine::load_elf(self, path) }
+    fn save_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::save_snapshot(self, name) }
+    fn load_snapshot(&mut self, name: &str) -> Result<(), String> { Machine::load_snapshot(self, name) }
+    fn ci_restore(&mut self, name: &str) -> Result<(), String> { Machine::ci_restore(self, name) }
+    fn ci_rollback(&mut self) -> Result<(), String> { Machine::ci_rollback(self) }
+
+    fn save_nvram(&self, path: Option<&str>) -> Result<String, String> {
+        let rtc = self.hpc3.rtc();
+        let path = path.unwrap_or_else(|| rtc.nvram_path()).to_string();
+        rtc.save_nvram(&path).map(|_| path).map_err(|e| e.to_string())
+    }
+    fn scratch_path(&self) -> Option<&std::path::Path> { Machine::scratch_path(self) }
+    fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
+        Some(self.hpc3.scsi().clone())
+    }
+    fn remount_cdrom_guest(&self, scsi_id: u8) { Machine::remount_cdrom_guest(self, scsi_id) }
+    fn pending_chd_sync_count(&self) -> usize { Machine::pending_chd_sync_count(self) }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        Machine::sync_chd_disks(self, only, progress, cancel)
+    }
+    fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
+        Some(self.hpc3.seeq().nat_control())
+    }
+    fn nat_expected(&self) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
+        Some(self.hpc3.seeq().gateway_addrs())
+    }
 }
 
 #[cfg(test)]
@@ -2477,6 +2509,22 @@ mod controller_lifetime_tests {
             cfg!(feature = "jitv2"),
             "auto is the shadow in a jitv2 build and the full model otherwise"
         );
+    }
+
+    /// The `Workstation` trait must forward the optional facilities to the
+    /// concrete `Machine`. A refactor once dropped these overrides, so
+    /// `--load-elf` and the CI snapshot/NVRAM/disc commands hit the trait's
+    /// `NOT_HERE` default while the inherent methods still worked.
+    #[test]
+    fn workstation_trait_forwards_load_elf() {
+        let machine = build_machine();
+        let dir = std::env::temp_dir().join(format!("iris-load-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("suite.elf");
+        std::fs::write(&path, crate::benchsuite::SUITE_ELF).unwrap();
+        let out = crate::workstation::Workstation::load_elf(&*machine, path.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.is_ok(), "Workstation::load_elf must forward to Machine: {out:?}");
     }
 
     fn build_machine() -> Box<Machine> {

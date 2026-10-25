@@ -117,6 +117,12 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **Restore the `Workstation` optional overrides.** A merge dropped the block
+  that forwards `load_elf`, snapshots, `ci_restore`/`ci_rollback`, `nvram save`,
+  disc and scratch commands and the NAT queries. Direct calls still worked, but
+  anything through `dyn Workstation` (the CI socket, `iris-bench --iris`) got
+  the trait's `NOT_HERE` default. Restored, with a trait-level regression test.
+  (main only; `0.1.6` is not affected.)
 - **A `setup-iris` composite action.** `.github/actions/setup-iris` installs
   `iris` and `iris-ci` from a published release or a checkout and puts both on
   `PATH`, so another workflow needs one step. The install logic is

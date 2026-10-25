@@ -132,6 +132,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | [miniroot-install-hang-scsi0-dma-irq-storm.md](scsi/miniroot-install-hang-scsi0-dma-irq-storm.md) | rule | IRIX miniroot install hangs on iris: SCSI0_DMA IRQ storm (FIXED) |
 | [openbsd.md](scsi/openbsd.md) | rule | OpenBSD SCSI Boot Crash — Investigation Notes |
 | [wd33c93a-must-not-hold-state-lock-across-dma.md](scsi/wd33c93a-must-not-hold-state-lock-across-dma.md) | rule | WD33C93A must not hold its state lock across the DMA transfer |
+| [workstation-trait-overrides-are-load-bearing.md](devices/workstation-trait-overrides-are-load-bearing.md) | rule | The `Workstation` optional overrides are load-bearing; a merge that drops them breaks CI and `--load-elf` |
 
 ## net/
 
