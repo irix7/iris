@@ -121,8 +121,10 @@ hashes are given where a change is easiest to understand by reading the commit.
   that forwards `load_elf`, snapshots, `ci_restore`/`ci_rollback`, `nvram save`,
   disc and scratch commands and the NAT queries. Direct calls still worked, but
   anything through `dyn Workstation` (the CI socket, `iris-bench --iris`) got
-  the trait's `NOT_HERE` default. Restored, with a trait-level regression test.
-  (main only; `0.1.6` is not affected.)
+  the trait's `NOT_HERE` default. The direct `--load-elf` path uses the
+  inherent method and still worked; the CI commands and `iris-bench --iris`
+  did not. Introduced by the O2/`Workstation` merge, shipped in `0.1.6`, fixed
+  in `0.1.7`; restored with a trait-level regression test.
 - **A `setup-iris` composite action.** `.github/actions/setup-iris` installs
   `iris` and `iris-ci` from a published release or a checkout and puts both on
   `PATH`, so another workflow needs one step. The install logic is

@@ -1,6 +1,6 @@
 # The `Workstation` trait's optional overrides are load-bearing
 
-**Symptom.** `iris --load-elf` reports the trait's `NOT_HERE` error, and the CI
+**Symptom.** Shipped in `0.1.6`, fixed in `0.1.7`. `iris --load-elf` reports the trait's `NOT_HERE` error, and the CI
 socket's `save`/`restore`/`rollback`, `nvram save`, disc commands, scratch
 commands and NAT queries all fail the same way, while the same operations work
 through the monitor or in-process.
