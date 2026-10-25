@@ -1,6 +1,6 @@
 # jitv2 integer conversions: inline the common case, call out the proofs
 
-**Status:** PR techomancer/iris#332, open 2026-10-26. The four conversion
+**Status:** merged upstream as techomancer/iris#332 (`fba85e7`), 2026-10-25. The four conversion
 families (`CVT.W/L.S/D`, `ROUND/TRUNC/CEIL/FLOOR.W/L.S/D`, `CVT.S/D.W/L`) were
 the last FPU instructions compiled to a per-op `call_indirect`; they cost
 17–19 ns against 3.1 ns for the already-inline `cvt.d.s`.
