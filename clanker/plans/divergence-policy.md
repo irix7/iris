@@ -95,6 +95,14 @@ the fork's version.
   flushing. Send the timestamp feature, then delete the sink and use upstream's
   `TeeBackend`/`CiSerialBackend` with the timestamp flag. Do not keep two
   writers.
+- **CPU clock model (#98).** Upstream's reply on techomancer/iris#322 points
+  at the existing `ci_clock` feature: normal builds keep the host wall clock,
+  and `ci_clock` derives Count from retired cycles for the determinism
+  validator. Revert the fork's cycle-derived-by-default clock, its ordered
+  guest-time timer queue (`800f785`, `e8b264e`) and the PIT/idle-park code that
+  depends on it, and use upstream's `ci_clock` for deterministic runs. This is
+  the largest revert left; do it as its own campaign after BlockNode, because
+  it touches the CPU, PIT, idle park, snapshots and their tests.
 - **Physical decode map.** Upstream replaced the fork's `DecodeMap` with a
   sparse, host-MMU-backed `SparseDeviceMap` over a 40-bit space. The fork still
   carries `DecodeMap` because `physical.rs` also holds the per-bank dirty
@@ -126,7 +134,7 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 | 9 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
 | 10 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
 | 11 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
-| 12 | CPU clock model (#98) | determinism and performance numbers, and the idle-park interaction | **discussion, then evidence** |
+| 12 | CPU clock model (#98) | **resolved by upstream**: use the existing `ci_clock` feature for determinism and keep the wall clock as default — see the revert list | **decided** |
 
 ## 4. Keep fork-only
 
