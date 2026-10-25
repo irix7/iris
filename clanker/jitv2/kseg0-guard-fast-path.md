@@ -1,5 +1,12 @@
 # jitv2 inline memory: one shifted compare for KSEG0 wins
 
+**Upstream status: rejected for now.** PR techomancer/iris#330 was closed on
+2026-10-25. The objection: on a working system most accesses are user-space
+KUSEG, and this adds a compare to every one of them; the bare-metal benchmark
+suite is all KSEG0, so 1.29x is a ceiling, not a prediction. Re-propose only
+with a user-space benchmark and a shape that does not tax KUSEG. The fork does
+not carry this change.
+
 **Rule.** The inline load/store guard first tests
 `(va >> 29) == core.jit_kseg0_rule`; on a match `phys = va & 0x1FFF_FFFF`, and
 everything downstream (cache model, VCE, aliases, generations) is the unchanged

@@ -83,7 +83,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [jit-v2-design.md](jitv2/jit-v2-design.md) | design | IRIS JIT v2 — Design Plan (draft for discussion) |
 | [jitv2_lockstep_region_ending_double_page_jump.md](jitv2/jitv2_lockstep_region_ending_double_page_jump.md) | rule | jitv2_lockstep: region-ending words landed 1-2 pages off (double-page-jump) |
 | [jitv2_lui_fusion_foreign_delay_slot_hazard.md](jitv2/jitv2_lui_fusion_foreign_delay_slot_hazard.md) | rule | jitv2 LUI+ORI/ADDIU fusion: missing foreign-delay-slot guard (fixed, then gated off by default) |
-| [kseg0-guard-fast-path.md](jitv2/kseg0-guard-fast-path.md) | rule | jitv2 inline memory: one shifted compare for KSEG0 wins; the dead-end shapes |
+| [kseg0-guard-fast-path.md](jitv2/kseg0-guard-fast-path.md) | history | jitv2 inline memory: the KSEG0 guard fast path, its dead ends, and why upstream rejected it |
 | [lockstep-must-disable-inline-memory.md](jitv2/lockstep-must-disable-inline-memory.md) | rule | jitv2_lockstep must disable the inline load/store path |
 | [measure-the-callout-mask-gain.md](jitv2/measure-the-callout-mask-gain.md) | measure | Measuring the callout clobber-mask gain, in reloads |
 | [mem-helper-batch-must-not-use-a-vec.md](jitv2/mem-helper-batch-must-not-use-a-vec.md) | rule | The memory-helper batch must not be collected in a `Vec` |
