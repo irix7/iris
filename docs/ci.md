@@ -249,6 +249,34 @@ directory. The artifact includes it: a boot that never reaches the menu usually
 explains itself there (missing files, GIO timeouts), and that file is also why a
 failed run does not fill the job log with device warnings.
 
+## Serial console and wait cursors
+
+`iris-ci serial-wait PATTERN` (and `serial-read`) consume the guest console
+through a **per-consumer cursor**. A cursor only moves forward: a wait returns
+the bytes from where that consumer last stopped through the match, and never
+rewinds. Sequential waits on one consumer must therefore name patterns in the
+order the guest prints them.
+
+A line printed before the previous wait's match will not satisfy the next wait,
+even though it is still in the transcript:
+
+```sh
+iris-ci serial-wait 'BOOT-READY'          # moves the default cursor past the line
+iris-ci serial-wait 'module: loaded'      # times out if it was printed earlier
+```
+
+Give independent assertions their own consumer, so each starts at its own
+cursor (a new consumer starts at the beginning of the buffer), or assert the
+patterns in log order on one consumer:
+
+```sh
+iris-ci serial-wait --consumer boot   'BOOT-READY'
+iris-ci serial-wait --consumer module 'module: loaded'
+```
+
+`--consumer` names the cursor only. The `--serial-log` file remains the full
+transcript; consumers do not get separate files.
+
 ## Caching
 
 Release mode downloads one archive of roughly 8 MB and does not cache it; the
