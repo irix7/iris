@@ -117,6 +117,13 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### CI and automation
 
+- **A `setup-iris` composite action.** `.github/actions/setup-iris` installs
+  `iris` and `iris-ci` from a published release or a checkout and puts both on
+  `PATH`, so another workflow needs one step. The install logic is
+  `tools/install-iris-ci.sh`, runnable by hand; [docs/ci.md](docs/ci.md) covers
+  the inputs, release asset naming, caching and a media-free PROM smoke
+  workflow. The action self-test exercises the latest release, a source build
+  and the universal macOS binary.
 - **`iris-ci screenshot` produces the guest screen in `--ci`.** A `--ci`
   instance installs no front-end renderer, so nothing filled the readback
   buffer and every screenshot came out black. The command now waits for the
