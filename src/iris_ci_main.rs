@@ -57,8 +57,9 @@ struct Cli {
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 
-    /// Serial-session name for serial-read/wait-serial cursors. Concurrent
-    /// agents on one instance should each set a distinct name.
+    /// Serial-session name for serial-read/wait-serial cursors. Cursors are
+    /// forward-only, so independent waits need distinct names; concurrent
+    /// agents on one instance should each set one.
     #[arg(long, global = true, default_value = "default")]
     consumer: String,
 
