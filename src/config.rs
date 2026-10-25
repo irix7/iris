@@ -969,12 +969,7 @@ impl CpuModel {
 /// - `shadow`: memory is the only store; tag arrays exist only to answer
 ///   CACHE instructions (`mips_cache_shadow`). jitv2's inline loads and stores
 ///   need no tag check against it.
-/// - `auto`: `shadow` in this fork's default build. The `accurate-cache`
-///   feature makes it `full`, preserving the fork's opt-in accurate model for
-///   the cache-accuracy suites; `--cache full` overrides either way. This is
-///   deliberately different from upstream, whose `auto` is `full` outside a
-///   `jitv2` build: the fork's benchmark history and performance defaults are
-///   the shadow model.
+/// - `auto`: `shadow` in a `jitv2` build, `full` otherwise.
 ///
 /// The R10000 (IP28) only has the shadow model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -994,7 +989,7 @@ impl CacheModel {
             (CpuModel::R10000, _) => true,
             (_, Self::Full) => false,
             (_, Self::Shadow) => true,
-            (_, Self::Auto) => !cfg!(feature = "accurate-cache"),
+            (_, Self::Auto) => cfg!(feature = "jitv2"),
         }
     }
 }
@@ -2489,9 +2484,9 @@ pub struct Cli {
     #[arg(long = "cpu", value_name = "MODEL")]
     pub cpu: Option<CpuModel>,
 
-    /// Cache model: `auto` (default: `shadow`, or `full` in an
-    /// `accurate-cache` build), `full` or `shadow`. Overrides
-    /// `[machine] cache`. The R10000 is always `shadow`.
+    /// Cache model: `auto` (default: `shadow` in a `jitv2` build, `full`
+    /// otherwise), `full` or `shadow`. Overrides `[machine] cache`. The
+    /// R10000 is always `shadow`.
     #[arg(long = "cache", value_name = "MODEL")]
     pub cache: Option<CacheModel>,
 

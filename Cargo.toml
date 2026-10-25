@@ -158,12 +158,6 @@ tcache = []
 # Panics at the exact diverging access instead of letting corruption surface as
 # a guest crash much later. Very slow; diagnostic only.
 tcache_verify = ["tcache"]
-# Accurate-cache opt-in (issue #35): makes `[machine] cache = auto` select
-# the functional two-level model (mips_cache_v2, with VCE) instead of the
-# observation-only shadow. The models are always compiled in, and the runtime
-# `--cache full|shadow` override still wins; this flag keeps the fork's old
-# accurate-cache build default (and the cache-accuracy CI suite) working.
-accurate-cache = []
 # Cache parity/ECC injection and the Cache Error exception, for SGI's IDE
 # cache diagnostics (dcache1, icache1, scache1): Status.CE forcing the ECC
 # register into stored check bits, Index_Load_Tag loading check bits into CP0

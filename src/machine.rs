@@ -2474,8 +2474,8 @@ mod controller_lifetime_tests {
         assert!(CacheModel::Full.is_shadow(CpuModel::R10000));
         assert_eq!(
             CacheModel::Auto.is_shadow(CpuModel::R4400),
-            !cfg!(feature = "accurate-cache"),
-            "auto keeps the fork's shadow default; the feature opts into full"
+            cfg!(feature = "jitv2"),
+            "auto is the shadow in a jitv2 build and the full model otherwise"
         );
     }
 

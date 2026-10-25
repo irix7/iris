@@ -38,7 +38,6 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `idle-pause` | Park the CPU in recognized guest idle loops; opt-in. | — |
 | `tcache` | Keep cache tags/state but use authoritative ppmem RAM for cacheable data. | — |
 | `tcache_verify` | Assert transparent-cache/RAM coherence on accesses; very slow. | `tcache` |
-| `accurate-cache` | Select the functional R4400/R5000 cache and raise VCE; default is the observation-only shadow. | — |
 | `default` | Default bundle: `tlbvmap` and `rexdiag`. | `tlbvmap`, `rexdiag` |
 | `rex-jit` | Cranelift compiler for Newport draw shaders; complements precompiled shaders. | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
 | `gr4-jit` | Cranelift compiler for IMPACT (GR4) raster pipelines (RSS/TE1 shaders). | `cranelift-codegen`, `cranelift-frontend`, `cranelift-jit`, `cranelift-module`, `cranelift-native` |
@@ -509,7 +508,6 @@ cargo run --release --features lightning             # disable emulator breakpoi
 cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit + gr2-jit)
 cargo run --release --features jitv2,gpujit          # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
-cargo run --release --features accurate-cache        # functional R4400/R5000 cache that raises VCE (slower; default is the observation-only shadow)
 cargo run --release --features ci_clock              # no-op: the cycle-derived CP0 Count clock is the default now
 cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
 cargo run -p iris-gui --release                      # the egui front-end, see iris-gui-README.md
@@ -542,7 +540,6 @@ both the interpreter and jitv2.
 | `jitstats` | Counts how far each load/store gets through the JIT inline-memory checks |
 | `instr_stats` | Per-opcode decode/execute counters (interpreter only; refused with `jitv2`) |
 | `tcache` / `tcache_verify` | Transparent cache over the ppmem window ([docs/tcache-design.md](docs/tcache-design.md)) / its self-check. Always on with `jitv2`; optional for an interpreter build |
-| `accurate-cache` | Run the functional R4400/R5000 cache model and raise VCEI/VCED. Off by default: every CPU uses the observation-only shadow, which bypasses the data path and never raises VCE. The R10000 keeps its shadow either way |
 | `jitv2_lockstep` | Verify every JIT instruction against the interpreter (implies `developer`) |
 | `jitv2_smc_check` | Report writes into the page the CPU is executing (run with `j2 inline_mem off`) |
 | `jitv2_opcodefusion` | jitv2 LUI+ORI/ADDIU and branch+NOP fusion (off by default; see "JIT compilers") |
@@ -567,15 +564,15 @@ or download. Pair R10000 with the IP28 profile, which has an embedded IP28 PROM.
 | ISA | MIPS III | MIPS IV | MIPS IV |
 | PRId / FPU FIR | `0x00000440` / `0x00000500` | `0x00002321` / `0x00002300` | `0x00000925` / `0x00000900` |
 
-By default all three CPUs run the **observation-only shadow** cache:
+By default a `jitv2` build runs the **observation-only shadow** cache:
 loads, stores and fetches access memory directly, and CACHE instructions operate
-on shadow tag/data arrays for the PROM's diagnostics. This models functional
-behaviour, not the physical CPU's timing or out-of-order execution. The
-`accurate-cache` feature selects the functional two-level cache model for the
-R4400 and R5000 instead, which keep decoded instructions in the cache and raise
-Virtual Coherency Exceptions (VCEI/VCED); the R10000 always keeps its shadow.
-The default is faster and never raises VCE; the functional path is retained for
-the `cpu-tests` write-back cache checks and a future guest that needs them.
+on shadow tag/data arrays for the PROM's diagnostics. Outside a `jitv2` build
+the default is the functional two-level model. `--cache full` selects the
+functional R4400/R5000 model explicitly: it keeps decoded instructions in the
+cache and raises Virtual Coherency Exceptions (VCEI/VCED), and `--cache shadow`
+selects the observation-only model; the R10000 always keeps its shadow. The
+shadow is faster and never raises VCE; the functional path is what the
+`cpu-tests` write-back cache checks exercise.
 
 This is a different machine to the guest, not a speed knob: IRIX reads PRId and
 configures itself from it, and an R4400 raises Reserved Instruction on the MIPS IV

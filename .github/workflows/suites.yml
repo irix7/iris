@@ -354,9 +354,9 @@ jobs:
       # cell by design — see clanker/cpu/tcache-discards-dirty-data-semantics.md.
       # Otherwise the engines match check-for-check.
       #
-      # The opt-in `accurate-cache` build keeps the functional model and so
-      # passes that test; it runs in its own job below with its own baseline —
-      # the same 126/110 less those 2 checks, i.e. 124/108.
+      # The full cache model (`--cache full`) keeps the functional model and
+      # so passes that test; it runs in its own job below with its own
+      # baseline — the same 126/110 less those 2 checks, i.e. 124/108.
       #
       # Gate on CPUTEST_FAILED, not CPUTEST_RC: the exit code saturates at 100
       # and both cells are past it.
@@ -401,9 +401,9 @@ jobs:
             bench/build/results/*.json
           if-no-files-found: ignore
 
-  # The opt-in `accurate-cache` build (#35): the R4400/R5000 run the functional
-  # `mips_cache_v2` model and raise VCE, where every default cell runs the
-  # observation-only shadow. Only the cache group can tell the two models
+  # The full cache-model cell (#35): the R4400/R5000 run the functional
+  # `mips_cache_v2` model and raise VCE via `--cache full`, where a `jitv2`
+  # build defaults to the observation-only shadow. Only the cache group can tell the two models
   # apart, so this is its own job over cpu-tests alone rather than a fifth
   # `run` axis — a matrix axis would drag a bench run and a per-runner host
   # baseline along with each accurate cell, and bench measures the shipping
@@ -416,7 +416,7 @@ jobs:
   # every default cell — clanker/cpu/tcache-discards-dirty-data-semantics.md.
   # The functional model keeps them and must pass.
   accurate-cache:
-    name: accurate-cache / ${{ matrix.cpu }}
+    name: full-cache / ${{ matrix.cpu }}
     needs: guests
     runs-on: ubuntu-24.04
     strategy:
@@ -438,23 +438,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The feature is the whole point of the cell, and cargo would happily
-      # build the default shadow machine if the flag were dropped. The guest
-      # banner below proves the run used the CPU it was asked for; the
-      # selected_cache_model unit test proves the flag selects the functional
-      # model (src/machine.rs).
-      - name: Build IRIS (accurate-cache)
-        run: cargo build --release --bin iris --features accurate-cache
+      # The `--cache full` flag is the whole point of the cell; the guest
+      # banner below proves the run used the CPU it was asked for, and the
+      # cache_model_selects_the_shadow_or_full_cpu unit test covers the
+      # selection itself (src/machine.rs).
+      - name: Build IRIS (cache model cell)
+        run: cargo build --release --bin iris
 
       # Same run, accounting and banner check as the `run` job's cpu-tests
       # step. Records the count rather than exiting on it so the baseline gate
       # below gives the one meaningful message; a timeout or a missing DONE
       # token is the harness breaking, not the emulator, and fails here.
-      - name: cpu-tests (accurate-cache)
+      - name: cpu-tests (cache model full)
         run: |
           cd cpu-tests
           chmod +x build/cputest.elf
           timeout 900 ../target/release/iris \
+            --cache full \
             --config run/bare.toml \
             --cpu ${{ matrix.cpu }} \
             --load-elf build/cputest.elf \
@@ -477,20 +477,20 @@ jobs:
       # The acceptance criterion, asserted by name so a regression is not just
       # a bare +2 in the count. The harness prints PASS on the test's padded
       # name line only when every check passed.
-      - name: cache/hit_inv_discards passes under accurate-cache
+      - name: cache/hit_inv_discards passes with the full cache model
         run: |
           grep -qE 'cache/hit_inv_discards.*PASS' cpu-tests/build/run.log \
-            || { echo "::error::cache/hit_inv_discards did not PASS under accurate-cache:"; \
+            || { echo "::error::cache/hit_inv_discards did not PASS with the full cache model:"; \
                  grep 'cache/hit_inv_discards' cpu-tests/build/run.log || true; exit 1; }
 
-      # The accurate-cache baseline is the default cells' 126/110 less the 2
+      # The full-cache baseline is the default cells' 126/110 less the 2
       # hit_inv_discards checks: this is exactly the functional model the
       # interpreter ran before #34 made the shadow the default, when suites.yml
       # carried 124/108 for the interpreter. Same gate as the default cells —
       # more is a regression, fewer means a gap closed and asks for this number
       # to come down.
       #
-      #            accurate-cache
+      #            full cache model
       #   r4400          124
       #   r5000          108
       - name: Result
@@ -499,22 +499,22 @@ jobs:
           CPUTEST_BASELINE: ${{ matrix.cpu == 'r4400' && 124 || 108 }}
         run: |
           {
-            echo "### accurate-cache / ${{ matrix.cpu }}"
+            echo "### full-cache / ${{ matrix.cpu }}"
             echo '```'
             grep -E '^ RESULT:' cpu-tests/build/run.log 2>/dev/null || echo " cpu-tests: no result"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -z "${CPUTEST_FAILED:-}" ]; then
-            echo "::error::cpu-tests (accurate-cache) recorded no result"
+            echo "::error::cpu-tests (full cache model) recorded no result"
             exit 1
           fi
           if [ "$CPUTEST_FAILED" -gt "$CPUTEST_BASELINE" ]; then
-            echo "::error::cpu-tests (accurate-cache) reported $CPUTEST_FAILED failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_FAILED - CPUTEST_BASELINE )) new"
+            echo "::error::cpu-tests (full cache model) reported $CPUTEST_FAILED failing checks, baseline is $CPUTEST_BASELINE — $(( CPUTEST_FAILED - CPUTEST_BASELINE )) new"
             exit 1
           fi
           if [ "$CPUTEST_FAILED" -lt "$CPUTEST_BASELINE" ]; then
-            echo "::notice::cpu-tests (accurate-cache) improved to $CPUTEST_FAILED failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
+            echo "::notice::cpu-tests (full cache model) improved to $CPUTEST_FAILED failing checks (baseline $CPUTEST_BASELINE) — lower CPUTEST_BASELINE in .github/workflows/suites.yml"
             echo "cpu-tests improved to $CPUTEST_FAILED (baseline $CPUTEST_BASELINE) — lower the baseline" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           fi
 

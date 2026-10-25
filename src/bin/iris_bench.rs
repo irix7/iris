@@ -920,8 +920,8 @@ enum Cmd {
         /// a single run.
         #[arg(long, default_value_t = 1)]
         repeat: u32,
-        /// Cache model for the in-process run: auto (shadow by default, full
-        /// in an accurate-cache build), full or shadow. With --iris:
+        /// Cache model for the in-process run: auto (shadow in a jitv2
+        /// build, full otherwise), full or shadow. With --iris:
         /// `-- --cache shadow`.
         #[arg(long, default_value = "auto")]
         cache: iris::config::CacheModel,
