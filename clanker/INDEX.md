@@ -76,6 +76,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [fr1-pin-must-be-re-derived.md](jitv2/fr1-pin-must-be-re-derived.md) | rule | A page's pinned FR mode must be re-derived, not pinned for life |
 | [gpr0-was-loaded-from-memory.md](jitv2/gpr0-was-loaded-from-memory.md) | rule | `$zero` was being loaded from memory, 79 times in one region |
 | [inlined-slot-pc-bd-bracket.md](jitv2/inlined-slot-pc-bd-bracket.md) | rule | The inlined delay slot's `core.pc` / `in_delay_slot` bracket |
+| [inline-conversions.md](jitv2/inline-conversions.md) | rule | jitv2 integer conversions: inline the common case, call out the proofs |
 | [instructions-jitv2-still-interprets.md](jitv2/instructions-jitv2-still-interprets.md) | history | What jitv2 still interprets, and which of it is worth compiling |
 | [interrupt-check-frequency-gates-gpr-forwarding.md](jitv2/interrupt-check-frequency-gates-gpr-forwarding.md) | measure | The pending-interrupt check, not block structure, is what blocks GPR forwarding |
 | [j2_per_instruction_category_toggle.md](jitv2/j2_per_instruction_category_toggle.md) | design | j2 per-instruction/category enable toggle |
