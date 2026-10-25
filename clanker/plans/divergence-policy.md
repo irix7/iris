@@ -67,6 +67,7 @@ evidence from the changelog or the issue.
 | REX3 auxiliary-clear conformance test | upstream #320 |
 | NFS host MAC derivation | upstream #321 |
 | 8254 PIT read-back and latch release | upstream #323 (the fork keeps its version only until the clock model is settled) |
+| Physical decode map | upstream `81a88ac`, adopted in `63f87d1`; the snapshot dirty bitmap now lives on `SparseDeviceMap` |
 | machine lifecycle helpers duplicated in `machine.rs` | removed by the O2/`Workstation` merge |
 | second-client console refusal | dropped; upstream's multi-client console won |
 
@@ -103,12 +104,6 @@ the fork's version.
   depends on it, and use upstream's `ci_clock` for deterministic runs. This is
   the largest revert left; do it as its own campaign after BlockNode, because
   it touches the CPU, PIT, idle park, snapshots and their tests.
-- **Physical decode map.** Upstream replaced the fork's `DecodeMap` with a
-  sparse, host-MMU-backed `SparseDeviceMap` over a 40-bit space. The fork still
-  carries `DecodeMap` because `physical.rs` also holds the per-bank dirty
-  bitmap (#48) the fork's incremental snapshots need. Port the dirty bitmap
-  onto upstream's map, then delete `DecodeMap`. Do not extend `DecodeMap`.
-  (Upstream `81a88ac`; deferred in merge `d3b7702`.)
 - **O2 SCSI raw-only shim.** `aic7880::attach_device` currently accepts raw
   images only because the fork's disks are `BlockNode`s and upstream's are
   `DiskBackend`s. This is temporary: delete it when BlockNode lands upstream;
