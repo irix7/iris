@@ -1,0 +1,105 @@
+# Composite action: install iris and iris-ci and put both on PATH.
+#
+#   - uses: irix7/iris/.github/actions/setup-iris@main
+#   - run: iris-ci --version
+#
+# The install logic lives in tools/install-iris-ci.sh so it can be run by hand;
+# this file only translates inputs into that script's flags. See docs/ci.md.
+name: Setup IRIS
+description: Install the iris and iris-ci binaries and add them to PATH.
+author: irix7
+branding:
+  icon: terminal
+  color: purple
+
+inputs:
+  version:
+    description: >-
+      Release to install: latest, v0.1.6+irix7, or 0.1.6+irix7. Ignored when
+      from-source is true.
+    required: false
+    default: latest
+  from-source:
+    description: >-
+      Build the checkout at `path` instead of downloading a release. The job
+      must already have a Rust toolchain (rustup reads rust-toolchain.toml).
+    required: false
+    default: "false"
+  path:
+    description: Checkout to build when from-source is true.
+    required: false
+    default: "."
+  features:
+    description: Cargo features for from-source builds.
+    required: false
+    default: lightning,gpujit
+  install-deps:
+    description: >-
+      On Linux, install the shared libraries the release needs (libGL, ALSA,
+      EGL, xkbcommon) and the build packages in source mode.
+    required: false
+    default: "true"
+  smoke:
+    description: Run `iris --help` and `iris-ci --help` after installing.
+    required: false
+    default: "true"
+
+outputs:
+  iris:
+    description: Absolute path to the installed iris binary.
+    value: ${{ steps.install.outputs.iris }}
+  iris-ci:
+    description: Absolute path to the installed iris-ci binary.
+    value: ${{ steps.install.outputs.iris-ci }}
+  version:
+    description: >-
+      The resolved release version (for example 0.1.6+irix7), or dev.<sha> in
+      source mode.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install iris and iris-ci
+      id: install
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_FROM_SOURCE: ${{ inputs.from-source }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_FEATURES: ${{ inputs.features }}
+        INPUT_INSTALL_DEPS: ${{ inputs.install-deps }}
+        INPUT_SMOKE: ${{ inputs.smoke }}
+        # Only used for the public GitHub API call that resolves `latest`.
+        # The token raises the rate limit; it is never written anywhere.
+        IRIS_GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        action_path="$GITHUB_ACTION_PATH"
+        if command -v cygpath >/dev/null 2>&1; then
+          action_path="$(cygpath -u "$action_path")"
+        fi
+        script="$action_path/../../../tools/install-iris-ci.sh"
+        if [ ! -f "$script" ]; then
+          echo "::error::setup-iris: $script is missing from the action checkout"
+          exit 1
+        fi
+
+        input_path="$INPUT_PATH"
+        if command -v cygpath >/dev/null 2>&1; then
+          input_path="$(cygpath -u "$input_path" 2>/dev/null || printf '%s' "$input_path")"
+        fi
+
+        args=(--version "$INPUT_VERSION")
+        case "$(printf '%s' "$INPUT_FROM_SOURCE" | tr '[:upper:]' '[:lower:]')" in
+          1|true|yes|on) args+=(--from-source --path "$input_path" --features "$INPUT_FEATURES") ;;
+        esac
+        case "$(printf '%s' "$INPUT_INSTALL_DEPS" | tr '[:upper:]' '[:lower:]')" in
+          1|true|yes|on) args+=(--install-deps) ;;
+        esac
+        case "$(printf '%s' "$INPUT_SMOKE" | tr '[:upper:]' '[:lower:]')" in
+          1|true|yes|on) args+=(--smoke) ;;
+        esac
+
+        bash "$script" "${args[@]}"
