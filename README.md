@@ -177,6 +177,7 @@ configuration inventory for both `iris` and `iris-gui`.
 | [STORAGE.md](STORAGE.md) | CHD, overlays, snapshots, CI automation, and scratch-volume file transfer. |
 | [docs/parallel-instances.md](docs/parallel-instances.md) | Running several VMs side by side: the `--instance` flags, the `StatePaths` / `derive_instance` seam, and the epic #1 ticket map. |
 | [TESTING.md](TESTING.md) | Rust and guest tests, benchmark commands, CPU matrices, and performance methodology. |
+| [docs/ci.md](docs/ci.md) | GitHub Actions: the `setup-iris` action, release and source installs, caching, and a media-free ROM smoke workflow. |
 | [CHANGELOG.md](CHANGELOG.md) | Dated repository changes. |
 | [clanker/TODO.md](clanker/TODO.md) | Current feature-completion backlog. |
 | [wsl/README.md](wsl/README.md) | Windows/WSL build, launch, and troubleshooting. |

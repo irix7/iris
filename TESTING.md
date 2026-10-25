@@ -78,3 +78,6 @@ It runs `--help` and `--print-instance` under `env -i` with an explicitly empty
 cannot start. `nix flake check` runs the same idea hermetically against a stub
 binary, so a library missing from the flake's `runtimeLibs` — or an `RPATH` that
 does not name it — turns the check red without needing a cargo build.
+
+For GitHub Actions, [docs/ci.md](docs/ci.md) covers the `setup-iris` composite
+action and a media-free ROM smoke workflow.
