@@ -70,6 +70,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [dirty-cache-page-probe.md](jitv2/dirty-cache-page-probe.md) | history | jitv2: the dirty-cache blind spot, and the probe that closes it |
 | [emit_absolute_pc_exit-in_delay_slot-followup.md](jitv2/emit_absolute_pc_exit-in_delay_slot-followup.md) | open | Follow-up: `emit_absolute_pc_exit` should own its own `in_delay_slot=false` clear |
 | [entry-word-bail-must-not-touch-pc-or-bd.md](jitv2/entry-word-bail-must-not-touch-pc-or-bd.md) | rule | An entry-word bail must not touch `pc` or `in_delay_slot` |
+| [fpu-fast-path-and-probe-images.md](jitv2/fpu-fast-path-and-probe-images.md) | rule | jitv2 FP arithmetic: prove flags away, and measure one kernel per image |
 | [flush-preserved-entry-point-inflation.md](jitv2/flush-preserved-entry-point-inflation.md) | rule | Flush-preserved pages inherited the previous program's entry points |
 | [fpu-flags-are-computed-not-read.md](jitv2/fpu-flags-are-computed-not-read.md) | rule | FPU exception flags are computed from bit patterns, never read from the host |
 | [fr1-pin-must-be-re-derived.md](jitv2/fr1-pin-must-be-re-derived.md) | rule | A page's pinned FR mode must be re-derived, not pinned for life |
