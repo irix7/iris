@@ -159,8 +159,8 @@ the first `[section]`, because TOML tables continue until the next header.
 | `ci_display` | `false` | Keep host graphics window visible in CI mode. |
 | `mouse_scroll_pixels_per_line` | `40.0` | Host scrolling distance per guest PS/2 detent. |
 | `lock_aspect_ratio` | `true` | Constrain standalone window aspect ratio; false allows letterboxing. |
-| `serial_log` | `unset` | Append guest channel-B output to this file (CI and ordinary runs). Raw bytes by default; flushed per completed line. |
-| `serial_log_timestamps` | `off` | `off` (raw transcript), `guest`, `wall` or `both`: prefix each log line with monotonic guest seconds and/or a UTC ISO-8601 wall stamp. |
+| `serial_log` | `unset` | Append guest console output to this file (ttyd1 on the Indy/Indigo2, the first serial port on the O2); used by CI, GUI capture and boot scripts. |
+| `serial_log_timestamps` | `off` | `off` (raw transcript) or `wall`: prefix each completed serial-log line with a UTC ISO-8601 stamp. In `wall` mode a partial line is held until its newline and written on stop. |
 | `state_dir` | `unset` | Instance state directory recorded by `--instance`/`--state-dir` (see [docs/parallel-instances.md](docs/parallel-instances.md)); derived automatically, not usually set by hand. The directory also holds the instance ownership lock, `iris.lock`, which is taken by the CLI rather than configured. |
 | `scsi_deferred_int` | `true` | Defer SCSI status interrupts for BSD compatibility. |
 
@@ -366,7 +366,7 @@ iris-gui does not parse this standalone option set; use its named-machine UI.
 | `--ci-socket` | Override the default control-socket path (/tmp/iris.sock). |
 | `--ci-display` | With --ci, keep the Newport window visible for interactive test development (deferred rendering at 10–15 fps). |
 | `--serial-log` | Append every byte the guest emits on ttyd1 (IRIX serial console) to this file, with or without `--ci`. The file is append-only and flushed at each newline; a partial line is flushed after at most ~100 ms. Default output is a byte-for-byte transcript. |
-| `--serial-log-timestamps` | With `--serial-log`, prefix each line: `off` (default, raw transcript), `guest` (`[   12.345678] `, monotonic guest seconds), `wall` (`[2026-10-24T12:34:56.789012Z] `), or `both`. Timestamp modes are an event stream, not a raw capture. |
+| `--serial-log-timestamps` | With `--serial-log`: `off` (default, raw transcript) or `wall` (`[2026-10-24T12:34:56.789012Z] ` before each completed line). In `wall` mode a partial line is held until its newline and written on stop; the mode is an event stream, not a raw capture. |
 | `--instance` | Run as fleet instance N (0-based): derive a private state dir, monitor/serial/CI ports, CI socket, guest MAC and NAT subnet so VMs can run side by side. |
 | `--state-dir` | Override the derived instance state directory (default: `iris-instance-<N>`). Implies instance mode. |
 | `--port-base` | Base port for the derived monitor/serial/CI block (default `9000 + N*10`). Implies instance mode. |

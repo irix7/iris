@@ -18,21 +18,44 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
-### Upstream sync — SGI O2 (IP32)
+### JIT v2
 
-- **O2 machine support from upstream.** `[machine] profile = "o2_ip32"` brings up
-  the IP32: the CRIME memory controller (its no-ECC alias and readback transfer
-  registers), MACE Ethernet and two serial ports, the AIC7880 SCSI controller,
-  and the O2 graphics console. Memory is configured as DIMM-pair kits (`banks`,
-  32–256 MB per pair, filled from pair A), and `[scsi.N] controller` selects
-  either of its two SCSI controllers. Snapshot manifests now name the machine
-  family, and the IMPACT display restarts with the machine.
-- **The machine is a `Workstation`.** Front-ends and the CI socket reach the
-  Indy/Indigo2 `Machine` and the O2 `O2Machine` through one trait, so the
-  monitor, CI status and lifecycle commands are board-independent.
-- **Fork integration:** the O2 serial console uses the shared `--serial-log`
-  sink and its timestamp modes; O2 SCSI currently accepts raw images only —
-  CHD and copy-on-write overlays return a clear error until that path is ported.
+- **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
+  `ROUND/TRUNC/CEIL/FLOOR.W/L.S/D` and the reverse `CVT.S/D.W/L` each emitted
+  a `call_indirect` into the interpreter's own conversion helper, so a guest
+  conversion cost 17-19 ns against 3.1 ns for the already-inline `cvt.d.s`
+  widening (and 8.9 ns for `cvt.s.d`, which still calls out). The common
+  case now compiles to a rounding step, the saturation cast and one Cause
+  store: RN-even rounding for the two dynamic-rounding instructions is an
+  add/subtract of a format-sized power of two in the source's sign direction
+  (only under `FCSR.RM == 0`, which is the only case where host MXCSR is
+  known to hold nearest-even), the fixed-mode instructions keep the existing
+  mode-independent bit manipulation. NaN, infinities, out-of-range values,
+  every other rounding mode and every Invalid/Inexact trap still branch to
+  the unchanged callout, so the exception model is the interpreter's own.
+  Per compiled instruction on an R4400 with `--cache shadow`: `cvt.w.s`
+  17.5 -> 6.4 ns, `cvt.l.d` 18.5 -> 6.7, `cvt.w.d` 18.6 -> 7.0,
+  `cvt.l.s` 18.6 -> 6.1, `trunc.w.s` 17.1 -> 8.9, `cvt.s.w` 8.6 -> 5.0,
+  `cvt.d.w` 7.2 -> 4.7, `cvt.s.l` 8.2 -> 5.1, `cvt.d.l` 7.7 -> 4.9;
+  the untouched `cvt.s.d` control is unchanged at 8.7-8.9. The equivalence
+  suite pins the whole core snapshot, `fpu_fcsr` included, across the range
+  edges, all four rounding modes, both FR modes and the enable-bit/trap
+  paths. (`src/cpu/jitv2/codegen.rs`) (Motivation and the A/B kernel method:
+  ranked recommendation 5 of
+  [Jupiter Belic's irix7/iris performance study](https://github.com/irix7/iris/blob/510adc5/clanker/perf/mem-and-fpu-hot-paths.md).)
+- **FP arithmetic skips the exception model for ordinary operands.** A guest
+  `fadd.s` in a jitv2 build emitted about 106 x86 instructions for the model
+  around one `vaddss`. Two ordinary finite operands — a biased exponent that
+  is neither zero nor all ones — cannot be denormal or NaN, cannot be a
+  signalling NaN and cannot make DIV divide by zero, so the instruction
+  provably raises no flag: the two operand checks, the by-value flags and the
+  per-instruction Cause store are skipped, and Cause is still cleared
+  whenever it is set. Every special operand (zero, denormal, infinity, NaN,
+  and a negative square root) runs the previous code unchanged, out of line;
+  the interpreter is untouched. Isolated kernels on an R4400 with
+  `--cache shadow`: `fadd.s` 8.2 -> 4.3 ns/op, `fmul.s` 8.2 -> 4.4,
+  `fdiv.s` 8.5 -> 4.2, `fsqrt.d` 6.1 -> 3.5; conversion kernels, which this
+  change does not touch, are unchanged. (`src/cpu/jitv2/codegen.rs`)
 
 ### Timers and timekeeping
 
@@ -50,14 +73,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ### Serial console
 
-- **`--serial-log` is usable as a boot-orchestration signal (#105).** The log
-  is flushed at every completed line, and a partial line is flushed after
-  about 100 ms, so a harness can tail it without waiting for process exit.
-  `--serial-log-timestamps off|guest|wall|both` optionally prefixes each line
-  with monotonic guest seconds and/or a UTC ISO-8601 wall clock; `off` (the
-  default) remains a byte-for-byte transcript, so transcript comparisons are
-  unchanged. Guest time is the emulator's synthetic clock (retired cycles at
-  10 ns each), not wall time. (`src/dev/serial_log.rs`)
+- **`--serial-log` is a shared, timestamped transcript (#105, upstream #325).**
+  The CI backend and the TCP tee write through one sink, so both paths produce
+  the same bytes. `--serial-log-timestamps off` (the default) is a
+  byte-for-byte transcript; `wall` prefixes each completed line with a UTC
+  ISO-8601 stamp. The fork's `guest` and `both` modes are gone with its
+  synthetic-clock sink: guest time is not wall time, and deterministic runs
+  use `ci_clock`. In `wall` mode a partial line is held until its newline and
+  flushed when the machine stops; `off` writes bytes as they arrive.
+  (`src/dev/serial_log.rs`)
 
 ### Idle / headless runs
 
@@ -114,7 +138,6 @@ hashes are given where a change is easiest to understand by reading the commit.
   derivation, the CI socket/serial path, concurrent instances and per-instance
   MACs. It needs no IRIX media: the Indy PROM command monitor is the serial
   endpoint.
-
 ### CI and automation
 
 - **Restore the `Workstation` optional overrides.** A merge dropped the block
@@ -140,21 +163,6 @@ hashes are given where a change is easiest to understand by reading the commit.
   GUI renderer attached it still returns the readback the renderer produced
   (host status bar and overlay included). (`src/ci.rs`, `src/gfx_display.rs`)
 
-- **Monitor startup is observable, and `machine-start` is idempotent (#102).**
-  A harness that sent `machine-start` before the monitor was listening lost the
-  command and had to send it again; there was no way to tell "not started" from
-  "started and stopped". `machine-start` now acknowledges the transition it
-  performed (`halted -> starting -> running`, or `running (no change)` for a
-  duplicate), and the new `machine-status [json]` reports one lifecycle state
-  (`idle`, `starting`, `running`, `halted`) plus whether the monitor is
-  accepting commands. `--ci` still leaves the CPU parked, but the control
-  socket is now created only after the monitor has bound, so connecting is
-  itself a readiness check; `iris-ci status --wait-ready N` polls it and
-  `iris-ci status` reports the same fields. A fixed sleep is no longer needed,
-  and a monitor that failed to bind is distinguishable from a guest that never
-  started. Both surfaces read `Machine::status`, so the acknowledgement, the
-  monitor command and the CI socket cannot disagree.
-
 - **`iris-ci` batch mode: a whole script runs over one control-socket
   connection.** `script FILE` (also spelled `batch FILE`) used to open a fresh
   connection for every command, so a five-step differential test paid five
@@ -165,6 +173,121 @@ hashes are given where a change is easiest to understand by reading the commit.
   step instead of stopping at the first, and the run still exits non-zero
   (`#80`).
 
+### SGI O2 (IP32)
+
+- **A new machine: the SGI O2.** `[machine] profile = "o2_ip32"` with an `[o2]`
+  section ([guide](docs/o2-ip32.md)): R10000 or R5000, CRIME memory and
+  rendering engine, MACE (PCI with two Adaptec 7880 SCSI controllers,
+  Ethernet on the NAT gateway, serial ports, PS/2, audio, clocks), GBE
+  display. Runs IRIX 6.5.22 to the desktop with OpenGL through the rendering
+  engine, and NetBSD 11 to multi-user and X. Needs the O2 PROM image; not in
+  iris-gui yet.
+- **The AIC-7880 is specified.** [docs/o2/aic7880.md](docs/o2/aic7880.md)
+  describes the O2's SCSI controller from the Adaptec data books, the
+  open-source drivers, the MACE spec and what the PROM and IRIX download: principles of operation, PCI
+  configuration space, every register and bit, the sequencer's instruction
+  set, the two downloaded programs (Adaptec's HIM and Gibbs' `aic7xxx.seq`),
+  and how the O2 wires and addresses the chips.
+- **Disks come from `[scsi.N]`.** The O2 reads the same SCSI tables as the
+  Indy and Indigo2, with `controller` naming the bus (0 internal, 1
+  external): changer lists, scratch volumes, CHD images, copy-on-write
+  overlays and the `--scsi1`/`--cdrom4` options now work on it, disc changes
+  reach its CD-ROMs, and an image that will not open stops the run as it
+  does elsewhere. `o2.disks` is deprecated and folded into `[scsi.N]` on
+  load. The monitor's `scsi` and `cow` commands (`scsi1`/`cow1` for the
+  external bus) work on the O2's Adaptec controllers: status, disc changes,
+  overlay commit and reset, and the chip's registers.
+- **One configuration.** The O2 is set up with the shared keys: `prom`,
+  `nvram` (the PROM's flash), `banks` (the kit in each DIMM pair),
+  `serial_port_a`/`serial_port_b`/`serial_log`, `headless`, `[clock]
+  fixed_mhz` (CP0 Count, half the CPU clock), `[network]` with `mac` and the
+  new `mode = "off"`, `[[port_forward]]`, `nat_subnet` and `[nfs]`. `[o2]`
+  keeps `mouse`, `control_port` and `arcs_fpu`; its old keys are folded into
+  the shared ones on load, with a note. The second serial port is served too,
+  and the flash is kept between runs by default.
+- **Scripting and inspection.** The O2's devices have monitor commands, and
+  `o2 <command>` (also on `[o2] control_port`) takes screen shots, types,
+  moves the mouse and reads memory ([debug.md](debug.md#sgi-o2-ip32)).
+- **`glReadPixels` reads the frame buffer.** IRIX's OpenGL reads pixels back
+  through a rendering-engine transfer from the frame buffer into a linear
+  buffer; the engine placed that transfer by the wrong registers and copied
+  nothing, so every read returned zeros.
+- **PROM network boot.** `[network] tftp_dir` serves the O2's PROM too:
+  `boot -f bootp():FILE`.
+- **Memory through CRIME's no-ECC alias.** Physical 0x00_8000_0000 is a
+  second view of memory, not MACE's PCI window. IRIX maps some pages there,
+  and they read as all ones: `netstat -ni` spun forever, so Netscape never
+  opened, and `/dev/mem` and `/dev/kmem` returned 0xffffffff for about one
+  page in six. IRIX on an R5000 O2 panicked with "init died" for the same
+  reason; it now boots to the desktop.
+
+### Physical address decoding
+
+- **The decode table is sparse and spans 40 bits.** `Physical` used to embed
+  a 1 MB array of device pointers covering a 32-bit physical space. It is now
+  a host-mapped table over a 40-bit space (`SparseDeviceMap`,
+  `src/ppmem/devmap.rs`, [design](docs/devmap-design.md)): pages of one
+  device share one 64 KB page, mixed pages come from a pool, and a page the
+  guest touches that nobody mapped is faulted in as the bus-error device with
+  a message naming the address. An Indy's table is about ten pages. Changes
+  swap whole pages in, so the DMA worker dispatching through the table during
+  a MEMCFG remap can no longer read a torn pointer. `phys map` in the monitor
+  shows the table. Groundwork for machines with a 40-bit address space.
+
+### Memory configuration
+
+- **`banks` has eight entries.** Every machine today uses the first four and
+  the rest must be 0; a config may list fewer, and files are written back with
+  four. Room for machines with more banks.
+
+### SCSI configuration
+
+- **One id on both controllers.** A `[scsi.N]` key is a slot: 1–7 on
+  controller 0, 16 + id on controller 1, so `[scsi.1]` and `[scsi.17]` put a
+  disk at id 1 on each of an Indigo2's or O2's controllers. `controller = 1`
+  in a low key still works, and two tables naming one target are refused.
+  Snapshot manifests record disks by slot, so an Indigo2 snapshot with a disk
+  on controller 1 taken before this change does not match its configuration.
+- **One `scsi` command for every controller.** The monitor's `scsi` and `cow`
+  subcommands and the run-time disc changes are implemented once, in
+  `src/scsi_monitor.rs`, over a controller's target table; the WD33C93A and
+  the Adaptec 7880 lend theirs and keep only their own subcommands (`regs`,
+  and the WD's `wdt`, `defer`, `debug`). `scsi status` now lists disks too.
+
+### Newport (REX3)
+
+- **Conformance tests for RGBMODE and the command FIFO.** A 24-bit RGB fill
+  needs `DRAWMODE1` bit 15 as well as the RGB plane selection; fills issued
+  back to back are accepted without polling because the emulated FIFO is much
+  deeper than the hardware's and back-pressures rather than dropping writes at
+  its brim. Both behaviours, and the deliberate divergences from a real REX3
+  (reset values, visible `GFIFOLEVEL` only for the last 32 slots, no FIFO
+  threshold interrupt), are now pinned by tests and recorded in
+  `docs/Indy/rex3.md`.
+### Monitor and CI
+
+- **The emulator's name matches the machine.** The IRIS expansion shown by
+  the console banner, the monitor prompt and the window title picked its
+  third word from a fixed list that included "Indy" whatever the profile.
+  The word now comes from the configured machine: Indy or IP24, Indigo2 with
+  IP22 or IP28, and only IP32 for the O2, alongside the model-neutral IRIX
+  and Iris. (`src/machine.rs`)
+
+- **`machine-start` is idempotent and acknowledges the transition, and
+  `machine-status` reports guest state and monitor readiness.** The monitor
+  command now prints `idle -> starting -> running` (or `running (no change)`),
+  `machine-stop` acknowledges symmetrically, and `machine-status [json]` gives
+  a caller one place to ask whether the guest is `idle`, `starting`, `running`
+  or `halted` and whether the monitor has bound its port. The CI socket gains
+  the same `status` command, `iris-ci status [--wait-ready SECS]` polls it
+  instead of sleeping, and `--ci` creates the control socket only after
+  `Machine::start` has bound the monitor, so a successful connection is
+  itself a readiness signal. Tests cover a command sent before the monitor is
+  ready, duplicate starts, start after halt/reset, and invalid transitions.
+- **IMPACT machines keep their display after a stop and start.** `machine-start`,
+  `reset`, snapshot loads and rollbacks restarted every peripheral a stop had
+  stopped except the IMPACT display engines and the Ultra64 board; those now
+  restart too.
 ### NAT gateway
 
 - **Gateway replies no longer wait for a poll tick.** A reply to a guest

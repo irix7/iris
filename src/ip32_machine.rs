@@ -255,7 +255,7 @@ impl O2Machine {
         let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::z85c30::CiSerialBackend::new()));
         if let Some(ci) = &ci_serial {
             if let Some(path) = cfg.serial_log.as_deref() {
-                match crate::dev::serial_log::SerialLog::open(
+                match crate::dev::serial_log::SerialLog::create(
                     std::path::Path::new(path),
                     cfg.serial_log_timestamps,
                 ) {
@@ -277,11 +277,9 @@ impl O2Machine {
                 None => eprintln!("iris: O2 serial port 1: port {port_a} unavailable; is another iris using it? (serial_port_a)"),
             }
             if let Some(path) = &cfg.serial_log {
-                // A fresh log each boot, as the O2 has always kept it (the
-                // tee appends): scripts look at its tail for this boot's
-                // prompts.
-                let _ = std::fs::File::create(path);
-                match crate::dev::serial_log::SerialLog::open(
+                // A fresh log each boot, as the O2 has always kept it: scripts
+                // look at its tail for this boot's prompts.
+                match crate::dev::serial_log::SerialLog::create(
                     std::path::Path::new(path),
                     cfg.serial_log_timestamps,
                 ) {

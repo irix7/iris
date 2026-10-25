@@ -597,7 +597,7 @@ scsi_deferred_int = true        # needed by OpenBSD/NetBSD; see --no-scsi-deferr
 # ci_socket = "/tmp/iris.sock"  # Windows default: "127.0.0.1:19851"
 # ci_display = false
 # serial_log = "ttyd1.log"
-# serial_log_timestamps = "off"  # off (raw), guest, wall or both
+# serial_log_timestamps = "off"  # off (raw) or wall (UTC ISO-8601 per completed line)
 
 # Bare-metal testing (cpu-tests/, bench/)
 # load_elf = "test.elf"
@@ -779,8 +779,7 @@ Automation and debugging
   --ci-socket <PATH>          Socket path (default /tmp/iris.sock)
   --ci-display                With --ci, keep the window
   --serial-log <FILE>         Append everything IRIX prints on ttyd1 to FILE
-  --serial-log-timestamps MODE
-                              Prefix each line: off (default), guest, wall, both
+  --serial-log-timestamps <MODE>  off (raw) or wall: timestamp each completed line
   --monitor-port <PORT>       Monitor TCP port (default 8888)
   --serial-port-a <PORT>      Serial channel A TCP port (default 8880)
   --serial-port-b <PORT>      Serial channel B TCP port (default 8881)

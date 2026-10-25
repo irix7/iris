@@ -43,28 +43,67 @@ use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks, p
 use crate::hptimer::TimerManager;
 use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
 
-pub fn emulator_name() -> &'static str {
-    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    NAME.get_or_init(|| {
+/// The profile of the machine this process is running, set by
+/// [`crate::workstation::build`] so [`emulator_name`] can pick a model word
+/// that matches it. Stored as the `MachineProfile` discriminant; `u8::MAX`
+/// means no machine has been built yet.
+static EMULATOR_PROFILE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Record the profile of the machine being built (see [`emulator_name`]).
+pub fn set_emulator_profile(profile: MachineProfile) {
+    EMULATOR_PROFILE.store(profile as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn emulator_profile() -> Option<MachineProfile> {
+    let raw = EMULATOR_PROFILE.load(std::sync::atomic::Ordering::Relaxed);
+    [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32]
+        .into_iter().find(|p| *p as u8 == raw)
+}
+
+/// The words an `I` in the expansion may stand for, per machine. Each list
+/// names the machine as the user configured it, so the title never calls an
+/// Indigo2 an Indy or an O2 anything but IP32. Without a profile only the
+/// model-neutral words remain.
+fn emulator_name_thirds(profile: Option<MachineProfile>) -> &'static [&'static str] {
+    match profile {
+        Some(MachineProfile::IndyIp24) => &["IRIX", "Iris", "Indy", "IP24"],
+        Some(MachineProfile::Indigo2Ip22) => &["IRIX", "Iris", "Indigo2", "IP22"],
+        Some(MachineProfile::Indigo2Ip28) => &["IRIX", "Iris", "Indigo2", "IP28"],
+        Some(MachineProfile::O2Ip32) => &["IRIX", "Iris", "IP32"],
+        None => &["IRIX", "Iris"],
+    }
+}
+
+/// The emulator's name for banners and window titles. Three runs in four it
+/// is the canonical one; otherwise an expansion of IRIS rolled once per
+/// process, whose third word is chosen to match the machine profile that
+/// `set_emulator_profile` recorded (so a GUI that starts a different machine
+/// later gets the same roll with the right model word).
+pub fn emulator_name() -> String {
+    /// `None` for the canonical name, else the roll (first, third, fourth).
+    static ROLL: std::sync::OnceLock<Option<(usize, u64, usize)>> = std::sync::OnceLock::new();
+    const FIRSTS: [&str; 9] = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable", "Irresistible"];
+    const FOURTHS: [&str; 4] = ["Simulator", "System", "Substitute", "Sandbox"];
+
+    let roll = ROLL.get_or_init(|| {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-
         if now % 4 != 0 {
-            return "Irresponsible Rust IRIX Simulator".to_string();
+            return None;
         }
+        Some((((now / 4) % FIRSTS.len() as u64) as usize, now / 64, ((now / 256) % FOURTHS.len() as u64) as usize))
+    });
 
-        let firsts = ["Irresponsible", "Incredible", "Insufferable", "Infuriating", "Inaccurate", "Incomplete", "Interactive", "Indomitable", "Irresistible"];
-        let thirds = ["IRIX", "Indy", "Iris"];
-        let fourths = ["Simulator", "System", "Substitute", "Sandbox"];
-
-        let first = firsts[((now / 4) % firsts.len() as u64) as usize];
-        let third = thirds[((now / 64) % thirds.len() as u64) as usize];
-        let fourth = fourths[((now / 256) % fourths.len() as u64) as usize];
-
-        format!("{} Rust {} {}", first, third, fourth)
-    }).as_str()
+    match *roll {
+        None => "Irresponsible Rust IRIX Simulator".to_string(),
+        Some((first, third_roll, fourth)) => {
+            let thirds = emulator_name_thirds(emulator_profile());
+            let third = thirds[(third_roll % thirds.len() as u64) as usize];
+            format!("{} Rust {} {}", FIRSTS[first], third, FOURTHS[fourth])
+        }
+    }
 }
 
 pub struct Machine {
@@ -82,8 +121,8 @@ pub struct Machine {
     /// When `cfg.ci` is set, the channel-A backend is replaced by this
     /// in-process one so the CI control socket can drive the console.
     ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
-    /// `--serial-log` sink, shared with the SCC backend; held here so
-    /// `stop` can flush a partial final line.
+    /// The shared `--serial-log` sink, kept so `stop` can flush a final
+    /// partial line (wall-timestamp mode holds one until its newline).
     serial_log: Option<Arc<crate::dev::serial_log::SerialLog>>,
     /// Most recent snapshot restored via `ci_restore`. `rollback` reuses this
     /// name as the fallback path if the in-memory checkpoint is absent.
@@ -552,33 +591,28 @@ impl Machine {
         let ioc = Ioc::new_for_profile(guinness, ci_enabled, cfg.machine.profile.ip28(), cfg.serial_ports());
         ioc.ps2().set_layout(cfg.keyboard);
 
-        // One log sink for the serial console, shared by the CI backend and
-        // the TCP tee. It is opened here so both paths use the same buffering
-        // and timestamp policy, and is kept on `Machine` to flush at stop.
-        let serial_log = match cfg.serial_log.as_deref() {
-            Some(path) => {
-                match crate::dev::serial_log::SerialLog::open(
-                    std::path::Path::new(path),
-                    cfg.serial_log_timestamps,
-                ) {
-                    Ok(log) => {
-                        eprintln!("iris: serial console mirroring to {}", path);
-                        Some(log)
-                    }
-                    Err(e) => {
-                        eprintln!("iris: serial_log: failed to open {}: {}", path, e);
-                        None
-                    }
+        // One sink for both serial paths, so the CI and TCP logs are the same
+        // bytes (timestamps included). Opened once, before any peripheral
+        // `start()` clones the current backend Arc into the RX/TX threads.
+        let serial_log = cfg.serial_log.as_deref().and_then(|path| {
+            match crate::dev::serial_log::SerialLog::open(
+                std::path::Path::new(path),
+                cfg.serial_log_timestamps,
+            ) {
+                Ok(log) => {
+                    eprintln!("iris: serial console mirroring to {}", path);
+                    Some(log)
+                }
+                Err(e) => {
+                    eprintln!("iris: serial_log: failed to open {}: {}", path, e);
+                    None
                 }
             }
-            None => None,
-        };
+        });
 
         // CI mode replaces the default TCP backend on channel B (tty1, the
         // SGI serial console) with an in-process backend the control socket
         // drives directly. Channel A (tty2) keeps its default TCP backend.
-        // Must happen before any peripheral `start()` call (which clones the
-        // current backend Arc into the RX/TX threads).
         let ci_serial = if ci_enabled {
             let b = Arc::new(crate::dev::z85c30::CiSerialBackend::new());
             if let Some(log) = &serial_log {
@@ -588,14 +622,11 @@ impl Machine {
             Some(b)
         } else {
             // Non-CI mode: channel B already has its TCP listener on
-            // 127.0.0.1:8881 (or `serial_port_b`).  If --serial-log was passed, wrap it in a
-            // TeeBackend so guest-emitted bytes get mirrored to the file
-            // in addition to whatever client is attached to the TCP socket.
+            // 127.0.0.1:8881 (or `serial_port_b`). Wrap it in a TeeBackend so
+            // guest-emitted bytes also reach the file.
             if let Some(log) = &serial_log {
                 let inner = ioc.scc().backend_b();
-                ioc.scc().set_backend_b(Arc::new(
-                    crate::dev::z85c30::TeeBackend::new(inner, log.clone()),
-                ));
+                ioc.scc().set_backend_b(Arc::new(crate::dev::z85c30::TeeBackend::new(inner, log.clone())));
             }
             None
         };
@@ -1011,11 +1042,6 @@ impl Machine {
         // The executor now sits at its final address inside `MipsCpu`, so
         // `hot.cycles` is stable: point the guest-time queue's clock at it.
         guest_timers.set_clock(cpu.cycles_ptr());
-        // The serial log's guest timestamp uses the same counter.
-        if let Some(log) = &serial_log {
-            log.set_guest_cycles(cpu.cycles_ptr());
-        }
-
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
         if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
@@ -2416,10 +2442,8 @@ impl Drop for Machine {
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
-        // Likewise the serial log's guest timestamp, and give the file one
-        // last flush before the sink is dropped.
+        // Give the serial log one last flush before the sink is dropped.
         if let Some(log) = &self.serial_log {
-            log.clear_guest_cycles();
             log.flush();
         }
         // Release the monitor port and this Machine's device handles, so the next
@@ -2483,6 +2507,45 @@ impl Workstation for Machine {
     }
     fn nat_expected(&self) -> Option<(std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr)> {
         Some(self.hpc3.seeq().gateway_addrs())
+    }
+}
+
+#[cfg(test)]
+mod emulator_name_tests {
+    use super::*;
+
+    /// No profile's expansion may name another machine: an Indigo2 is never
+    /// an "Indy", an Indy never "IP22", and the O2 is only ever "IP32".
+    #[test]
+    fn thirds_name_only_the_configured_machine() {
+        let foreign = |p: Option<MachineProfile>| -> &'static [&'static str] {
+            match p {
+                Some(MachineProfile::IndyIp24) => &["Indigo2", "IP22", "IP28", "IP32", "O2"],
+                Some(MachineProfile::Indigo2Ip22) => &["Indy", "IP24", "IP28", "IP32", "O2"],
+                Some(MachineProfile::Indigo2Ip28) => &["Indy", "IP24", "IP22", "IP32", "O2"],
+                Some(MachineProfile::O2Ip32) => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "O2"],
+                None => &["Indy", "Indigo2", "IP24", "IP22", "IP28", "IP32", "O2"],
+            }
+        };
+        for p in [None, Some(MachineProfile::IndyIp24), Some(MachineProfile::Indigo2Ip22),
+                  Some(MachineProfile::Indigo2Ip28), Some(MachineProfile::O2Ip32)] {
+            let thirds = emulator_name_thirds(p);
+            assert!(!thirds.is_empty());
+            for w in thirds {
+                assert!(w.starts_with('I'), "{p:?}: {w} breaks the acronym");
+                assert!(!foreign(p).contains(w), "{p:?}: {w} names another machine");
+            }
+        }
+    }
+
+    #[test]
+    fn profile_round_trips_through_the_global() {
+        for p in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22, MachineProfile::Indigo2Ip28, MachineProfile::O2Ip32] {
+            set_emulator_profile(p);
+            assert_eq!(emulator_profile(), Some(p));
+        }
+        let name = emulator_name();
+        assert!(name.starts_with('I') && name.contains(" Rust "), "{name}");
     }
 }
 

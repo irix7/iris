@@ -1237,10 +1237,10 @@ pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     console: Mutex<ConsoleRing>,
     cv: Condvar,
-    /// Optional file mirror: every guest output byte is appended through the
-    /// shared [`SerialLog`]. Host-injected bytes are echoed by IRIX anyway,
-    /// so writing only guest output already captures the full transcript
-    /// without duplication.
+    /// Optional file mirror: every byte that flows through ttyd1 in either
+    /// direction is appended here. Host-injected bytes are echoed by IRIX
+    /// anyway, so writing only guest output already captures the full
+    /// transcript without duplication.
     log: Mutex<Option<Arc<SerialLog>>>,
 }
 
@@ -1254,8 +1254,8 @@ impl CiSerialBackend {
         }
     }
 
-    /// Attach the shared log sink. The caller opens the file (and chooses the
-    /// timestamp mode) once, so the CI and TCP paths write identical bytes.
+    /// Attach the shared serial-log sink. The caller opens the file (and
+    /// picks the timestamp mode), so the CI and TCP paths write the same bytes.
     pub fn set_log(&self, log: Arc<SerialLog>) {
         *self.log.lock() = Some(log);
     }
@@ -1668,7 +1668,7 @@ mod tests {
             "iris-tee-serial-log-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let log = SerialLog::open(
-            &path, crate::config::SerialLogTimestamps::Off).unwrap();
+            &path, crate::dev::serial_log::SerialLogTimestamps::Off).unwrap();
         let tee = TeeBackend::new(Arc::new(NullBackend), log.clone());
         for b in b"ttyd1: up\n" {
             tee.send_byte(*b);
@@ -1680,20 +1680,20 @@ mod tests {
     }
 
     #[test]
-    fn ci_serial_log_flushes_lines_and_reset_flushes_a_partial_line() {
+    fn ci_serial_log_mirrors_every_byte() {
         let path = std::env::temp_dir().join(format!(
             "iris-ci-serial-log-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let log = SerialLog::open(&path, crate::config::SerialLogTimestamps::Off)
+        let log = SerialLog::open(&path, crate::dev::serial_log::SerialLogTimestamps::Off)
             .unwrap();
         let backend = CiSerialBackend::new();
         backend.set_log(log.clone());
         for b in b"line one\r\nline two" {
             backend.send_byte(*b);
         }
-        // A completed line is on disk while the backend is still open; the
-        // partial second line is not.
-        assert_eq!(std::fs::read(&path).unwrap(), b"line one\r\n");
+        // Off mode writes bytes as they arrive, including a partial line;
+        // reset does not add or remove anything.
+        assert_eq!(std::fs::read(&path).unwrap(), b"line one\r\nline two");
         backend.reset();
         assert_eq!(std::fs::read(&path).unwrap(), b"line one\r\nline two");
         drop(backend);
