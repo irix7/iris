@@ -63,6 +63,9 @@ evidence from the changelog or the issue.
 | REX3 RGBMODE / FIFO conformance | upstream #288 |
 | monitor state and `machine-start` ack | upstream #312 (fork PR #289 closed as superseded) |
 | CI screenshot without a renderer | upstream #315 |
+| REX3 hot/cold compile queue | upstream #319 |
+| REX3 auxiliary-clear conformance test | upstream #320 |
+| NFS host MAC derivation | upstream #321 |
 | machine lifecycle helpers duplicated in `machine.rs` | removed by the O2/`Workstation` merge |
 | second-client console refusal | dropped; upstream's multi-client console won |
 
@@ -105,20 +108,18 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 
 | Order | Divergence | Evidence | State |
 |---|---|---|---|
-| 1 | REX3 auxiliary-clear conformance test (`846f8da`) | the test itself: it pins RGBMODE, FIFO depth/level/backpressure, screen bounds and FIFO drain, and fails if any of those regress | **sent: #320** |
-| 2 | NFS host MAC from the bridge IP (`4283144`) | two bridged instances collide at L2 (#10); the new test fails on the fixed MAC and passes with the derivation | **sent: #321** |
-| 3 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
-| 4 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
-| 5 | 8254 PIT readback/latch (#106 code) | a test that the read-back command is ignored on upstream's PIT and returns the counter with the patch | **needs port + failing test** |
-| 6 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
-| 7 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
-| 8 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
-| 9 | VINO descriptor engine (#96) | replay/validation captures from #56/#71/#70 on real IRIX | **needs capture** |
-| 10 | BlockNode storage (#89) | the fork's storage test suite run against the new interface, plus a no-behaviour-change statement | **ready as a refactor** |
-| 11 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
-| 12 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
-| 13 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
-| 14 | CPU clock model (#98) | determinism and performance numbers, and the idle-park interaction | **discussion, then evidence** |
+| 1 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
+| 2 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
+| 3 | 8254 PIT readback/latch (#106 code) | a test that the read-back command is ignored on upstream's PIT and returns the counter with the patch | **needs port + failing test** |
+| 4 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
+| 5 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
+| 6 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
+| 7 | VINO descriptor engine (#96) | replay/validation captures from #56/#71/#70 on real IRIX | **needs capture** |
+| 8 | BlockNode storage (#89) | the fork's storage test suite run against the new interface, plus a no-behaviour-change statement | **ready as a refactor** |
+| 9 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
+| 10 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
+| 11 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
+| 12 | CPU clock model (#98) | determinism and performance numbers, and the idle-park interaction | **discussion, then evidence** |
 
 ## 4. Keep fork-only
 
