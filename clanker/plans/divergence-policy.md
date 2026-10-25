@@ -77,11 +77,11 @@ the fork's version.
   `cfg!(feature = "jitv2")`. This is a correctness divergence for speed.
   Revert the default; keep `cache = "shadow"` as an explicit opt-in. Only send
   a default change upstream if the benchmark history justifies it.
-  (`e6050b7`)
-- **VCE gating for the full cache model.** Upstream's R10000 model re-aliases
-  instead of raising; the fork raises VCE at run time for the same case.
-  Compare against upstream's current `mips_cache_v2.rs`, keep the R4400 VCE
-  behaviour both have, delete the fork branch. (`b917df6`, part of `8df2ad0`)
+  (`e6050b7`) **Done:** `e7a7f62` adopts upstream's selection and drops the
+  `accurate-cache` feature; the CI cell passes `--cache full`.
+- **VCE gating — already converged.** The merged `mips_cache_v2.rs` differs
+  from upstream only by a jitv2 AOT geometry helper; there is no separate VCE
+  branch left to revert. (`b917df6` was subsumed by the O2/`Workstation` merge.)
 - **HAL2 output plumbing.** The fork owns `open_cpal_output`,
   `AudioOutput`/`Resampler` traits and the cpal stream setup; upstream now has
   `host_audio`, shared with the O2. Send the pacing/backpressure layer, then
@@ -105,8 +105,8 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 
 | Order | Divergence | Evidence | State |
 |---|---|---|---|
-| 1 | REX3 auxiliary-clear conformance test (`846f8da`) | the test itself: it pins RGBMODE, FIFO depth/level/backpressure, screen bounds and FIFO drain, and fails if any of those regress | **ready** |
-| 2 | NFS host MAC from the bridge IP (`4283144`) | two bridged instances collide at L2 (#10); add a unit test that distinct IPs derive distinct MACs | **ready with test** |
+| 1 | REX3 auxiliary-clear conformance test (`846f8da`) | the test itself: it pins RGBMODE, FIFO depth/level/backpressure, screen bounds and FIFO drain, and fails if any of those regress | **sent: #320** |
+| 2 | NFS host MAC from the bridge IP (`4283144`) | two bridged instances collide at L2 (#10); the new test fails on the fixed MAC and passes with the derivation | **sent: #321** |
 | 3 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
 | 4 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
 | 5 | 8254 PIT readback/latch (#106 code) | a test that the read-back command is ignored on upstream's PIT and returns the counter with the patch | **needs port + failing test** |
