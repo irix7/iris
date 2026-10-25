@@ -18,6 +18,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork release 0.1.8
+
+- **Upstream sync: jitv2 performance, serial timestamps and O2 documentation.**
+  This release adopts upstream's FP exception fast path (#328; `fadd.s`/`fmul.s`
+  1.5–2.0×), inline FPU integer conversions (#332; 2.7–3.1× float→int),
+  wall-clock `--serial-log` timestamps (#325), the sparse 40-bit decode table
+  and the 8254 read-back command. The fork's serial sink and its `guest`/`both`
+  timestamp modes are gone: the CI and TCP paths share upstream's `off|wall`
+  sink, while the per-consumer console cursors remain. The O2 gains the
+  AIC-7880 specification and the shared `[scsi.N]` disk configuration.
+- **Known issue:** jitv2 cold-page compile latency can let a short kernel
+  finish before its code is published, so it runs interpreted (#112). The
+  benchmark layout noise it causes is documented; there is no fix yet.
+
 ### JIT v2
 
 - **FPU integer conversions are compiled inline.** `CVT.W/L.S/D`,
