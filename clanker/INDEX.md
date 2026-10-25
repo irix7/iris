@@ -372,6 +372,7 @@ Plans, task briefs and reviews written for agents. Each states its own status; m
 
 | Note | Kind | Title |
 |---|---|---|
+| [ci-clock-reversion.md](plans/ci-clock-reversion.md) | plan | Reverting the fork clock to upstream's `ci_clock` |
 | [cow-chd-sync-plan.md](plans/cow-chd-sync-plan.md) | plan | Plan: copy-on-write protection + "Syncing CHD file…" apply-on-shutdown |
 | [divergence-policy.md](plans/divergence-policy.md) | plan | Divergence policy: what we send, what we revert, what stays ours |
 | [gui-benchmark-plan.md](plans/gui-benchmark-plan.md) | plan | Benchmark in iris-gui |

@@ -129,7 +129,7 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 | 9 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
 | 10 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
 | 11 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
-| 12 | CPU clock model (#98) | **resolved by upstream**: use the existing `ci_clock` feature for determinism and keep the wall clock as default — see the revert list | **decided** |
+| 12 | CPU clock model (#98) | **resolved by upstream**: use the existing `ci_clock` feature for determinism and keep the wall clock as default — see the revert list and `plans/ci-clock-reversion.md` | **decided, planned** |
 
 ## 4. Keep fork-only
 
