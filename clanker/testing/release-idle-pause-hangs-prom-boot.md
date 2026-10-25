@@ -1,6 +1,9 @@
 # Release builds with idle-pause park the no-disk PROM boot and never wake it
 
-Status: open, 2026-10-25. Observed with `irix7/iris` release `v0.1.6+irix7`.
+Status: open, 2026-10-25. Observed once with `irix7/iris` release `v0.1.6+irix7`;
+**not reproduced** on a quiet host with the same binary and the same config (see
+the update at the end). Treat the workaround as belt-and-braces, not a fix for a
+confirmed emulator bug.
 
 ## Symptom
 
@@ -47,3 +50,14 @@ waiting for the PROM.
 
 `docs/ci.md` carries the user-facing version of this workaround; this note is
 the evidence trail.
+
+## Update, 2026-10-25 (reproduction attempt)
+
+The exact config above, the same `v0.1.6+irix7` release binary, on a quiet host:
+the menu appears in under 10 s (`System Maintenance Menu` / `Option?` in a 333-byte
+serial log) with `idle-pause` active. A second run with `--ci --headless` and the
+embedded PROM also halts normally (`No boot payload present - halted`). So the
+hang is not deterministic; it may be load- or timing-dependent, or was an
+artifact of the busy host that first ran the smoke (fake apt, several downloads).
+Keep `IRIS_NO_IDLE=1` in the release self-test until someone reproduces it with
+the failing command and artifacts.
