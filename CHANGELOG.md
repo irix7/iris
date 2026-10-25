@@ -18,6 +18,22 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Upstream sync — SGI O2 (IP32)
+
+- **O2 machine support from upstream.** `[machine] profile = "o2_ip32"` brings up
+  the IP32: the CRIME memory controller (its no-ECC alias and readback transfer
+  registers), MACE Ethernet and two serial ports, the AIC7880 SCSI controller,
+  and the O2 graphics console. Memory is configured as DIMM-pair kits (`banks`,
+  32–256 MB per pair, filled from pair A), and `[scsi.N] controller` selects
+  either of its two SCSI controllers. Snapshot manifests now name the machine
+  family, and the IMPACT display restarts with the machine.
+- **The machine is a `Workstation`.** Front-ends and the CI socket reach the
+  Indy/Indigo2 `Machine` and the O2 `O2Machine` through one trait, so the
+  monitor, CI status and lifecycle commands are board-independent.
+- **Fork integration:** the O2 serial console uses the shared `--serial-log`
+  sink and its timestamp modes; O2 SCSI currently accepts raw images only —
+  CHD and copy-on-write overlays return a clear error until that path is ported.
+
 ### Timers and timekeeping
 
 - **The IOC 8254 PIT is readable, advances with guest cycles, and says so
