@@ -303,6 +303,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |
 | [interpreter-dispatch-is-call-threading.md](perf/interpreter-dispatch-is-call-threading.md) | measure | The interpreter dispatches via call threading — the slowest portable technique |
+| [mem-and-fpu-hot-paths.md](perf/mem-and-fpu-hot-paths.md) | measure | Guest memory and FPU hot paths: what is actually slow |
 | [nat-and-enet-threads-poll-at-1ms.md](perf/nat-and-enet-threads-poll-at-1ms.md) | measure | NAT and seeq-enet threads poll at 1 ms; make them event-driven |
 | [phase3-platform.md](perf/phase3-platform.md) | design | Phase 3 platform notes |
 | [rex3-processor-must-park-when-idle.md](perf/rex3-processor-must-park-when-idle.md) | rule | The REX3-Processor thread must park when the gfifo is idle |
