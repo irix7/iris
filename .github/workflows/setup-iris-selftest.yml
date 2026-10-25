@@ -1,0 +1,235 @@
+# Self-test for .github/actions/setup-iris.
+#
+# Proves the action on the platform that matters for CI (Linux x64), in both
+# modes: the latest published release, and a build of this checkout. The macOS
+# job is the cheap universal-binary check. Windows is implemented in the action
+# but has no job here yet.
+#
+# The boot smoke needs no IRIX media: with an empty [scsi] table and the
+# embedded PROM, iris falls through to the System Maintenance menu, which the
+# CI serial socket can read. See docs/ci.md.
+name: Setup IRIS self-test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/actions/setup-iris/**"
+      - ".github/workflows/setup-iris-selftest.yml"
+      - "tools/install-iris-ci.sh"
+  pull_request:
+    paths:
+      - ".github/actions/setup-iris/**"
+      - ".github/workflows/setup-iris-selftest.yml"
+      - "tools/install-iris-ci.sh"
+  schedule:
+    # Monday morning: catch a broken release or a rotated asset name.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: setup-iris-selftest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-linux:
+    name: Release (Linux x64, latest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup IRIS
+        id: setup
+        uses: ./.github/actions/setup-iris
+        with:
+          version: latest
+      - name: Check the outputs and PATH
+        env:
+          IRIS_BIN: ${{ steps.setup.outputs.iris }}
+          IRIS_CI_BIN: ${{ steps.setup.outputs.iris-ci }}
+          IRIS_VERSION: ${{ steps.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -x "$IRIS_BIN"
+          test -x "$IRIS_CI_BIN"
+          command -v iris
+          command -v iris-ci
+          # A release version, e.g. 0.1.6+irix7. iris has no --version switch;
+          # the action reports the resolved release, and iris-ci was stamped
+          # with the same string at build time.
+          case "$IRIS_VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "unexpected version '$IRIS_VERSION'"; exit 1 ;;
+          esac
+          version_output=$(iris-ci --version)
+          case "$version_output" in
+            *"$IRIS_VERSION"*) ;;
+            *) echo "iris-ci --version '$version_output' does not contain '$IRIS_VERSION'"; exit 1 ;;
+          esac
+          iris --help >/dev/null
+          iris-ci --help >/dev/null
+      - name: Headless --ci boot from the embedded PROM
+        # Release builds enable idle-pause. The no-disk PROM boot can park in
+        # an idle loop that is not woken, so for this ROM-only smoke we turn
+        # parking off; source builds with lightning,gpujit do not need it.
+        # See the troubleshooting section of docs/ci.md.
+        env:
+          IRIS_NO_IDLE: "1"
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/iris-smoke"
+          mkdir -p "$work"
+          cd "$work"
+          # No SCSI targets: the default config would attach scsi1.raw and
+          # fail at startup because CI has no IRIX media.
+          cat > "$work/machine.toml" <<'EOF'
+          banks = [128, 128, 0, 0]
+          headless = true
+          no_audio = true
+
+          [machine]
+          profile = "indy_ip24"
+
+          [scsi]
+          EOF
+
+          socket="$work/iris.sock"
+          iris --config "$work/machine.toml" --ci \
+            --ci-socket "$socket" --monitor-port 18888 \
+            --serial-log "$work/serial.log" >"$work/iris.out" 2>&1 &
+          pid=$!
+          cleanup() {
+            status=$?
+            kill "$pid" 2>/dev/null || true
+            if [ "$status" -ne 0 ]; then
+              echo "--- iris output (tail)"
+              tail -50 "$work/iris.out" || true
+              echo "--- serial log (tail)"
+              tail -50 "$work/serial.log" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          # The CI socket exists only after the monitor binds, so poll rather
+          # than sleep. A fresh --ci machine is ready while still `starting`.
+          iris-ci --socket "$socket" status --wait-ready 30
+          iris-ci --socket "$socket" start
+          iris-ci --socket "$socket" status --wait-ready 10
+          iris-ci --socket "$socket" serial-wait 'Option?' --timeout 60
+          grep -q 'System Maintenance Menu' "$work/serial.log"
+
+          iris-ci --socket "$socket" quit
+          wait "$pid"
+
+  build-linux:
+    name: Source (Linux x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml pins the nightly; rustup installs it from there.
+      - name: Install the pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      - name: Setup IRIS from source
+        id: setup
+        uses: ./.github/actions/setup-iris
+        with:
+          from-source: true
+          path: .
+          features: lightning,gpujit
+      - name: Check the outputs and PATH
+        env:
+          IRIS_BIN: ${{ steps.setup.outputs.iris }}
+          IRIS_CI_BIN: ${{ steps.setup.outputs.iris-ci }}
+          IRIS_VERSION: ${{ steps.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -x "$IRIS_BIN"
+          test -x "$IRIS_CI_BIN"
+          command -v iris
+          command -v iris-ci
+          # Source mode reports dev.<short-sha>; the binary's own stamp is the
+          # Cargo package version, so the two are not expected to match.
+          case "$IRIS_VERSION" in
+            dev.*) ;;
+            *) echo "unexpected source version '$IRIS_VERSION'"; exit 1 ;;
+          esac
+          iris --help >/dev/null
+          iris-ci --help >/dev/null
+      - name: Headless --ci boot from the embedded PROM
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/iris-smoke"
+          mkdir -p "$work"
+          cd "$work"
+          cat > "$work/machine.toml" <<'EOF'
+          banks = [128, 128, 0, 0]
+          headless = true
+          no_audio = true
+
+          [machine]
+          profile = "indy_ip24"
+
+          [scsi]
+          EOF
+
+          socket="$work/iris.sock"
+          iris --config "$work/machine.toml" --ci \
+            --ci-socket "$socket" --monitor-port 18888 \
+            --serial-log "$work/serial.log" >"$work/iris.out" 2>&1 &
+          pid=$!
+          cleanup() {
+            status=$?
+            kill "$pid" 2>/dev/null || true
+            if [ "$status" -ne 0 ]; then
+              echo "--- iris output (tail)"
+              tail -50 "$work/iris.out" || true
+              echo "--- serial log (tail)"
+              tail -50 "$work/serial.log" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          iris-ci --socket "$socket" status --wait-ready 30
+          iris-ci --socket "$socket" start
+          iris-ci --socket "$socket" status --wait-ready 10
+          iris-ci --socket "$socket" serial-wait 'Option?' --timeout 60
+          grep -q 'System Maintenance Menu' "$work/serial.log"
+
+          iris-ci --socket "$socket" quit
+          wait "$pid"
+
+  release-macos:
+    name: Release (macOS universal, latest)
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Setup IRIS
+        id: setup
+        uses: ./.github/actions/setup-iris
+        with:
+          version: latest
+      - name: Check the binaries
+        env:
+          IRIS_BIN: ${{ steps.setup.outputs.iris }}
+          IRIS_CI_BIN: ${{ steps.setup.outputs.iris-ci }}
+          IRIS_VERSION: ${{ steps.setup.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -x "$IRIS_BIN"
+          test -x "$IRIS_CI_BIN"
+          command -v iris
+          command -v iris-ci
+          iris --help >/dev/null
+          iris-ci --help >/dev/null
+          iris-ci --version
+          echo "IRIS $IRIS_VERSION on macOS"
