@@ -33,13 +33,21 @@ harness code. 40/40 accuracy in both shapes.
 
 ## Lever not yet proven
 
+Upstream's default is one worker (`default_jitv2_threads() -> 1`); the fork's
+`9d1988a` already uses `min(available_parallelism, 4)`, so fork builds run four.
+The sweep below was on upstream with an explicit override.
+
 Explicit `[jitv2] threads = 4` made most aligned kernels fast in one sweep, and
-2 was marginal. But the default is already `min(available_parallelism, 4)` —
-4 on this host — so that sweep does not prove "more workers by default"; host
-load (2.4–4.1 from other sessions) may explain the difference. The next
-experiment is one ordered per-page timeline (`REQ → POP → compile → SEAL →
-PUB`, plus queue depth), with a controlled A/B of default threads and
-`j2 inline on`.
+2 was marginal. But it is not a clean win: four workers add 1–3 s to the 38 s
+suite, regress packed `cvt_s_d` 129 → 143 ns/op in one cell, and leave one
+aligned run at 103.6 ns/op. Inline compile reaches 10–15 ns/op but destroys
+`int/alu` (2.8 → ~960 ns/op) and doubles the suite's wall time.
+
+The timeline shows the queue is the cost: 501 ms of the 529 ms first-publish
+latency is waiting behind other pages' compiles. The compile itself is 13.6 ms
+and seal -> publish 14 ms, so a shorter seal timer cannot fix it. The next
+design levers are compile throughput (workers, smaller compiles) and avoiding
+a full-page recompile for every newly discovered entry.
 
 ## Reproduction
 
