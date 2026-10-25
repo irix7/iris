@@ -28,6 +28,31 @@ Order of preference: upstream the change; then a thin compatibility layer;
 then keep the patch only until its campaign lands; never a parallel
 implementation.
 
+## Evidence bar
+
+An upstream PR is opened only when it is **proven**. The PR body and commit
+message carry the evidence; a reviewer must be able to check the claim without
+trusting us.
+
+What counts:
+
+- **A failing test**: the test exists before the change (or the failure is
+  pasted), it fails on upstream `main`, and it passes with the patch. A test
+  added by the patch is evidence only when the old code actually fails it —
+  say so and show the failure.
+- **Measurements**: before/after numbers with the host, build features, the
+  command, and the run count. One run is a sample, not a result.
+- **A capture**: a trace, replay, serial transcript, register dump or
+  guest-side reproduction that fails on upstream and passes with the patch.
+- **For a test-only or docs PR**: the behaviour it pins and why nothing pinned
+  it before — a conformance test is evidence when it would have caught a real
+  regression, not when it restates the implementation.
+
+"Feels faster", "cleaner", a single unmeasured run, or a test that passes on
+both sides is not evidence. An item without evidence stays on the shelf; it
+does not become a PR. When a PR merges, delete the fork's copy and link the
+evidence from the changelog or the issue.
+
 ## 1. Already converged — no action
 
 | Fork work | How it converged |
@@ -78,22 +103,22 @@ the fork's version.
 
 Each item is a convergence PR: after it lands, the fork deletes its copy.
 
-| Order | Divergence | Effort / blocker |
-|---|---|---|
-| 1 | REX3 auxiliary-clear conformance test (`846f8da`) | 1 file; add to rex3 PR #319 or send alone |
-| 2 | NFS host MAC from the bridge IP (`4283144`) | 5 lines |
-| 3 | `--serial-log-timestamps` | medium; unblocks the serial-sink revert |
-| 4 | GR2 FIN2/FIN3 sequence tokens (#95) | dedicated port; upstream's `gr2/mod.rs` diverged 575 lines |
-| 5 | 8254 PIT readback/latch (#106 code) | port onto upstream's host-`Instant` PIT; the fork's guest-clock conclusion stays fork-side |
-| 6 | Per-consumer CI serial cursors (#97) | after the serial backend converges |
-| 7 | HAL2 pacing and backpressure (#91) | port onto `host_audio`; then revert the plumbing |
-| 8 | REX3 VDMA condvar re-dispatch (`c8e7a49`, #40) | small |
-| 9 | VINO descriptor engine (#96) | high risk, after storage |
-| 10 | BlockNode storage (#89) | foundation; then advisory lock (#90), O2 SCSI, bulk DMA (#101) |
-| 11 | StateDesc campaign (#92) | four PRs; then the journal (#93) |
-| 12 | Perf bundles (#100) | split by area; send only measured wins |
-| 13 | jitv2 (#99) | rebase on upstream jitv2; send measured wins; drop the rest |
-| 14 | CPU clock model (#98) | discussion first; if upstream declines, a *documented* fork divergence under the determinism goal |
+| Order | Divergence | Evidence | State |
+|---|---|---|---|
+| 1 | REX3 auxiliary-clear conformance test (`846f8da`) | the test itself: it pins RGBMODE, FIFO depth/level/backpressure, screen bounds and FIFO drain, and fails if any of those regress | **ready** |
+| 2 | NFS host MAC from the bridge IP (`4283144`) | two bridged instances collide at L2 (#10); add a unit test that distinct IPs derive distinct MACs | **ready with test** |
+| 3 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
+| 4 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
+| 5 | 8254 PIT readback/latch (#106 code) | a test that the read-back command is ignored on upstream's PIT and returns the counter with the patch | **needs port + failing test** |
+| 6 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
+| 7 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
+| 8 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
+| 9 | VINO descriptor engine (#96) | replay/validation captures from #56/#71/#70 on real IRIX | **needs capture** |
+| 10 | BlockNode storage (#89) | the fork's storage test suite run against the new interface, plus a no-behaviour-change statement | **ready as a refactor** |
+| 11 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
+| 12 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
+| 13 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
+| 14 | CPU clock model (#98) | determinism and performance numbers, and the idle-park interaction | **discussion, then evidence** |
 
 ## 4. Keep fork-only
 
@@ -114,6 +139,9 @@ not with storage, because they exist to let parallel instances share a base
 image.
 
 ## 5. Execution order
+
+A PR whose evidence row is not satisfied is not opened; its fork code waits,
+or is reverted if upstream does not need it.
 
 Phase 0 (cheap convergence):
 
