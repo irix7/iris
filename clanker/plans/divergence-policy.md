@@ -110,7 +110,7 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 |---|---|---|---|
 | 1 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
 | 2 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
-| 3 | 8254 PIT readback/latch (#106 code) | a test that the read-back command is ignored on upstream's PIT and returns the counter with the patch | **needs port + failing test** |
+| 3 | 8254 PIT readback/latch (#106 code) | three tests fail on upstream's PIT (read-back ignored, single-byte latch stuck); they pass with the patch | **sent: #323** |
 | 4 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
 | 5 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
 | 6 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
