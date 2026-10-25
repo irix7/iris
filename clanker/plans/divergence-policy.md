@@ -108,7 +108,7 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 
 | Order | Divergence | Evidence | State |
 |---|---|---|---|
-| 1 | `--serial-log-timestamps` | the CI use case plus a test that a completed line is visible with its stamp; feature PRs need the need shown, not a benchmark | **ready with test** |
+| 1 | `--serial-log-timestamps` | three tests (raw identity, wall stamping/hold, stamp shape) plus a live ROM boot showing the stamps | **sent: #325** |
 | 2 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
 | 3 | 8254 PIT readback/latch (#106 code) | three tests fail on upstream's PIT (read-back ignored, single-byte latch stuck); they pass with the patch | **sent: #323** |
 | 4 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
