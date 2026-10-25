@@ -61,6 +61,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [code-arena-page-free-list-not-possible.md](jitv2/code-arena-page-free-list-not-possible.md) | open | A page-granular free list for the jitv2 code arena is impossible |
 | [code-size-does-not-predict-speed.md](jitv2/code-size-does-not-predict-speed.md) | measure | Emitted-code size did not predict speed — four changes, one marginal win |
 | [codegen-gotchas.md](jitv2/codegen-gotchas.md) | rule | JIT v2 codegen gotchas |
+| [cold-page-compile-latency.md](jitv2/cold-page-compile-latency.md) | measure | jitv2 cold-page compile latency can outlive a short kernel; `j2 pcp` before execution misleads |
 | [compile-churn-avoidance-snapshot.md](jitv2/compile-churn-avoidance-snapshot.md) | design | Compile churn avoidance: skip a recompile whose inputs did not change |
 | [cop0-does-not-have-to-end-a-region.md](jitv2/cop0-does-not-have-to-end-a-region.md) | design | CP0 does not have to end a region |
 | [corpus-capture-from-the-pcp-cache.md](jitv2/corpus-capture-from-the-pcp-cache.md) | howto | Corpus capture: `j2 corpus`, and the two bitmaps that look interchangeable |

@@ -30,6 +30,6 @@ Guest `cvt.w.s`/`cvt.l.d` kernels 1.76×. Whole workspace 1755 passed.
 **Gotchas.** The magic-number round is invalid at the boundary: `2^23 + 1`
 came back as `2^23` until the `|x| < 2^23` select was added — the edge test
 caught it. And do not attribute a guest-kernel regression to a conversion
-emitter without a per-instruction probe: a page-aligned entry can run entirely
-interpreted (issue #112), and one shared code page makes layout noise larger
+emitter without a per-instruction probe: a cold page's compile can land after a short
+kernel has finished (issue #112), and one shared code page makes layout noise larger
 than the change.

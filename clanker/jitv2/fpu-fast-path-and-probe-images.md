@@ -18,7 +18,7 @@ suite identical, full workspace 1429 passed.
 **Gotcha (measurement).** The study's multi-kernel probe image is
 layout-sensitive: several hot loops share one compiled guest page, and
 *untouched* kernels moved up to 3× between builds. The root cause is now
-known: a page-aligned entry can fail to request a compile and run interpreted
-for the whole run (issue #112). Measure FP kernels with one kernel per image
+known: a cold page's compile can land after a short kernel has finished, so it
+runs interpreted for the whole run (compile latency, issue #112). Measure FP kernels with one kernel per image
 when attributing a change to the model; keep a control kernel in the same image
 to detect drift.

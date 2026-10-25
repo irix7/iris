@@ -1,0 +1,85 @@
+--- /tmp/opencode/repro-page-request/fpu.c.orig	2026-10-26 08:22:29.368366621 +1000
++++ /tmp/opencode/repro-page-request/fpu.c	2026-10-26 08:22:29.419133485 +1000
+@@ -455,6 +455,66 @@
+ static u64 v_matmul(void) { u64 h = 0; (void)mm_go(1, &h); return h; }
+ static u64 r_matmul(u32 n) { return mm_go(n, 0); }
+ 
++/* ---- irix7/iris#112 repro kernels (local, not for commit) -----------------
++ *
++ * One conversion per iteration over an L1-resident array, conversion forced
++ * to the exact instruction. CVT_ALIGN=4096 gives the page-aligned shape from
++ * #112; build with -DCVT_ALIGN=1 for the packed-entries shape.
++ */
++#ifndef CVT_ALIGN
++#define CVT_ALIGN 4096
++#endif
++#ifndef CVT_ONLY_CONTROL
++#define CVT_ONLY_CONTROL 0
++#endif
++#define CVT_N 1024
++static float     cvt_src_s[CVT_N];
++static double    cvt_src_d[CVT_N];
++static int       cvt_src_w[CVT_N];
++static union { long long l[CVT_N]; double d[CVT_N]; } cvt_src_l;
++static int       cvt_src_ready;
++static void cvt_src_init(void)
++{
++    u32 i;
++    if (cvt_src_ready) return;
++    for (i = 0; i < CVT_N; i++) {
++        cvt_src_s[i] = (float)(i & 1023) * 0.25f - 128.0f;
++        cvt_src_d[i] = (double)(i & 1023) * 0.25 - 128.0;
++        cvt_src_w[i] = (int)(i & 1023) - 512;
++        cvt_src_l.l[i] = ((long long)(i & 1023) - 512) * 1000003LL;
++    }
++    cvt_src_ready = 1;
++}
++__attribute__((unused)) static inline int cvt_w_s_asm(float x)
++{ float r; int i; __asm__ ("cvt.w.s %0, %1" : "=f"(r) : "f"(x)); __asm__ ("mfc1 %0, %1" : "=r"(i) : "f"(r)); return i; }
++__attribute__((unused)) static inline long long cvt_l_d_asm(double x)
++{ double r; long long i; __asm__ ("cvt.l.d %0, %1" : "=f"(r) : "f"(x)); __asm__ ("dmfc1 %0, %1" : "=r"(i) : "f"(r)); return i; }
++__attribute__((unused)) static inline float cvt_s_d_asm(double x)
++{ float r; __asm__ ("cvt.s.d %0, %1" : "=f"(r) : "f"(x)); return r; }
++__attribute__((unused)) static inline float cvt_s_l_asm(double b)
++{ float r; __asm__ ("cvt.s.l %0, %1" : "=f"(r) : "f"(b)); return r; }
++__attribute__((unused)) static inline double cvt_d_l_asm(double b)
++{ double r; __asm__ ("cvt.d.l %0, %1" : "=f"(r) : "f"(b)); return r; }
++#define CVT_KERNEL(name, acc_t, expr, sink_stmt, cksum, vpasses)              \
++__attribute__((aligned(CVT_ALIGN), noinline))                                 \
++static u64 name##_go(u32 passes, u64 *out)                                    \
++{ acc_t acc = 0; u32 p, i; cvt_src_init();                                    \
++  for (p = 0; p < passes; p++) for (i = 0; i < CVT_N; i++) acc += (expr);     \
++  sink_stmt; if (out) *out = cksum(CKSUM_INIT, acc); return (u64)passes * CVT_N; } \
++static u64 v_##name(void) { u64 h = 0; (void)name##_go(vpasses, &h); return h; } \
++static u64 r_##name(u32 n) { return name##_go(n, 0); }
++#if CVT_ONLY_CONTROL
++CVT_KERNEL(cvt_s_d, float, cvt_s_d_asm(cvt_src_d[i]), SINK((int)(acc != 0.0f)), cksum_f32, 4)
++#else
++CVT_KERNEL(cvt_w_s, int,       cvt_w_s_asm(cvt_src_s[i]), SINK(acc),         cksum_u64, 4)
++CVT_KERNEL(cvt_l_d, long long, cvt_l_d_asm(cvt_src_d[i]), SINK((int)acc),    cksum_u64, 4)
++CVT_KERNEL(cvt_s_d, float,     cvt_s_d_asm(cvt_src_d[i]), SINK((int)(acc != 0.0f)), cksum_f32, 4)
++CVT_KERNEL(cvt_s_w, float,     (float)cvt_src_w[i],       SINK((int)(acc != 0.0f)), cksum_f32, 4)
++CVT_KERNEL(cvt_d_w, double,    (double)cvt_src_w[i],      SINK((int)(acc != 0.0)),  cksum_f64, 4)
++CVT_KERNEL(cvt_s_l, float,     cvt_s_l_asm(cvt_src_l.d[i]), SINK((int)(acc != 0.0f)), cksum_f32, 4)
++CVT_KERNEL(cvt_d_l, double,    cvt_d_l_asm(cvt_src_l.d[i]), SINK((int)(acc != 0.0)),  cksum_f64, 4)
++#endif
++
+ /* ── registration ─────────────────────────────────────────────────────────── */
+ 
+ static const struct bench benches[] = {
+@@ -465,6 +525,15 @@
+     BENCH("fpu/whetstone", "loop", v_whetstone, r_whetstone, 1u <<  6, BG_FPU),
+     BENCH("fpu/linpack",   "flop", v_linpack,   r_linpack,   4,        BG_FPU),
+     BENCH("fpu/matmul",    "flop", v_matmul,    r_matmul,    4,        BG_FPU),
++    BENCH("fpu/cvt_s_d",   "op",   v_cvt_s_d,   r_cvt_s_d,   1u << 10, BG_FPU),
++#if !CVT_ONLY_CONTROL
++    BENCH("fpu/cvt_w_s",   "op",   v_cvt_w_s,   r_cvt_w_s,   1u << 10, BG_FPU),
++    BENCH("fpu/cvt_l_d",   "op",   v_cvt_l_d,   r_cvt_l_d,   1u << 10, BG_FPU),
++    BENCH("fpu/cvt_s_w",   "op",   v_cvt_s_w,   r_cvt_s_w,   1u << 10, BG_FPU),
++    BENCH("fpu/cvt_d_w",   "op",   v_cvt_d_w,   r_cvt_d_w,   1u << 10, BG_FPU),
++    BENCH("fpu/cvt_s_l",   "op",   v_cvt_s_l,   r_cvt_s_l,   1u << 10, BG_FPU),
++    BENCH("fpu/cvt_d_l",   "op",   v_cvt_d_l,   r_cvt_d_l,   1u << 10, BG_FPU),
++#endif
+ };
+ 
+ const struct bench_group group_fpu = {
