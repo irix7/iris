@@ -91,11 +91,11 @@ the fork's version.
   `AudioOutput`/`Resampler` traits and the cpal stream setup; upstream now has
   `host_audio`, shared with the O2. Send the pacing/backpressure layer, then
   replace the fork's plumbing with `host_audio` and delete ours.
-- **Serial-log sink.** Upstream flushes the serial log per byte in both
-  backends. The fork's `SerialLog` exists for timestamps and partial-line
-  flushing. Send the timestamp feature, then delete the sink and use upstream's
-  `TeeBackend`/`CiSerialBackend` with the timestamp flag. Do not keep two
-  writers.
+- **Serial-log sink — done.** Upstream #325 landed the shared sink and the
+  `off|wall` timestamp modes. The upstream merge (`f93ca35`) deletes the fork's
+  `guest`/`both` sink and its partial-line flusher; the CI and TCP paths use
+  one `SerialLog`, and the fork's per-consumer console cursors (#97) remain.
+  Do not reintroduce a second writer.
 - **CPU clock model (#98).** Upstream's reply on techomancer/iris#322 points
   at the existing `ci_clock` feature: normal builds keep the host wall clock,
   and `ci_clock` derives Count from retired cycles for the determinism
@@ -118,9 +118,9 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 
 | Order | Divergence | Evidence | State |
 |---|---|---|---|
-| 1 | `--serial-log-timestamps` | three tests (raw identity, wall stamping/hold, stamp shape) plus a live ROM boot showing the stamps | **sent: #325** |
+| 1 | `--serial-log-timestamps` | three tests (raw identity, wall stamping/hold, stamp shape) plus a live ROM boot showing the stamps | **merged: #325; sink deleted in `f93ca35`** |
 | 2 | GR2 FIN2/FIN3 sequence tokens (#95) | a minimal upstream test where a deep FIFO raises FIN3 early; the fork's `fin3-must-track-pending-finish` rule describes the failure | **needs upstream repro** |
-| 3 | 8254 PIT readback/latch (#106 code) | three tests fail on upstream's PIT (read-back ignored, single-byte latch stuck); they pass with the patch | **sent: #323** |
+| 3 | 8254 PIT readback/latch (#106 code) | three tests fail on upstream's PIT (read-back ignored, single-byte latch stuck); they pass with the patch | **merged: #323** |
 | 4 | Per-consumer CI serial cursors (#97) | a two-consumer test where one consumer steals the other's bytes | **needs test** |
 | 5 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
 | 6 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
@@ -162,7 +162,8 @@ Phase 0 (cheap convergence):
 
 Phase 1 (serial and GR2):
 
-4. Send serial timestamps; revert the serial sink.
+4. ~~Send serial timestamps; revert the serial sink.~~ Done: #325 and the
+   upstream merge.
 5. Port GR2 sequence tokens.
 6. Port the PIT readback onto upstream's PIT.
 
