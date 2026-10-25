@@ -313,6 +313,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [shadow-cache-r4400-r5000.md](perf/shadow-cache-r4400-r5000.md) | design | Shadow cache for R4400/R5000: what it is for, what it costs |
 | [wait-instruction-spins-instead-of-parking.md](perf/wait-instruction-spins-instead-of-parking.md) | history | WAIT spins instead of parking (implemented; kept for the reasoning) |
 | [word-swap-bulk-copy-simd.md](perf/word-swap-bulk-copy-simd.md) | measure | The word-swap bulk copy should be a SIMD dword shuffle |
+| [interpreter-data-path-not-the-bottleneck.md](perf/interpreter-data-path-not-the-bottleneck.md) | measure | The interpreter data-path split is not worth it: 13.2 % ceiling, placement noise 5 % |
 
 ## testing/
 
