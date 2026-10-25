@@ -111,6 +111,12 @@ the fork's version.
 - **Unmeasured perf branches.** Any part of the perf buckets (`9d1988a`,
   `d90dcc2`) that has no before/after measurement reverts rather than becoming
   a permanent fork behaviour.
+- **jitv2 compile-pool default — measured, decision open.** Upstream defaults
+  to one worker; the fork's `9d1988a` uses `min(available_parallelism, 4)`.
+  The #112 cold-page A/B shows 4 workers recover 127–166 ns/op aligned kernels
+  to 13–18, but add 1–3 s to a 38 s suite and mix the packed results. Keep the
+  fork default for now and document it; send upstream only after a real IRIX
+  boot soak, otherwise revert to upstream's 1.
 
 ## 3. Send upstream
 

@@ -90,7 +90,7 @@ The MIPS JIT (`src/cpu/jitv2/`): design, Cranelift codegen, delay slots, invalid
 | [measure-the-callout-mask-gain.md](jitv2/measure-the-callout-mask-gain.md) | measure | Measuring the callout clobber-mask gain, in reloads |
 | [mem-helper-batch-must-not-use-a-vec.md](jitv2/mem-helper-batch-must-not-use-a-vec.md) | rule | The memory-helper batch must not be collected in a `Vec` |
 | [nested-delay-slot-across-page-boundary.md](jitv2/nested-delay-slot-across-page-boundary.md) | rule | Nested delay slot across a page boundary (jitv2 codegen) |
-| [parallel-compile-pool-sizing.md](jitv2/parallel-compile-pool-sizing.md) | measure | The compile pool defaults to one worker; parallel compilation is cheap |
+| [parallel-compile-pool-sizing.md](jitv2/parallel-compile-pool-sizing.md) | measure | Compile-pool sizing: a few workers, capped at four; the fork uses 4, upstream 1 |
 | [read-status-in-registers.md](jitv2/read-status-in-registers.md) | rule | JIT memory hooks return status in registers, never memory |
 | [retry-bail-in-delay-slot-must-arm-the-branch.md](jitv2/retry-bail-in-delay-slot-must-arm-the-branch.md) | rule | A retry bail out of an inlined delay slot must arm the branch |
 | [smc-writes-to-executing-page.md](jitv2/smc-writes-to-executing-page.md) | design | Self-modifying writes onto the page being executed (`jitv2_smc_check`) |

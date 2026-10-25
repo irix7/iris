@@ -1,7 +1,12 @@
-# The compile pool defaults to one worker; parallel compilation is cheap and bounded
+# Compile-pool sizing: a few workers, capped at four
 
-The jitv2 compile pool runs a single worker by default: `default_jitv2_threads() -> 1`
-(`src/config.rs:711`). The multi-worker machinery already exists — per-worker
+Status: implemented in the fork (`9d1988a`); upstream still defaults to one
+worker (2026-10-26). The cold-page A/B below is the evidence; a real IRIX boot
+soak is still missing.
+
+Upstream's jitv2 compile pool runs a single worker by default:
+`default_jitv2_threads() -> 1`. The fork's `9d1988a` changes that to
+`min(available_parallelism, 4)`. The multi-worker machinery already exists — per-worker
 `Codegen`, shared-arena reservation by a leader, a barrier that rebuilds the arena
 while other workers park, and an N=4 concurrency test — but production never
 turns it on.
@@ -51,3 +56,23 @@ memory goal favour the HotSpot/Truffle shape.
 
 Measure boot wall-clock and `j2 status` queue depth before/after; correctness is
 unaffected (compilation is async off the CPU thread).
+
+## Measured trade-off (2026-10-26, #112)
+
+A controlled A/B on the aligned bench image (R4400, `lightning,jitv2`,
+`--cache shadow`, 3 interleaved runs per cell, 40/40 accuracy) measured the
+effect on cold pages and on the whole suite:
+
+- The aligned conversion kernels go from 127–166 ns/op with one worker to
+  13–18 ns/op with four; inline compile reaches 10–15 ns/op but destroys
+  `int/alu` (2.8 → ~960 ns/op) and doubles the suite's wall time.
+- Four workers add 1–3 s to the 38 s suite, regress packed `cvt_s_d`
+  129 → 143 ns/op in one cell, and leave one aligned run at 103.6 ns/op.
+- The cold-page timeline is queue wait, not seal logic: 501 ms of the 529 ms
+  first-publish latency is waiting behind other pages' compiles; the compile
+  itself is 13.6 ms and seal → publish 14 ms.
+
+So four workers is the right shape for the fork, but not yet a proven upstream
+default. Keep it and document it; send it upstream only after a real IRIX boot
+soak. If the fork gives it up, revert to upstream's 1 rather than inventing a
+third value.
