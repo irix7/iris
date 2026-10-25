@@ -80,12 +80,25 @@ pub struct ScsiDeviceConfig {
     /// already exists or `scratch=false`.
     #[serde(default)]
     pub size_mb: Option<u32>,
-    /// Which HPC3 SCSI chip this target lives on: 0 (default) or 1. Indigo2
-    /// (IP22 fullhouse) has two independent WD33C93A controllers; Indy
-    /// (IP24 guinness) only has controller 0, so `controller = 1` is
-    /// rejected outside the Indigo2 profile — see `MachineConfig::validate`.
+    /// Which SCSI controller this target lives on: 0 (default) or 1. Indigo2
+    /// (IP22 fullhouse) has two independent WD33C93A controllers and the O2
+    /// two Adaptec 7880s (0 the internal bus, 1 the external connector);
+    /// Indy (IP24 guinness) only has controller 0, so `controller = 1` is
+    /// rejected there — see `MachineConfig::validate`.
     #[serde(default)]
     pub controller: u8,
+}
+
+/// The `[scsi.N]` key, and the snapshot manifest's disk number, that names
+/// `id` on `controller`: the id itself on controller 0, 16 + id on
+/// controller 1. Sixteen slots per controller, as SCSI ids go.
+pub fn scsi_slot(controller: u8, id: u8) -> u8 {
+    controller * 16 + id
+}
+
+/// `SCSI ID 1` on controller 0, `SCSI 1:1` on another, for messages.
+pub fn scsi_label(controller: u8, id: u8) -> String {
+    if controller == 0 { format!("SCSI ID {id}") } else { format!("SCSI {controller}:{id}") }
 }
 
 impl Default for ScsiDeviceConfig {
@@ -117,6 +130,67 @@ impl ScsiDeviceConfig {
 
     pub fn is_cdrom(&self) -> bool { self.kind() == ScsiKind::Cdrom }
     pub fn is_daynaport(&self) -> bool { self.kind() == ScsiKind::Daynaport }
+
+    /// Where the `[scsi.KEY]` table puts this target, as (controller, id).
+    /// Keys 1–7 are ids on `controller` (0 unless the key says otherwise);
+    /// a key of 16 + id names controller 1 directly, so the same id can be
+    /// used on both controllers. See [`scsi_slot`].
+    pub fn placement(&self, key: u8) -> (u8, u8) {
+        if key >= 16 { (key / 16, key % 16) } else { (self.controller, key) }
+    }
+
+    /// The media this target starts with: the active image and, for a
+    /// CD-ROM, the changer list built from `path` and `discs` with empty
+    /// entries skipped (an empty `path` is a drive with its tray empty, to be
+    /// loaded at run time). A disk is just its path.
+    pub fn media(&self) -> (String, Vec<String>) {
+        if !self.is_cdrom() {
+            return (self.path.clone(), vec![]);
+        }
+        let mut list: Vec<String> = Vec::new();
+        if !self.path.is_empty() {
+            list.push(self.path.clone());
+        }
+        for d in &self.discs {
+            if !d.is_empty() && !list.contains(d) {
+                list.push(d.clone());
+            }
+        }
+        let active = list.first().cloned().unwrap_or_default();
+        (active, list)
+    }
+
+    /// Where a `--ci` run keeps the copy-on-write overlay of the disk at
+    /// `id`: under /tmp and named for the process, so an interactive iris
+    /// holding `PATH.overlay` can coexist with any number of CI runs. The
+    /// files are kept for post-mortem inspection.
+    pub fn ci_overlay_path(id: u8) -> String {
+        format!("/tmp/iris-ci-{}-scsi{}.overlay", std::process::id(), id)
+    }
+
+    /// For `scratch = true`: make sure the volume exists, creating it with a
+    /// minimal SGI volume header and `size_mb` MB when it does not, and
+    /// return its path for the CI socket's scratch commands. None when the
+    /// target is not a scratch volume, or cannot be one (a CD-ROM or an
+    /// overlay is not host-writable in place), which is reported.
+    pub fn prepare_scratch(&self, id: u8) -> Option<std::path::PathBuf> {
+        if !self.scratch {
+            return None;
+        }
+        if self.is_cdrom() || self.overlay {
+            println!("Note: SCSI ID {}: scratch=true is incompatible with cdrom/overlay; ignoring scratch flag", id);
+            return None;
+        }
+        let path = std::path::Path::new(&self.path);
+        if !path.exists() {
+            let size_mb = self.size_mb.unwrap_or(64) as u64;
+            match crate::sgi_vh::create_scratch_image(path, size_mb * 1024 * 1024) {
+                Ok(()) => println!("iris: created scratch volume {} ({} MB, with SGI VH)", self.path, size_mb),
+                Err(e) => println!("Note: could not create scratch volume {}: {}", self.path, e),
+            }
+        }
+        Some(path.to_path_buf())
+    }
 
     /// A DaynaPort target for this SCSI id, with defaults filled in.
     /// Errors describe a bad `mac` / `subnet`; `validate()` catches those first.
@@ -466,6 +540,9 @@ pub enum NetMode {
     /// The guest appears as a real L2 host on the physical LAN; NAT services
     /// (DHCP/DNS/NFS/port-forward) are NOT provided — use the real network's.
     Pcap,
+    /// No Ethernet: the adapter is not plugged into anything. O2 only for now
+    /// (`MachineConfig::validate`); the Indy and Indigo2 always have a network.
+    Off,
 }
 
 impl Default for NetMode {
@@ -521,6 +598,7 @@ impl Default for NetworkConfig {
 pub struct NetworkSection {
     /// Backend: "nat" (default) or "pcap".
     #[serde(default)]
+    /// `off` unplugs the Ethernet (O2 only for now).
     pub mode: NetMode,
     /// Host interface to bridge onto in PCAP mode (e.g. "eth0", "en0").
     /// Run `iris --list-net-interfaces` to enumerate candidates.
@@ -622,10 +700,15 @@ pub enum MachineProfile {
     /// Use an IMPACT board (`src/dev/mgras/`): an IP28 kernel carries no
     /// Newport driver, so REX3 is not an alternative for that guest.
     Indigo2Ip28,
+    /// SGI O2 IP32: CRIME, MACE and GBE, with an R5000 or R10000. Built from
+    /// the `[o2]` section, not the fullhouse/Guinness options above; see
+    /// `src/ip32_machine.rs`.
+    O2Ip32,
 }
 
 impl MachineProfile {
-    /// All selectable profiles, in display order. Single source of truth for the
+    /// All selectable profiles, in display order. (Not the O2 yet: iris-gui's
+    /// machine editor has no `[o2]` section.) Single source of truth for the
     /// GUI dropdowns (Config tab + New Machine dialog) so they never drift.
     pub const ALL: [Self; 3] = [Self::IndyIp24, Self::Indigo2Ip22, Self::Indigo2Ip28];
 
@@ -634,10 +717,27 @@ impl MachineProfile {
             Self::IndyIp24 => "SGI Indy (IP24)",
             Self::Indigo2Ip22 => "SGI Indigo2 (IP22)",
             Self::Indigo2Ip28 => "SGI Indigo2 IMPACT (IP28)",
+            Self::O2Ip32 => "SGI O2 (IP32)",
         }
     }
 
     /// MC/IOC/HPC3 Guinness vs Fullhouse layout. Indy IP24 is Guinness (`true`).
+    /// How many SCSI controllers the machine has: two on the Indigo2 (two
+    /// WD33C93As) and the O2 (two Adaptec 7880s, the second on the external
+    /// connector), one on the Indy.
+    pub fn scsi_controllers(self) -> u8 {
+        match self {
+            Self::Indigo2Ip22 | Self::O2Ip32 => 2,
+            _ => 1,
+        }
+    }
+
+    /// How many memory banks the machine has: four on all of them (the MC's
+    /// four banks; the O2's four DIMM pairs). `banks` has room for more.
+    pub fn memory_banks(self) -> usize {
+        4
+    }
+
     pub fn guinness(self) -> bool {
         matches!(self, Self::IndyIp24)
     }
@@ -917,6 +1017,113 @@ impl Default for MachineSection {
     }
 }
 
+/// What only an O2 has (`[o2]` section). The rest of an O2 is the shared
+/// keys: `prom` (its PROM image, not embedded), `nvram` (the PROM's flash,
+/// which holds its environment), `banks` (the kit in each DIMM pair),
+/// `serial_port_a`/`serial_port_b`/`serial_log`, `headless` (a serial
+/// console instead of the graphics console), `[clock] fixed_mhz` (CP0 Count,
+/// half the CPU clock), `[network]`, `[[port_forward]]` and `[scsi.N]`. The
+/// deprecated keys below are the old O2-only spellings of those:
+/// [`MachineConfig::fold_deprecated`] moves them over when a file is loaded
+/// and they are never written back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct O2Section {
+    /// A PS/2 mouse on the second port (with the graphics console).
+    #[serde(default = "o2_on")]
+    pub mouse: bool,
+    /// A TCP port on 127.0.0.1 for driving the machine from a script: screen
+    /// shots, keys, the mouse (see `src/ip32_machine.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_port: Option<u16>,
+    /// Test aid, not hardware behaviour: lend a kernel the FPU while it is
+    /// inside the PROM (NetBSD prints through the PROM's graphics console
+    /// with CU1 clear, and the PROM scrolls with FPU loads).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub arcs_fpu: bool,
+
+    /// Deprecated: `prom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prom: Option<String>,
+    /// Deprecated: `nvram`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flash: Option<String>,
+    /// Deprecated: `banks`, fitted largest kits first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_mb: Option<u32>,
+    /// Deprecated: `banks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimms: Option<Vec<u32>>,
+    /// Deprecated: `[scsi.N]` with `controller` = bus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<O2Disk>,
+    /// Deprecated: `serial_port_a`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_port: Option<u16>,
+    /// Deprecated: `serial_log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial_log: Option<String>,
+    /// Deprecated: `headless` (its inverse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphics: Option<bool>,
+    /// Deprecated: `[clock] fixed_mhz`, which is half of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_mhz: Option<u32>,
+    /// Deprecated: `[network] mode = "off"` when false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<bool>,
+    /// Deprecated: `[[port_forward]]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<PortForwardConfig>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// An entry of the deprecated `o2.disks` list; see [`O2Section::disks`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct O2Disk {
+    pub id: u8,
+    /// The controller: 0 (internal, ids 1-4 under IRIX) or 1 (external).
+    #[serde(default)]
+    pub bus: u8,
+    pub path: String,
+    #[serde(default)]
+    pub cdrom: bool,
+    /// Copy-on-write, as `[scsi.N] overlay`: the image is never written,
+    /// writes go to `{path}.overlay`, and a snapshot carries them, so its
+    /// disk matches its memory.
+    #[serde(default)]
+    pub overlay: bool,
+}
+
+fn o2_on() -> bool {
+    true
+}
+
+impl Default for O2Section {
+    fn default() -> Self {
+        Self {
+            mouse: true,
+            control_port: None,
+            arcs_fpu: false,
+            prom: None,
+            flash: None,
+            ram_mb: None,
+            dimms: None,
+            disks: Vec::new(),
+            serial_port: None,
+            serial_log: None,
+            graphics: None,
+            cpu_mhz: None,
+            net: None,
+            forwards: Vec::new(),
+        }
+    }
+}
+
 /// Misc debug/capture runtime tuning (`[debug]` section). Applied to process
 /// env at Start. These knobs are independent of any particular JIT engine —
 /// gui_gl_capture picks iris-gui's framebuffer capture renderer, no_idle
@@ -1035,8 +1242,10 @@ impl Jitv2Config {
 pub struct ClockConfig {
     /// CP0 Count frequency in MHz. Count ticks at a fixed rate; there is no
     /// runtime inference. None selects the profile default: 33 MHz on
-    /// IP22/IP24 or 97.5 MHz on IP28. IRIX reports twice the Count rate as
-    /// CPU MHz; host emulation throughput is independent of this setting.
+    /// IP22/IP24, 97.5 MHz on IP28, 90 MHz on the O2 (a 180 MHz CPU). IRIX
+    /// reports twice the Count rate as CPU MHz, and the O2's PROM measures
+    /// it the same way; host emulation throughput is independent of this
+    /// setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_mhz: Option<f64>,
 }
@@ -1409,9 +1618,15 @@ pub struct MachineConfig {
     #[serde(skip)]
     pub replace: bool,
 
-    /// RAM bank sizes in MB. Valid values: 0 (absent), 8, 16, 32, 64, 128.
-    #[serde(default = "default_banks")]
-    pub banks: [u32; 4],
+    /// RAM bank sizes in MB, one per bank, up to [`MAX_BANKS`]. Every machine
+    /// today has four (`MachineProfile::memory_banks`); the rest must be 0.
+    /// On the Indy and Indigo2 a bank is 0 (absent), 8, 16, 32, 64 or 128 MB
+    /// (the IP28 also 256 or 512); on the O2 it is the kit in a DIMM pair, 32,
+    /// 64, 128 or 256 MB, largest first from pair A. A config may list fewer
+    /// than eight; the rest are 0, and a config is written back with the
+    /// trailing zeros beyond the fourth trimmed.
+    #[serde(default = "default_banks", with = "banks_serde")]
+    pub banks: [u32; MAX_BANKS],
 
     /// Window scale factor (1 = native, 2 = 2× for HiDPI/4K). CLI --2x overrides this.
     #[serde(default = "default_scale")]
@@ -1579,6 +1794,10 @@ pub struct MachineConfig {
     #[serde(default)]
     pub jitv2: Jitv2Config,
 
+    /// The O2 (`[o2]` section), used when `[machine] profile = "o2_ip32"`.
+    #[serde(default)]
+    pub o2: O2Section,
+
     /// Host performance tuning (`[perf]` section).
     #[serde(default)]
     pub perf: PerfConfig,
@@ -1639,20 +1858,62 @@ fn tcp_port(addr: &str) -> Option<u16> {
 fn default_scroll_pixels_per_line() -> f64 { 40.0 }
 fn default_lock_aspect_ratio() -> bool { true }
 
+/// `prom` when a config does not set it. The O2 then tries
+/// `ip32_machine::O2_PROM_FILE` as well, having no embedded PROM.
+pub const DEFAULT_PROM: &str = "prom.bin";
+/// `nvram` when a config does not set it: the DS1386's file on the Indy, the
+/// PROM's flash on the O2.
+pub const DEFAULT_NVRAM: &str = "nvram.bin";
+
 fn default_prom() -> String {
-    "prom.bin".to_string()
+    DEFAULT_PROM.to_string()
 }
 
 fn default_nvram() -> String {
-    "nvram.bin".to_string()
+    DEFAULT_NVRAM.to_string()
 }
 
 fn default_nveeprom() -> String {
     "nveeprom.bin".to_string()
 }
 
-fn default_banks() -> [u32; 4] {
-    [128, 128, 0, 0]
+/// Room in `banks`: eight, for machines with more than today's four.
+pub const MAX_BANKS: usize = 8;
+
+fn default_banks() -> [u32; MAX_BANKS] {
+    banks_from4([128, 128, 0, 0])
+}
+
+/// Four bank sizes as a full `banks` array.
+pub fn banks_from4(four: [u32; 4]) -> [u32; MAX_BANKS] {
+    let mut banks = [0u32; MAX_BANKS];
+    banks[..4].copy_from_slice(&four);
+    banks
+}
+
+/// `banks` as TOML: any length from 1 to [`MAX_BANKS`] is read and padded
+/// with zeros; it is written with at least four entries and no trailing
+/// zeros beyond them, so a four-bank machine's config looks as it always has.
+mod banks_serde {
+    use super::MAX_BANKS;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(banks: &[u32; MAX_BANKS], ser: S) -> Result<S::Ok, S::Error> {
+        let n = banks.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1).max(4);
+        banks[..n].serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<[u32; MAX_BANKS], D::Error> {
+        let list = Vec::<u32>::deserialize(de)?;
+        if list.is_empty() || list.len() > MAX_BANKS {
+            return Err(serde::de::Error::custom(format!(
+                "banks: {} entries; give 1 to {MAX_BANKS} bank sizes in MB", list.len()
+            )));
+        }
+        let mut banks = [0u32; MAX_BANKS];
+        banks[..list.len()].copy_from_slice(&list);
+        Ok(banks)
+    }
 }
 
 fn default_scale() -> u32 { 1 }
@@ -1715,6 +1976,7 @@ impl Default for MachineConfig {
             graphics: GraphicsSection::default(),
             debug: DebugConfig::default(),
             jitv2: Jitv2Config::default(),
+            o2: O2Section::default(),
             perf: PerfConfig::default(),
             clock: ClockConfig::default(),
             rtc_offset: RtcOffset::default(),
@@ -1746,7 +2008,10 @@ impl MachineConfig {
             return Self::default();
         };
         match toml::from_str::<Self>(&text) {
-            Ok(cfg) => cfg,
+            Ok(mut cfg) => {
+                cfg.fold_deprecated();
+                cfg
+            }
             Err(e) => {
                 eprintln!("Configuration error: failed to parse {}:\n{}", path, e);
                 // Common footgun: backslashes in a double-quoted string (Windows
@@ -1801,6 +2066,93 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// Translate keys an older iris wrote into their current form, saying so
+    /// once. The old `[o2]` spellings move to the shared keys they stand for
+    /// when those are still at their defaults (a shared key that is set wins);
+    /// `o2.disks` becomes `[scsi.N]` entries with `controller` = bus and
+    /// replaces the `scsi` map, since a config that has it never meant the
+    /// Indy's default disks.
+    pub fn fold_deprecated(&mut self) {
+        let mut moved: Vec<&str> = Vec::new();
+        if let Some(prom) = self.o2.prom.take() {
+            if self.prom == DEFAULT_PROM { self.prom = prom; }
+            moved.push("o2.prom -> prom");
+        }
+        if let Some(flash) = self.o2.flash.take() {
+            if self.nvram == DEFAULT_NVRAM { self.nvram = flash; }
+            moved.push("o2.flash -> nvram");
+        }
+        if let Some(mb) = self.o2.ram_mb.take() {
+            match crate::dev::crime_mem::kits_for(mb) {
+                Ok(kits) if self.banks == default_banks() => {
+                    self.banks = [0; MAX_BANKS];
+                    self.banks[..kits.len()].copy_from_slice(&kits);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("iris: o2.ram_mb = {mb}: {e}; ignored"),
+            }
+            moved.push("o2.ram_mb -> banks");
+        }
+        if let Some(kits) = self.o2.dimms.take() {
+            if self.banks == default_banks() && !kits.is_empty() && kits.len() <= MAX_BANKS {
+                self.banks = [0; MAX_BANKS];
+                self.banks[..kits.len()].copy_from_slice(&kits);
+            }
+            moved.push("o2.dimms -> banks");
+        }
+        if !self.o2.disks.is_empty() {
+            self.scsi.clear();
+            for d in std::mem::take(&mut self.o2.disks) {
+                self.scsi.insert(d.id, ScsiDeviceConfig {
+                    path: d.path,
+                    cdrom: d.cdrom,
+                    overlay: d.overlay,
+                    controller: d.bus,
+                    ..Default::default()
+                });
+            }
+            moved.push("o2.disks -> [scsi.N] (controller = bus)");
+        }
+        if let Some(port) = self.o2.serial_port.take() {
+            if self.serial_port_a.is_none() { self.serial_port_a = Some(port); }
+            moved.push("o2.serial_port -> serial_port_a");
+        }
+        if let Some(log) = self.o2.serial_log.take() {
+            if self.serial_log.is_none() { self.serial_log = Some(log); }
+            moved.push("o2.serial_log -> serial_log");
+        }
+        if let Some(graphics) = self.o2.graphics.take() {
+            if !graphics { self.headless = true; }
+            moved.push("o2.graphics -> headless (inverted)");
+        }
+        if let Some(mhz) = self.o2.cpu_mhz.take() {
+            if self.clock.fixed_mhz.is_none() { self.clock.fixed_mhz = Some(mhz as f64 / 2.0); }
+            moved.push("o2.cpu_mhz -> [clock] fixed_mhz (half: CP0 Count)");
+        }
+        if let Some(net) = self.o2.net.take() {
+            if !net { self.network.mode = NetMode::Off; }
+            moved.push("o2.net -> [network] mode = \"off\"");
+        }
+        if !self.o2.forwards.is_empty() {
+            let forwards = std::mem::take(&mut self.o2.forwards);
+            self.port_forward.extend(forwards);
+            moved.push("o2.forwards -> [[port_forward]]");
+        }
+        if !moved.is_empty() {
+            eprintln!(
+                "iris: deprecated [o2] keys folded into the shared settings ({}); move them in the config to silence this",
+                moved.join(", ")
+            );
+        }
+    }
+
+    /// The O2's memory as the kit in each DIMM pair from pair A: `banks` with
+    /// the trailing zeros dropped.
+    pub fn o2_kits(&self) -> Vec<u32> {
+        let n = self.banks.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        self.banks[..n].to_vec()
+    }
+
     /// Validate bank sizes, returns a description of any errors.
     pub fn validate(&self) -> Result<(), String> {
         if self.graphics.heads != 1 && self.graphics.heads != 2 {
@@ -1823,36 +2175,88 @@ impl MachineConfig {
                 return Err("graphics.resolution presets require Newport (graphics.board = newport)".into());
             }
         }
-        for (&id, dev) in &self.scsi {
-            if dev.controller != 0 && self.machine.profile != MachineProfile::Indigo2Ip22 {
+        let mut placed: std::collections::HashMap<(u8, u8), u8> = std::collections::HashMap::new();
+        let mut keys: Vec<u8> = self.scsi.keys().copied().collect();
+        keys.sort();
+        for key in keys {
+            let dev = &self.scsi[&key];
+            let (controller, id) = dev.placement(key);
+            if id == 0 || id > 7 {
+                return Err(format!("scsi.{}: SCSI ID {} is out of range (1–7; the controller itself is 0)", key, id));
+            }
+            if key >= 16 && dev.controller != 0 && dev.controller != controller {
                 return Err(format!(
-                    "scsi.{}: controller {} is only valid on Indigo2 (machine.profile = indigo2_ip22) — Indy has a single SCSI controller (0)",
-                    id, dev.controller
+                    "scsi.{}: the key already puts the target on controller {}; controller = {} contradicts it",
+                    key, controller, dev.controller
                 ));
             }
-            if dev.controller > 1 {
-                return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", id, dev.controller));
+            if controller > 1 {
+                return Err(format!("scsi.{}: controller {} is invalid (valid: 0, 1)", key, controller));
+            }
+            if controller != 0 && self.machine.profile.scsi_controllers() < 2 {
+                return Err(format!(
+                    "scsi.{}: controller {} is only valid on Indigo2 (machine.profile = indigo2_ip22) and O2 (o2_ip32), which have two SCSI controllers — this machine has one (0)",
+                    key, controller
+                ));
+            }
+            if let Some(other) = placed.insert((controller, id), key) {
+                return Err(format!(
+                    "scsi.{} and scsi.{} both name {}", other, key, scsi_label(controller, id)
+                ));
+            }
+            if dev.is_daynaport() && self.machine.profile == MachineProfile::O2Ip32 {
+                return Err(format!(
+                    "scsi.{}: kind = \"daynaport\" is not available on the O2 (its Ethernet is built in)", key
+                ));
             }
         }
         if self.scale < 1 || self.scale > 4 {
             return Err(format!("scale {} is invalid (valid: 1, 2, 3, 4)", self.scale));
         }
         self.validate_listener_ports()?;
-        for (i, &sz) in self.banks.iter().enumerate() {
-            if !VALID_BANK_SIZES.contains(&sz) {
+        let bank_count = self.machine.profile.memory_banks();
+        for (i, &sz) in self.banks.iter().enumerate().skip(bank_count) {
+            if sz != 0 {
                 return Err(format!(
-                    "bank{} size {} MB is invalid (valid: {:?})",
-                    i, sz, VALID_BANK_SIZES
+                    "bank{} size {} MB: {:?} has {} memory banks, so banks beyond the {}th must be 0",
+                    i, sz, self.machine.profile, bank_count, bank_count
                 ));
             }
-            // The IP22/IP24 MC cannot express banks larger than 128 MB at its base
-            // shift; only the IP28's can.
-            if sz > 128 && !self.machine.profile.ip28() {
-                return Err(format!(
-                    "bank{} size {} MB needs the IP28 (machine.profile = indigo2_ip28)",
-                    i, sz
-                ));
+        }
+        if self.machine.profile == MachineProfile::O2Ip32 {
+            // A bank is the kit in a DIMM pair, filled from pair A.
+            if let Some(gap) = self.banks[..bank_count].iter().position(|&b| b == 0) {
+                if self.banks[gap..bank_count].iter().any(|&b| b != 0) {
+                    return Err(format!("banks: DIMM pair {} is empty but a later pair is populated; fill the pairs from A", (b'A' + gap as u8) as char));
+                }
             }
+            crate::dev::crime_mem::check_kits(&self.o2_kits()).map_err(|e| format!("banks: {e}"))?;
+        } else {
+            for (i, &sz) in self.banks.iter().enumerate().take(bank_count) {
+                if !VALID_BANK_SIZES.contains(&sz) {
+                    return Err(format!(
+                        "bank{} size {} MB is invalid (valid: {:?})",
+                        i, sz, VALID_BANK_SIZES
+                    ));
+                }
+                // The IP22/IP24 MC cannot express banks larger than 128 MB at its base
+                // shift; only the IP28's can.
+                if sz > 128 && !self.machine.profile.ip28() {
+                    return Err(format!(
+                        "bank{} size {} MB needs the IP28 (machine.profile = indigo2_ip28)",
+                        i, sz
+                    ));
+                }
+            }
+        }
+        match (self.network.mode, self.machine.profile) {
+            (NetMode::Off, p) if p != MachineProfile::O2Ip32 => {
+                return Err("network.mode = \"off\" is only available on the O2 for now; the Indy and Indigo2 always have their Ethernet".into());
+            }
+            (NetMode::Pcap, MachineProfile::O2Ip32) => {
+                return Err("network.mode = \"pcap\" is not available on the O2 yet (its Ethernet runs on the NAT gateway)".into());
+            }
+            _ => {}
         }
         if let Some(ref s) = self.nat_subnet {
             if let Err(e) = parse_nat_subnet(s) {
@@ -1863,9 +2267,6 @@ impl MachineConfig {
             parse_mac(mac).map_err(|e| format!("network.mac: {}", e))?;
         }
         for (id, dev) in &self.scsi {
-            if *id == 0 || *id > 7 {
-                return Err(format!("SCSI ID {} is out of range (1–7)", id));
-            }
             // A CD-ROM may legitimately start with an empty tray (no path, no
             // discs) and have media loaded at runtime; any discs list is valid
             // as a changer queue. So there is nothing CD-ROM-specific to check.
@@ -2576,7 +2977,7 @@ mod export_tests {
     #[test]
     fn two_512_mb_banks_require_ip28() {
         let mut cfg = MachineConfig::default();
-        cfg.banks = [512, 512, 0, 0];
+        cfg.banks = banks_from4([512, 512, 0, 0]);
         for profile in [MachineProfile::IndyIp24, MachineProfile::Indigo2Ip22] {
             cfg.machine.profile = profile;
             assert!(cfg.validate().unwrap_err().contains("512 MB needs the IP28"));
@@ -2590,7 +2991,7 @@ mod export_tests {
     fn a_256_mb_bank_is_an_ip28_bank() {
         let mut cfg = MachineConfig::default();
         cfg.machine.profile = MachineProfile::Indigo2Ip22;
-        cfg.banks = [256, 128, 0, 0];
+        cfg.banks = banks_from4([256, 128, 0, 0]);
         let err = cfg.validate().expect_err("the IP22 MC cannot express a 256 MB bank");
         assert!(err.contains("256 MB"), "{err}");
         {
@@ -2598,6 +2999,186 @@ mod export_tests {
             cfg.machine.cpu = CpuModel::R10000;
             cfg.validate().expect("the IP28 MC can");
         }
+    }
+
+    /// The O2 reads the same `[scsi.N]` tables as the other machines, with
+    /// `controller` as the bus; like the Indigo2 it has two. Its Ethernet is
+    /// built in, so a DaynaPort target is refused.
+    #[test]
+    fn o2_takes_scsi_tables_with_controller_as_bus() {
+        let mut cfg = MachineConfig::default();
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.scsi.insert(2, ScsiDeviceConfig { path: "external.raw".into(), controller: 1, ..Default::default() });
+        cfg.validate().expect("the O2 has two SCSI controllers");
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        cfg.machine.cpu = CpuModel::default();
+        assert!(cfg.validate().unwrap_err().contains("controller 1"), "the Indy has one");
+        cfg.machine.profile = MachineProfile::O2Ip32;
+        cfg.machine.cpu = CpuModel::R10000;
+        cfg.scsi.insert(3, ScsiDeviceConfig { kind_field: ScsiKind::Daynaport, ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("daynaport"));
+    }
+
+    /// `banks` reads one to eight entries and pads; it writes four or more
+    /// with no trailing zeros past the fourth; banks a machine does not have
+    /// must be 0; the O2 takes DIMM kits, largest first, and nothing else.
+    #[test]
+    fn banks_have_eight_slots_and_four_users() {
+        let cfg: MachineConfig = toml::from_str("banks = [64, 64]").expect("short list pads");
+        assert_eq!(cfg.banks, banks_from4([64, 64, 0, 0]));
+        let s = toml::to_string(&MachineConfig::default()).expect("serialize");
+        assert!(s.contains("banks = [128, 128, 0, 0]"), "four entries, no more:\n{s}");
+        assert!(toml::from_str::<MachineConfig>("banks = [8, 8, 8, 8, 8, 8, 8, 8, 8]").is_err(), "nine is too many");
+
+        let mut cfg = MachineConfig::default();
+        cfg.banks[4] = 8;
+        assert!(cfg.validate().unwrap_err().contains("has 4 memory banks"));
+
+        let mut o2 = MachineConfig::default();
+        o2.machine.profile = MachineProfile::O2Ip32;
+        o2.machine.cpu = CpuModel::R10000;
+        o2.validate().expect("two 128 MB kits are an O2's 256 MB");
+        o2.banks = banks_from4([256, 256, 256, 256]);
+        o2.validate().expect("1 GB");
+        assert_eq!(o2.o2_kits(), vec![256, 256, 256, 256]);
+        o2.banks = banks_from4([8, 0, 0, 0]);
+        assert!(o2.validate().unwrap_err().contains("no 8 MB kit"));
+        o2.banks = banks_from4([128, 0, 128, 0]);
+        assert!(o2.validate().unwrap_err().contains("pair B is empty"));
+        o2.banks = banks_from4([64, 128, 0, 0]);
+        assert!(o2.validate().unwrap_err().contains("largest kit goes in pair A"));
+        o2.banks = default_banks();
+        o2.network.mode = NetMode::Pcap;
+        assert!(o2.validate().unwrap_err().contains("pcap"));
+        o2.network.mode = NetMode::Off;
+        o2.validate().expect("an unplugged O2");
+        let mut indy = MachineConfig::default();
+        indy.network.mode = NetMode::Off;
+        assert!(indy.validate().unwrap_err().contains("only available on the O2"));
+    }
+
+    /// Every old `[o2]` key lands on the shared key it stood for, and the
+    /// section keeps only what is the O2's alone.
+    #[test]
+    fn deprecated_o2_keys_fold_into_shared_settings() {
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [machine]
+            profile = "o2_ip32"
+            cpu = "r10000"
+            [o2]
+            prom = "o2prom.bin"
+            flash = "o2flash.bin"
+            ram_mb = 384
+            serial_port = 2291
+            serial_log = "o2.log"
+            graphics = false
+            cpu_mhz = 195
+            net = false
+            mouse = false
+            control_port = 2293
+            forwards = [ { proto = "tcp", host_port = 2292, guest_port = 22 } ]
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert_eq!(cfg.prom, "o2prom.bin");
+        assert_eq!(cfg.nvram, "o2flash.bin");
+        assert_eq!(cfg.banks, banks_from4([256, 128, 0, 0]), "384 MB, largest kits first");
+        assert_eq!(cfg.serial_port_a, Some(2291));
+        assert_eq!(cfg.serial_log.as_deref(), Some("o2.log"));
+        assert!(cfg.headless);
+        assert_eq!(cfg.clock.fixed_mhz, Some(97.5));
+        assert_eq!(cfg.network.mode, NetMode::Off);
+        assert_eq!(cfg.port_forward.len(), 1);
+        assert_eq!(cfg.port_forward[0].host_port, 2292);
+        assert!(!cfg.o2.mouse);
+        assert_eq!(cfg.o2.control_port, Some(2293));
+        cfg.validate().expect("the folded config is a valid O2");
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        for gone in ["ram_mb =", "cpu_mhz =", "flash =", "forwards =", "graphics =", "serial_port =", "net ="] {
+            assert!(!s.contains(gone), "{gone} must not be written back:\n{s}");
+        }
+
+        // A shared key that is set wins over the old spelling.
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            prom = "mine.bin"
+            [machine]
+            profile = "o2_ip32"
+            [o2]
+            prom = "old.bin"
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert_eq!(cfg.prom, "mine.bin");
+    }
+
+    /// `[scsi.17]` is id 1 on controller 1, so one id can be on both
+    /// controllers; `controller = 1` on a low key still works; a key that
+    /// names a controller cannot be contradicted, two tables cannot name the
+    /// same target, and id 0 and controller 2 do not exist.
+    #[test]
+    fn slot_keys_place_targets_on_either_controller() {
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [machine]
+            profile = "indigo2_ip22"
+            [scsi.1]
+            path = "internal.raw"
+            [scsi.17]
+            path = "external.raw"
+            [scsi.4]
+            path = "cd.iso"
+            cdrom = true
+            controller = 1
+        "#).expect("parse");
+        cfg.validate().expect("two controllers, no collision");
+        assert_eq!(cfg.scsi[&1].placement(1), (0, 1));
+        assert_eq!(cfg.scsi[&17].placement(17), (1, 1));
+        assert_eq!(cfg.scsi[&4].placement(4), (1, 4));
+        assert_eq!(scsi_slot(1, 1), 17);
+        assert_eq!(scsi_label(0, 1), "SCSI ID 1");
+        assert_eq!(scsi_label(1, 1), "SCSI 1:1");
+
+        cfg.scsi.insert(20, ScsiDeviceConfig { path: "twice.iso".into(), cdrom: true, ..Default::default() });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("scsi.4 and scsi.20 both name SCSI 1:4"), "{err}");
+        cfg.scsi.remove(&20);
+
+        cfg.scsi.insert(18, ScsiDeviceConfig { path: "x.raw".into(), controller: 0, ..Default::default() });
+        cfg.validate().expect("controller 0 on a slot key is just the default");
+        cfg.scsi.get_mut(&18).unwrap().controller = 2;
+        assert!(cfg.validate().unwrap_err().contains("contradicts"));
+        cfg.scsi.remove(&18);
+
+        cfg.scsi.insert(16, ScsiDeviceConfig { path: "x.raw".into(), ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("out of range"));
+        cfg.scsi.remove(&16);
+        cfg.scsi.insert(33, ScsiDeviceConfig { path: "x.raw".into(), ..Default::default() });
+        assert!(cfg.validate().unwrap_err().contains("controller 2 is invalid"));
+        cfg.scsi.remove(&33);
+
+        cfg.machine.profile = MachineProfile::IndyIp24;
+        assert!(cfg.validate().unwrap_err().contains("this machine has one"));
+    }
+
+    /// An older O2 config's `o2.disks` becomes `[scsi.N]` entries, replacing
+    /// the default disks, and is gone from the section afterwards.
+    #[test]
+    fn deprecated_o2_disks_fold_into_scsi() {
+        let mut cfg: MachineConfig = toml::from_str(r#"
+            [machine]
+            profile = "o2_ip32"
+            [o2]
+            disks = [ { id = 1, path = "sys.raw", overlay = true },
+                      { id = 4, path = "cd.iso", cdrom = true, bus = 1 } ]
+        "#).expect("parse");
+        cfg.fold_deprecated();
+        assert!(cfg.o2.disks.is_empty());
+        assert_eq!(cfg.scsi.len(), 2, "the list replaces the default map");
+        assert_eq!(cfg.scsi[&1].path, "sys.raw");
+        assert!(cfg.scsi[&1].overlay);
+        assert_eq!(cfg.scsi[&1].controller, 0);
+        assert!(cfg.scsi[&4].is_cdrom());
+        assert_eq!(cfg.scsi[&4].controller, 1);
+        let s = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(!s.contains("disks"), "the deprecated key is never written back:\n{s}");
     }
 }
 

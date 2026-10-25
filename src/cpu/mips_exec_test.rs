@@ -279,6 +279,22 @@ mod tests {
         assert_eq!(exec.core.read_gpr(3), 0); // 32-bit wrapping add, result sign extended (0 -> 0)
     }
 
+    /// IRIX 6.5.22's IP32 `mte_set_tlb` (n32, 32-bit kernel, Status 0)
+    /// builds a CRIME linear-TLB pair `(1<<31|page) << 32 | (1<<31|page+1)`
+    /// with these exact words; the O2 recorded 0xffffffff80042041 instead.
+    #[test]
+    fn irix_crime_tlb_pair_builds_in_32bit_kernel_mode() {
+        let (mut exec, _) = create_executor();
+        exec.core.cp0_status = 0;
+        exec.core.write_gpr(16, 0x42040);
+        exec.core.write_gpr(4, 0x42041);
+        for w in [0x3c09_8000u32, 0x0130_7025, 0x000e_703c, 0x0124_6025, 0x000c_603c, 0x000c_603e, 0x018e_6025] {
+            assert_eq!(exec.exec(w), EXEC_COMPLETE, "{w:08x}");
+        }
+        assert_eq!(exec.core.read_gpr(14), 0x8004_2040_0000_0000);
+        assert_eq!(exec.core.read_gpr(12), 0x8004_2040_8004_2041);
+    }
+
     #[test]
     fn test_add_overflow() {
         let (mut exec, _) = create_executor();
@@ -911,6 +927,43 @@ mod tests {
         exec.core.cp0_entryhi = 10;
         assert_eq!(exec.read_data::<4>(0x1000).unwrap(), 0xAAAA_AAAA,
                    "setup: ASID 10 should see PFN 0x50");
+    }
+
+    /// A machine's physical alias (the O2's no-ECC view of memory at
+    /// 0x8000_0000) reaches memory at its target through both a TLB mapping
+    /// and XKPHYS; without one the address goes to the bus unchanged.
+    #[test]
+    fn a_physical_alias_reaches_its_target() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(a_physical_alias_reaches_its_target_inner)
+            .unwrap().join().unwrap();
+    }
+    fn a_physical_alias_reaches_its_target_inner() {
+        use crate::cpu::mips_tlb::MipsTlb;
+        let read = |alias: Option<(u64, u64, u64)>| {
+            let (mut exec, mem) = create_executor_with_tlb(MipsTlb::default());
+            exec.phys_alias = alias;
+            exec.core.cp0_status &= !crate::cpu::mips_core::STATUS_ERL;
+            exec.update_translate_fn();
+            // VA 0x1000, the odd page of VPN2 0, uncached at PFN 0x80001.
+            exec.core.cp0_index = 3;
+            exec.core.cp0_pagemask = 0;
+            exec.core.cp0_entryhi = 0;
+            exec.core.cp0_entrylo0 = 0;
+            exec.core.cp0_entrylo1 = (0x80001 << 6) | (2 << 3) | (1 << 2) | (1 << 1) | 1;
+            let tlbwi = (OP_COP0 << 26) | (0x10 << 21) | 0x02;
+            assert_eq!(exec.exec(tlbwi), EXEC_COMPLETE);
+            mem.set_word(0x4000_1000, 0x1234_5678);
+            mem.set_word(0x8000_1000, 0xdead_beef);
+            let mapped = exec.read_data::<4>(0x1000).unwrap();
+            exec.core.cp0_status |= crate::cpu::mips_core::STATUS_KX;
+            exec.update_translate_fn();
+            let xkphys = exec.read_data::<4>(0x9000_0000_8000_1000).unwrap();
+            (mapped, xkphys)
+        };
+        assert_eq!(read(Some((0x8000_0000, 0x4000_0000, 0x4000_0000))), (0x1234_5678, 0x1234_5678), "the alias reaches memory");
+        assert_eq!(read(None), (0xdead_beef, 0xdead_beef), "no alias: the address as it is");
     }
 
     #[test]

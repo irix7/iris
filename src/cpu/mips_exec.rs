@@ -1526,6 +1526,18 @@ pub struct MipsExecutor<T: Tlb, C: CpuModel> {
     /// recompiling to compare against).
     #[cfg(feature = "jitv2")]
     pub jitv2_dispatch_enabled: bool,
+    /// Called by the CPU thread between batches of instructions (about every
+    /// thousand), with the executor locked: for a machine that has to act on
+    /// where the guest is running (the O2 hands its cache over to the
+    /// shadow model once a kernel starts, and back when POST starts over).
+    /// None costs one check per batch.
+    pub batch_hook: Option<Box<dyn FnMut(&mut MipsExecutor<T, C>) + Send>>,
+    /// A window of physical addresses that reaches memory at another address,
+    /// `(base, size, target)`, applied to mapped and XKPHYS translations
+    /// before the bus sees the low 32 bits. The O2 has a no-ECC alias of its
+    /// memory at 0x8000_0000 that would otherwise reach the PCI window the
+    /// bus decodes there. None on the other machines.
+    pub phys_alias: Option<(u64, u64, u64)>,
     /// `jitcheck`'s hardware-read fixup: `validate_jit_determinism`'s two
     /// passes run at genuinely different real wall-clock speed, so any
     /// device register whose value is driven by host time (e.g. the MC's
@@ -2951,6 +2963,8 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
             // `j2 dispatch on|off` still flips it at runtime.
             #[cfg(feature = "jitv2")]
             jitv2_dispatch_enabled: !matches!(std::env::var("IRIS_JIT_DISPATCH").as_deref(), Ok("off") | Ok("0")),
+            batch_hook: None,
+            phys_alias: None,
             #[cfg(feature = "developer")]
             hw_read_fixup_replay: None,
             #[cfg(feature = "developer")]
@@ -3098,8 +3112,10 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         // Publish for the async compile worker, which owns its Codegen by
         // value and so cannot be stamped directly (see worker_loop).
         let core_addr = &mut self.core as *mut MipsCore as usize;
+        let geometry_changed;
         {
             let j = self.jitv2.lock();
+            geometry_changed = *j.dc_geometry.lock() != geom && j.pages_used() > 0;
             *j.dc_geometry.lock() = geom;
             // Everything codegen may bake as an immediate reaches its final
             // value here — this method is the last thing that moves any of
@@ -3136,6 +3152,22 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
         self.core.jit_tc_base = self.cache.tcache_base_ptr();
         self.core.jit_tc_gen = self.cache.tcache_gen_ptr();
         self.core.jit_l2_tags = self.cache.jit_l2_tags_ptr();
+        // A cache that changes shape at run time (the O2's hand-over from the
+        // full model to the tagless one once a kernel starts): code compiled
+        // so far probes the old shape, and the compile workers took their
+        // geometry when they started. Flushing discards that code and
+        // restarts the workers, which then read the geometry published
+        // above. Without it, every inline load on the O2 probed the full
+        // model's emptied tags and called out (73M helper calls a second
+        // at idle); going back to the full model on a reboot would also
+        // leave tagless code reading memory under the full model's dirty
+        // lines.
+        if geometry_changed {
+            unsafe { self.jitv2.lock().flush_from_cpu_thread(self.sysad.clone()); }
+            // Not clear_pcp alone: the fetch nanotlb would still hit, and
+            // nothing would re-derive the page step_jit needs.
+            self.nanotlb_invalidate();
+        }
     }
 
     /// Install JIT v2's memory-access and exception-delivery hooks
@@ -5151,7 +5183,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         let phys_addr = virt_addr & 0x07FF_FFFF_FFFF_FFFF;
                         // bits_61_59 is the C field directly: 2=Uncached, 3=Cacheable, 5=CacheableCoherent
                         let c = match bits_61_59 { 3 | 5 => bits_61_59 as u32, _ => TR_UNCACHED };
-                        TranslateResult::ok(phys_addr, c)
+                        TranslateResult::ok(self.fold_phys_alias(phys_addr), c)
                     } else {
                         if !DEBUG { self.core.cp0_badvaddr = virt_addr; }
                         TranslateResult::exc(exec_exception(if access_type == AccessType::Write { EXC_ADES } else { EXC_ADEL }))
@@ -5204,6 +5236,15 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         }
     }
 
+    /// A physical address through [`Self::phys_alias`], if it falls in it.
+    #[inline(always)]
+    fn fold_phys_alias(&self, pa: u64) -> u64 {
+        match self.phys_alias {
+            Some((base, size, target)) if pa.wrapping_sub(base) < size => pa - base + target,
+            _ => pa,
+        }
+    }
+
     /// TLB translation.  When `DEBUG` is true, CP0 side-effect registers are
     /// not written on miss/invalid/modified — the exception result is still
     /// returned so the caller knows the translation failed.
@@ -5228,7 +5269,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                     // ok_mapped, not ok: this came from the TLB, so the nutlb
                     // fill needs TR_MAPPED plus the entry's G bit to decide
                     // whether to ASID-qualify the tag it stores.
-                    TranslateResult::ok_mapped(phys_addr, cache_attr as u32, global)
+                    TranslateResult::ok_mapped(self.fold_phys_alias(phys_addr), cache_attr as u32, global)
                 }
             }
             TlbResult::Miss { .. } => {
@@ -12144,11 +12185,12 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     #[cfg(not(feature = "jitv2"))]
                     run_batch!(step_int);
                 }
+                if let Some(mut hook) = guard.batch_hook.take() {
+                    hook(&mut guard);
+                    guard.batch_hook = Some(hook);
+                }
                 // Fire any guest-time deadlines the batch crossed (8254 PIT
                 // channels and, harmlessly, the no-callback Compare entry).
-                // The Compare IP7 itself is delivered per-instruction by the
-                // step preamble's threshold check; this drains the rest of the
-                // one ordered queue.
                 guard.drain_guest_timers();
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {

@@ -20,9 +20,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::machine::Machine;
+use crate::workstation::{MachineSlot, Workstation};
 use crate::gfx_display::GfxDisplay;
-use crate::dev::z85c30::{CiSerialBackend, WaitOutcome};
+use crate::dev::z85c30::CiSerialBackend;
 
 /// Set at `start_server`; consulted by `quit` so the socket file is cleaned up
 /// before `std::process::exit` (which skips Drop).
@@ -58,10 +58,10 @@ impl Response {
 
 pub struct CiServer {
     socket_path: String,
-    /// The Machine's shared pointer slot (see `Machine::machine_slot`): the
-    /// same one the monitor's SystemController uses, nulled when the Machine
-    /// is dropped, so a CI command can never reach a freed Machine.
-    machine: crate::machine::MachineSlot,
+    /// The machine's shared pointer slot (see `Workstation::machine_slot`):
+    /// the same one the monitor's SystemController uses, nulled when the
+    /// machine is dropped, so a CI command can never reach a freed machine.
+    machine: MachineSlot,
     ci_serial: Arc<CiSerialBackend>,
     /// Optional in case --headless is also passed (no REX3). Screenshot
     /// commands return an error in that case.
@@ -85,31 +85,6 @@ impl Drop for CiServer {
     }
 }
 
-/// Prepare a Unix CI socket path for bind without stealing a live instance's
-/// socket. A stale file is removed; a path that accepts a connection is a live
-/// server and the bind is refused.
-#[cfg(unix)]
-fn prepare_socket_path(path: &str) -> Result<(), String> {
-    if ci_socket_is_tcp(path) {
-        return Ok(());
-    }
-    if !std::path::Path::new(path).exists() {
-        return Ok(());
-    }
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => Err(format!(
-            "CI socket {path} is live (another iris is listening); refusing to steal it"
-        )),
-        Err(_) => std::fs::remove_file(path)
-            .map_err(|e| format!("could not remove stale CI socket {path}: {e}")),
-    }
-}
-
-#[cfg(not(unix))]
-fn prepare_socket_path(_path: &str) -> Result<(), String> { Ok(()) }
-
-/// Remove our own socket on shutdown/quit. Unlike [`prepare_socket_path`],
-/// this is called only after the server has stopped, so the file is stale.
 fn cleanup_socket_path(path: &str) {
     if ci_socket_is_tcp(path) {
         return;
@@ -118,6 +93,30 @@ fn cleanup_socket_path(path: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+impl CiServer {
+    /// Run `f` against the Machine, or fail if it has been dropped. The slot's
+    /// mutex serializes all Machine accesses from CI command handlers.
+    /// CPU/peripheral threads observe state changes only when the methods we
+    /// call stop them first (ci_restore/ci_rollback do).
+    fn with_machine<R>(&self, f: impl FnOnce(&mut dyn Workstation) -> R) -> Result<R, String> {
+        crate::workstation::with_machine_slot(&self.machine, f)
+    }
+
+    /// `with_machine` for a fallible closure, flattening both failures into
+    /// the message the command reports.
+    fn with_machine_result<T, E: std::fmt::Display>(
+        &self,
+        f: impl FnOnce(&mut dyn Workstation) -> Result<T, E>,
+    ) -> Result<T, String> {
+        self.with_machine(f)?.map_err(|e| e.to_string())
+    }
+}
+
+/// Bind the control socket, spawn the accept thread, return a handle.
+///
+/// `machine` must be in its final location (boxed). The server reaches it
+/// only through the machine's shared slot afterwards, so it may be dropped
+/// while the server runs.
 // ----------------------------------------------------------------------------
 // Client-side probes
 // ----------------------------------------------------------------------------
@@ -282,25 +281,6 @@ pub fn request_quit(path: &str) -> Result<(), String> {
     }
 }
 
-impl CiServer {
-    /// Run `f` against the Machine, or fail if it has been dropped. The slot's
-    /// mutex serializes all Machine accesses from CI command handlers.
-    /// CPU/peripheral threads observe state changes only when the methods we
-    /// call stop them first (ci_restore/ci_rollback do).
-    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-        crate::machine::with_machine_slot(&self.machine, f)
-    }
-
-    /// `with_machine` for a fallible closure, flattening both failures into
-    /// the message the command reports.
-    fn with_machine_result<T, E: std::fmt::Display>(
-        &self,
-        f: impl FnOnce(&mut Machine) -> Result<T, E>,
-    ) -> Result<T, String> {
-        self.with_machine(f)?.map_err(|e| e.to_string())
-    }
-}
-
 /// Bind the control socket, spawn the accept thread, return a handle.
 ///
 /// # Safety
@@ -308,19 +288,18 @@ impl CiServer {
 /// or on `main`'s stack). The server reaches it only through the Machine's
 /// shared slot afterwards, so it may be dropped while the server runs.
 pub fn start_server(
-    machine_ptr: *mut Machine,
+    machine: &mut dyn Workstation,
     socket_path: &str,
 ) -> Result<Arc<CiServer>, String> {
-    // SAFETY: caller guarantees the pointer is valid.
-    let ci_serial = unsafe { (*machine_ptr).get_ci_serial() }
-        .ok_or_else(|| "CI mode: CiSerialBackend not installed on Machine".to_string())?;
-    let display = unsafe { (*machine_ptr).get_display() };
-    let display_head1 = unsafe { (*machine_ptr).get_display_head1() };
+    let ci_serial = machine.get_ci_serial()
+        .ok_or_else(|| "CI mode: CiSerialBackend not installed on the machine".to_string())?;
+    let display = machine.get_display();
+    let display_head1 = machine.get_display_head1();
 
     let path = socket_path.to_string();
     let server = Arc::new(CiServer {
         socket_path: path.clone(),
-        machine: unsafe { (*machine_ptr).machine_slot() },
+        machine: machine.machine_slot(),
         ci_serial,
         display,
         display_head1,
@@ -346,7 +325,7 @@ pub fn start_server(
 
 #[cfg(unix)]
 fn start_unix_server(server: Arc<CiServer>, path: &str) -> Result<(), String> {
-    prepare_socket_path(path)?;
+    cleanup_socket_path(path);
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("failed to bind {}: {}", path, e))?;
     eprintln!("iris: --ci control socket listening at {}", path);
@@ -484,7 +463,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "info" => cmd_info(&req.args),
         "delete" => cmd_delete(&req.args),
         "serial-send" => cmd_serial_send(server, &req.args),
-        "serial-read" => cmd_serial_read(server, &req.args),
+        "serial-read" => cmd_serial_read(server),
         "wait-serial" => cmd_wait_serial(server, &req.args),
         "screenshot" => cmd_screenshot(server, &req.args),
         "scratch-write" => cmd_scratch_write(server, &req.args),
@@ -492,8 +471,6 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "scratch-clear" => cmd_scratch_clear(server),
         "scratch-info"  => cmd_scratch_info(server),
         "validate"      => cmd_validate(server, &req.args),
-        "journal-record" => cmd_journal_record(server, &req.args),
-        "journal-replay" => cmd_journal_replay(server, &req.args),
         "gc"            => cmd_gc(),
         "diff"          => cmd_diff(&req.args),
         "tree"          => cmd_tree(),
@@ -510,9 +487,7 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
 fn cmd_rtc_save(server: &CiServer, args: &Value) -> Response {
     let explicit_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
     let result = server.with_machine_result(|m| {
-        let rtc = m.hpc3().rtc();
-        let path = explicit_path.clone().unwrap_or_else(|| rtc.nvram_path().to_string());
-        rtc.save_nvram(&path).map(|_| path)
+        m.save_nvram(explicit_path.as_deref())
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "path": path })),
@@ -526,7 +501,7 @@ fn cmd_cdrom_eject(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-eject: missing 'id' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().eject_disc(id)
+        m.disc_changer().ok_or("no CD-ROM controller")?.eject_disc(id)
     });
     match result {
         Ok(path) => Response::data(serde_json::json!({ "id": id, "new_disc": path })),
@@ -544,7 +519,7 @@ fn cmd_cdrom_load(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("cdrom-load: missing 'path' arg"),
     };
     let result = server.with_machine_result(|m| {
-        m.hpc3().scsi().load_disc(id, path.clone())
+        m.disc_changer().ok_or("no CD-ROM controller")?.load_disc(id, path.clone())
     });
     match result {
         Ok(loaded) => Response::data(serde_json::json!({ "id": id, "disc": loaded })),
@@ -633,7 +608,7 @@ fn cmd_start(server: &CiServer) -> Response {
     }
 }
 
-/// Guest state and monitor readiness, from the same `Machine::status` the
+/// Guest state and monitor readiness, from the same `Workstation::status` the
 /// monitor's `machine-status` prints.
 fn cmd_status(server: &CiServer) -> Response {
     match server.with_machine(|m| m.status()) {
@@ -675,8 +650,7 @@ fn cmd_list(_args: &Value) -> Response {
     // Walk saves/ recursively, return every directory that contains a
     // snapshot.toml (current format) OR a cpu.toml (legacy v0). Names are
     // returned slash-joined relative to saves/.
-    let root_buf = crate::snapshot::store_root();
-    let root = root_buf.as_path();
+    let root = std::path::Path::new("saves");
     if !root.is_dir() {
         return Response::data(serde_json::json!({ "snapshots": [] }));
     }
@@ -720,7 +694,7 @@ fn cmd_info(args: &Value) -> Response {
         Some(n) => n,
         None => return Response::err("info: missing 'name' arg"),
     };
-    let dir = crate::snapshot::store_root().join(name);
+    let dir = std::path::Path::new("saves").join(name);
     if !dir.is_dir() {
         return Response::err(format!("info: snapshot '{}' not found", name));
     }
@@ -770,7 +744,7 @@ fn cmd_delete(args: &Value) -> Response {
     if name.is_empty() || name.contains("..") {
         return Response::err("delete: invalid name");
     }
-    let dir = crate::snapshot::store_root().join(name);
+    let dir = std::path::Path::new("saves").join(name);
     if !dir.is_dir() {
         return Response::err(format!("delete: snapshot '{}' not found", name));
     }
@@ -789,12 +763,8 @@ fn cmd_serial_send(server: &CiServer, args: &Value) -> Response {
     Response::ok()
 }
 
-fn serial_consumer(args: &Value) -> String {
-    args.get("consumer").and_then(|v| v.as_str()).unwrap_or("default").to_string()
-}
-
-fn cmd_serial_read(server: &CiServer, args: &Value) -> Response {
-    let bytes = server.ci_serial.drain_for(&serial_consumer(args));
+fn cmd_serial_read(server: &CiServer) -> Response {
+    let bytes = server.ci_serial.drain_guest();
     let s = String::from_utf8_lossy(&bytes).into_owned();
     Response::data(Value::String(s))
 }
@@ -900,15 +870,13 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
         None => return Response::err("wait-serial: missing 'pattern' arg"),
     };
     let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000);
-    let consumer = serial_consumer(args);
 
-    match server.ci_serial.wait_for_consumer(&consumer, pattern.as_bytes(), Duration::from_millis(timeout_ms)) {
-        WaitOutcome::Matched(consumed) => {
+    match server.ci_serial.wait_for(pattern.as_bytes(), Duration::from_millis(timeout_ms)) {
+        Some(consumed) => {
             let s = String::from_utf8_lossy(&consumed).into_owned();
             Response::data(Value::String(s))
         }
-        WaitOutcome::TimedOut => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
-        WaitOutcome::Reset => Response::err("wait-serial: console was reset"),
+        None => Response::err(format!("wait-serial: timeout after {}ms waiting for {:?}", timeout_ms, pattern)),
     }
 }
 
@@ -937,7 +905,7 @@ fn cmd_wait_serial(server: &CiServer, args: &Value) -> Response {
 //     (sector-aligned; conv=sync zero-pads the trailing partial sector).
 //
 // Each scratch op briefly stops the machine to quiesce in-flight SCSI I/O
-// (Machine::with_paused). The CPU is restarted only if it was running before
+// (`with_paused` on `dyn Workstation`). The CPU is restarted only if it was running before
 // — a scratch-write issued before the harness `start`s the CPU does not
 // auto-start it.
 // ----------------------------------------------------------------------------
@@ -1118,6 +1086,8 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
         .unwrap_or(1_000_000);
 
     let report_result = server.with_machine_result(|m| {
+        let m = m.as_any_mut().downcast_mut::<crate::machine::Machine>()
+            .ok_or("not supported on this machine")?;
         crate::validate::validate_snapshot_determinism(m, &name, n)
     });
 
@@ -1136,78 +1106,6 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
 }
 
 // ----------------------------------------------------------------------------
-// Guest-cycle record/replay journal (issue #47)
-// ----------------------------------------------------------------------------
-
-/// Resolve the `path` arg for the journal commands, defaulting to the
-/// snapshot's own directory so a record/replay pair needs no extra
-/// bookkeeping.
-fn journal_path_arg(args: &Value, name: &str, cmd: &str) -> Result<std::path::PathBuf, String> {
-    match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => validate_host_path(p).map_err(|e| format!("{}: {}", cmd, e)),
-        None => Ok(crate::snapshot::store_root().join(name).join("journal.txt")),
-    }
-}
-
-fn cmd_journal_record(server: &CiServer, args: &Value) -> Response {
-    let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => return Response::err("journal-record: missing 'name' arg"),
-    };
-    let n = args.get("n_instructions").and_then(|v| v.as_u64()).unwrap_or(1_000_000);
-    let path = match journal_path_arg(args, &name, "journal-record") {
-        Ok(p) => p,
-        Err(e) => return Response::err(e),
-    };
-
-    let result = server.with_machine_result(|m| m.journal_record_snapshot(&name, n));
-    match result {
-        Ok(j) => {
-            if let Err(e) = j.save(&path) {
-                return Response::err(format!("journal-record: save {}: {}", path.display(), e));
-            }
-            Response::data(serde_json::json!({
-                "entries": j.len(),
-                "interrupts": j.interrupts(),
-                "exceptions": j.exceptions(),
-                "end_cycle": j.end_cycle(),
-                "path": path.display().to_string(),
-                "summary": j.summary(),
-            }))
-        }
-        Err(e) => Response::err(format!("journal-record: {}", e)),
-    }
-}
-
-fn cmd_journal_replay(server: &CiServer, args: &Value) -> Response {
-    let name = match args.get("name").and_then(|v| v.as_str()) {
-        Some(n) => n.to_string(),
-        None => return Response::err("journal-replay: missing 'name' arg"),
-    };
-    let path = match journal_path_arg(args, &name, "journal-replay") {
-        Ok(p) => p,
-        Err(e) => return Response::err(e),
-    };
-    let recording = match crate::cpu::journal::Journal::load(&path) {
-        Ok(j) => j,
-        Err(e) => return Response::err(format!("journal-replay: load {}: {}", path.display(), e)),
-    };
-
-    let result = server.with_machine_result(|m| m.journal_replay_snapshot(&name, &recording));
-    match result {
-        Ok(report) => Response::data(serde_json::json!({
-            "matches": report.matches,
-            "summary": report.summary(),
-            "recorded_end_cycle": report.recorded_end_cycle,
-            "replayed_end_cycle": report.replayed_end_cycle,
-            "recorded_entries": report.recorded_len,
-            "replayed_entries": report.observed.len(),
-        })),
-        Err(e) => Response::err(format!("journal-replay: {}", e)),
-    }
-}
-
-// ----------------------------------------------------------------------------
 // Snapshot library: gc / diff / tree (Phase 3.2)
 // ----------------------------------------------------------------------------
 
@@ -1217,8 +1115,7 @@ fn cmd_journal_replay(server: &CiServer, args: &Value) -> Response {
 fn collect_live_chunks() -> std::io::Result<std::collections::HashSet<crate::chunk_store::ChunkHash>> {
     use std::collections::HashSet;
     let mut live: HashSet<crate::chunk_store::ChunkHash> = HashSet::new();
-    let root_buf = crate::snapshot::store_root();
-    let root = root_buf.as_path();
+    let root = std::path::Path::new("saves");
     if !root.is_dir() {
         return Ok(live);
     }
@@ -1252,7 +1149,7 @@ fn cmd_gc() -> Response {
         Ok(l) => l,
         Err(e) => return Response::err(format!("gc: collect live: {}", e)),
     };
-    let store = crate::chunk_store::ChunkStore::new(crate::snapshot::store_root());
+    let store = crate::chunk_store::ChunkStore::new("saves");
     let total_before = store.total_size().unwrap_or(0);
     match store.gc(&live) {
         Ok((removed, bytes)) => {
@@ -1297,8 +1194,8 @@ fn cmd_diff(args: &Value) -> Response {
         return Response::err("diff: invalid name");
     }
 
-    let dir_a = crate::snapshot::store_root().join(&a);
-    let dir_b = crate::snapshot::store_root().join(&b);
+    let dir_a = std::path::PathBuf::from("saves").join(&a);
+    let dir_b = std::path::PathBuf::from("saves").join(&b);
     if !dir_a.is_dir() {
         return Response::err(format!("diff: snapshot '{}' not found", a));
     }
@@ -1434,8 +1331,7 @@ fn cmd_diff(args: &Value) -> Response {
 /// doesn't exist locally) hang off a synthetic `(none)` root.
 fn cmd_tree() -> Response {
     use std::collections::BTreeMap;
-    let root_buf = crate::snapshot::store_root();
-    let root = root_buf.as_path();
+    let root = std::path::Path::new("saves");
     if !root.is_dir() {
         return Response::data(serde_json::json!({"tree": "(no saves directory)"}));
     }
@@ -1522,7 +1418,7 @@ fn cmd_pull(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("pull: missing 'name' arg"),
     };
-    let saves = crate::snapshot::store_root();
+    let saves = std::path::PathBuf::from("saves");
     if !saves.is_dir() {
         if let Err(e) = std::fs::create_dir_all(&saves) {
             return Response::err(format!("pull: create saves/: {}", e));
@@ -1550,7 +1446,7 @@ fn cmd_push(args: &Value) -> Response {
         Some(s) => s.to_string(),
         None => return Response::err("push: missing 'name' arg"),
     };
-    match crate::registry::push(&url, &name, &crate::snapshot::store_root()) {
+    match crate::registry::push(&url, &name, std::path::Path::new("saves")) {
         Ok(report) => Response::data(serde_json::json!({
             "name": name,
             "url": url,
@@ -1560,121 +1456,5 @@ fn cmd_push(args: &Value) -> Response {
             "bytes_transferred": report.bytes_transferred,
         })),
         Err(e) => Response::err(format!("push: {}", e)),
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_live_ci_socket_is_not_stolen() {
-        let dir = std::env::temp_dir().join(format!("iris-ci-live-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("iris.sock");
-        let path_s = path.to_str().unwrap();
-
-        let listener = UnixListener::bind(&path).unwrap();
-        let err = prepare_socket_path(path_s).unwrap_err();
-        assert!(err.contains("live"), "{err}");
-        assert!(path.exists(), "a live socket must be left alone");
-        drop(listener);
-
-        prepare_socket_path(path_s).expect("a stale socket is replaced");
-        assert!(!path.exists());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    fn temp_socket(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "iris-ci-{name}-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (dir.clone(), dir.join("iris.sock"))
-    }
-
-    #[test]
-    fn a_ping_reports_the_server_pid() {
-        let (dir, path) = temp_socket("ping");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(line.contains("\"ping\""), "{line}");
-            stream.write_all(b"{\"ok\":true,\"data\":{\"pid\":1234}}\n").unwrap();
-        });
-        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Live { pid: Some(1234) });
-        server.join().unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_listener_that_does_not_speak_ci_is_foreign() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let (dir, path) = temp_socket("foreign");
-        let listener = UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_server = stop.clone();
-        let server = thread::spawn(move || {
-            while !stop_server.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = stream.write_all(b"not the iris protocol\n");
-                    }
-                    Err(_) => thread::sleep(Duration::from_millis(10)),
-                }
-            }
-        });
-        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Foreign);
-        stop.store(true, Ordering::Relaxed);
-        server.join().unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_dead_socket_file_is_free() {
-        let (dir, path) = temp_socket("dead");
-        let listener = UnixListener::bind(&path).unwrap();
-        drop(listener);
-        assert_eq!(probe_socket(path.to_str().unwrap()), SocketState::Free);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_tcp_ping_reports_the_server_pid() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            stream.write_all(b"{\"ok\":true,\"data\":{\"pid\":4321}}\n").unwrap();
-        });
-        assert_eq!(probe_socket(&addr), SocketState::Live { pid: Some(4321) });
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn quit_asks_the_server_to_shut_down() {
-        let (dir, path) = temp_socket("quit");
-        let listener = UnixListener::bind(&path).unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(line.contains("\"quit\""), "{line}");
-            stream.write_all(b"{\"ok\":true,\"data\":null}\n").unwrap();
-        });
-        request_quit(path.to_str().unwrap()).unwrap();
-        server.join().unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

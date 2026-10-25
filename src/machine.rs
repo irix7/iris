@@ -6,7 +6,7 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig};
+use crate::config::{GraphicsBoard, MachineConfig, MachineProfile, NetworkConfig, ScsiDeviceConfig};
 use crate::machine_state::{GuestState, MachineStatus, TransitionAck};
 use crate::traits::{BusDevice, Device, Resettable, Saveable, MachineEvent};
 use crate::locks::LockMonitor;
@@ -41,6 +41,7 @@ use crate::snapshot::{Snapshot, Manifest, SCHEMA_VERSION, ChunksManifest, DiskRe
 use crate::state_desc::{value_signature, value_field_list};
 use crate::chunk_store::{ChunkStore, get_chunks_as_words, put_words_as_chunks, put_words_as_chunks_selective};
 use crate::hptimer::TimerManager;
+use crate::workstation::{MachineRef, MachineSlot, SystemController, Workstation};
 
 pub fn emulator_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -179,7 +180,7 @@ struct RollbackCheckpoint {
 /// capture and snapshot load so the two paths can't drift.
 /// Inverse of `parse_cow_table`: build a `{"scsi<id>": [dirty sectors...]}`
 /// table from `export_overlays`'s output.
-fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
+pub(crate) fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     let mut tbl = toml::map::Map::new();
     for (id, dirty) in overlays {
         let arr: Vec<toml::Value> = dirty.into_iter().map(|v| toml::Value::Integer(v as i64)).collect();
@@ -188,7 +189,7 @@ fn build_cow_table(overlays: Vec<(usize, Vec<u64>)>) -> toml::Value {
     toml::Value::Table(tbl)
 }
 
-fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
+pub(crate) fn parse_cow_table(cow_toml: &toml::Value) -> Vec<(usize, Vec<u64>)> {
     let mut sets = Vec::new();
     if let Some(tbl) = cow_toml.as_table() {
         for (k, v) in tbl {
@@ -495,8 +496,9 @@ impl Machine {
 
         // 1. Create all devices first
         // Memory Controller
+        let mc_banks: [u32; 4] = cfg.banks[..4].try_into().expect("the MC has four banks");
         let mc = MemoryController::new_for_profile(
-            eeprom_mc.clone(), guinness, cfg.banks, cfg.machine.profile.ip28());
+            eeprom_mc.clone(), guinness, mc_banks, cfg.machine.profile.ip28());
         // IP28: IRIX takes the CPU speed from the PROM's `cpufreq` (194, i.e.
         // a 195 MHz R10000) instead of measuring it, and times with it: UST
         // assumes Count at half that, and the RPSS cycle counter the MC clock
@@ -628,42 +630,39 @@ impl Machine {
             if initialized { eeprom.update_ip28_checksum(); }
         }
 
-        // Attach SCSI devices from config (IDs 1–7).
-        let mut scsi_ids: Vec<u8> = cfg.scsi.keys().copied().collect();
-        scsi_ids.sort();
-        // CI mode: isolate each COW overlay so an interactive iris holding
-        // {base}.overlay can coexist with any number of `--ci` processes.
-        // By default the overlay lives under /tmp; IRIS_COW_OVERLAY_DIR moves
-        // it into that directory instead (per-task rigs keep it on the shared
-        // volume). Files are kept for post-mortem inspection; cleanup
-        // happens on machine drop below.
+        // Attach SCSI devices from config: each `[scsi.KEY]` table puts a
+        // target on a controller (`ScsiDeviceConfig::placement`).
+        let mut scsi_keys: Vec<u8> = cfg.scsi.keys().copied().collect();
+        scsi_keys.sort();
         let ci_pid = std::process::id();
         // Track the on-disk path of any scratch device so the CI socket can
         // read/write its bytes directly (Phase 2.4).
         let mut scratch_path: Option<std::path::PathBuf> = None;
-        for id in scsi_ids {
-            let dev = &cfg.scsi[&id];
+        for key in scsi_keys {
+            let dev = &cfg.scsi[&key];
+            let (controller, id) = dev.placement(key);
+            let label = crate::config::scsi_label(controller, id);
             // DaynaPort SCSI/Link: a network adapter, not storage. None of the
             // scratch / changer / overlay handling below applies — it has no
             // image at all.
             if dev.is_daynaport() {
-                let params = match dev.daynaport_params(id) {
+                let params = match dev.daynaport_params(key) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("iris: fatal: SCSI ID {}: {}", id, e);
+                        eprintln!("iris: fatal: {}: {}", label, e);
                         crate::instance::cleanup_for_exit();
                         std::process::exit(1);
                     }
                 };
-                match hpc3.add_scsi_daynaport(dev.controller, id as usize, params) {
+                match hpc3.add_scsi_daynaport(controller, id as usize, params) {
                     Ok(()) => println!(
-                        "iris: DaynaPort SCSI/Link at SCSI ID {} — MAC {}, gateway {} (guest {}/{})",
-                        id, crate::net::mac_str(&params.mac),
+                        "iris: DaynaPort SCSI/Link at {} — MAC {}, gateway {} (guest {}/{})",
+                        label, crate::net::mac_str(&params.mac),
                         params.subnet.gateway_ip, params.subnet.client_ip, params.subnet.netmask),
                     Err(e) => {
-                        let msg = format!("could not attach DaynaPort to SCSI ID {id}: {e}");
+                        let msg = format!("could not attach DaynaPort to {label}: {e}");
                         if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                            eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                            eprintln!("iris: warning: {msg}; continuing without {label}");
                         } else {
                             eprintln!("iris: fatal: {msg}");
                             crate::instance::cleanup_for_exit();
@@ -673,62 +672,28 @@ impl Machine {
                 }
                 continue;
             }
-            // Scratch volume: pre-create a raw file with a minimal SGI Volume
-            // Header if it doesn't exist. Refuse cdrom/overlay combinations —
-            // scratch must be a host-writable raw file. Default size 64 MB.
-            //
-            // The VH lays out partition 7 ("vol") spanning sectors 8..end and
-            // partition 8 ("vh") spanning sectors 0..7 (the VH itself).
-            // Without a VH, IRIX recognises the device but returns I/O error
-            // on every read because /dev/rdsk/dks0dNvh and /dev/rdsk/dks0dNvol
-            // both consult the partition table at sector 0.
-            //
-            // Convention: host writes payload via scratch-write at offset >=
-            // SCRATCH_PAYLOAD_OFFSET (4096). Guest reads from offset 0 of
-            // /dev/rdsk/dks0dNvol (which maps to sector 8 of the disk by
-            // partition 7's first_block=8).
-            if dev.scratch {
-                if dev.cdrom || dev.overlay {
-                    println!("Note: SCSI ID {}: scratch=true is incompatible with cdrom/overlay; ignoring scratch flag", id);
+            // Scratch volume (see `ScsiDeviceConfig::prepare_scratch`): the
+            // file gets an SGI volume header, without which IRIX returns I/O
+            // errors on every read of /dev/rdsk/dks0dNvh and dks0dNvol.
+            // Convention: the host writes its payload at offset >=
+            // SCRATCH_PAYLOAD_OFFSET (4096); the guest reads from offset 0 of
+            // the vol partition, which starts at sector 8.
+            if let Some(path) = dev.prepare_scratch(key) {
+                if scratch_path.is_some() {
+                    println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
                 } else {
-                    let path = std::path::Path::new(&dev.path);
-                    if !path.exists() {
-                        let size_mb = dev.size_mb.unwrap_or(64) as u64;
-                        let bytes = size_mb * 1024 * 1024;
-                        match crate::sgi_vh::create_scratch_image(path, bytes) {
-                            Ok(()) => println!("iris: created scratch volume {} ({} MB, with SGI VH)", dev.path, size_mb),
-                            Err(e) => println!("Note: could not create scratch volume {}: {}", dev.path, e),
-                        }
-                    }
-                    if scratch_path.is_some() {
-                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
-                    } else {
-                        scratch_path = Some(path.to_path_buf());
-                    }
+                    scratch_path = Some(path);
                 }
             }
-            let (path, discs) = if dev.cdrom {
-                // Build the changer list, skipping empty paths (an empty path
-                // means "drive present, tray empty" — a valid CD-ROM state
-                // where media is loaded later at runtime).
-                let mut list: Vec<String> = Vec::new();
-                if !dev.path.is_empty() {
-                    list.push(dev.path.clone());
-                }
-                for d in &dev.discs {
-                    if !d.is_empty() && !list.contains(d) {
-                        list.push(d.clone());
-                    }
-                }
-                // Active disc is the first entry, or empty (no media) if none.
-                let active = list.first().cloned().unwrap_or_default();
-                (active, list)
-            } else {
-                (dev.path.clone(), vec![])
-            };
-            let result = if ci_enabled && dev.overlay && !dev.cdrom {
+            let (path, discs) = dev.media();
+            let cdrom = dev.is_cdrom();
+            // CI mode: isolate each COW overlay under /tmp so an interactive
+            // iris holding {base}.overlay can coexist with any number of `--ci`
+            // processes; cleanup happens on machine drop below.
+            let result = if ci_enabled && dev.overlay && !cdrom {
                 // IRIS_COW_OVERLAY_DIR relocates the CI overlay; without it,
-                // keep the historical /tmp location keyed by pid.
+                // keep the historical /tmp location keyed by pid, or the
+                // instance's state directory when there is one.
                 let ci_overlay = match std::env::var_os("IRIS_COW_OVERLAY_DIR") {
                     Some(dir) => format!("{}/scsi{}.overlay", dir.to_string_lossy(), id),
                     None => match cfg.state_dir.as_deref() {
@@ -736,9 +701,9 @@ impl Machine {
                         None => format!("/tmp/iris-ci-{}-scsi{}.overlay", ci_pid, id),
                     },
                 };
-                hpc3.add_scsi_device_with_overlay(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay, &ci_overlay)
+                hpc3.add_scsi_device_with_overlay(controller, id as usize, &path, cdrom, discs, dev.overlay, &ci_overlay)
             } else {
-                hpc3.add_scsi_device(dev.controller, id as usize, &path, dev.cdrom, discs, dev.overlay)
+                hpc3.add_scsi_device(controller, id as usize, &path, cdrom, discs, dev.overlay)
             };
             if let Err(e) = result {
                 // A configured disk that won't attach (missing/corrupt image,
@@ -754,9 +719,9 @@ impl Machine {
                 // skip just this device and boot without it; the GUI's Start
                 // preflight already warns the user about an unreadable disk, and
                 // they can stop, re-pick or detach it, and start again.
-                let msg = format!("could not attach {path} to SCSI ID {id}: {e}");
+                let msg = format!("could not attach {path} to {label}: {e}");
                 if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                    eprintln!("iris: warning: {msg}; continuing without SCSI ID {id}");
+                    eprintln!("iris: warning: {msg}; continuing without {label}");
                     continue;
                 }
                 eprintln!("iris: fatal: {msg}");
@@ -767,12 +732,14 @@ impl Machine {
 
         // Disk + nvram provenance for snapshot manifests. Captured here while
         // the MachineConfig `cfg` is still in scope (it is shadowed by the CPU
-        // config below). Identity is the configured path + host file size.
+        // config below). Identity is the slot (controller * 16 + id, see
+        // `config::scsi_slot`), the configured path and the host file size.
         let mut disk_provenance: Vec<DiskRef> = cfg.scsi.iter()
             .filter(|(_, dev)| !dev.is_daynaport()) // no image behind a DaynaPort
-            .map(|(&id, dev)| {
+            .map(|(&key, dev)| {
+                let (controller, id) = dev.placement(key);
                 let size_bytes = std::fs::metadata(&dev.path).map(|m| m.len()).unwrap_or(0);
-                DiskRef { id, path: dev.path.clone(), size_bytes }
+                DiskRef { id: crate::config::scsi_slot(controller, id), path: dev.path.clone(), size_bytes }
             }).collect();
         disk_provenance.sort_by_key(|d| d.id);
         let nvram_provenance = cfg.nvram.clone();
@@ -1286,80 +1253,6 @@ impl Machine {
         self.scratch_path.as_deref()
     }
 
-    /// Briefly stop the machine, run `work`, then restart peripherals and the
-    /// CPU only if it was running before. Used by the scratch-write/read/clear
-    /// CI commands to mutate the scratch file without racing the SCSI device's
-    /// in-flight reads. CPU stays stopped if the harness hasn't called `start`
-    /// yet — a file injected before boot stays injected, the CPU doesn't get
-    /// auto-started.
-    pub fn with_paused<R>(&mut self, work: impl FnOnce() -> R) -> R {
-        let was_running = self.cpu.is_running();
-        self.stop();
-        let r = work();
-        self.restart_peripherals();
-        if was_running {
-            self.cpu.start();
-        }
-        r
-    }
-
-    /// The guest's current state and whether the monitor is accepting
-    /// commands. Every surface that reports state — `machine-status`, the
-    /// `machine-start` acknowledgement, and the CI socket's `status` — goes
-    /// through here, so they cannot disagree.
-    pub fn status(&self) -> MachineStatus {
-        let cpu_running = self.cpu.is_running();
-        MachineStatus {
-            // Running is read from the CPU, not stored: `start`/`stop` and
-            // breakpoints change the CPU's flag without a machine-level
-            // transition, and a stale lifecycle copy would be a second,
-            // wrong answer.
-            state: if cpu_running { GuestState::Running } else { self.lifecycle },
-            cpu_running,
-            monitor_addr: self.monitor.bound_addr(),
-        }
-    }
-
-    /// Start the CPU and peripherals on behalf of `machine-start`.
-    ///
-    /// Idempotent: a running machine is left alone and the acknowledgement says
-    /// so. A machine that is `Starting` only needs the CPU released; an `Idle`
-    /// or `Halted` one also restarts its peripherals. The returned
-    /// [`TransitionAck`] is what the monitor prints.
-    pub fn start_guest(&mut self) -> Result<TransitionAck, String> {
-        let from = self.status().state;
-        if from == GuestState::Running {
-            return Ok(TransitionAck { from, via: None, to: from });
-        }
-
-        let via = if from == GuestState::Starting {
-            None
-        } else {
-            self.lifecycle = self
-                .lifecycle
-                .transition(GuestState::Starting)
-                .map_err(|e| e.to_string())?;
-            Some(GuestState::Starting)
-        };
-        // Peripherals are idempotently startable; do it even from `Starting`
-        // in case a previous stop left one of them down.
-        self.restart_peripherals();
-        self.cpu.start();
-        let to = self.status().state;
-        Ok(TransitionAck { from, via, to })
-    }
-
-    /// Stop the CPU and peripherals on behalf of `machine-stop`.
-    ///
-    /// Idempotent: stopping a halted machine changes nothing. Returns the
-    /// transition for the monitor's acknowledgement.
-    pub fn stop_guest(&mut self) -> TransitionAck {
-        let from = self.status().state;
-        self.stop();
-        let to = self.status().state;
-        TransitionAck { from, via: None, to }
-    }
-
     pub fn start(&mut self) {
         // Publish "starting" before the monitor binds, so a caller that polls
         // readiness can tell "not started" (Idle) from "startup under way".
@@ -1397,10 +1290,10 @@ impl Machine {
     /// use. Must be called while `self` is in its final location (boxed, or on
     /// `main`'s stack) — the slot records this address.
     pub(crate) fn machine_slot(&mut self) -> MachineSlot {
-        let ptr = self as *mut Machine;
+        let ptr = self as *mut Machine as *mut dyn Workstation;
         let slot = self.controller_slot
             .get_or_insert_with(|| Arc::new(Mutex::new(MachineRef(ptr))));
-        debug_assert_eq!(slot.lock().0, ptr, "Machine moved after its slot was handed out");
+        debug_assert!(std::ptr::addr_eq(slot.lock().0, ptr), "Machine moved after its slot was handed out");
         slot.clone()
     }
 
@@ -1412,53 +1305,10 @@ impl Machine {
         // The controller and the event thread reach this Machine through the
         // shared slot, which `Drop` nulls: iris-gui drops a Machine on Stop
         // while the monitor thread (and a connected client) lives on.
-        // SystemController stops all threads before mutating machine state.
         assert!(!self.controller_registered, "register_system_controller called twice");
         self.controller_registered = true;
-        let ctrl = Arc::new(SystemController {
-            machine: self.machine_slot(),
-        });
-        // We need interior mutability to register after construction.
-        // Monitor::register_device takes &mut self, so we use unsafe to call it.
-        // SAFETY: This is called once, before the monitor server thread starts,
-        // while we have exclusive access to Machine.
-        let monitor_ptr = Arc::as_ptr(&self.monitor) as *mut Monitor;
-        unsafe {
-            (*monitor_ptr).register_device(ctrl.clone());
-        }
-
-        // Spawn the event dispatch thread: receives MachineEvent from devices and
-        // performs the requested system-level action.
-        // Uses the same SystemController (which is Send+Sync via unsafe impls) so it
-        // can stop all threads and mutate machine state safely.
-        if let Some(rx) = self.event_rx.take() {
-            thread::Builder::new().name("machine-events".to_string()).spawn(move || {
-                while let Ok(event) = rx.recv() {
-                    let _ = ctrl.with_machine(|machine| {
-                        match event {
-                            MachineEvent::HardReset => {
-                                println!("Machine: SIN hard reset");
-                                machine.reset();
-                                machine.cpu.start();
-                            }
-                            MachineEvent::PowerOff => {
-                                println!("Machine: soft power-off");
-                                machine.stop();
-                                // Hosts that embed iris as a library (e.g. iris-gui)
-                                // set IRIS_NO_EXIT_ON_POWEROFF=1 so a guest halt
-                                // does not kill the host process.
-                                #[cfg(not(feature = "developer"))]
-                                if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_none() {
-                                    crate::instance::cleanup_for_exit();
-                                    std::process::exit(0);
-                                }
-                            }
-                        }
-                        Ok(())
-                    });
-                }
-            }).unwrap();
-        }
+        let slot = self.machine_slot();
+        crate::workstation::register_system_controller(&self.monitor, slot, self.event_rx.take());
     }
 
     pub fn stop(&mut self) {
@@ -1688,67 +1538,6 @@ impl Machine {
         cancel: &dyn Fn() -> bool,
     ) -> std::io::Result<usize> {
         self.hpc3.scsi().sync_chd_disks(only, progress, cancel)
-    }
-
-    /// Cumulative count of guest-originated Ethernet frames the NAT engine has
-    /// processed. Monotonic for the life of the machine; an embedder samples the
-    /// delta to tell whether the guest's internal networking is alive.
-    pub fn net_guest_frames(&self) -> u64 {
-        self.hpc3.seeq().nat_control().guest_frames()
-    }
-
-    /// NAT addresses the emulator hands the guest: (ec0 client IP, gateway IP,
-    /// netmask) — the source of truth for what the guest's ec0 should be.
-    pub fn nat_expected(&self) -> (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr) {
-        self.hpc3.seeq().gateway_addrs()
-    }
-
-    /// The guest's own source IP as last seen on the wire (None if no frame has
-    /// revealed one yet). Captured passively, so it works even when the guest's
-    /// networking is misconfigured and nothing routes.
-    pub fn net_observed_guest_ip(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_guest_ip()
-    }
-
-    /// The guest's likely default gateway, inferred passively from the in-subnet
-    /// address it keeps ARP-ing for but can't resolve. None if none seen.
-    pub fn net_observed_gateway(&self) -> Option<std::net::Ipv4Addr> {
-        self.hpc3.seeq().nat_control().observed_gateway()
-    }
-
-    /// Live status of the PCAP bridged-capture backend. `Inactive` unless this is
-    /// a `--features pcap` build whose active machine uses `mode = "pcap"`; goes
-    /// `PermissionDenied` when the raw capture can't be opened for lack of
-    /// privilege, which the GUI turns into an "Enable packet capture" prompt.
-    pub fn net_pcap_status(&self) -> crate::net::PcapStatus {
-        self.hpc3.seeq().nat_control().pcap_status()
-    }
-
-    /// Move the running NAT onto a new subnet without a reboot: the NAT thread
-    /// swaps its `(gateway, client, netmask)` and flushes connection state on
-    /// its next loop. Typically gateway = network+1, client = network+2.
-    pub fn set_nat_subnet(&self, gateway: std::net::Ipv4Addr, client: std::net::Ipv4Addr, netmask: std::net::Ipv4Addr) {
-        self.hpc3.seeq().nat_control().request_subnet(gateway, client, netmask);
-    }
-
-    /// Tell the NAT engine the host's own IPv4 networks `(network, prefix)` so it
-    /// won't adopt a guest subnet that overlaps them (which would shadow the
-    /// host's real LAN). The embedder gathers these from the host interfaces.
-    pub fn set_host_nets(&self, nets: Vec<(std::net::Ipv4Addr, u8)>) {
-        self.hpc3.seeq().nat_control().set_host_nets(nets);
-    }
-
-    /// Replace the running NAT's inbound port-forward rules without a reboot;
-    /// the NAT thread rebinds its host listeners on its next loop.
-    pub fn set_port_forwards(&self, rules: Vec<crate::config::PortForwardConfig>) {
-        self.hpc3.seeq().nat_control().set_port_forwards(rules);
-    }
-
-    /// Change the PCAP bridged host interface (`None` = auto-pick) on a running
-    /// machine without rebooting the guest: the PcapEngine reopens its capture on
-    /// the new NIC. No-op in NAT mode.
-    pub fn set_pcap_interface(&self, iface: Option<String>) {
-        self.hpc3.seeq().nat_control().request_pcap_interface(iface);
     }
 
     /// Step the CPU `n` instructions in-line on the calling thread, with all
@@ -2091,13 +1880,16 @@ impl Machine {
         Ok(())
     }
 
-    /// Restart peripherals (MC, HPC3, REX3) without restarting the monitor server.
+    /// Restart everything `stop` stopped, less the CPU, without restarting the
+    /// monitor server.
     fn restart_peripherals(&mut self) {
         self.mc.start();
         self.hpc3.start();
         if let Some(rex3) = &self._phys.rex3 { rex3.start(); }
+        if let Some(mgras) = &self._phys.mgras { mgras.start_display(); }
         if let Some(rex3) = &self._phys.rex3_head1 { rex3.start(); }
         if let Some(gr2) = &self._phys.gr2 { gr2.start(); }
+        if let Some(u64) = &self._phys.ultra64 { u64.start(); }
     }
 
     /// Helper to power-on reset all devices.
@@ -2405,6 +2197,9 @@ impl Machine {
             .unwrap_or_default();
         let schema_version = match manifest {
             Some(m) => {
+                if let Some(other) = &m.machine {
+                    return Err(format!("snapshot {name} is of another machine ({other})"));
+                }
                 if m.host_arch != std::env::consts::ARCH {
                     return Err(format!(
                         "snapshot host_arch '{}' does not match current host '{}'; cross-arch load is not supported",
@@ -2609,33 +2404,6 @@ impl Machine {
     }
 }
 
-// ---- SystemController — registers reset/save/load with the monitor ----
-
-/// A raw pointer to a live `Machine`, or null once that Machine is dropped.
-pub(crate) struct MachineRef(*mut Machine);
-
-// SAFETY: only dereferenced under the slot's Mutex, while non-null; `Drop for
-// Machine` nulls it under that same Mutex before any field is torn down.
-unsafe impl Send for MachineRef {}
-unsafe impl Sync for MachineRef {}
-
-pub(crate) type MachineSlot = Arc<Mutex<MachineRef>>;
-
-/// Run `f` against the Machine behind `slot`, or fail if it has been dropped.
-pub(crate) fn with_machine_slot<R>(slot: &MachineSlot, f: impl FnOnce(&mut Machine) -> R) -> Result<R, String> {
-    let guard = slot.lock();
-    let ptr = guard.0;
-    if ptr.is_null() {
-        return Err("machine is not running".to_string());
-    }
-    // SAFETY: non-null only while the Machine is alive. Drop nulls it while
-    // holding this lock, and `guard` is held until `f` returns, so the Machine
-    // cannot be freed while `f` runs.
-    let result = f(unsafe { &mut *ptr });
-    drop(guard);
-    Ok(result)
-}
-
 impl Drop for Machine {
     fn drop(&mut self) {
         // Runs before any field is dropped. Taking the lock waits for an
@@ -2643,7 +2411,7 @@ impl Drop for Machine {
         // a half-destroyed Machine. No controller command drops the Machine, so
         // this never waits on a lock its own thread holds.
         if let Some(slot) = self.controller_slot.take() {
-            slot.lock().0 = std::ptr::null_mut();
+            slot.lock().0 = MachineRef::null();
         }
         // The guest clock points into this Machine's CPU core.
         #[cfg(feature = "perfetto")]
@@ -2660,119 +2428,30 @@ impl Drop for Machine {
     }
 }
 
-/// A thin monitor device that wraps the machine behind a Mutex so the monitor
-/// thread can issue system-level commands (reset, save, load).
-pub struct SystemController {
-    machine: MachineSlot,
-}
+/// The Indy and Indigo2 family as the front ends see it: each method is the
+/// inherent one of the same name.
+impl Workstation for Machine {
+    fn start(&mut self) { Machine::start(self) }
+    fn stop(&mut self) { Machine::stop(self) }
+    fn reset(&mut self) { Machine::reset(self) }
+    fn restart_peripherals(&mut self) { Machine::restart_peripherals(self) }
+    fn cpu_start(&self) { Machine::cpu_start(self) }
+    fn cpu_is_running(&self) -> bool { Machine::cpu_is_running(self) }
+    fn machine_slot(&mut self) -> MachineSlot { Machine::machine_slot(self) }
+    fn register_system_controller(&mut self) { Machine::register_system_controller(self) }
+    fn monitor_addr(&self) -> Option<std::net::SocketAddr> { Machine::monitor_addr(self) }
+    fn lifecycle(&self) -> GuestState { self.lifecycle }
+    fn set_lifecycle(&mut self, state: GuestState) { self.lifecycle = state; }
 
-
-impl SystemController {
-    fn with_machine<R>(&self, f: impl FnOnce(&mut Machine) -> Result<R, String>) -> Result<R, String> {
-        with_machine_slot(&self.machine, f)?
-    }
-}
-
-impl Device for SystemController {
-    fn step(&self, _cycles: u64) {}
-    fn stop(&self) {}
-    fn start(&self) {}
-    fn is_running(&self) -> bool { false }
-    fn get_clock(&self) -> u64 { 0 }
-
-    fn register_commands(&self) -> Vec<(String, String)> {
-        vec![
-            ("machine-start".to_string(), "Start CPU and all peripherals (idempotent; prints the state transition)".to_string()),
-            ("machine-stop".to_string(),  "Stop CPU and all peripherals (idempotent; prints the state transition)".to_string()),
-            ("machine-status".to_string(), "machine-status [json] — Guest state (idle/starting/running/halted) and monitor readiness".to_string()),
-            ("reset".to_string(),         "Reset all hardware to power-on state".to_string()),
-            ("save".to_string(),          "save <name> — Save snapshot to saves/<name>/".to_string()),
-            ("load".to_string(),          "load <name> — Load snapshot from saves/<name>/".to_string()),
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            ("jitcheck".to_string(), "jitcheck <n> [skip] — capture live state, run n instructions interpreter-only vs real JIT dispatch, reconverge past the first `skip` divergences and stop at the next one [DEV]".to_string()),
-        ]
-    }
-
-    fn execute_command(&self, cmd: &str, args: &[&str], mut writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
-        match cmd {
-            "machine-stop" => {
-                let ack = self.with_machine(|m| Ok(m.stop_guest()))?;
-                let _ = writeln!(writer, "machine-stop: {}", ack.text());
-                Ok(())
-            }
-            "machine-start" => {
-                let ack = self.with_machine(|m| m.start_guest())?;
-                let _ = writeln!(writer, "machine-start: {}", ack.text());
-                Ok(())
-            }
-            "machine-status" => {
-                let json = match args {
-                    [] => false,
-                    ["json"] => true,
-                    _ => return Err("Usage: machine-status [json]".to_string()),
-                };
-                let status = self.with_machine(|m| Ok(m.status()))?;
-                if json {
-                    let _ = writeln!(writer, "{}", status.to_json());
-                } else {
-                    let _ = writeln!(writer, "{}", status.text());
-                }
-                Ok(())
-            }
-            "reset" => {
-                let _ = writeln!(writer, "Resetting machine...");
-                self.with_machine(|m| { m.reset(); Ok(()) })
-            }
-            "save" => {
-                let name = args.first().ok_or_else(|| "Usage: save <name>".to_string())?;
-                let _ = writeln!(writer, "Saving snapshot '{}'...", name);
-                self.with_machine(|m| m.save_snapshot(name))
-            }
-            "load" => {
-                let name = args.first().ok_or_else(|| "Usage: load <name>".to_string())?;
-                let _ = writeln!(writer, "Loading snapshot '{}'...", name);
-                self.with_machine(|m| m.load_snapshot(name))
-            }
-            #[cfg(all(feature = "jitv2", feature = "developer"))]
-            "jitcheck" => {
-                let n: u64 = args.first()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or("Usage: jitcheck <n> [skip]".to_string())?;
-                let skip: u64 = args.get(1)
-                    .map(|s| s.parse().map_err(|_| "Usage: jitcheck <n> [skip]".to_string()))
-                    .transpose()?
-                    .unwrap_or(0);
-                let _ = writeln!(writer, "jitcheck: capturing live state, running {} instructions interpreter-only then with real JIT dispatch (skipping first {} divergence(s))...", n, skip);
-                self.with_machine(|m| {
-                    let report = crate::validate::validate_jit_determinism(m, n, skip)
-                        .map_err(|e| format!("jitcheck failed: {}", e))?;
-                    for (i, d) in report.skipped.iter().enumerate() {
-                        let _ = writeln!(writer, "jitcheck: SKIPPED divergence #{} at instruction {} of {} (pc={:#018x}), reconverged and continued", i + 1, d.instruction, n, d.replay_pc);
-                        for (field, a, b) in &d.diffs {
-                            let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                        }
-                    }
-                    let next_divergence_number = report.skipped.len() + 1;
-                    match &report.stopped_at {
-                        None => {
-                            let _ = writeln!(writer, "jitcheck: no further divergence across {} instructions", n);
-                            let _ = writeln!(writer, "jitcheck: CPU left stopped (peripherals still running) with the replay (JIT-dispatch) pass's final state loaded — 'start' to resume the CPU");
-                        }
-                        Some(d) => {
-                            let _ = writeln!(writer, "jitcheck: DIVERGED (divergence #{}) at instruction {} of {} (pc={:#018x})", next_divergence_number, d.instruction, n, d.replay_pc);
-                            for (field, a, b) in &d.diffs {
-                                let _ = writeln!(writer, "  {}: interp={} jit={}", field, a, b);
-                            }
-                            let _ = writeln!(writer, "jitcheck: rerun with skip={} to reconverge past this one too", next_divergence_number);
-                            let _ = writeln!(writer, "jitcheck: stopped immediately at the divergence — CPU left stopped exactly as the JIT-dispatch pass left it (peripherals still running, console stays live) — 'start' to resume the CPU");
-                        }
-                    }
-                    Ok(())
-                })
-            }
-            _ => Err(format!("Unknown command: {}", cmd)),
-        }
-    }
+    fn get_display(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display(self) }
+    fn get_display_head1(&self) -> Option<Arc<dyn crate::gfx_display::GfxDisplay>> { Machine::get_display_head1(self) }
+    fn get_ps2(&self) -> Arc<crate::dev::ps2::Ps2Controller> { Machine::get_ps2(self) }
+    fn get_timer_manager(&self) -> Arc<TimerManager> { Machine::get_timer_manager(self) }
+    fn get_cpu_debug(&self) -> Arc<dyn CpuDebug> { Machine::get_cpu_debug(self) }
+    fn fasttick_count(&self) -> Arc<AtomicU64> { Machine::fasttick_count(self) }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { Machine::get_ci_serial(self) }
+    fn inject_serial_console(&self, bytes: &[u8]) { Machine::inject_serial_console(self, bytes) }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }
 
 #[cfg(test)]

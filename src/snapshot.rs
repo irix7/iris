@@ -186,6 +186,10 @@ pub struct Manifest {
     /// Cache model at capture time, `CpuModel::CACHE_KIND`: "full" or
     /// "shadow". None for manifests from before it was a choice.
     pub cpu_cache: Option<String>,
+    /// The machine, for one that is not the Indy and Indigo2 family: "o2_ip32"
+    /// for the O2. None for the Indy and Indigo2 and every older manifest. A
+    /// snapshot loads only into the machine it names.
+    pub machine: Option<String>,
 }
 
 impl Manifest {
@@ -212,6 +216,7 @@ impl Manifest {
             cpu_model: None,
             state: Vec::new(),
             cpu_cache: None,
+            machine: None,
         }
     }
 
@@ -274,6 +279,9 @@ impl Manifest {
                 Value::Table(dt)
             }).collect();
             tbl.insert("state".into(), Value::Array(devs));
+        }
+        if let Some(m) = &self.machine {
+            tbl.insert("machine".into(), Value::String(m.clone()));
         }
         Value::Table(tbl)
     }
@@ -338,6 +346,7 @@ impl Manifest {
             }).collect())
             .unwrap_or_default();
         let cpu_cache = tbl.get("cpu_cache").and_then(|x| x.as_str()).map(String::from);
+        let machine = tbl.get("machine").and_then(|x| x.as_str()).map(String::from);
         Ok(Self {
             schema_version,
             iris_git_rev,
@@ -352,6 +361,7 @@ impl Manifest {
             cpu_model,
             state,
             cpu_cache,
+            machine,
         })
     }
 }
@@ -734,6 +744,7 @@ mod tests {
                 ],
             }],
             cpu_cache: Some("shadow".into()),
+            machine: Some("o2_ip32".into()),
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -757,6 +768,7 @@ mod tests {
             .expect("manifest from text");
         assert_eq!(reparsed.state, m.state);
         assert_eq!(reparsed.schema_version, m.schema_version);
+        assert_eq!(m2.machine, m.machine);
     }
 
     #[test]
@@ -775,6 +787,7 @@ mod tests {
             cpu_model: None,
             state: vec![],
             cpu_cache: None,
+            machine: None,
         };
         let v = m.to_toml();
         let m2 = Manifest::from_toml(&v).expect("parse");
@@ -787,6 +800,7 @@ mod tests {
         assert!(m2.nvram.is_none());
         assert!(m2.cpu_model.is_none(), "legacy manifest has no cpu_model");
         assert!(m2.state.is_empty());
+        assert!(m2.machine.is_none(), "an Indy/Indigo2 manifest names no machine");
     }
 
     #[test]

@@ -176,6 +176,13 @@ pub mod ppmem;
 #[cfg(feature = "faultmmio")]
 pub mod faultmmio;
 pub mod machine;
+pub mod workstation;
+/// The SGI O2 (IP32): its bus and devices -- see `docs/o2-ip32.md` (and, for how it was built, `clanker/devices/ip32-o2-bringup-log.md`).
+/// Not yet wired into `Physical`; `ip32_machine` drives the CPU against it.
+pub mod ip32;
+pub mod ip32_handover;
+pub mod ip32_screen;
+pub mod ip32_machine;
 pub mod machine_state;
 pub mod platform;
 pub mod physical;
@@ -189,7 +196,10 @@ pub mod cow_disk;
 pub mod chd_disk;
 pub mod block_node;
 pub mod scsi;
+pub mod scsi_monitor;
 pub mod irq;
+pub mod host_audio;
+pub mod pci;
 pub mod ui;
 pub mod cpu;
 pub mod dev;

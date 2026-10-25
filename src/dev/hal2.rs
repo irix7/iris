@@ -971,7 +971,6 @@ fn open_cpal_output(underruns: Arc<AtomicU64>, playing: Arc<AtomicBool>, cfg: &A
     None
 }
 
-
 // ─── impl Hal2 ────────────────────────────────────────────────────────────────
 
 impl Hal2 {

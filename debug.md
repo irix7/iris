@@ -108,7 +108,7 @@ tools/mon.py "machine-start"
 
 `machine-status` is available as soon as a monitor connection is accepted; the
 `json` form is one object with `state`, `cpu_running`, `monitor_ready` and
-`monitor_addr`. `iris-ci status` prints the same fields from `Machine::status`.
+`monitor_addr`. `iris-ci status` prints the same fields from the same source.
 If the monitor could not bind its port (another iris is using it), the CI
 socket still answers but reports `monitor_ready` false, so a harness can tell a
 bind failure from a guest that never started.
@@ -304,8 +304,13 @@ interpreter), `--features jitv2_smc_check` (writes onto executing pages), and
 | `scsi dayna` | DaynaPort MAC, addresses and counters |
 | `scsi wdt [N]` / `scsi wdt file <path>` | WD33C93A transaction ring: last `N` / all to a file **[DEV]** |
 | `scsi debug <on\|off>` | Per-command trace **[DEV]** |
-| `scsi0 ...` / `scsi1 ...` | The same, for controller 0 / controller 1 (Indigo2) |
-| `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays |
+| `scsi0 ...` / `scsi1 ...` | The same, for controller 0 / controller 1 (Indigo2 and O2) |
+| `cow status` / `cow commit [id]` / `cow reset [id]` | Copy-on-write overlays (`cow1 ...` on the O2's second controller) |
+
+On the O2 the controllers are Adaptec 7880s: `scsi regs` shows that chip's
+interrupt status, queues and command totals, and `wdt`, `defer`, `debug` and
+`dayna` are not there. Ids are per controller, as in the `[scsi.N]` tables
+(`[scsi.17]` is id 1 on controller 1, so `scsi1 eject 1`).
 
 Queue position `[0]` is the mounted disc, `[1]` the next on eject. A disc
 change reaches IRIX as a Unit Attention ("medium changed") on its next
@@ -404,7 +409,7 @@ headless.
 | `rtc save [file]` | Save the RTC NVRAM |
 | `rtc r <offset>` / `rtc w <offset> <val>` | Read / write NVRAM bytes |
 | `rtc debug <on\|off>` | RTC trace **[DEV]** |
-| `pit status` / `pit debug <on\|off>` | 8254 timer state, clock chain and timing-reference capability / trace **[DEV]** |
+| `pit status` / `pit debug <on\|off>` | 8254 timer state / trace **[DEV]** |
 | `hal2 status` | HAL2 audio state |
 | `ps2 status` / `ps2 debug <on\|off>` | PS/2 controller state / keyboard and mouse trace |
 | `ps2 type <ascii>` / `ps2 enter` / `ps2 esc` | Type text / press Enter / press Esc (Esc stops PROM autoboot) |
@@ -415,12 +420,6 @@ headless.
 
 `nveeprom save` (Indigo2) and `rtc save` (Indy) persist PROM changes before
 a forced termination; a normal stop saves them automatically.
-
-`pit status` states the timer's time base explicitly: it counts the guest
-cycle clock, the same clock CP0 Count is derived from, so it is not an
-independent or host-referenced clock. An unclocked counter (counter 2 not
-programmed as a rate generator) is shown with `armed=false` and `null=true`.
-See [docs/Indy/ioc-8254-timer.md](docs/Indy/ioc-8254-timer.md).
 
 ### Networking
 
@@ -480,6 +479,44 @@ See [docs/perfetto.md](docs/perfetto.md) for categories and analysis.
 With `[ultra64] enabled = true`: `ultra status | send <hex> | reset | r
 <offset> | w <offset> <val> | dump <offset> <size> | disasm <offset> <count>
 | load <path> [offset]`. See [HELP.md](HELP.md#n64-development-board-ultra64).
+
+### SGI O2 (IP32)
+
+The O2's devices register their own commands (see [the O2 guide](docs/o2-ip32.md));
+its SCSI controllers answer to `scsi`/`cow` and `scsi1`/`cow1` as described under
+[SCSI, CD-ROM and disks](#scsi-cd-rom-and-disks):
+
+| Command | Description |
+|---|---|
+| `crime status` / `crime regs` / `crime irqlog [n]` / `crime touched` | CRIME interrupts, mask and memory banks / registers / recent interrupt changes / registers the guest used |
+| `re status` / `re notes` | CRIME rendering engine state / notes on unusual commands |
+| `gbe status` | GBE display engine: timing, frame buffer, tiles |
+| `isa status` | MACE ISA interrupts |
+| `pci status` / `pci config <slot>` | MACE PCI bridge / a function's configuration space |
+| `mec status` | MACE Ethernet: rings, receive buffers, frame counts |
+| `sdma status` | MACE serial DMA |
+| `maceps2 status` / `maceps2 traffic` | PS/2 ports / recent bytes each way |
+| `audio status` / `audio codec` | MACE audio rings and rates / AD1843 codec registers |
+| `ust status` | MACE UST counter |
+| `rtc status` / `rtc dump` / `rtc r <reg>` / `rtc w <reg> <val>` | DS1687 RTC |
+| `onewire status` / `onewire log` | 1-Wire ID chip (the MAC address) |
+
+`o2 <command>` runs the same commands `[o2] control_port` serves, one per line:
+
+| Command | Description |
+|---|---|
+| `o2 shot PATH` | Screen shot (PNG) |
+| `o2 status` | GBE display state |
+| `o2 pixel X Y` | One screen pixel |
+| `o2 type TEXT` | Type on the PS/2 keyboard (`\r` is Enter) |
+| `o2 key\|keydown\|keyup NAME` | Press, hold or release a key |
+| `o2 mouse DX DY [BUTTONS]` / `o2 click [BUTTON]` | Move the mouse / click |
+| `o2 pc` / `o2 regs` | CPU PC / registers as last published |
+| `o2 peek ADDR LEN PATH` | Physical memory to a file (up to 1 MB) |
+| `o2 retrace PATH` | Recorded rendering-engine primitives (`IRIS_IP32_RE_TRACE`) |
+| `o2 scsi PATH` | The SCSI controllers' recent commands |
+| `o2 unmapped` | Bus accesses that reached no device (the first 64 distinct), with the PC that made each |
+| `o2 ps2log PATH` / `o2 crimelog PATH` / `o2 nictrace PATH` | PS/2 traffic / recent CRIME interrupt-register accesses / the MAC-address chip's register trace and 1-Wire protocol log |
 
 ## Recipes
 
@@ -617,9 +654,7 @@ Commands without a dedicated tool (graphics, devices, `j2`) go through
   boot and log in, run guest commands, copy files in and out, screenshots,
   snapshots, CD changes ([STORAGE.md](STORAGE.md#ci-control-socket-and-iris-ci)).
 - **Serial console**: ports 8880 (channel A) and 8881 (channel B, the IRIX
-  console); `serial_log` writes the console to a file, flushed at each
-  completed line, with optional guest/wall timestamps
-  ([HELP.md](HELP.md#capturing-the-console-to-a-file)).
+  console); `serial_log` writes the console to a file ([HELP.md](HELP.md#serial-ports)).
 - **Environment variables** for traces, JIT diagnostics and logging are
   listed in [FEATURES.md](FEATURES.md#environment-and-diagnostic-controls).
 - **Crashes on Windows**: `crash_diag.rs` logs otherwise silent process

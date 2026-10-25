@@ -133,7 +133,7 @@ impl TransitionAck {
 }
 
 /// A snapshot of the guest's state plus whether the monitor is accepting
-/// commands, produced only by `Machine::status`.
+/// commands, produced only by `Workstation::status`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MachineStatus {
     pub state: GuestState,
