@@ -1,6 +1,5 @@
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::io::Write as IoWrite;
 
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BusDevice, Device, BUS_OK};
@@ -9,6 +8,7 @@ use crate::exp::eval_const_expr;
 use crate::cpu::mips_dis;
 use crate::dev::mem::{BlackHoleRegion, UnmappedRam};
 use crate::ppmem::{MappedMemory, PpMemSpace, PpMemory};
+use crate::ppmem::devmap::{entry_eq, Entry, SparseDeviceMap, SLOT_SHIFT};
 
 use crate::dev::prom::PromPort;
 use crate::dev::mc::MemoryController;
@@ -197,7 +197,7 @@ const PROM_END: u32  = 0x1FD00000;
 // per MC spec: "The bottom 512KB of memory is just an alias for the memory located
 // at address 0x08000000 to 0x0807ffff."
 // Implemented as an AliasBus that adds LOMEM_BASE to the incoming address, so
-// accesses go through the normal lomem device_map entries — no direct bank pointer needed.
+// accesses go through the normal lomem decode-table entries — no direct bank pointer needed.
 const ALIAS_BASE: u32   = 0x00000000;
 const ALIAS_END: u32    = 0x00080000;
 
@@ -219,24 +219,28 @@ fn alias_offset_for(ip28: bool) -> u32 {
 }
 
 
-/// What one 64 KB `device_map` slot should point at after a MEMCFG write.
+/// What one 64 KB decode-table slot should point at after a MEMCFG write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BankSlot {
     Unmapped,
     Bank(usize),
 }
 
-/// Decide every `device_map` slot a MEMCFG write can affect: the lomem and
+/// Decide every decode-table slot a MEMCFG write can affect: the lomem and
 /// himem windows, each bank's placement, and wherever a bank sat outside
 /// those windows last time. Returns one entry per slot, in slot order, plus
 /// the slots this placement puts outside the windows, for the next call.
 ///
 /// A plan rather than a sequence of stores, for two reasons:
 ///
-/// - **The whole target state is described at once.** Both 256 MB windows are
-///   laid out (about 8200 slots), so [`DecodeMap::apply_plan`] can diff it
-///   against the live snapshot and skip publishing entirely when nothing
-///   moved. A slot that ends up where it started is never rewritten.
+/// - **Only the differences get written.** Wiping both 256 MB windows and
+///   mapping the banks back over them is about 8200 slots per MEMCFG write,
+///   while the MC's DMA worker may be dispatching through the table from its
+///   own thread. Collapsing to one entry per slot means a slot that ends up
+///   where it started is never touched, not wiped and rewritten, and the
+///   table is never seen half-way through a change. (The table now swaps
+///   whole pages atomically, so a transient would no longer be a torn
+///   pointer; it would still be a slot briefly answering as unmapped.)
 /// - **A bank placed outside the windows is unmapped again when it moves.**
 ///   MEMCFG's base field reaches far beyond lomem and himem, and a wipe of
 ///   only those two left such a slot pointing at a bank the MC had since
@@ -275,247 +279,28 @@ fn plan_bank_slots(
     (plan.into_iter().collect(), outside)
 }
 
-/// Map a physical address to `(bank, in-bank byte offset)` using the bank
-/// placements captured by `remap_banks`, or `None` when no bank window covers
-/// it. The offset folds SIMM mirroring: `mask` is `period - 1`, so
-/// `rel & mask == rel % period` is the byte within the bank that `PpMemory`
-/// would have addressed.
-///
-/// Used by the snapshot dirty-tracking hook on the ppmem fast path, which
-/// writes RAM without going through `PpMemory`'s own write methods.
-#[inline(always)]
-fn attribute_ram_write(
-    bank_windows: &[Option<(u32, u32, u32)>; 4],
-    addr: u32,
-) -> Option<(usize, usize)> {
-    for (bank, window) in bank_windows.iter().enumerate() {
-        if let Some((base, mask, limit)) = *window {
-            let rel = addr.wrapping_sub(base);
-            if rel < limit {
-                return Some((bank, (rel & mask) as usize));
-            }
-        }
-    }
-    None
-}
-
 // Mystery Black Hole (64KB at 0x02080000)
 const MYSTERY_HOLE_BASE: u32 = 0x02080000;
 const MYSTERY_HOLE_END: u32  = 0x02090000;
-
-/// The stateless sink the decode table starts out pointing at, and the target
-/// of every slot a MEMCFG write leaves unmapped. A `static` (rather than null)
-/// keeps the table free of null data pointers even before `init` runs.
-static BOOT_ERR: ErrorBus = ErrorBus { debug: AtomicBool::new(false) };
-const BOOT_PTR: *const dyn BusDevice = &BOOT_ERR;
-
-/// One immutable snapshot of the 64 KB-granularity physical decode table.
-///
-/// `slots[addr >> 16]` is the `BusDevice` for that 64 KB page. A snapshot is
-/// built once and never mutated; a MEMCFG remap builds a whole new one and
-/// publishes it through [`DecodeMap`]'s atomic pointer. Because the 16-byte
-/// fat pointers are only ever read out of immutable memory, a concurrent
-/// reader cannot observe half of one entry and half of another — the tear the
-/// old in-place `device_map` allowed.
-struct DecodeTable {
-    slots: [*const dyn BusDevice; 65536],
-}
-
-// SAFETY: every slot is a non-null `*const dyn BusDevice` pointing either at a
-// device owned by `Physical` (which is `Send + Sync`) or at the static
-// `BOOT_ERR`. `BusDevice: Send + Sync`, and the table is immutable once built,
-// so sharing an `&DecodeTable` across threads is data-race free.
-unsafe impl Send for DecodeTable {}
-unsafe impl Sync for DecodeTable {}
-
-/// The physical decode table as an atomically-published immutable snapshot,
-/// with bounded retirement of the snapshots it supersedes.
-///
-/// Readers call [`device_at`](Self::device_at), which loads the live snapshot
-/// once and indexes it. The MC-DMA worker and other device threads do this
-/// concurrently with the CPU thread's `remap_banks`. A remap builds a whole
-/// new snapshot (copy-on-write) and stores it with `Release`, so a reader
-/// observes either the entire old table or the entire new one.
-///
-/// A superseded snapshot is **not** freed the instant it is replaced: a reader
-/// that loaded the old pointer just before the swap may still be reading a
-/// slot out of it. It is pushed onto a bounded retire ring instead, and only
-/// the snapshot that falls off the far end of that ring is freed. The ring
-/// keeps [`RETIRED_KEEP`] generations behind the live one, so the live
-/// snapshot plus at most `RETIRED_KEEP` superseded ones are ever resident — a
-/// fixed `(RETIRED_KEEP + 1)` MiB rather than 1 MiB leaked per real remap.
-///
-/// # Safety
-///
-/// The only dereference of a snapshot is the `(*table).slots[addr >> 16]` in
-/// [`device_at`](Self::device_at): one `Acquire` load followed by a plain
-/// index, with no lock, allocation, syscall or yield in between, so a reader
-/// cannot *block* while holding a snapshot pointer. A reader would have to be
-/// descheduled across all `RETIRED_KEEP` subsequent *real* remaps to outlive
-/// the grace the ring provides, and a remap is serialised on the single CPU
-/// thread. IP28's frequent refresh-bit rewrites do not count: they leave every
-/// bank where it was, and [`apply_plan`](Self::apply_plan) diffs the plan and
-/// publishes nothing.
-struct DecodeMap {
-    live: AtomicPtr<DecodeTable>,
-    /// Superseded snapshots, oldest first. Only the writer (the CPU thread,
-    /// through `publish`) touches this; the mutex exists because `DecodeMap`
-    /// is shared as part of `Physical`, not because readers contend on it.
-    retired: Mutex<VecDeque<Box<DecodeTable>>>,
-    /// How many superseded snapshots to retain. `RETIRED_KEEP` in production;
-    /// the tests widen it to keep a concurrent publish loop from reclaiming a
-    /// snapshot a reader is still looking at.
-    retire_keep: usize,
-}
-
-/// Superseded snapshots retained behind the live one — the grace period,
-/// counted in remaps rather than wall-clock time. Two is the "current plus the
-/// previous generation" the design calls for, plus one more for slack.
-const RETIRED_KEEP: usize = 2;
-
-impl DecodeMap {
-    /// Start with every slot pointing at `BOOT_ERR`, exactly as the old
-    /// in-line table did. `init`/`build_device_map` replaces it before any
-    /// other thread holds the bus.
-    fn boot() -> Self {
-        Self::with_retire_keep(RETIRED_KEEP)
-    }
-
-    /// `boot` with an explicit retire depth, so tests can publish concurrently
-    /// without reclaiming a snapshot a reader still holds (see the tests).
-    fn with_retire_keep(retire_keep: usize) -> Self {
-        Self {
-            live: AtomicPtr::new(Box::into_raw(Box::new(DecodeTable {
-                slots: [BOOT_PTR; 65536],
-            }))),
-            retired: Mutex::new(VecDeque::new()),
-            retire_keep,
-        }
-    }
-
-    /// The device for `addr`'s 64 KB slot, from the current snapshot.
-    ///
-    /// One acquire load, then a plain index into immutable memory: this is the
-    /// same O(1) `addr >> 16` dispatch as before, with the fat pointer read
-    /// now guaranteed to come from a stable table.
-    #[inline(always)]
-    fn device_at(&self, addr: u32) -> *const dyn BusDevice {
-        // Acquire pairs with `publish`'s Release store: a reader that observes
-        // the new pointer also observes the fully-built snapshot behind it.
-        let table = self.live.load(Ordering::Acquire);
-        // SAFETY: `table` is the boot snapshot or one published by
-        // `apply_plan`. The live snapshot is never freed while it is live, and
-        // a superseded one is held on the retire ring for `retire_keep` later
-        // publishes (see the type comment). `addr >> 16` is always in
-        // `0..65536`, so the index is in bounds.
-        unsafe { (*table).slots[(addr >> 16) as usize] }
-    }
-
-    /// The live snapshot pointer.
-    fn snapshot(&self) -> *const DecodeTable {
-        self.live.load(Ordering::Acquire)
-    }
-
-    /// A private copy of the live snapshot, ready to edit before publishing.
-    fn clone_live(&self) -> Box<DecodeTable> {
-        let live = self.snapshot();
-        // SAFETY: as `device_at`; the array of `Copy` pointers is copied out
-        // of the immutable snapshot.
-        Box::new(DecodeTable {
-            slots: unsafe { (*live).slots },
-        })
-    }
-
-    /// Publish `table` with a single release store, retiring the snapshot it
-    /// supersedes onto the bounded ring.
-    ///
-    /// The snapshot that falls off the far end of the ring is dropped here.
-    /// It is `retire_keep` generations behind the new live snapshot, so any
-    /// reader that could still reach it had `retire_keep` real remaps to
-    /// finish a single non-blocking `device_at` (see the type comment).
-    fn publish(&self, table: Box<DecodeTable>) {
-        let old = self.live.swap(Box::into_raw(table), Ordering::Release);
-        let mut retired = self.retired.lock().unwrap();
-        // SAFETY: `old` was produced by an earlier `live.swap`/`Box::into_raw`
-        // and is now unreachable through `live`; nothing else has a copy.
-        if !old.is_null() {
-            retired.push_back(unsafe { Box::from_raw(old) });
-        }
-        while retired.len() > self.retire_keep {
-            retired.pop_front();
-        }
-    }
-
-    /// Superseded snapshots currently retained. Tests only.
-    #[cfg(test)]
-    fn retired_len(&self) -> usize {
-        self.retired.lock().unwrap().len()
-    }
-
-    /// Apply a [`plan_bank_slots`] plan to a copy of the live table and
-    /// publish it, mapping `BankSlot::Bank(b)` to `bank_ptrs[b]` and
-    /// `BankSlot::Unmapped` to `unmapped_ptr`.
-    ///
-    /// Returns `true` if anything changed. On `false` nothing is allocated and
-    /// no pointer is swapped, so a MEMCFG write that leaves every bank where it
-    /// was costs nothing and leaks nothing.
-    fn apply_plan(
-        &self,
-        plan: &[(u32, BankSlot)],
-        bank_ptrs: [*const dyn BusDevice; 4],
-        unmapped_ptr: *const dyn BusDevice,
-    ) -> bool {
-        let resolve = |target: BankSlot| match target {
-            BankSlot::Unmapped => unmapped_ptr,
-            BankSlot::Bank(b) => bank_ptrs[b],
-        };
-        let live = self.snapshot();
-        let changed = plan.iter().any(|&(idx, target)| {
-            // SAFETY: as `device_at`; `idx` comes from `plan_bank_slots`, always
-            // a valid slot index.
-            !std::ptr::addr_eq(unsafe { (*live).slots[idx as usize] }, resolve(target))
-        });
-        if !changed {
-            return false;
-        }
-        let mut table = self.clone_live();
-        for &(idx, target) in plan {
-            table.slots[idx as usize] = resolve(target);
-        }
-        self.publish(table);
-        true
-    }
-}
-
-impl Drop for DecodeMap {
-    fn drop(&mut self) {
-        // Reclaim the live snapshot; the retired ring drops with its field.
-        // Dropping the map means `Physical` is going away, so no reader can
-        // reach either any more.
-        let live = *self.live.get_mut();
-        if !live.is_null() {
-            // SAFETY: `live` came from `Box::into_raw` and is not shared.
-            unsafe { drop(Box::from_raw(live)); }
-        }
-    }
-}
 
 /// Physical Bus (Physical)
 ///
 /// Acts as the central hub for connecting devices.
 /// Routes all bus accesses to the appropriate device based on address.
 /// Devices are stored directly in the struct for zero-overhead access.
-/// Uses a 64KB granularity lookup table for O(1) address decoding.
+/// Decodes with one indexed load from a table of 64 KB slots; the table
+/// itself is sparse and host-MMU-backed (`SparseDeviceMap`), so it spans a
+/// 40-bit space while costing a few pages.
 ///
 /// Memory is split into 4 × 128MB banks (0..3). MEMCFG0/1 in the MC
 /// configure at which physical address each bank appears. On MEMCFG write,
-/// the MC invokes remap_banks() which updates device_map and each bank's
+/// the MC invokes remap_banks() which updates the decode table and each bank's
 /// base_addr. Banks 0/1 occupy lomem slots; banks 2/3 occupy himem slots.
 pub struct Physical {
     // 4 × 128MB RAM banks (0,1 in lomem; 2,3 in himem). base_addr set by remap_banks().
     banks: [RamBank; 4],
     /// ppmem's 4GB window. Banks are mapped into it by `remap_banks` in
-    /// addition to being installed in `device_map`, so the mapping-based fast
+    /// addition to being installed in the decode table, so the mapping-based fast
     /// path and the bus path stay in agreement. `None` if the window could not
     /// be reserved, in which case only the bus path is used.
     ppmem_space: Option<PpMemSpace>,
@@ -558,28 +343,20 @@ pub struct Physical {
     vino_gio_alias: AliasBus, // GIO aperture at 0x1F080000 → VINO at 0x00080000
     black_hole: BlackHoleRegion,
 
-    // Lookup table: 64KB granularity (65536 entries, one per `addr >> 16`),
-    // published as an immutable snapshot and swapped on each MEMCFG remap.
-    // The MC-DMA thread may be dispatching through it from its own thread while
-    // the CPU thread rewrites the mapping, so entries are never mutated in
-    // place — see `DecodeMap`.
-    device_map: DecodeMap,
+    /// The decode table: one device per 64 KB slot of a 40-bit physical
+    /// space, sparse and host-MMU-backed (`src/ppmem/devmap.rs`). Slots the
+    /// Indy and Indigo2 decode are filled in `init`; a slot nobody filled is
+    /// faulted in as the CPU bus-error device the first time it is touched.
+    devmap: SparseDeviceMap,
+    /// `devmap.base()`, cached so the hot path is a load off `self` and one
+    /// indexed load.
+    map_base: *const Entry,
 
     /// 64 KB slots the last `remap_banks` placed a RAM bank in outside the
     /// lomem and himem windows. MEMCFG's base field reaches well beyond those
     /// two, and a bank parked out there has to be unmapped again when it
     /// moves — see `plan_bank_slots`.
     banks_outside_windows: Vec<u32>,
-    /// Placement of each bank (`conf_base`, period mask, `limit`) as decoded by
-    /// the last `remap_banks`, or `None` for an absent/unmapped bank. The ppmem
-    /// fast path writes RAM directly, bypassing `PpMemory`'s write methods, so
-    /// it needs this to attribute a physical write back to `(bank, in-bank
-    /// offset)` for the snapshot dirty bitmap. See `note_ram_write`.
-    bank_windows: [Option<(u32, u32, u32)>; 4],
-    /// Snapshot chunk-dirty tracking. Off until the first `save_snapshot`, so a
-    /// run that never snapshots pays only a relaxed load per RAM write rather
-    /// than the bank lookup in `note_ram_write`. Enabled after a baseline save.
-    track_chunk_dirty: AtomicBool,
     /// Where the 512 KB alias at physical 0 points — see `alias_offset_for`.
     alias_offset: u32,
     /// This machine is an IP28. Only used to label the bank-map trace.
@@ -590,7 +367,7 @@ pub struct Physical {
     host_freq: u64,
 }
 
-// Safety: Physical owns all devices and the pointers in device_map point to owned data
+// Safety: Physical owns all devices and the pointers in the decode table point to owned data
 // All the devices themselves are Send+Sync, and we never mutate through the pointers
 unsafe impl Send for Physical {}
 unsafe impl Sync for Physical {}
@@ -663,11 +440,14 @@ impl Physical {
         let vino_gio_alias = AliasBus::new(std::ptr::null::<ErrorBus>(), 0xE1000000u32);
         let black_hole = BlackHoleRegion::new();
 
-        // The lookup table is filled in init(). It starts as an immutable
-        // snapshot pointing at the stateless `BOOT_ERR` sink (never null), and
-        // `build_device_map`/`remap_banks` replace it wholesale by pointer
-        // swap, so the MC's DMA worker never sees a torn 16-byte fat pointer.
-        let device_map = DecodeMap::boot();
+        // The decode table. Only reserved here: `init` fills it once `self`
+        // is in its final place, since the entries point at fields of `self`.
+        // Nothing dispatches before that; a dispatch that did would fault
+        // with a message naming the address rather than read a null.
+        let devmap = SparseDeviceMap::new().unwrap_or_else(|e| {
+            panic!("iris: cannot reserve the physical address decode table: {e}")
+        });
+        let map_base = devmap.base();
 
         // ppmem: reserve the 4GB window over these banks. A failure here is
         // not fatal — the bus path works regardless — so log and carry on
@@ -715,10 +495,9 @@ impl Physical {
             alias_bus,
             vino_gio_alias,
             black_hole,
-            device_map,
+            devmap,
+            map_base,
             banks_outside_windows: Vec::new(),
-            bank_windows: [None; 4],
-            track_chunk_dirty: AtomicBool::new(false),
             alias_offset: alias_offset_for(ip28),
             is_ip28: ip28,
             trace: AtomicBool::new(false),
@@ -748,22 +527,29 @@ impl Physical {
         let prom_ptr: *const dyn BusDevice = &self.prom;
         let black_hole_ptr: *const dyn BusDevice = &self.black_hole;
 
-        // Build the whole table off to the side, then publish it with one
-        // pointer swap. Nothing observes a half-filled table.
-        let mut table = Box::new(DecodeTable { slots: [BOOT_PTR; 65536] });
+        let map = &self.devmap;
+        let set = |base: u32, end: u32, dev: Entry| {
+            map.fill_bytes(base as u64, end as u64, dev)
+                .unwrap_or_else(|e| panic!("physical: mapping {base:#010x}..{end:#010x}: {e}"));
+        };
 
-        // Layer 1: fill entire table with CPU bus error device
-        for i in 0..65536usize {
-            table.slots[i] = cpu_err_ptr;
-        }
+        // Whatever is never mapped below answers as a CPU bus error. Within
+        // the 32-bit space that is filled in now (layer 1); the rest of the
+        // 40-bit table stays untouched until the guest reaches it, and the
+        // first access to a slot up there faults it in as the same device,
+        // with a message naming the address.
+        map.set_default(cpu_err_ptr)
+            .unwrap_or_else(|e| panic!("physical: setting the bus-error default: {e}"));
+
+        // Layer 1: the whole 32-bit space, CPU bus error device
+        map.fill(0, 1 << (32 - SLOT_SHIFT), cpu_err_ptr)
+            .unwrap_or_else(|e| panic!("physical: filling the 32-bit space: {e}"));
 
         // Layer 2: overlay GIO space (0x18000000..0x1FA00000) with GIO timeout device
         // This covers: reserved future GIO (0x18000000..0x1F000000) + Newport slot
         // (0x1F000000..0x1F400000) + GIO expansion slots 0/1 (0x1F400000..0x1FA00000)
         // Real devices will overlay their own ranges on top in layer 3.
-        for i in (0x1800_0000u32 >> 16)..(0x1FA0_0000u32 >> 16) {
-            table.slots[i as usize] = gio_err_ptr;
-        }
+        set(0x1800_0000, 0x1FA0_0000, gio_err_ptr);
 
         // Memory banks are NOT mapped here — MEMCFG0/1 control their placement.
         // remap_banks() is called by the MC when MEMCFG is written.
@@ -772,17 +558,13 @@ impl Physical {
         // Layer 3: real devices overlaid on top
 
         // Map VINO (physical 0x00080000, one 64KB slot)
-        table.slots[(crate::dev::vino::VINO_BASE >> 16) as usize] = vino_ptr;
+        set(crate::dev::vino::VINO_BASE, crate::dev::vino::VINO_BASE + (1 << SLOT_SHIFT), vino_ptr);
 
         // Map Mystery Hole
-        for i in (MYSTERY_HOLE_BASE >> 16)..((MYSTERY_HOLE_END - 1) >> 16) + 1 {
-            table.slots[i as usize] = black_hole_ptr;
-        }
+        set(MYSTERY_HOLE_BASE, MYSTERY_HOLE_END, black_hole_ptr);
 
         // 2nd hpc
-        for i in (0x1F980000 >> 16)..((0x1F990000 - 1) >> 16) + 1 {
-            table.slots[i as usize] = black_hole_ptr;
-        }
+        set(0x1F980000, 0x1F990000, black_hole_ptr);
 
         // HPC1 region (0x1FB00000–0x1FB80000) — older HPC chip iris doesn't
         // emulate. IRIX still probes here during normal operation (visible as
@@ -793,47 +575,33 @@ impl Physical {
         // black hole (reads as zero, writes silently accepted) prevents the
         // bus error from firing and avoids the panic — without implementing
         // real HPC1 semantics, which would be a much larger emulation gap.
-        for i in (0x1FB00000u32 >> 16)..((HPC3_BASE - 1) >> 16) + 1 {
-            table.slots[i as usize] = black_hole_ptr;
-        }
+        set(0x1FB00000, HPC3_BASE, black_hole_ptr);
 
         // Map Newport/REX3 (4MB GIO slot at 0x1F000000) — only if graphics enabled
         if let Some(rex3_ptr) = rex3_ptr {
-            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-                table.slots[i as usize] = rex3_ptr;
-            }
+            set(NEWPORT_BASE, NEWPORT_END, rex3_ptr);
         } else if let Some(gr2_ptr) = gr2_ptr {
             // GR2 (XZ / Extreme): the whole 4 MB gfx slot; see src/dev/gr2.
-            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-                table.slots[i as usize] = gr2_ptr;
-            }
+            set(NEWPORT_BASE, NEWPORT_END, gr2_ptr);
         } else if let Some(mgras_ptr) = mgras_ptr {
             // IMPACT in the graphics slot. The expansion slots stay unmapped so
             // their probes bus-error, as empty slots do.
-            for i in (NEWPORT_BASE >> 16)..((NEWPORT_END - 1) >> 16) + 1 {
-                table.slots[i as usize] = mgras_ptr;
-            }
+            set(NEWPORT_BASE, NEWPORT_END, mgras_ptr);
         }
         // else: GIO timeout from layer 2 already covers the Newport slot
 
         // Second Newport head at GIO expansion slot 1 (dual-head).
         if let Some(h1_ptr) = rex3_head1_ptr {
-            for i in (GIO_SLOT1_BASE >> 16)..((GIO_SLOT1_END - 1) >> 16) + 1 {
-                table.slots[i as usize] = h1_ptr;
-            }
+            set(GIO_SLOT1_BASE, GIO_SLOT1_END, h1_ptr);
         }
 
         // GIO expansion slot 0 (0x1F400000–0x1F5FFFFF): N64 dev board if enabled
         if let Some(u64_ptr) = ultra64_ptr {
             use crate::dev::ultra64::{GIO_SLOT0_BASE, RAMROM_BASE, RAMROM_SIZE};
             // Control registers: 0x1F400000–0x1F4FFFFF (16 × 64KB slots)
-            for i in (GIO_SLOT0_BASE >> 16)..((RAMROM_BASE - 1) >> 16) + 1 {
-                table.slots[i as usize] = u64_ptr;
-            }
+            set(GIO_SLOT0_BASE, RAMROM_BASE, u64_ptr);
             // RAMROM window: 0x1F500000–0x1F5FFFFF (16 × 64KB slots)
-            for i in (RAMROM_BASE >> 16)..((RAMROM_BASE + RAMROM_SIZE - 1) >> 16) + 1 {
-                table.slots[i as usize] = u64_ptr;
-            }
+            set(RAMROM_BASE, RAMROM_BASE + RAMROM_SIZE, u64_ptr);
         }
         // GIO expansion slot 1 — second Newport when rex3_head1 absent: GIO timeout remains
 
@@ -842,55 +610,40 @@ impl Physical {
         if let Some(td) = self.testdev.as_deref() {
             let td_ptr: *const dyn BusDevice = td;
             use crate::dev::testdev::{TEST_DEV_BASE, TEST_DEV_SIZE};
-            for i in (TEST_DEV_BASE >> 16)..((TEST_DEV_BASE + TEST_DEV_SIZE - 1) >> 16) + 1 {
-                table.slots[i as usize] = td_ptr;
-            }
+            set(TEST_DEV_BASE, TEST_DEV_BASE + TEST_DEV_SIZE, td_ptr);
         }
 
         // Map MC registers (128KB at 0x1FA00000)
-        for i in (MC_BASE >> 16)..((MC_END - 1) >> 16) + 1 {
-            table.slots[i as usize] = mc_ptr;
-        }
+        set(MC_BASE, MC_END, mc_ptr);
 
         // Map HPC3 (512KB at 0x1FB80000)
-        for i in (HPC3_BASE >> 16)..((HPC3_END - 1) >> 16) + 1 {
-            table.slots[i as usize] = hpc3_ptr;
-        }
+        set(HPC3_BASE, HPC3_END, hpc3_ptr);
 
         // Map PROM (1MB at 0x1FC00000)
-        for i in (PROM_BASE >> 16)..((PROM_END - 1) >> 16) + 1 {
-            table.slots[i as usize] = prom_ptr;
-        }
+        set(PROM_BASE, PROM_END, prom_ptr);
 
         // Alias: points back into Physical itself with `alias_offset()` added.
         // So alias accesses go: AliasBus → Physical::read/write(addr + LOMEM_BASE)
-        // → device_map lookup → whichever bank is mapped at LOMEM_BASE.
+        // → table lookup → whichever bank is mapped at LOMEM_BASE.
         // This way alias automatically tracks whatever MEMCFG maps at LOMEM_BASE.
         self.alias_bus.target = self as *const Physical as *const dyn BusDevice;
         let alias_ptr: *const dyn BusDevice = &self.alias_bus;
-        for i in (ALIAS_BASE >> 16)..(ALIAS_END >> 16) {
-            table.slots[i as usize] = alias_ptr;
-        }
+        set(ALIAS_BASE, ALIAS_END, alias_ptr);
 
         // VINO GIO alias: 0x1F080000 → 0x00080000
-        // Routes through Physical again with 0xFF000000 added (wrapping subtraction of 0x1F000000)
+        // Routes through Physical again with 0xE1000000 added (wrapping subtraction of 0x1F000000)
         // so the re-dispatched address falls into VINO's primary slot at 0x0008xxxx.
         self.vino_gio_alias.target = self as *const Physical as *const dyn BusDevice;
         let vino_gio_alias_ptr: *const dyn BusDevice = &self.vino_gio_alias;
-        table.slots[(0x1F080000u32 >> 16) as usize] = vino_gio_alias_ptr;
-
-        // Publish. `init` runs before any other thread holds the bus, so the
-        // boot snapshot being replaced is not observable; it is retired onto
-        // the bounded ring like any other superseded table (see `DecodeMap`).
-        self.device_map.publish(table);
+        set(0x1F080000, 0x1F090000, vino_gio_alias_ptr);
     }
 
-    /// Remap memory banks in device_map.
+    /// Remap memory banks in the decode table.
     ///
     /// `bank_addrs[i]` is `Some((base, addr_mask, limit))` if bank i is valid, or `None`.
     /// - `base`      — physical base address
     /// - `addr_mask` — applied inside Memory for aliasing (SIMM wrapping); equals size_mb*1MB-1
-    /// - `limit`     — number of bytes to map in the device_map; slots beyond limit stay as
+    /// - `limit`     — number of bytes to map in the decode table; slots beyond limit stay as
     ///                 UnmappedRam and return 0, matching the hardware behaviour of reads past
     ///                 the real SIMM boundary
     ///
@@ -937,13 +690,9 @@ impl Physical {
 
         for (bank_idx, maybe_bank) in bank_addrs.iter().enumerate() {
             let Some((conf_base, addr_mask, limit)) = *maybe_bank else {
-                self.bank_windows[bank_idx] = None;
                 dlog_dev!(LogModule::Mc, "[MEMCFG] bank {} not mapped", bank_idx);
                 continue;
             };
-            // The ppmem fast path can answer for addresses inside this window;
-            // remember how to get from such an address back to the bank.
-            self.bank_windows[bank_idx] = Some((conf_base, addr_mask, limit));
 
             if self.is_ip28 {
                 eprintln!("iris: IP28 experiment: bank {bank_idx} -> base {conf_base:#010x} mask {addr_mask:#010x} limit {limit:#010x}");
@@ -981,19 +730,38 @@ impl Physical {
             }
         }
 
-        // Publish the new placement as a whole immutable snapshot, swapped in
-        // with a single release store. The DMA worker can be dispatching
-        // through the old table right now; it either keeps using that one (now
-        // on the retire ring, not yet freed) or picks up the complete new one,
-        // so it can never see a torn 16-byte fat pointer. See `DecodeMap`.
+        // Now point the table at the banks, whose masks are set. The plan
+        // is one entry per slot; apply it as runs of one target, and leave
+        // a run alone that already answers as planned. The DMA worker can be
+        // dispatching through the table right now: a run that does change
+        // is swapped in whole pages by `SparseDeviceMap`, so it sees the old
+        // page or the new one, never a torn pointer. See `plan_bank_slots`.
         let (plan, outside) = plan_bank_slots(&bank_addrs, &self.banks_outside_windows);
         self.banks_outside_windows = outside;
-        self.device_map.apply_plan(&plan, bank_ptrs, unmapped_ptr);
+        let mut i = 0;
+        while i < plan.len() {
+            let (start, target) = plan[i];
+            let mut j = i + 1;
+            while j < plan.len() && plan[j].1 == target && plan[j].0 == plan[j - 1].0 + 1 {
+                j += 1;
+            }
+            let ptr = match target {
+                BankSlot::Unmapped => unmapped_ptr,
+                BankSlot::Bank(b) => bank_ptrs[b],
+            };
+            let count = (j - i) as u64;
+            if !self.devmap.all_are(start as u64, count, ptr) {
+                self.devmap.fill(start as u64, count, ptr).unwrap_or_else(|e| {
+                    panic!("physical: remapping slots {start:#x}+{count:#x}: {e}")
+                });
+            }
+            i = j;
+        }
 
         // ppmem: the low-512KB alias of bank 0 (MC spec — the bottom 512KB
         // mirrors 0x08000000..0x0807ffff). Mapped as real pages rather than
         // routed through AliasBus, so it is the same physical memory with no
-        // re-dispatch. AliasBus stays installed in device_map as the bus-path
+        // re-dispatch. AliasBus stays installed in the decode table as the bus-path
         // equivalent; both see identical memory.
         if let (true, Some(sp)) = (ppmem_placement_changed, &self.ppmem_space) {
             let bank0_mapped = bank_addrs[0].is_some_and(|(base, _, _)| base == self.alias_offset);
@@ -1026,6 +794,46 @@ impl Physical {
         if let Some(sp) = &self.ppmem_space {
             self.ppmem_bitmap = sp.bitmap_ptr();
         }
+    }
+
+    /// The device behind `addr`: one indexed load from the decode table.
+    #[inline(always)]
+    fn dev_at(&self, addr: u32) -> Entry {
+        // SAFETY: `map_base` spans the whole table for the life of `devmap`;
+        // a page nobody filled is faulted in by devmap's handler, so every
+        // load lands on a readable page holding a live device pointer.
+        unsafe { *self.map_base.add((addr >> SLOT_SHIFT) as usize) }
+    }
+
+    /// Name a decode-table entry for the monitor.
+    fn device_name(&self, dev: Entry) -> String {
+        fn e<T: BusDevice + 'static>(t: &T) -> Entry { t }
+        let mut known: Vec<(Entry, String)> = vec![
+            (e(&self.cpu_bus_error), "cpu bus error".into()),
+            (e(&self.gio_bus_error), "gio timeout".into()),
+            (e(&self.unmapped_ram), "unmapped ram (reads 0)".into()),
+            (e(&self.alias_bus), "low-memory alias".into()),
+            (e(&self.vino_gio_alias), "vino gio alias".into()),
+            (e(&self.black_hole), "black hole".into()),
+            (e(&self.vino), "vino".into()),
+            (e(&self.mc), "mc".into()),
+            (e(&self.hpc3), "hpc3".into()),
+            (e(&self.prom), "prom".into()),
+        ];
+        for (i, b) in self.banks.iter().enumerate() {
+            known.push((e(b), format!("bank {i}")));
+        }
+        if let Some(d) = self.rex3.as_deref() { known.push((e(d), "newport (rex3)".into())); }
+        if let Some(d) = self.rex3_head1.as_deref() { known.push((e(d), "newport head 1".into())); }
+        if let Some(d) = self.gr2.as_deref() { known.push((e(d), "gr2".into())); }
+        if let Some(d) = self.mgras.as_deref() { known.push((e(d), "impact (mgras)".into())); }
+        if let Some(d) = self.ultra64.as_deref() { known.push((e(d), "ultra64".into())); }
+        if let Some(d) = self.testdev.as_deref() { known.push((e(d), "test device".into())); }
+        known
+            .into_iter()
+            .find(|(p, _)| entry_eq(*p, dev))
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| format!("{:p}", dev as *const ()))
     }
 
     /// Is `addr` backed by a whole directly-mapped 64MB region?
@@ -1083,38 +891,14 @@ impl Physical {
         }
     }
 
-    /// Attribute a directly-mapped RAM write at `addr` to a bank chunk and set
-    /// its snapshot dirty bit.
+    /// Arm snapshot chunk-dirty tracking.
     ///
-    /// The ppmem fast path stores straight into the window; it never reaches
-    /// `PpMemory::write*`, so without this an incremental save would see those
-    /// chunks as clean. The bank lookup is only paid while tracking is armed
-    /// (after the first save); before that this is one relaxed load.
-    #[inline(always)]
-    fn note_ram_write(&self, addr: u32) {
-        if !self.track_chunk_dirty.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some((bank, off)) = attribute_ram_write(&self.bank_windows, addr) {
-            self.banks[bank].mark_dirty_byte(off);
-        }
-    }
-
-    /// [`note_ram_write`](Self::note_ram_write) for a `[addr, addr+len)` block.
-    #[inline]
-    fn note_ram_write_range(&self, addr: u32, len: usize) {
-        if !self.track_chunk_dirty.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Some((bank, off)) = attribute_ram_write(&self.bank_windows, addr) {
-            self.banks[bank].mark_dirty_range(off, len.max(1));
-        }
-    }
-
-    /// Arm snapshot chunk-dirty tracking. Called after the first save, once
-    /// every chunk's pristine content has been recorded.
+    /// The banks mark the 64 KiB chunk of every write themselves (see
+    /// `PpMemory::mark_dirty_byte`), which is what an incremental save reads;
+    /// there is no separate direct-window path in this decode table, so this
+    /// is the point at which the caller says "the baseline has been saved".
     pub fn enable_chunk_dirty_tracking(&self) {
-        self.track_chunk_dirty.store(true, Ordering::Relaxed);
+        // The banks track unconditionally; kept as the caller's seam.
     }
 
     /// One `true` per 64 KiB chunk of bank `i` that may have changed since the
@@ -1157,7 +941,7 @@ impl Device for Physical {
 
     fn register_commands(&self) -> Vec<(String, String)> {
         let cmds = vec![
-            ("phys".to_string(), "Physical Bus commands: mem, dis, trace, error <on|off>, hole <on|off>, bench".to_string()),
+            ("phys".to_string(), "Physical Bus commands: mem, dis, map, trace, error <on|off>, hole <on|off>, bench".to_string()),
             ("mm".to_string(), "Alias for phys mem".to_string()),
             ("md".to_string(), "Alias for phys dis".to_string()),
             ("trace".to_string(), "Enable/disable tracing: trace <on|off>".to_string()),
@@ -1205,6 +989,27 @@ impl Device for Physical {
                 let r = BusDevice::read32(self, addr as u32);
                 if r.is_ok() { writeln!(writer, "{}", mips_dis::disassemble(r.data, addr, None)).unwrap(); }
                 else { writeln!(writer, "Could not fetch instruction at {:016x}", addr).unwrap(); }
+            }
+            "map" => {
+                let s = self.devmap.stats();
+                writeln!(writer,
+                    "decode table: {} pages of {} KB ({} MB of guest space each): {} untouched, {} shared, {} private",
+                    s.pages, s.page_bytes >> 10, ((s.page_bytes as u64 / 16) << SLOT_SHIFT) >> 20,
+                    s.unmapped, s.shared, s.private).unwrap();
+                writeln!(writer,
+                    "  {} constant page(s), {} pool page(s) ({} free), {} KB in use, {} fault(s)",
+                    s.const_pages, s.pool_pages, s.pool_free, s.in_use_bytes() >> 10, s.faults).unwrap();
+                for a in &s.first_faults {
+                    writeln!(writer, "  faulted in: {:#012x}", a).unwrap();
+                }
+                for r in self.devmap.runs() {
+                    let name = match r.dev {
+                        Some(d) => self.device_name(d),
+                        None => "(untouched)".to_string(),
+                    };
+                    writeln!(writer, "  {:#012x}-{:#012x} {}",
+                        r.start << SLOT_SHIFT, (r.end << SLOT_SHIFT) - 1, name).unwrap();
+                }
             }
             "error" => {
                 if actual_args.is_empty() {
@@ -1281,12 +1086,7 @@ impl Device for Physical {
 impl BusDevice for Physical {
     #[inline(always)]
     fn read8(&self, addr: u32) -> BusRead8 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            let v = unsafe { *self.ppmem_base.add(off ^ 3) };
-            return BusRead8::ok(v);
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read8(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
@@ -1298,15 +1098,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write8(&self, addr: u32, val: u8) -> u32 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            unsafe { *self.ppmem_base.add(off ^ 3) = val };
-            self.note_ram_write(addr);
-            #[cfg(feature = "jitv2")]
-            self.ppmem_bump_gen_range(addr, 1);
-            return BUS_OK;
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write8(addr, val) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) { println!("PHYS8 Write {:08x} val={:02x} -> {:08x}", addr, val, ws); }
@@ -1315,12 +1107,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read16(&self, addr: u32) -> BusRead16 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            let v = unsafe { *((self.ppmem_base as *const u16).add((off >> 1) ^ 1)) };
-            return BusRead16::ok(v);
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read16(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
@@ -1332,15 +1119,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write16(&self, addr: u32, val: u16) -> u32 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            unsafe { *((self.ppmem_base as *mut u16).add((off >> 1) ^ 1)) = val };
-            self.note_ram_write(addr);
-            #[cfg(feature = "jitv2")]
-            self.ppmem_bump_gen_range(addr, 1);
-            return BUS_OK;
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write16(addr, val) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) { println!("PHYS16 Write {:08x} val={:04x} -> {:08x}", addr, val, ws); }
@@ -1349,12 +1128,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read32(&self, addr: u32) -> BusRead32 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            let v = unsafe { *(self.ppmem_base.add(off) as *const u32) };
-            return BusRead32::ok(v);
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read32(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
@@ -1366,15 +1140,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write32(&self, addr: u32, val: u32) -> u32 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            unsafe { *(self.ppmem_base.add(off) as *mut u32) = val };
-            self.note_ram_write(addr);
-            #[cfg(feature = "jitv2")]
-            self.ppmem_bump_gen_range(addr, 1);
-            return BUS_OK;
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write32(addr, val) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) { println!("PHYS32 Write {:08x} val={:08x} -> {:08x}", addr, val, ws); }
@@ -1383,12 +1149,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn read64(&self, addr: u32) -> BusRead64 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            let v = unsafe { (*(self.ppmem_base.add(off) as *const u64)).rotate_left(32) };
-            return BusRead64::ok(v);
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let r = unsafe { (*device_ptr).read64(addr) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) {
@@ -1400,15 +1161,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write64(&self, addr: u32, val: u64) -> u32 {
-        if self.ppmem_ptr(addr).is_some() {
-            let off = addr as usize;
-            unsafe { *(self.ppmem_base.add(off) as *mut u64) = val.rotate_left(32) };
-            self.note_ram_write(addr);
-            #[cfg(feature = "jitv2")]
-            self.ppmem_bump_gen_range(addr, 1);
-            return BUS_OK;
-        }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         let ws = unsafe { (*device_ptr).write64(addr, val) };
         #[cfg(not(feature = "lightning"))]
         if self.trace.load(Ordering::Relaxed) { println!("PHYS64 Write {:08x} val={:016x} -> {:08x}", addr, val, ws); }
@@ -1417,7 +1170,7 @@ impl BusDevice for Physical {
 
     #[inline(always)]
     fn write64_masked(&self, addr: u32, val: u64, mask: u64) -> u32 {
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).write64_masked(addr, val, mask) }
     }
 
@@ -1428,13 +1181,13 @@ impl BusDevice for Physical {
     // any DMA-specific override (e.g. Rex3::dma_read64) entirely.
     #[inline(always)]
     fn dma_read64(&self, addr: u32) -> BusRead64 {
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).dma_read64(addr) }
     }
 
     #[inline(always)]
     fn dma_write64(&self, addr: u32, val: u64) -> u32 {
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).dma_write64(addr, val) }
     }
 
@@ -1445,13 +1198,13 @@ impl BusDevice for Physical {
     // (Rex3's single-token push) actually gets a chance to run.
     #[inline(always)]
     fn dma_write64_bulk(&self, addr: u32, vals: &[u64]) -> u32 {
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).dma_write64_bulk(addr, vals) }
     }
 
     #[inline(always)]
     fn dma_read64_bulk(&self, addr: u32, out: &mut [u64]) -> u32 {
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).dma_read64_bulk(addr, out) }
     }
 
@@ -1465,7 +1218,7 @@ impl BusDevice for Physical {
         if let Some(p) = self.ppmem_gen_ptr(addr) {
             return p;
         }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).gen_ptr(addr) }
     }
 
@@ -1480,7 +1233,7 @@ impl BusDevice for Physical {
         if let Some(p) = self.ppmem_ptr(addr) {
             return Some(p as *const u64);
         }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).mem_ptr(addr) }
     }
 
@@ -1490,27 +1243,31 @@ impl BusDevice for Physical {
             // Same layout as PpMemory::read_block — storage keeps qwords
             // rotate_left(32).
             unsafe {
-                std::ptr::copy_nonoverlapping(p as *const u64, buf.as_mut_ptr(), buf.len());
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = (*p.add(i)).rotate_left(32);
+                }
             }
-            crate::ppmem::swap_word_halves(buf);
             return BUS_OK;
         }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).read_block(addr, buf) }
     }
 
     #[inline]
     fn write_block(&self, addr: u32, buf: &[u64]) -> u32 {
         if let Some(p) = self.ppmem_ptr(addr) {
-            crate::ppmem::swap_word_halves_store(buf, p);
-            self.note_ram_write_range(addr, buf.len().max(1) * 8);
+            unsafe {
+                for (i, &val) in buf.iter().enumerate() {
+                    *p.add(i) = val.rotate_left(32);
+                }
+            }
             // The gen bump still has to happen: a cache writeback mutates RAM
             // under any compiled artifact for those pages.
             #[cfg(feature = "jitv2")]
             self.ppmem_bump_gen_range(addr, buf.len());
             return BUS_OK;
         }
-        let device_ptr = self.device_map.device_at(addr);
+        let device_ptr = self.dev_at(addr);
         unsafe { (*device_ptr).write_block(addr, buf) }
     }
 }
@@ -1536,30 +1293,6 @@ mod ppmem_tests {
             None,
             None,
         ]
-    }
-
-    /// The ppmem fast-path write must attribute a physical address to the
-    /// right bank and in-bank offset, mirroring included, so the snapshot
-    /// dirty bitmap tracks the chunk that actually changed (#48).
-    #[test]
-    fn attribute_ram_write_finds_the_bank_and_offset() {
-        // Bank 0: 8MB SIMM repeating every 8MB across a 32MB slot at 0x08000000.
-        // Bank 1: 128MB at 0x10000000. Bank 2 absent, bank 3 128MB at 0x20000000.
-        let windows: [Option<(u32, u32, u32)>; 4] = [
-            Some((0x0800_0000, 0x007F_FFFF, 32 << 20)),
-            Some((0x1000_0000, 0x07FF_FFFF, 128 << 20)),
-            None,
-            Some((0x2000_0000, 0x07FF_FFFF, 128 << 20)),
-        ];
-        assert_eq!(attribute_ram_write(&windows, 0x0800_1000), Some((0, 0x1000)));
-        // Second mirror of the undersized bank folds back onto the same bytes.
-        assert_eq!(attribute_ram_write(&windows, 0x0800_0000 + (8 << 20) + 0x1000), Some((0, 0x1000)));
-        assert_eq!(attribute_ram_write(&windows, 0x1000_2000), Some((1, 0x2000)));
-        assert_eq!(attribute_ram_write(&windows, 0x2000_3000), Some((3, 0x3000)));
-        // Past the slot's limit (or in the gap) there is no bank to attribute.
-        assert_eq!(attribute_ram_write(&windows, 0x0800_0000 + (32 << 20)), None);
-        assert_eq!(attribute_ram_write(&windows, 0x1800_0000), None);
-        assert_eq!(attribute_ram_write(&windows, 0x0000_0000), None);
     }
 
     /// After a remap, every address the bitmap claims is directly mapped must
@@ -1760,9 +1493,8 @@ mod bank_plan_tests {
         Some((base, size - 1, size))
     }
 
-    /// `device_map` state in miniature: apply a plan the way
-    /// `DecodeMap::apply_plan` does and count the slots that change. A
-    /// non-zero count means a remap would publish (and leak) a new snapshot.
+    /// The decode table in miniature: apply a plan the way `remap_banks` does and
+    /// count the stores that actually happen.
     fn apply(map: &mut [BankSlot], plan: &[(u32, BankSlot)]) -> usize {
         let mut stores = 0;
         for &(idx, target) in plan {
@@ -1830,179 +1562,5 @@ mod bank_plan_tests {
         assert_eq!(map[(PARKED >> 16) as usize], BankSlot::Unmapped,
                    "a slot outside the windows kept pointing at a bank that moved");
         assert!(outside.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod decode_map_tests {
-    //! `remap_banks` publishes the physical decode table by pointer swap: it
-    //! builds a whole new immutable snapshot and stores it with one atomic
-    //! pointer write, so a concurrent reader sees either the entire old table
-    //! or the entire new one, never a mix of the two.
-    use super::*;
-
-    /// A distinct, leaked `BusDevice` standing in for a bank pointer.
-    fn dummy() -> *const dyn BusDevice {
-        Box::leak(Box::new(ErrorBus::new())) as *const ErrorBus as *const dyn BusDevice
-    }
-
-    /// Raw pointers are `!Send`; this wrapper lets a test hand one to a thread.
-    struct SendPtr(*const dyn BusDevice);
-    unsafe impl Send for SendPtr {}
-
-    /// `DecodeTable`/`DecodeMap::boot` build a 1 MiB array on the stack, the
-    /// same reason `Machine::new` runs on a 64 MB thread (main.rs).
-    fn on_big_stack(f: impl FnOnce() + Send + 'static) {
-        std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(f)
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    /// Bank placements for two 128 MB SIMMs at LOMEM, as `memcfg_bank_info`
-    /// decodes them (the default `iris.toml` config).
-    fn two_128mb_banks() -> [Option<(u32, u32, u32)>; 4] {
-        let m0 = MemoryController::encode_memcfg_half(LOMEM_BASE, 128).unwrap();
-        let m1 = MemoryController::encode_memcfg_half(LOMEM_BASE + BANK_SIZE, 128).unwrap();
-        [
-            MemoryController::memcfg_bank_info(m0, 128),
-            MemoryController::memcfg_bank_info(m1, 128),
-            None,
-            None,
-        ]
-    }
-
-    #[test]
-    fn remap_publishes_a_whole_new_table() {
-        on_big_stack(|| {
-            let map = DecodeMap::boot();
-            let unmapped = dummy();
-            let banks = [dummy(), dummy(), dummy(), dummy()];
-
-            let addrs = two_128mb_banks();
-            let (plan, _) = plan_bank_slots(&addrs, &[]);
-            let old = map.snapshot();
-
-            assert!(
-                map.apply_plan(&plan, banks, unmapped),
-                "a real remap must publish a new table"
-            );
-
-            // A fresh read sees the new snapshot...
-            assert!(std::ptr::addr_eq(map.device_at(LOMEM_BASE), banks[0]));
-            assert!(std::ptr::addr_eq(map.device_at(LOMEM_BASE + BANK_SIZE), banks[1]));
-
-            // ...while a reader that already loaded the old pointer still sees
-            // the complete old table: it was not freed, and not mutated in
-            // place (every boot slot is still `BOOT_PTR`). It now sits on the
-            // retire ring rather than being leaked.
-            assert_eq!(map.retired_len(), 1, "the superseded snapshot was not retired");
-            for i in [0usize, 1, (LOMEM_BASE >> 16) as usize, 65535] {
-                let p = unsafe { (*old).slots[i] };
-                assert!(
-                    std::ptr::addr_eq(p, BOOT_PTR),
-                    "the superseded snapshot was mutated in place at slot {i}"
-                );
-            }
-
-            // A MEMCFG write that moves no bank must not publish (and so retire
-            // nothing).
-            let live = map.snapshot();
-            assert!(
-                !map.apply_plan(&plan, banks, unmapped),
-                "an unchanged remap must not publish"
-            );
-            assert!(
-                std::ptr::addr_eq(map.snapshot(), live),
-                "an unchanged remap swapped the table"
-            );
-            assert_eq!(map.retired_len(), 1, "an unchanged remap retired a snapshot");
-        });
-    }
-
-    /// The leak the pointer-swap change introduced is bounded: superseded
-    /// snapshots are retained for a grace period (a fixed number of remaps)
-    /// and then freed, so a long run of real remaps does not grow the heap by
-    /// 1 MiB each time.
-    #[test]
-    fn superseded_tables_are_bounded() {
-        on_big_stack(|| {
-            let map = DecodeMap::with_retire_keep(2);
-            let banks = [dummy(), dummy(), dummy(), dummy()];
-            let unmapped = dummy();
-
-            // A run of real remaps, each publishing a distinctly-mutated copy
-            // of the live table so the ring never sees the same snapshot twice.
-            for i in 0..64u32 {
-                let mut table = map.clone_live();
-                table.slots[(LOMEM_BASE >> 16) as usize] = banks[(i % 4) as usize];
-                table.slots[((HIMEM_BASE >> 16) as usize) + (i as usize % 4096)] = unmapped;
-                map.publish(table);
-                assert!(
-                    map.retired_len() <= map.retire_keep,
-                    "retire ring grew past its bound at publish {i}"
-                );
-            }
-
-            // Sixty-four publishes, at most `retire_keep` superseded snapshots
-            // resident: everything older was dropped, so the leak is bounded.
-            assert_eq!(map.retired_len(), map.retire_keep);
-        });
-    }
-
-    #[test]
-    fn readers_never_observe_a_mixed_table() {
-        use std::sync::Arc;
-
-        on_big_stack(|| {
-            // A retire depth wider than the whole publish run, so no snapshot
-            // is reclaimed underneath the concurrent reader. This test is
-            // about tear-freedom, not reclamation; the ring bounds the leak.
-            const PUBLISHES: usize = 16;
-            let map = Arc::new(DecodeMap::with_retire_keep(2 * PUBLISHES + 2));
-            let a = SendPtr(dummy());
-            let b = SendPtr(dummy());
-            assert!(!std::ptr::addr_eq(a.0, b.0));
-
-            // Alternate publishing two homogeneous tables.
-            let writer = {
-                let map = map.clone();
-                std::thread::Builder::new()
-                    .stack_size(64 * 1024 * 1024)
-                    .spawn(move || {
-                        let (SendPtr(a), SendPtr(b)) = (a, b);
-                        for _ in 0..PUBLISHES {
-                            map.publish(Box::new(DecodeTable { slots: [a; 65536] }));
-                            std::thread::yield_now();
-                            map.publish(Box::new(DecodeTable { slots: [b; 65536] }));
-                            std::thread::yield_now();
-                        }
-                    })
-                    .unwrap()
-            };
-
-            // Each read loads the snapshot pointer exactly once, the way
-            // `device_at` does. Both published tables are homogeneous, so any
-            // two slots read from a single load must agree; seeing `a` and `b`
-            // together would mean a torn or in-place update.
-            let mut reads = 0u64;
-            while reads < 2_000_000 {
-                let t = map.snapshot();
-                let d0 = unsafe { (*t).slots[0] };
-                let d1 = unsafe { (*t).slots[65535] };
-                assert!(
-                    std::ptr::addr_eq(d0, d1),
-                    "reader observed a mixed decode table"
-                );
-                reads += 1;
-            }
-            writer.join().unwrap();
-            assert!(
-                map.retired_len() <= map.retire_keep,
-                "the retire ring grew past its bound"
-            );
-        });
     }
 }

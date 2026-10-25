@@ -9,10 +9,12 @@
 //! Full design and rationale: `docs/ppmem-design.md`.
 //! Verified platform findings: `clanker/build/mmap-rs-fixed-address-aliasing.md`.
 
+pub mod devmap;
 pub mod map;
 #[allow(clippy::module_inception)]
 pub mod ppmem;
 
+pub use devmap::SparseDeviceMap;
 pub use map::{align_up, granularity, is_aligned, AddrSpace, Prot, SharedMem};
 pub use ppmem::{
     swap_word_halves, swap_word_halves_store, MappedMemory, PpMemSpace, PpMemory, BITMAP_SHIFT,
