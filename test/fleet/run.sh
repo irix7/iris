@@ -60,7 +60,7 @@ fail() { echo "fleet: FAIL: $*" >&2; exit 1; }
 
 # ── 1. derivation must be disjoint ───────────────────────────────────────────
 # --print-instance is the discoverability surface agents use to find endpoints.
-declare -A DIR SOCK MON MAC SUBNET LOCK
+declare -a DIR SOCK MON MAC SUBNET LOCK
 for ((i=0;i<N;i++)); do
   out="$("$IRIS" --config "$CONFIG" --instance "$i" --print-instance)"
   DIR[$i]="$(sed -n 's/^state_dir: //p'   <<<"$out")"
@@ -98,7 +98,7 @@ done
 
 for ((i=0;i<N;i++)); do
   sock="$WORK/inst$i/iris.sock"
-  for _ in $(seq 1 60); do [[ -S "$sock" ]] && break; sleep 1; done
+  for ((n=0;n<60;n++)); do [[ -S "$sock" ]] && break; sleep 1; done
   [[ -S "$sock" ]] || { tail -20 "$WORK/inst$i.stdout" >&2; fail "instance $i socket never appeared"; }
 done
 echo "fleet: $N instances up"
@@ -107,7 +107,7 @@ echo "fleet: $N instances up"
 ci() { local i="$1"; shift; "$IRIS_CI" --socket "$WORK/inst$i/iris.sock" "$@" >/dev/null 2>&1; }
 wait_log() { # i  extended-regex  timeout_s
   local i="$1" pat="$2" t="$3" f="$WORK/inst$i/serial.log"
-  for _ in $(seq 1 "$((t*5))"); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
+  for ((n=0;n<t*5;n++)); do grep -qE "$pat" "$f" 2>/dev/null && return 0; sleep 0.2; done
   return 1
 }
 reach_monitor() { # i
@@ -130,7 +130,7 @@ echo "fleet: $N instances at the PROM command monitor"
 # The send/read goes through the live CI serial path (not just the log file):
 # an agent's `serial-wait` must observe the PROM's answer on this instance.
 for ((i=0;i<N;i++)); do ci "$i" serial-send "printenv"; done
-declare -A EADDR
+declare -a EADDR
 for ((i=0;i<N;i++)); do
   ci "$i" serial-wait "eaddr=" --timeout 30 \
     || { tail -30 "$WORK/inst$i/serial.log" >&2; fail "instance $i: serial-wait never saw eaddr="; }
