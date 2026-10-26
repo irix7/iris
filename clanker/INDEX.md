@@ -133,6 +133,7 @@ WD33C93A, SCSI targets (disk, CD-ROM, DaynaPort) and guest SCSI drivers.
 | Note | Kind | Title |
 |---|---|---|
 | [a-write-cdb-must-outlive-its-data-request.md](scsi/a-write-cdb-must-outlive-its-data-request.md) | rule | A write CDB must outlive the chip's request for its data |
+| [blocknode-upstream-port.md](scsi/blocknode-upstream-port.md) | rule | BlockNode is upstream; keep `ScsiDevice::open` when the fork syncs |
 | [daynaport-target-gotchas.md](scsi/daynaport-target-gotchas.md) | rule | DaynaPort target: the three things that bite |
 | [hpc3-dma-is-bulk-not-byte-at-a-time.md](scsi/hpc3-dma-is-bulk-not-byte-at-a-time.md) | design | HPC3 DMA is bulk, not byte-at-a-time — and so is the real hardware |
 | [linux-lun-scan-and-mode-sense-gaps.md](scsi/linux-lun-scan-and-mode-sense-gaps.md) | rule | Linux SCSI probe noise: phantom LUNs, missing Caching page, no MODE SENSE(10) |

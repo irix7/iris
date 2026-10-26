@@ -131,7 +131,7 @@ Each item is a convergence PR: after it lands, the fork deletes its copy.
 | 5 | HAL2 pacing/backpressure (#91) | the underrun/drift numbers in `clanker/perf/hal2-pump-thread.md` and `clanker/devices/cpal-alsa-busy-poll.md`, with method and run count | **cite the existing numbers** |
 | 6 | REX3 VDMA condvar re-dispatch (`c8e7a49`) | before/after CPU time or latency for the busy-wait path | **needs measurement** |
 | 7 | VINO descriptor engine (#96) | replay/validation captures from #56/#71/#70 on real IRIX | **needs capture** |
-| 8 | BlockNode storage (#89) | the fork's storage test suite run against the new interface, plus a no-behaviour-change statement | **ready as a refactor** |
+| 8 | BlockNode storage (#89) | the fork's storage test suite run against the new interface, plus a no-behaviour-change statement | **sent: techomancer/iris#337** (one commit, all CI green; advisory lock stays fork-only) |
 | 9 | StateDesc campaign (#92) | parity and migration tests per PR | **per-PR evidence** |
 | 10 | Perf bundles (#100) | benchmark history: named host, features, run count, before/after | **measured wins only** |
 | 11 | jitv2 (#99) | the same benchmark standard | **measured wins only** |
