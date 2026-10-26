@@ -189,18 +189,30 @@ in [docs/interrupt_map.md](docs/interrupt_map.md).
 
 ### Time
 
-CP0 Count is derived from retired cycles: each retired instruction is
-`NS_PER_GUEST_CYCLE` = 10 ns of synthetic guest time, scaled to guest ticks by
-the fixed Count frequency (33 MHz on IP22/IP24, 97.5 MHz on IP28; `[clock]
-fixed_mhz` overrides). IRIX reports twice the Count frequency as CPU MHz. The
-Count==Compare interrupt (IP7) is delivered deterministically: the `step()`
-preamble raises it when `hot.cycles` reaches `count_fire_cycle`, and a Count
-read that steps over Compare raises it at the crossing. There is no
+CP0 Count is derived from host wall-clock time at a fixed rate (33 MHz on
+IP22/IP24, 97.5 MHz on IP28; `[clock] fixed_mhz` overrides). There is no
 calibration or fast/slow-tick inference — that was removed in September 2026.
-The host clock is kept only for pacing (idle parking) and for real time, and
-other periodic device events still come from host timers (`src/hptimer.rs`).
-`--features ci_clock` is a retired no-op: the cycle-derived clock is the
-default and the feature no longer changes behaviour (#42).
+The Compare interrupt and other periodic device events come from host timers
+(`src/hptimer.rs`), not from counting instructions. A guest that runs faster
+or slower than real hardware sees the same time passing.
+
+`--features ci_clock` instead derives Count from retired instructions at
+`NS_PER_GUEST_CYCLE` = 10 ns each, scaled to guest ticks by the fixed Count
+frequency. The Compare interrupt becomes a `hot.cycles` threshold
+(`count_fire_cycle`) checked by the per-instruction preamble, so two runs from
+the same state execute identically regardless of host speed. Use it for the
+snapshot determinism validator and deterministic replays, not for interactive
+use: guest wall-clock no longer tracks host time (see `FEATURES.md`).
+
+Snapshots record which clock they were captured with (the CPU state
+description's `clock` field, version 3) and refuse a restore into the other
+model. Version-2 fork snapshots (cycle-clock only) migrate to the running
+build's clock and get a fresh Compare deadline.
+
+Idle parking (`--features idle-pause`) works in both models: the parked CPU
+still advances `hot.cycles` at the 10 ns/guest-cycle pacing rate for
+cross-thread readers, and wakes on any pending interrupt — the hptimer's IP7
+in a wall-clock build, or the cycle threshold under `ci_clock`.
 
 ## 4. Threads
 

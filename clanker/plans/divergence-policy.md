@@ -96,14 +96,14 @@ the fork's version.
   `guest`/`both` sink and its partial-line flusher; the CI and TCP paths use
   one `SerialLog`, and the fork's per-consumer console cursors (#97) remain.
   Do not reintroduce a second writer.
-- **CPU clock model (#98).** Upstream's reply on techomancer/iris#322 points
-  at the existing `ci_clock` feature: normal builds keep the host wall clock,
-  and `ci_clock` derives Count from retired cycles for the determinism
-  validator. Revert the fork's cycle-derived-by-default clock, its ordered
-  guest-time timer queue (`800f785`, `e8b264e`) and the PIT/idle-park code that
-  depends on it, and use upstream's `ci_clock` for deterministic runs. This is
-  the largest revert left; do it as its own campaign after BlockNode, because
-  it touches the CPU, PIT, idle park, snapshots and their tests.
+- **CPU clock model (#98) — done.** Upstream's reply on techomancer/iris#322
+  pointed at the existing `ci_clock` feature: normal builds keep the host wall
+  clock, and `ci_clock` derives Count from retired cycles for the determinism
+  validator. `convergence/ci-clock` adopts upstream's clock code, removes the
+  ordered guest-time queue (`800f785`, `e8b264e`), returns the PIT to
+  upstream's `Instant` channels (keeping #323's read-back) and keeps idle-pace
+  re-expressed against the wall clock. The CPU state description is v3 with a
+  `clock` field and a v2 migration. See `plans/ci-clock-reversion.md`.
 - **O2 SCSI raw-only shim.** `aic7880::attach_device` currently accepts raw
   images only because the fork's disks are `BlockNode`s and upstream's are
   `DiskBackend`s. This is temporary: delete it when BlockNode lands upstream;

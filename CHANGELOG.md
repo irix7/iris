@@ -18,6 +18,28 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Clock
+
+- **The default CPU clock is the host wall clock again; `ci_clock` is a real
+  feature again.** CP0 Count is derived from host time at the configured rate,
+  and the Compare interrupt is armed on the `hptimer` thread. This reverts the
+  fork's cycle-derived-by-default clock (0.1.5) and its ordered guest-time
+  timer queue. Guest wall-clock once more tracks host time: a guest that runs
+  faster than an R4400 sees the same seconds pass.
+- **Deterministic runs need `--features ci_clock`.** That build derives Count
+  from retired instructions at 10 ns each, turns Compare into a cycle
+  threshold, and is the one the snapshot determinism validator uses. It is not
+  for interactive use. Snapshots record which clock captured them and refuse a
+  restore into the other model; version-2 fork snapshots migrate and get a
+  fresh Compare deadline.
+- **The 8254 PIT is host-timed again** (read-back and latch release from
+  upstream #323). It is no longer derived from the same cycle counter as CP0
+  Count.
+- **Idle-pace stays.** A parked guest still advances `hot.cycles` for
+  cross-thread readers, wakes on any interrupt, and paces a masked-interrupt
+  spin at ~0 % host CPU. The PIT and Compare now arrive from the `hptimer`
+  thread instead of a guest-cycle queue.
+
 ### Fork release 0.1.8
 
 - **Upstream sync: jitv2 performance, serial timestamps and O2 documentation.**

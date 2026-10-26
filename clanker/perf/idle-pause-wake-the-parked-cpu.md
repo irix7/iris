@@ -38,25 +38,18 @@ which is exactly the cost the flag exists to avoid.
 across the slice, so it cannot pass on an interrupt that happened to land just
 before a boundary.
 
-## Wake latency to a guest-timer deadline (#68)
+## Wake latency to a guest-timer deadline (#68) — superseded
 
-Once #43 armed guest-time deadlines, `park` no longer sleeps a fixed
-`SLICE_NS` when a deadline is due: it sleeps to the soonest `hot.cycles`
-deadline (Compare or a queued 8254 PIT timer). The figure that matters is the
-host wall-clock time *after* that deadline at which the CPU thread wakes —
-the observed sleep minus the sleep the deadline asked for. `park` cannot
-return before `hot.cycles` reaches the deadline, so a spurious `wake` costs an
-extra loop iteration, not an early return.
+> **Superseded (2026-10-26, #98).** #43's guest-time timer queue was removed
+> when the fork reverted to upstream's host wall clock. `park` is back to
+> waking on any pending interrupt, with the hptimer delivering Compare and PIT
+> ticks exactly like a device line; it does not target a `hot.cycles` deadline
+> any more. The measurement and test below described the queue build and no
+> longer exist. The unpark-latency rule above is unchanged, and the
+> `--features ci_clock` threshold exit is still behind a feature flag, so the
+> "every exit clears `PARKED`" warning still applies.
 
-`host_wake_latency_after_the_guest_deadline_is_bounded` measures it for a
-300 us guest deadline (30 000 cycles) and bounds the **best of five** samples:
-
-| deadline | intrinsic overshoot (idle dev host) | bound |
-|---|---|---|
-| 300 us | ~60-75 us | 500 us |
-
-Best-of-five because a `park_timeout` is a futex wait: a loaded host schedules
-the wake late for reasons the emulator does not control (a busy dev box showed
-outliers up to ~6 ms). The bound is deliberately under the retired 1 ms slice,
-so a park that reverted to slice parking (~700 us overshoot on a 300 us
-deadline) fails the test.
+Once #43 armed guest-time deadlines, `park` slept to the soonest `hot.cycles`
+deadline (Compare or a queued 8254 PIT timer) instead of the fixed `SLICE_NS`.
+The measured overshoot on an idle dev host was ~60-75 us for a 300 us deadline.
+That machinery is gone with the queue.

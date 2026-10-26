@@ -28,7 +28,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
 | [cp0-index-masks-never-wraps.md](cpu/cp0-index-masks-never-wraps.md) | rule | CP0 `Index` selects a TLB slot by masking, never modulo |
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
-| [cpu-count-is-wallclock-derived.md](cpu/cpu-count-is-wallclock-derived.md) | rule | CP0 Count is wallclock-derived, so Count tests flake |
+| [cpu-count-is-wallclock-derived.md](cpu/cpu-count-is-wallclock-derived.md) | rule | CP0 Count is wallclock-derived in default builds, so Count tests flake; `ci_clock` is the deterministic exception |
 | [cpu-model-is-runtime-not-compile-time.md](cpu/cpu-model-is-runtime-not-compile-time.md) | design | The emulated CPU is a runtime flag now, not a cargo feature |
 | [entryhi-region-falls-out-of-sign-extension.md](cpu/entryhi-region-falls-out-of-sign-extension.md) | rule | EntryHi.Region on a 32-bit TLB miss comes free from sign extension |
 | [fpu-exception-model-vs-r4400.md](cpu/fpu-exception-model-vs-r4400.md) | open | What IRIS's FPU does that an R4400's does not |
@@ -120,7 +120,7 @@ Non-graphics devices: MC/MEMCFG and RAM banks, HPC3, VDMA, EEPROMs and NVRAM, PS
 | [o2-cache-handover-full-to-shadow.md](devices/o2-cache-handover-full-to-shadow.md) | design | O2 cache: the full model through POST, the shadow model after; switched by PC range and a tag-store trigger, and why the log flips during a reboot |
 | [memcfg-limit-is-not-the-bank-size.md](devices/memcfg-limit-is-not-the-bank-size.md) | rule | MEMCFG: `limit` is the slot, `addr_mask+1` is the mirror period — they differ |
 | [nvram-persistence.md](devices/nvram-persistence.md) | design | Battery-backed state on Stop |
-| [pit-is-not-an-independent-time-base.md](devices/pit-is-not-an-independent-time-base.md) | rule | The 8254 PIT is not an independent time base |
+| [pit-is-not-an-independent-time-base.md](devices/pit-is-not-an-independent-time-base.md) | rule | The 8254 PIT is host-timed again; not a good CP0 Count accuracy reference |
 | [ps2-aux-mux-probe-and-status-bit.md](devices/ps2-aux-mux-probe-and-status-bit.md) | rule | PS/2 mouse not detected under Linux 3.2 guests (and keyboard sometimes flaky too) |
 | [serial-log-wall-only.md](devices/serial-log-wall-only.md) | rule | Serial log timestamps are wall-clock only (off or wall) |
 | [vdma-gio-side-is-always-whole-qwords.md](devices/vdma-gio-side-is-always-whole-qwords.md) | rule | The GIO side of a VDMA transfer is always whole qwords — only memory is ragged |
@@ -293,6 +293,7 @@ Snapshots, `iris-ci`, scratch volumes, round-trip tests.
 | Note | Kind | Title |
 |---|---|---|
 | [ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md](snapshot/ci-mode-overlay-path-is-tmpiris-ci-pid-scsiidoverlay.md) | howto | CI mode overlay path is /tmp/iris-ci-PID-scsiID.overlay |
+| [determinism-validator-live-count.md](snapshot/determinism-validator-live-count.md) | rule | The determinism validator must release the stopped-CPU Count latch |
 | [iris-ci-is-the-canonical-ci-socket-interface.md](snapshot/iris-ci-is-the-canonical-ci-socket-interface.md) | howto | iris-ci is the canonical CI socket interface |
 | [l1d-tag-must-match-the-cache-line-layout.md](snapshot/l1d-tag-must-match-the-cache-line-layout.md) | rule | L1D cache tag must match one manual layout, not two |
 | [machine-pointer-holders-must-share-the-drop-slot.md](snapshot/machine-pointer-holders-must-share-the-drop-slot.md) | rule | Raw `*mut Machine` holders must share the slot that Drop nulls |
@@ -316,7 +317,7 @@ Host performance: idle parking, thread parking, GFIFO, benchmarks.
 | [hot-path-inlining-must-be-explicit.md](perf/hot-path-inlining-must-be-explicit.md) | rule | Hot-path inlining must be stated, not left to the inliner |
 | [idle-pause-masked-interrupt-must-wake.md](perf/idle-pause-masked-interrupt-must-wake.md) | rule | idle-pause: a masked interrupt must end the park too |
 | [idle-pause-must-not-park-with-interrupts-masked.md](perf/idle-pause-must-not-park-with-interrupts-masked.md) | rule | The idle-park heuristic must not park when Status.IM is zero |
-| [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice |
+| [idle-pause-wake-the-parked-cpu.md](perf/idle-pause-wake-the-parked-cpu.md) | rule | idle-pause: an interrupt must unpark the CPU thread, not wait for the slice (its deadline-park section is superseded by #98) |
 | [idle-pause-work.md](perf/idle-pause-work.md) | history | Idle-pause work — findings & handoff |
 | [interpreter-dispatch-is-call-threading.md](perf/interpreter-dispatch-is-call-threading.md) | measure | The interpreter dispatches via call threading — the slowest portable technique |
 | [mem-and-fpu-hot-paths.md](perf/mem-and-fpu-hot-paths.md) | measure | Guest memory and FPU hot paths: what is actually slow |

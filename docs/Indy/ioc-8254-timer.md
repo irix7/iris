@@ -58,59 +58,53 @@ Reading:
   because the high byte is recomputed from the live count. Latch first.
 
 Status byte: `OUT` (D7), null count (D6), then the programmed mode word
-(`RW`, `M2..M0`, `BCD`). D6 is set by the control or count write and clears
-once the count reaches the counting element. IRIS clears it when the channel
-is armed, so a counter with no input clock keeps D6 set — the test for "not
-clocked" rather than "stuck". The OUT bit is coarse in IRIS: high while a
-mode 2/3 channel is armed, low otherwise. GATE inputs and the output waveform
-are not modelled.
+(`RW`, `M2..M0`, `BCD`). The OUT bit is coarse in IRIS: high while the channel
+is armed and counting, low otherwise. Null count is not modelled, so D6 stays
+clear; a channel with no input clock is identified by its zero input frequency
+and unarmed state instead. GATE inputs and the output waveform are not
+modelled.
 
 ## Resolution and time base
 
-IRIS derives every channel deadline from the guest cycle counter
-(`hot.cycles`) and never from the host clock:
+Each channel is armed as a recurring host timer on the `hptimer` thread
+(`src/hptimer.rs`) for one full period (`reload / input_freq`), and a read
+interpolates the remaining count from a host `Instant` and the channel's
+period. Consequences:
 
-- One input tick is 1 µs at the 1 MHz counter-2 input, which is **100 guest
-  cycles** at the emulator's 10 ns per retired cycle.
+- One input tick is 1 µs at the 1 MHz counter-2 input.
 - A read truncates to whole ticks; 16 bits gives a maximum period of 65.535 ms
   before the counter reloads.
 - The per-tick nanosecond value is `1e9 / input_freq` in integers, so a
   counter-2 reload that does not divide 1 MHz evenly rounds the tick to whole
   nanoseconds (the 1 MHz case itself is exact).
-- Deadlines are absolute (`deadline + period`), so there is no per-tick
-  accumulation error. A 100 Hz counter produces exactly 1000 interrupts in
-  10 s of guest time.
+- Delivery is host-timed, so it jitters with host scheduling. It does not
+  accumulate error over a period: each period re-arms from the current host
+  instant rather than by adding ticks.
 
-## It is not an independent reference
+## Host reference, and what may be calibrated against it
 
-This is the part that matters to a guest timing probe.
+The PIT is a host-timer device. In the default build CP0 Count is also
+host-anchored, at `count_hz`, so a guest that compares the two is measuring
+the emulator's chosen ratio plus the jitter of two different host paths. That
+is useful as a sanity check but is not evidence of hardware accuracy, and the
+ratio is not exact.
 
-- CP0 Count is derived from the **same** `hot.cycles` clock, scaled by
-  `count_hz` (33 MHz by default). The PIT-to-Count ratio is therefore a
-  constant chosen by the emulator — 33 Counts per PIT tick at the default —
-  and calibrating one against the other measures that constant, not the
-  machine. It cannot detect drift, and it will always pass.
-- Against host wall time the rate is undefined while executing: one guest
-  cycle is one retired instruction, so a PIT second is however long it takes
-  the host to retire 100 million instructions. Only while the CPU is parked
-  idle (or stalled in `WAIT`) does the cycle clock advance at 10 ns per host
-  nanosecond.
-- The only host-referenced clock the guest has is the battery-backed DS1386
-  RTC, at 10 ms (hundredths of a second) resolution. That can bound
-  long-term drift, but it cannot calibrate a microsecond timer.
+Under `--features ci_clock` Count is derived from retired instructions while
+the PIT remains host-timed. The two then diverge by design: PIT time tracks
+the host, Count tracks executed instructions. A guest timing probe that
+assumes they agree will see that difference.
 
-IRIS therefore offers **no independent microsecond timing source**. An OS
-that needs to calibrate against real time must use something outside the
-emulated timing path — NTP over the emulated network, or the RTC for a coarse
-check. Calibrating CP0 Count against the PIT is circular and should be
-skipped.
+The only guest-visible clock that is independent of both is the battery-backed
+DS1386 RTC, at 10 ms (hundredths of a second) resolution. That can bound
+long-term drift, but it cannot calibrate a microsecond timer. An OS that needs
+to calibrate against real time should use something outside the emulated
+timing path — NTP over the emulated network, or the RTC for a coarse check.
 
 ## Diagnostics
 
-`pit status` prints the reference, the clock chain and each channel's mode,
-reload, live count, input frequency and armed/null state. It is the quickest
-way to tell a counter that is not clocked from one that is counting.
-`pit debug on` traces register reads and writes.
+`pit status` prints each channel's mode, reload, live count, input frequency
+and armed state. It is the quickest way to tell a counter that is not clocked
+from one that is counting. `pit debug on` traces register reads and writes.
 
-The model is in `src/dev/pit8254.rs`; the shared guest-time queue it arms
-deadlines on is in `src/cpu/guest_timer.rs`.
+The model is in `src/dev/pit8254.rs`; the host timers it arms are in
+`src/hptimer.rs`.

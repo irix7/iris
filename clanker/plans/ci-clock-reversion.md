@@ -1,8 +1,10 @@
 # Reverting the fork clock to upstream's `ci_clock`
 
-**Status:** decided 2026-10-25 (irix7/iris#98, techomancer/iris#322). Not started.
-This is the largest convergence left; do it as one campaign, not as incidental
-edits.
+**Status:** done 2026-10-26 (irix7/iris#98, techomancer/iris#322), branch
+`convergence/ci-clock`. Measured on `callisto` (x86_64, 16 cores): determinism
+on/off, boot time and bench. Idle-pace stays, with a known cold-boot
+interaction recorded in `clanker/testing/release-idle-pause-hangs-prom-boot.md`.
+This was the largest convergence left; it was done as one campaign.
 
 ## What upstream has
 
