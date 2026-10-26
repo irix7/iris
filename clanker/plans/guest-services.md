@@ -29,11 +29,11 @@ image starts one. Desktop-instance management is out of scope.
 | Lifecycle policy | Observe `idle status` plus guest load; apply the headless profile; cleanly stop unused instances with `guest-shutdown powerdown` |
 | Packaging | One IRIX `inst` product, `iris_guest`, one `sw` subsystem, `.tardist` built in the guest with MIPSpro + `gendist` |
 | New emulated hardware | None |
-| New host port/path | None (the CI socket and the existing state directory are the boundary) |
+| New host port/path | None for v1 control; v1.1 adds only a derived `127.0.0.1` `guest_data` forward. |
 | Pause/resume | **Out of scope**; the guest cannot pause the VM, and `machine-stop` is not a transparent pause |
 | Second idle detector | **Not proposed**; the host detector already does this |
 | Headless profile | **v1**: stop `xdm`/`amstart` via a fixed allowlist if the image started them; report the result. No arbitrary command execution. |
-| Command pipe | **v1.1, opt-in**: `guest-run`/`guest-shell` with stdin, stdout, stderr and exit status; small/interactive over GuestLink, bulk via NFS/scratch or the TCP data path. |
+| Command pipe | **v1.1, opt-in**: `guest-run`/`guest-shell` with stdin, stdout, stderr and exit status; control on GuestLink, **data over a per-instance TCP forward** (serial fallback only for small/early payloads). |
 | Effort | ~13–16 engineer-days for v1, plus ~6–9 for v1.1 with the command pipe |
 
 The honest summary: **a guest agent will not lower the 2 % host CPU a settled
@@ -113,7 +113,7 @@ Three separate questions hide in that one:
 | Clean stop/reboot | Scrape the console or telnet, type `shutdown`, hope the prompt parser is right; `iris-ci quit` saves NVRAM but does not flush the guest filesystem | `iris-ci guest-shutdown powerdown --wait 120`; the guest runs `/etc/shutdown`, XFS unmounts, then `Machine::stop` saves NVRAM and release builds exit | Shutdown time, exit status, no XFS repair on next boot |
 | Load/telemetry | Parse `uptime`, `date`, `ps` from the console; each scrape costs guest CPU and bytes on the console | `guest-get-load`, `guest-get-time`, `guest-get-osinfo`, `iris-get-status`; one small request, no shell, no console echo | Request latency, bytes on the wire, guest CPU per scrape |
 | Fleet policy | The scheduler cannot tell "at getty" from "running a build" without scraping | Park counters (host) plus guest load (guest) plus job markers (launcher) | False stops in a fleet run |
-| Automation | `iris-ci run/put/get` drive `/bin/sh` and parse prompts; csh quirks, base64 over the console | v1.1 `guest-run`/`guest-shell`: stdin/stdout/stderr and exit status, no prompt parsing (§3.7); `guest-file-*` stays out | Console bytes per operation, round-trip latency, exit-status accuracy |
+| Automation | `iris-ci run/put/get` drive `/bin/sh` and parse prompts; csh quirks, base64 over the console | v1.1 `guest-run`/`guest-shell`: stdin/stdout/stderr and exit status over a TCP data channel (§3.7); serial control, no prompt parsing; `guest-file-*` stays out | Console bytes per operation, TCP throughput and round-trip latency, exit-status accuracy |
 | Coverage the detector misses | A headless guest with `xdm` spinning on an absent framebuffer never parks (87,700 distinct PCs over 3 s in the 5.3 investigation) | The agent applies the named headless profile in v1 (stop `xdm`/`amstart` through a fixed allowlist); the idle detector then parks normally | Host CPU before/after the profile; no userland process left spinning |
 | Quiesce before a snapshot | `sync` typed at the console | `iris-sync-fs`; future fsfreeze-like cooperation | Snapshot validator pass rate |
 
@@ -164,7 +164,7 @@ instance simply does not enable the profile.
 | Transport | Available | Throughput / latency | Conflicts | Host work | Guest work | Security | Cost | Verdict |
 |---|---|---|---|---|---|---|---|---|
 | **SCC channel A** (`/dev/ttyd2`, host `serial_port_a`) | After `init` reaches run level 2; before network | Baud-paced unless host-speed; 100–300 B JSON is fine; not for bulk | `ttyd2` may have a `getty` (`respawn`) on some releases; console is `ttyd1` | Add a `GuestLink` backend; no new port | Open tty, raw termios, read/write | Localhost/in-process; device mode must be tightened | **Low** | **v1** |
-| **TCP port forward through NAT** | Only after guest network and the agent binds a port | Fast (emulated SEEQ, but orders of magnitude over 9600) | Needs a free guest port and a host forward; `bind=any` exposes it | Derive a per-instance host port in `derive_instance`; add forward | Agent listens on TCP; inetd or self-bind | Network-reachable; needs auth | Medium | v1.1 optional |
+| **TCP port forward through NAT** | Only after guest network and the agent binds a port | Emulated SEEQ 10 Mbps ≈1.2 MB/s; orders of magnitude over serial; enough for logs and small payloads, not bulk trees | Needs a fixed guest port and a host forward; bind to the NAT address, never `0.0.0.0`; host forward binds `127.0.0.1` | Derive a per-instance host port in `derive_instance`; add a forward | Agent self-binds; one-shot token from the serial handshake | Localhost forward + token; no general network exposure | Medium | **v1.1 data plane** |
 | **NFS `/shared`** | After mount; host serves it in-process | Bulk only | Mount can hang; `/shared` is `noexec` in the test loop | None (already exists) | Mount, poll files | Host directory permissions | Low | Payloads only |
 | **Scratch SCSI volume** | After the guest mounts it | Bulk only; block device | Guest page cache vs host writes; mount/unmount | `iris-ci scratch-*` already exists | Mount, parse | Disk image access | Low | Payloads only |
 | **New emulated device** (virtio-serial-like) | After an IRIX driver exists | Excellent | Needs a PCI/GIO device and a DDI/DKI driver | New device model, GFIFO/interrupt work | Kernel driver + user daemon | Device-local | **High** | Out of scope |
@@ -637,33 +637,56 @@ propagation.
 
 **Protocol**
 
-Newline-delimited JSON events on the same `GuestLink`:
+Control is newline-delimited JSON on `GuestLink`; data is the framed TCP
+stream below.
 
 ```
-host -> guest  {"id":1,"cmd":"guest-run","argv":["cat"],"tty":false,"timeout_ms":30000}
-host -> guest  {"id":1,"event":"stdin","data":"<base64>"} ... {"id":1,"event":"eof"}
-guest -> host  {"id":1,"event":"stdout","data":"<base64>"}
-guest -> host  {"id":1,"event":"stderr","data":"<base64>"}
-guest -> host  {"id":1,"event":"exit","status":0,"signal":null}
+host -> guest  {"id":1,"cmd":"guest-run","argv":["cat"],"tty":false,
+                "timeout_ms":30000,"token":"<hex>"}
+guest -> host  {"id":1,"event":"data-ready","port":7777}
+# host connects to 127.0.0.1:<derived forward>, sends the token, then frames:
+#   u32 channel (0 stdin, 1 stdout, 2 stderr, 3 exit), u32 length, bytes
+host -> guest  channel 0 ... ; channel 0, length 0 (EOF)
+guest -> host  channel 1/2 ... ; channel 3 with status/signal
 ```
 
-`guest-kill` or closing stdin cancels; a timeout kills the process group.
-Chunks are at most 4 KiB and base64-encoded, so binary data is safe. stdout and
-stderr stay separate; the host may merge them for display. The agent stops
-reading the child when its outbound queue is full (backpressure), and the host
-must keep reading. One command runs at a time on the serial link; per-instance
+The control request carries only argv, tty, timeout, token and the data port;
+stdin/stdout/stderr bytes use the TCP framing, so they are binary-safe and have
+no JSON/base64 overhead on the data path. stdout and stderr stay separate; the
+host may merge them for display. The agent stops reading the child when its
+outbound queue is full (backpressure), and the host must keep reading.
+`guest-kill` or closing the data connection cancels; a timeout kills the
+process group. One command runs at a time per instance; per-instance
 concurrency comes from separate instances.
 
-**Transport**
+**Transport — serial control, TCP data**
 
-Control and small payloads go over ttyd2/`GuestLink`; `host_speed` bypasses SCC
-pacing, but this is still not a bulk pipe. Interactive commands and test output
-are fine. Build trees, tarballs and large logs go through NFS `/shared` or the
-scratch volume in v1, or the v1.1 TCP data channel. The host enforces a soft
-per-stream cap (default 4 MiB) and refuses a `guest-run` that asks for more;
-redirect large output to a file instead. The TCP data path, if enabled, binds
-the guest listener to the NAT address, forwards to host `127.0.0.1`, and
-requires a token.
+Control and negotiation use ttyd2/`GuestLink` because they must work before
+guest networking and for lifecycle. Bulk command I/O does **not** go over the
+serial line:
+
+- `guest-run`/`guest-shell` send their request over `GuestLink`. The agent
+  binds a listener on a fixed guest port (default 7777), bound to the NAT
+  address, and expects a one-shot token delivered in the handshake.
+- `derive_instance` adds a per-instance host forward (for example
+  `port_base + 4` -> guest 7777), bound to host `127.0.0.1`. `iris-ci guest-run`
+  asks the CI socket for the endpoint/token, connects to that local forward,
+  and speaks the framed data protocol below. The forward, not the guest, is the
+  only reachable side.
+- The data connection is a raw framed stream: `u32 channel` (0 stdin, 1 stdout,
+  2 stderr, 3 exit), `u32 length`, then bytes. For `--tty` there is one merged
+  output stream and one stdin stream. The exit frame carries status/signal.
+- The emulated SEEQ is 10 Mbps (~1.2 MB/s): fine for interactive commands,
+  test output and small pipes; **not** a build-tree transport. NFS `/shared`,
+  the scratch volume or a file redirect remain the bulk path. Measure it on
+  the rig before promising more.
+- Serial fallback remains for a guest whose network is down: a small `guest-run`
+  can use the GuestLink with a 4 MiB per-stream cap and a warning. It is a
+  convenience, not the normal path.
+- If 10 Mbps is not enough for a real workload, the next data plane is a
+  hostcall stream (page-sized transfers through `iris-hostcall`, no network,
+  but IRIS-only and it runs on the CPU thread) or a new emulated device. Do not
+  pretend the serial line is the answer.
 
 **Agent implementation**
 
@@ -679,8 +702,10 @@ choice, and the transport is local-only.
 
 - `[guest] allow_run = true` is opt-in; default false. `guest-info` advertises
   whether it is enabled.
-- No network listener by default; the state directory/CI socket remains the
-  authority.
+- The data listener is bound to the guest NAT address, never `0.0.0.0`; the
+  host-side forward binds `127.0.0.1` and requires the one-shot token from the
+  serial handshake. No general network exposure; the state directory/CI socket
+  remains the authority.
 - argv-only by default; `allow_shell` is a separate opt-in; no
   `guest-file-*`, fsfreeze, SSH or password commands.
 - Log command name and argv length, never payload bytes; enforce timeouts and
@@ -690,10 +715,11 @@ choice, and the transport is local-only.
 
 **Acceptance**
 
-`cat` round trip of 1 MiB over serial and over TCP, binary-safe; exit 0 and
-exit 1; stderr separation; timeout; cancel; `guest-shell` runs `date`; no
-orphan process; 10,000 pings still clean; no periodic wakeups when idle. These
-belong to v1.1, not the v1 milestone gate.
+`cat` round trip of 1 MiB over TCP (binary-safe, measure MB/s), plus the
+serial fallback with a small payload; exit 0 and exit 1; stderr separation;
+timeout; cancel; `guest-shell` runs `date`; no orphan process; 10,000 pings
+still clean; no periodic wakeups when idle. These belong to v1.1, not the v1
+milestone gate.
 
 ---
 
@@ -705,13 +731,14 @@ belong to v1.1, not the v1 milestone gate.
 |---|---|
 | `src/guest_link.rs` (new) | `GuestLink: SerialBackend`: `to_guest`/`from_guest` queues, `push_host`, `wait_line`, `reset`, `generation`, 64 KiB cap, `host_speed() = true` |
 | `src/guest.rs` (new) | `GuestService`: request/response matching, `guest-sync`, timeouts, `ping/info/load/time/osinfo/shutdown/status`, error types |
+| `src/guest_data.rs` (new, v1.1) | TCP data client/proxy: endpoint/token from CI, `guest-run`/`guest-shell` stream framing, stdin/stdout/stderr, exit status, cancel/timeout |
 | `src/dev/z85c30.rs` | No protocol logic; `set_backend_a` already exists. Optionally expose `guest_link()` for diagnostics |
 | `src/machine.rs` | Create `GuestLink` + `GuestService` when `cfg.guest.enabled`; install the link on SCC A before `start()`; store the service; `get_guest()` |
 | `src/dev/hpc3.rs` | Hold `Option<Arc<GuestService>>`; register `guest` monitor command and dispatch it |
-| `src/ci.rs` | Hold `Option<Arc<GuestService>>`; add `guest-*` and `idle-status` commands; reset on restore/rollback |
+| `src/ci.rs` | Hold `Option<Arc<GuestService>>`; add `guest-*`, `guest-data-info`, `guest-run`/`guest-shell` and `idle-status` commands; reset on restore/rollback |
 | `src/config.rs` | `GuestConfig` + `[guest]` table + CLI flags + validation; `--print-instance` line |
 | `src/instance.rs` | Skip the serial-A listener preflight when guest mode owns A |
-| `src/iris_ci_main.rs` | `guest-ping`, `guest-info`, `guest-load`, `guest-time`, `guest-status`, `guest-shutdown`, `guest-sync`, `idle-status` |
+| `src/iris_ci_main.rs` | `guest-ping`, `guest-info`, `guest-load`, `guest-time`, `guest-status`, `guest-shutdown`, `guest-sync`, `idle-status`; v1.1 `guest-run`/`guest-shell` streaming |
 | `src/monitor.rs` | No change if `guest` is registered on HPC3 (already registered) |
 | `iris-gui` | Out of scope; later a Debug-tab status line |
 | `clanker/iris_mcp.py` | No new tool; `run_command "guest status"` covers it |
@@ -760,7 +787,9 @@ Host TOML:
 ```toml
 [guest]
 enabled = false          # opt-in; no change to existing configs
-transport = "scc-a"      # v1: only value
+transport = "scc-a"      # control channel; v1: only value
+data = "tcp"             # v1.1 command data: tcp (default) or serial fallback
+data_guest_port = 7777   # agent listener; forwarded per instance
 request_timeout_ms = 2000
 shutdown_timeout_ms = 120000
 ```
@@ -785,13 +814,16 @@ serial_a: guest (in-process)
 serial_b: 9032
 ci_socket: /home/me/iris-fleet/iris-instance-3/iris.sock
 guest: scc-a
+guest_data: 9034          # v1.1 only; 127.0.0.1 -> guest 7777
 ```
 
-No new `StatePaths` accessor and no new `derive_instance` value in v1. If a
-per-instance guest log is added later, it must be
-`StatePaths::guest_log()` -> `<state_dir>/iris-guest.log`; do not invent a
-path at the call site. If a TCP transport is added later, the port must be
-derived in `derive_instance` (e.g. `port_base + 4`), not chosen by a script.
+v1 adds no `StatePaths` accessor and no `derive_instance` value. v1.1's TCP
+data channel **does** add one derived endpoint: `guest_data` =
+`port_base + 4` -> guest `data_guest_port`, bound to `127.0.0.1`, printed by
+`--print-instance`. The one-shot token is generated per command and sent over
+the serial handshake, so it has no state-directory file. If a per-instance
+guest log is added later, it must be `StatePaths::guest_log()` ->
+`<state_dir>/iris-guest.log`; do not invent a path at the call site.
 
 One `Machine` per process (the fleet invariant) means the `GuestLink` and
 `GuestService` are fields of `Machine`, not process globals. A fleet of N
@@ -1199,7 +1231,7 @@ not widen it.
 | M3 — Packaging | idb/spec, gendist, tardist, install/upgrade/uninstall | 2 | `inst -a` ≤30 s; upgrade keeps config; uninstall leaves no process/links |
 | M4 — Fleet + headless | `[guest]`, `--guest`, `--print-instance`, preflight skip, 8 headless-instance run, profile + stop policy, docs | 3 | 8 instances: all ping; all apply headless; all stop; no cross-talk; idle CPU unchanged |
 | M5 — Rig hardening | 6.5.22/6.5.30, getty/respawn case, crash/recovery, measurements | 2–3 | Test matrix green; numbers recorded in `clanker/` |
-| v1.1 (optional) | TCP transport, command pipe (§3.7), `guest-get-fsinfo`/network, supervisor | 6–9 | Separate plan |
+| v1.1 (optional) | TCP data channel, command pipe (§3.7), `guest-get-fsinfo`/network, supervisor | 6–9 | Separate plan |
 
 Total v1: **13–16 engineer-days**, assuming access to a 6.5 guest and the
 packaging skill's workflow. The critical path is M1 (IRIX tty behaviour), not
@@ -1232,7 +1264,8 @@ the host code.
 - Pause/resume and any second idle detector.
 - virtio/vsock/new emulated device; `hostcall` as the v1 transport.
 - O2/IP32 support; IRIX 5.3 guarantee (o32 builds, not tested).
-- TCP transport, remote network exposure, multi-client multiplexing.
+- General TCP exposure beyond the 127.0.0.1 per-instance data forward, remote
+  network exposure, multi-client multiplexing.
 - QGA wire compatibility or third-party QGA clients.
 - A full fleet scheduler UI; only the reference policy script.
 - Package signing, licensing, SGI patch products, GUI integration.
@@ -1281,10 +1314,12 @@ the v1 decisions. Revisit only if that use case changes.
    `StatePaths::guest_log()` through the seam rather than inventing a path.
 8. **No QGA wire compatibility.** The protocol is a documented QGA-inspired
    subset; third-party QGA clients are not a goal.
-9. **Command piping is v1.1, opt-in.** `guest-run`/`guest-shell` require
-   `[guest] allow_run = true`; argv-only, no shell unless `allow_shell` is also
-   set, root in private development images, local transport only. Small data
-   uses `GuestLink`; bulk goes through NFS/scratch or the TCP data path.
+9. **Command piping is v1.1, opt-in, with a TCP data plane.** `guest-run`/
+   `guest-shell` require `[guest] allow_run = true`; control is serial,
+   stdin/stdout/stderr use the per-instance 127.0.0.1 forward to the guest's
+   7777 listener with a one-shot token. argv-only, no shell unless
+   `allow_shell`, root in private development images. Serial fallback is capped
+   at 4 MiB; bulk files use NFS/scratch.
 
 The only remaining human check is the IRIX fact list: `getloadavg`/`sysmp`,
 termios details, `/dev/ttyd2` permissions and the exact `xdm`/`amstart` init
@@ -1363,7 +1398,7 @@ QGA design does not port directly, and the reason this plan uses a serial line.
 | Ack before shutdown | QGA's no-response | Lets `iris-ci` report "accepted" vs "no agent"; the 200 ms delay covers the reply |
 | Stop, not pause | Snapshot/pause | `machine-stop` panics the kernel; a transparent pause is a host feature, not a guest command |
 | No second idle detector | Guest idle hint | The host detector sees the PC stream and every interrupt; a guest hint adds wakeups and trust |
-| No new `StatePaths`/`derive_instance` values | Guest log/port | v1 needs neither; adding them later must go through the seam |
-| Streaming `guest-run` in v1.1 | QGA `guest-exec` | Headless dev needs stdin/stdout/exit status; QGA's base64/poll shape is not a pipe, and file/fsfreeze stay out |
+| No new `StatePaths` values; v1.1 adds one derived endpoint | Guest log/port | v1 needs neither; v1.1's `guest_data` port goes through `derive_instance`, and any future log through `StatePaths` |
+| Streaming `guest-run` in v1.1 | QGA `guest-exec` | Headless dev needs stdin/stdout/exit status; QGA's base64/poll shape is not a pipe. TCP data plane because serial is control-only; hostcall/new device if 10 Mbps is not enough |
 | Install links, not inittab edits | `inittab` respawn | The package must not fight a site's getty; `inst` owns `rc` links |
 | Native MIPSpro build | Cross-clang | `gendist`/`strip` are in the guest; no IRIX sysroot in the tree |
