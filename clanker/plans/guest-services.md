@@ -33,15 +33,17 @@ image starts one. Desktop-instance management is out of scope.
 | Pause/resume | **Out of scope**; the guest cannot pause the VM, and `machine-stop` is not a transparent pause |
 | Second idle detector | **Not proposed**; the host detector already does this |
 | Headless profile | **v1**: stop `xdm`/`amstart` via a fixed allowlist if the image started them; report the result. No arbitrary command execution. |
-| Effort | ~13–16 engineer-days for one engineer, including rig time |
+| Command pipe | **v1.1, opt-in**: `guest-run`/`guest-shell` with stdin, stdout, stderr and exit status; small/interactive over GuestLink, bulk via NFS/scratch or the TCP data path. |
+| Effort | ~13–16 engineer-days for v1, plus ~6–9 for v1.1 with the command pipe |
 
 The honest summary: **a guest agent will not lower the 2 % host CPU a settled
 6.5 getty already uses.** It earns its place by making it safe to *stop*
 instances that are running but unused, by replacing console scraping for
 lifecycle and telemetry, by giving the fleet a reliable answer to "is this
-guest actually doing work?", and by stopping a desktop session that a headless
+guest actually doing work?", by stopping a desktop session that a headless
 image did not need — the one case where the host detector cannot park because
-the CPU is busy in a userland spin.
+the CPU is busy in a userland spin — and, from v1.1, by replacing prompt
+scraping with a real stdin/stdout/exit-status pipe for guest commands.
 
 ---
 
@@ -111,7 +113,7 @@ Three separate questions hide in that one:
 | Clean stop/reboot | Scrape the console or telnet, type `shutdown`, hope the prompt parser is right; `iris-ci quit` saves NVRAM but does not flush the guest filesystem | `iris-ci guest-shutdown powerdown --wait 120`; the guest runs `/etc/shutdown`, XFS unmounts, then `Machine::stop` saves NVRAM and release builds exit | Shutdown time, exit status, no XFS repair on next boot |
 | Load/telemetry | Parse `uptime`, `date`, `ps` from the console; each scrape costs guest CPU and bytes on the console | `guest-get-load`, `guest-get-time`, `guest-get-osinfo`, `iris-get-status`; one small request, no shell, no console echo | Request latency, bytes on the wire, guest CPU per scrape |
 | Fleet policy | The scheduler cannot tell "at getty" from "running a build" without scraping | Park counters (host) plus guest load (guest) plus job markers (launcher) | False stops in a fleet run |
-| Automation | `iris-ci run/put/get` drive `/bin/sh` and parse prompts; csh quirks, base64 over the console | v1 only telemetry/lifecycle; v2 `guest-exec`/`guest-file-*` gated | Console bytes per operation, failure rate |
+| Automation | `iris-ci run/put/get` drive `/bin/sh` and parse prompts; csh quirks, base64 over the console | v1.1 `guest-run`/`guest-shell`: stdin/stdout/stderr and exit status, no prompt parsing (§3.7); `guest-file-*` stays out | Console bytes per operation, round-trip latency, exit-status accuracy |
 | Coverage the detector misses | A headless guest with `xdm` spinning on an absent framebuffer never parks (87,700 distinct PCs over 3 s in the 5.3 investigation) | The agent applies the named headless profile in v1 (stop `xdm`/`amstart` through a fixed allowlist); the idle detector then parks normally | Host CPU before/after the profile; no userland process left spinning |
 | Quiesce before a snapshot | `sync` typed at the console | `iris-sync-fs`; future fsfreeze-like cooperation | Snapshot validator pass rate |
 
@@ -135,10 +137,11 @@ instance simply does not enable the profile.
 - **Not fsfreeze.** We have not confirmed a supported IRIX 6.5/XFS freeze
   interface. `iris-sync-fs` calls `sync()` twice; it is weaker than QGA's
   fsfreeze and must be described as such.
-- **Not an arbitrary exec/file service.** `guest-exec` and `guest-file-*` are
-  excluded from v1 for security and scope. They are the main reason a guest
-  agent becomes a root RCE, and the current console path already covers the
-  rare cases.
+- **Not an arbitrary file service, and no exec in v1.** `guest-file-*` stays
+  out. v1.1 adds a deliberately narrow, opt-in streaming pipe (`guest-run` and
+  `guest-shell`, §3.7) because headless development needs it; that is not QGA's
+  non-streaming `guest-exec`, and it is argv-only unless the caller opts into a
+  shell. The console path remains the fallback when the agent is absent.
 
 ---
 
@@ -592,10 +595,11 @@ small helper rather than dropping to seconds.
 
 - **Trust boundary:** the host-side CI socket / monitor, not the serial line.
   `GuestLink` is in-process; there is no TCP listener by default.
-- **Root daemon, fixed command set.** The agent runs as root because
-  `/etc/shutdown` needs it and the tty is root-owned. It exposes no arbitrary
-  exec, file access, password change or SSH key operation. The worst a caller
-  can do is power off/reboot the guest and read load/time/os identity.
+- **Root daemon, fixed command set in v1.** The agent runs as root because
+  `/etc/shutdown` needs it and the tty is root-owned. v1 exposes no arbitrary
+  exec, file access, password change or SSH key operation. The v1.1 command pipe
+  (§3.7) is a separate opt-in (`[guest] allow_run`) and does not change the v1
+  surface.
 - **Local users.** A user who can write `/dev/ttyd2` can issue those commands.
   The init script sets the device to `0600 root:sys` and uses `TIOCEXCL`. This
   is a deliberate, documented trade-off; if the site needs ttyd2 for a terminal,
@@ -609,6 +613,87 @@ small helper rather than dropping to seconds.
   guest service adds no new host-side privilege.
 - **Logging.** Log command names and errors, never full request bodies if a
   future command carries data. No secrets in v1.
+
+---
+
+### 3.7 Piping into and out of guest commands (v1.1)
+
+Headless development wants `echo ... | iris-ci guest-run -- cat`,
+`iris-ci guest-run -- make`, and an interactive `iris-ci guest-shell` without
+scraping a prompt. QGA's `guest-exec` is not that shape: it takes base64
+`input-data`, returns a PID, and the caller polls `guest-exec-status` for
+base64 output after exit. We extend the idea with streaming and exit-status
+propagation.
+
+**Host surface**
+
+- `iris-ci guest-run [--stdin FILE|-] [--tty] [--timeout SECS] [--user NAME]
+  -- argv...` connects local stdin/stdout/stderr to the guest process and
+  exits with the guest's status (or `128+signal`). `--tty` allocates a guest
+  PTY and puts the local terminal in raw mode.
+- `iris-ci guest-shell` is `guest-run --tty -- /bin/sh -i`.
+- argv is passed to `execve`; there is no shell interpretation. `--shell`
+  (`/bin/sh -c`) exists only when `[guest] allow_shell = true`.
+
+**Protocol**
+
+Newline-delimited JSON events on the same `GuestLink`:
+
+```
+host -> guest  {"id":1,"cmd":"guest-run","argv":["cat"],"tty":false,"timeout_ms":30000}
+host -> guest  {"id":1,"event":"stdin","data":"<base64>"} ... {"id":1,"event":"eof"}
+guest -> host  {"id":1,"event":"stdout","data":"<base64>"}
+guest -> host  {"id":1,"event":"stderr","data":"<base64>"}
+guest -> host  {"id":1,"event":"exit","status":0,"signal":null}
+```
+
+`guest-kill` or closing stdin cancels; a timeout kills the process group.
+Chunks are at most 4 KiB and base64-encoded, so binary data is safe. stdout and
+stderr stay separate; the host may merge them for display. The agent stops
+reading the child when its outbound queue is full (backpressure), and the host
+must keep reading. One command runs at a time on the serial link; per-instance
+concurrency comes from separate instances.
+
+**Transport**
+
+Control and small payloads go over ttyd2/`GuestLink`; `host_speed` bypasses SCC
+pacing, but this is still not a bulk pipe. Interactive commands and test output
+are fine. Build trees, tarballs and large logs go through NFS `/shared` or the
+scratch volume in v1, or the v1.1 TCP data channel. The host enforces a soft
+per-stream cap (default 4 MiB) and refuses a `guest-run` that asks for more;
+redirect large output to a file instead. The TCP data path, if enabled, binds
+the guest listener to the NAT address, forwards to host `127.0.0.1`, and
+requires a token.
+
+**Agent implementation**
+
+`fork`/`execve` with pipes; optional `openpty`/`forkpty` for `--tty` (verify the
+6.5 API). `poll`/`select` on the child fds and the serial input; `waitpid` for
+the exit status; close unrelated descriptors; sanitised environment; optional
+cwd; timeout; kill the process group on cancel. The daemon is root in v1;
+`--user` is best-effort setuid after fork, or a later privilege-separation
+item. In a private headless development guest, root exec is the pragmatic
+choice, and the transport is local-only.
+
+**Security**
+
+- `[guest] allow_run = true` is opt-in; default false. `guest-info` advertises
+  whether it is enabled.
+- No network listener by default; the state directory/CI socket remains the
+  authority.
+- argv-only by default; `allow_shell` is a separate opt-in; no
+  `guest-file-*`, fsfreeze, SSH or password commands.
+- Log command name and argv length, never payload bytes; enforce timeouts and
+  output caps; kill the process group on disconnect.
+- The CI socket can already quit the VM; this adds command execution, so the
+  state directory must be `0700` and the guest is a trusted development image.
+
+**Acceptance**
+
+`cat` round trip of 1 MiB over serial and over TCP, binary-safe; exit 0 and
+exit 1; stderr separation; timeout; cancel; `guest-shell` runs `date`; no
+orphan process; 10,000 pings still clean; no periodic wakeups when idle. These
+belong to v1.1, not the v1 milestone gate.
 
 ---
 
@@ -1114,7 +1199,7 @@ not widen it.
 | M3 — Packaging | idb/spec, gendist, tardist, install/upgrade/uninstall | 2 | `inst -a` ≤30 s; upgrade keeps config; uninstall leaves no process/links |
 | M4 — Fleet + headless | `[guest]`, `--guest`, `--print-instance`, preflight skip, 8 headless-instance run, profile + stop policy, docs | 3 | 8 instances: all ping; all apply headless; all stop; no cross-talk; idle CPU unchanged |
 | M5 — Rig hardening | 6.5.22/6.5.30, getty/respawn case, crash/recovery, measurements | 2–3 | Test matrix green; numbers recorded in `clanker/` |
-| v1.1 (optional) | TCP transport, `guest-get-fsinfo`/network, supervisor | 3–5 | Separate plan |
+| v1.1 (optional) | TCP transport, command pipe (§3.7), `guest-get-fsinfo`/network, supervisor | 6–9 | Separate plan |
 
 Total v1: **13–16 engineer-days**, assuming access to a 6.5 guest and the
 packaging skill's workflow. The critical path is M1 (IRIX tty behaviour), not
@@ -1139,8 +1224,9 @@ the host code.
 
 ### 7.3 Explicitly out of scope
 
-- `guest-exec`, `guest-file-*`, `guest-fsfreeze-*`, `guest-ssh-*`,
-  `guest-set-user-password`.
+- QGA-style non-streaming `guest-exec` and all of `guest-file-*`,
+  `guest-fsfreeze-*`, `guest-ssh-*`, `guest-set-user-password`. The v1.1
+  streaming `guest-run`/`guest-shell` is §3.7; file transfer remains out.
 - General desktop management beyond the fixed `xdm`/`amstart` stop; starting
   or reconfiguring a desktop session is not a guest-service job.
 - Pause/resume and any second idle detector.
@@ -1195,6 +1281,10 @@ the v1 decisions. Revisit only if that use case changes.
    `StatePaths::guest_log()` through the seam rather than inventing a path.
 8. **No QGA wire compatibility.** The protocol is a documented QGA-inspired
    subset; third-party QGA clients are not a goal.
+9. **Command piping is v1.1, opt-in.** `guest-run`/`guest-shell` require
+   `[guest] allow_run = true`; argv-only, no shell unless `allow_shell` is also
+   set, root in private development images, local transport only. Small data
+   uses `GuestLink`; bulk goes through NFS/scratch or the TCP data path.
 
 The only remaining human check is the IRIX fact list: `getloadavg`/`sysmp`,
 termios details, `/dev/ttyd2` permissions and the exact `xdm`/`amstart` init
@@ -1274,5 +1364,6 @@ QGA design does not port directly, and the reason this plan uses a serial line.
 | Stop, not pause | Snapshot/pause | `machine-stop` panics the kernel; a transparent pause is a host feature, not a guest command |
 | No second idle detector | Guest idle hint | The host detector sees the PC stream and every interrupt; a guest hint adds wakeups and trust |
 | No new `StatePaths`/`derive_instance` values | Guest log/port | v1 needs neither; adding them later must go through the seam |
+| Streaming `guest-run` in v1.1 | QGA `guest-exec` | Headless dev needs stdin/stdout/exit status; QGA's base64/poll shape is not a pipe, and file/fsfreeze stay out |
 | Install links, not inittab edits | `inittab` respawn | The package must not fight a site's getty; `inst` owns `rc` links |
 | Native MIPSpro build | Cross-clang | `gendist`/`strip` are in the guest; no IRIX sysroot in the tree |
