@@ -60,13 +60,13 @@ fail() { echo "journal: FAIL: $*" >&2; exit 1; }
     --ci >"$WORK/iris.stdout" 2>&1 ) &
 PID=$!
 
-for _ in $(seq 1 60); do [[ -S "$WORK/iris.sock" ]] && break; sleep 1; done
+for ((n=0;n<60;n++)); do [[ -S "$WORK/iris.sock" ]] && break; sleep 1; done
 [[ -S "$WORK/iris.sock" ]] || { tail -20 "$WORK/iris.stdout" >&2; fail "CI socket never appeared"; }
 
 ci() { "$IRIS_CI" --socket "$WORK/iris.sock" "$@"; }
 wait_log() { # pattern timeout_s
   local pat="$1" t="$2"
-  for _ in $(seq 1 "$((t*5))"); do grep -qE "$pat" "$WORK/serial.log" 2>/dev/null && return 0; sleep 0.2; done
+  for ((n=0;n<t*5;n++)); do grep -qE "$pat" "$WORK/serial.log" 2>/dev/null && return 0; sleep 0.2; done
   return 1
 }
 
