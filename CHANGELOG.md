@@ -33,6 +33,10 @@ hashes are given where a change is easiest to understand by reading the commit.
 - **New monitor commands.** `idle on|off|status` switches parking at runtime
   and reports park/sleep/wake counters; `idleprof stats` prints the same park
   counters.
+- **The other idle core was the ethernet device.** `seeq-enet` set its `busy`
+  flag after one frame and never cleared it on the no-work path, pinning the
+  thread at 100 % for the rest of the run. Fixed; two parallel 6.5 instances
+  now sit at 1-2 % each.
 - **Not verified:** IRIX 5.3 (no image on the rig). Its 14-instruction idle
   loop fits the new rules and the park/wake mechanics are unchanged.
 
