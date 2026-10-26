@@ -18,15 +18,28 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork release 0.1.10
+
+- **IRIX 6.5 idle parking works.** A settled 6.5 instance uses ~2 % host CPU,
+  with two parallel instances at 1–2 % each; the wall-clock `idle-pause` cold
+  boot is back to 42–50 s. The detector samples PC clusters because the 6.5
+  scheduler loop's registers change every pass; it keeps the interrupt, mask,
+  wake and Compare rules, waits 60 s after start, and adds
+  `idle on|off|status` and `idleprof stats`.
+- **`seeq-enet` no longer spins at 100 % after one frame.** The `busy` flag is
+  cleared on the no-work path, so an idle guest no longer pins a second core.
+  Fixed separately in #84.
+
 ### Idle parking
 
 - **IRIX 6.5's idle loop is recognised and parked.** On a settled 6.5 IP22
   getty the emulator process now uses ~2 % host CPU instead of ~200 %. The old
   detector hashed PC and registers and required an exact repeat; 6.5's idle
   path is a ~470-byte scheduler loop whose registers evolve every iteration,
-  so it never fired. The replacement samples the PC every 32 instructions and
-  parks when one long kernel cluster dominates the sample window, while
-  rejecting short countdown/device-poll loops and user-mode code.
+  so it never fired. The replacement samples the PC every 32 sample calls
+  (about 320 instructions in the batch loop) and parks when one long kernel
+  cluster dominates the sample window, while rejecting short
+  countdown/device-poll loops and user-mode code.
 - **Boot is not slowed.** Parking waits 60 s after the CPU thread starts
   (`IRIS_IDLE_WARMUP_SECS` overrides). A fresh 6.5 boot reaches a login prompt
   in 42 s with idle-pause; `ci_clock,idle-pause` takes 46 s.
