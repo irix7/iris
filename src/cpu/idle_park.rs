@@ -6,41 +6,24 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::cpu::mips_core::{CAUSE_IP_MASK, NS_PER_GUEST_CYCLE, STATUS_IM_MASK};
+use crate::cpu::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
 use crate::cpu::mips_core::MipsCore;
 
 const IDLE_RING: usize = 32;
 const SLICE_NS: u64 = 1_000_000;
-/// Upper bound on a single park when a guest-time deadline is armed, so a
-/// stop request or a lost wake is still noticed promptly. Not a fixed slice:
-/// with a timer due sooner, the park ends at the timer.
-const MAX_PARK_NS: u64 = 100_000_000;
-
-/// The soonest thing that can end a park: the Compare deadline or the next
-/// guest-time timer (8254 PIT) on the shared queue. `u64::MAX` when neither
-/// is armed.
-fn next_deadline_cycle(core: &MipsCore) -> u64 {
-    let queue = core
-        .guest_timers
-        .as_ref()
-        .map(|t| t.next_deadline())
-        .unwrap_or(u64::MAX);
-    core.count_fire_cycle.min(queue)
-}
-
-/// How long to sleep before re-checking: the time to the next guest-time
-/// deadline, or a short fallback slice when only external interrupts can wake
-/// us. This is what replaces the fixed 1 ms slice.
-fn park_timeout_nanos(core: &MipsCore) -> u64 {
-    let deadline = next_deadline_cycle(core);
-    if deadline == u64::MAX {
-        return SLICE_NS;
-    }
-    let remaining = deadline.saturating_sub(core.hot.cycles);
-    remaining
-        .saturating_mul(crate::cpu::mips_core::NS_PER_GUEST_CYCLE)
-        .min(MAX_PARK_NS)
-}
+/// Host-pacing rate for `hot.cycles` while the CPU is parked: one guest cycle
+/// per 10 ns of real time, the rate `NS_PER_GUEST_CYCLE` names under
+/// `ci_clock`. In every build this keeps cross-thread cycle readers
+/// (WD33C93A's deferred-interrupt spin, CP0 Random) moving during a park.
+const STALL_NS_PER_CYCLE: u64 = 10;
+/// After a park wakes on a pending line the guest cannot take (`(ip & im) ==
+/// 0`), do not park again for this many `hot.cycles`. A genuine idle loop
+/// wakes for an unmasked interrupt; waking for a masked one means the
+/// "repeated state" was a device-poll or DELAY loop that happened to look
+/// idle. Sleeping that loop caps it at one batch per slice, and with the
+/// wall-clock model the park no longer moves Count to compensate, so boot
+/// crawls. About 20 ms of host pacing at the 10 ns/cycle rate.
+const PARK_BACKOFF_CYCLES: u64 = 2_000_000;
 
 /// The CPU thread while it is parked in [`IdleParkState::park`], so an
 /// interrupt source can wake it at once instead of leaving it to notice on its
@@ -69,6 +52,9 @@ pub struct IdleParkState {
     ring: [u64; IDLE_RING],
     ring_len: usize,
     ring_pos: usize,
+    /// Do not park again before `hot.cycles` reaches this value; set after a
+    /// park that woke on a masked line (see [`PARK_BACKOFF_CYCLES`]).
+    park_skip_until_cycle: u64,
 }
 
 /// What to do with a repeated (idle-spin) architectural state.
@@ -77,17 +63,15 @@ pub enum IdleDecision {
     /// deliver so the guest should run, not sleep.
     None,
     /// The state repeats with interrupts enabled and a mask bit set: park
-    /// the CPU thread; an unmasked interrupt or the next guest-time
-    /// deadline ends the park.
+    /// the CPU thread; an unmasked interrupt ends the park.
     Park,
-    /// The state repeats but interrupts are masked (`IE=0` or `IM=0`),
-    /// so no interrupt can end a park. Pace instead: sleep in bounded
-    /// slices, advancing guest cycles at the 10 ns/cycle host-pacing rate
-    /// so CP0 Count/Compare and any armed guest timer keep tracking
-    /// wall-clock time. Each slice re-checks `running` and the interrupt
-    /// word, so a monitor command, soft reset, or newly-unmasked
-    /// interrupt ends it at once. Never sleeps past the next
-    /// guest-time deadline.
+    /// A masked interrupt is already pending (`ip != 0`), so parking would
+    /// wait for a line the guest only takes after it drops the spl — which it
+    /// can only do running. Pace instead: sleep in bounded slices, advancing
+    /// `hot.cycles` at the 10 ns/cycle host-pacing rate so cross-thread
+    /// readers keep moving. Each slice re-checks `running` and the interrupt
+    /// word, so a monitor command, a soft reset, or a newly-unmasked
+    /// interrupt ends it at once.
     Pace,
 }
 
@@ -112,6 +96,12 @@ impl IdleParkState {
     /// mask bit set the spin is safe to `park`; with interrupts masked it is
     /// paced instead (see [`IdleParkState::pace`]).
     pub fn update(&mut self, core: &MipsCore) -> IdleDecision {
+        // A recent park woke on a line the guest could not take: keep
+        // executing for the back-off window instead of re-parking a loop
+        // that is waiting on device progress.
+        if core.hot.cycles < self.park_skip_until_cycle {
+            return IdleDecision::None;
+        }
         let pending = core.hot.interrupts.load(Ordering::Relaxed) as u32;
         let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
         let im = core.cp0_status & STATUS_IM_MASK;
@@ -119,6 +109,17 @@ impl IdleParkState {
 
         // An interrupt is ready to deliver: run the guest, don't sleep.
         if interrupt_ready {
+            self.ring_len = 0;
+            self.ring_pos = 0;
+            return IdleDecision::None;
+        }
+
+        // With every mask bit clear nothing can satisfy `park`'s
+        // `(ip & im) != 0`, so parking here never wakes. Do not pace either:
+        // an IE=0/IM=0 repeated loop is not an idle guest but a busy wait
+        // (the PROM's device-poll and DELAY loops look exactly like this),
+        // and sleeping it throttles boot to about one batch per slice.
+        if im == 0 {
             self.ring_len = 0;
             self.ring_pos = 0;
             return IdleDecision::None;
@@ -137,14 +138,17 @@ impl IdleParkState {
             return IdleDecision::Pace;
         }
 
-        let ie = core.interrupts_enabled();
+        // IE=0: no interrupt can be delivered at all, so a park could never
+        // end. Same busy-wait trap as `im == 0` above; keep executing.
+        if !core.interrupts_enabled() {
+            self.ring_len = 0;
+            self.ring_pos = 0;
+            return IdleDecision::None;
+        }
+
         let h = Self::hash_state(core);
         if self.ring[..self.ring_len].contains(&h) {
-            return if ie && im != 0 {
-                IdleDecision::Park
-            } else {
-                IdleDecision::Pace
-            };
+            return IdleDecision::Park;
         }
         self.ring[self.ring_pos] = h;
         self.ring_pos = (self.ring_pos + 1) % IDLE_RING;
@@ -154,74 +158,19 @@ impl IdleParkState {
         IdleDecision::None
     }
 
-    /// Pace a repeated state whose interrupts are masked.
-    ///
-    /// Unlike [`IdleParkState::park`], this never waits indefinitely: every
-    /// slice is bounded, so there is no deadlock risk when nothing can wake
-    /// the CPU. Guest cycles advance during the sleep at the host-pacing rate
-    /// (`NS_PER_GUEST_CYCLE`), so CP0 Count and any armed Compare/PIT guest
-    /// timer keep tracking wall-clock time. The loop ends at once when
-    /// `running` is cleared (monitor command / soft reset), when an interrupt
-    /// becomes deliverable, when the guest re-enables interrupts (the normal
-    /// park path takes over next), or when the next guest-time deadline is
-    /// reached.
-    pub fn pace(&self, core: &mut MipsCore, running: &AtomicBool) {
-        *PARKER.lock() = Some(std::thread::current());
-        loop {
-            if !running.load(Ordering::Relaxed) {
-                break;
-            }
-            // Announce the park before the last look at the pending word
-            // (Dekker): a writer sets its bit then reads `PARKED`, so either
-            // we see the bit here or the writer sees `PARKED` and unparks us
-            // via [`wake`].
-            PARKED.store(true, Ordering::SeqCst);
-            let ie = core.interrupts_enabled();
-            let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
-            let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
-            let im = core.cp0_status & STATUS_IM_MASK;
-            if (ip & im) != 0 {
-                break;
-            }
-            // The guest re-enabled interrupts: hand back to the run loop so
-            // the next `update` can park normally.
-            if ie && im != 0 {
-                break;
-            }
-            // Stop once the soonest guest deadline — Compare or a queued PIT
-            // timer — is reached, so the run loop can deliver it.
-            if core.hot.cycles >= next_deadline_cycle(core) {
-                break;
-            }
-            let t0 = Instant::now();
-            // `park_timeout_nanos` paces to the next deadline, or falls back
-            // to a 1 ms slice when nothing is armed. With interrupts masked
-            // and no deadline, use the capped maximum instead so a long spin
-            // costs ~1% of a core instead of waking every millisecond.
-            let slice = if im == 0 && next_deadline_cycle(core) == u64::MAX {
-                MAX_PARK_NS
-            } else {
-                park_timeout_nanos(core)
-            };
-            std::thread::park_timeout(Duration::from_nanos(slice));
-            let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / NS_PER_GUEST_CYCLE);
-        }
-        // Every exit leaves the flag clear: a stale `true` would put `wake`
-        // on the mutex for a running CPU.
-        PARKED.store(false, Ordering::SeqCst);
-    }
-
     /// Park in ≤1 ms slices until an interrupt is pending (masked or not)
     /// or the CPU stops.
     ///
-    /// The Count==Compare deadline is a `hot.cycles` threshold, so parking
-    /// must stop once the threshold is crossed and let step()'s preamble
-    /// deliver IP7. `hot.cycles` is advanced during the sleep — at the
-    /// `NS_PER_GUEST_CYCLE` (10 ns) host-pacing rate — so the deadline still
-    /// arrives, and cross-thread cycle readers (Wd33c93a's deferred-interrupt
-    /// spin-wait, CP0 Random, CP0 Count) keep seeing progress.
-    pub fn park(&self, core: &mut MipsCore, running: &AtomicBool) {
+    /// The Count==Compare interrupt needs no special handling here: the
+    /// compare timer fires on the hptimer thread and ORs IP7 into
+    /// `hot.interrupts` exactly like a device line, and CP0 Count itself is
+    /// virtual (materialized from the wall clock on read), so nothing has to
+    /// advance it during the sleep. Only `hot.cycles` is advanced — at the
+    /// 10 ns/guest-cycle host-pacing rate — so cross-thread cycle readers
+    /// (Wd33c93a's deferred-interrupt spin-wait, CP0 Random) keep seeing
+    /// progress. Under `ci_clock` the compare deadline is a cycles threshold
+    /// instead, so the park also stops once it is crossed.
+    pub fn park(&mut self, core: &mut MipsCore, running: &AtomicBool) {
         // Only park once the guest has actually armed a Compare deadline.
         // Before that (PROM), Compare use is ad-hoc and there may be nothing
         // armed to wake us. cp0_compare is zero out of reset and the guest
@@ -250,22 +199,81 @@ impl IdleParkState {
             if ip != 0 {
                 break;
             }
-            // Stop once the soonest guest deadline — Compare or a queued PIT
-            // timer — is reached, so the run loop can deliver it.
-            if core.hot.cycles >= next_deadline_cycle(core) {
+            // ci_clock has no hptimer — the fire point is a cycles threshold
+            // checked in step()'s preamble, so stop parking once we cross it.
+            #[cfg(feature = "ci_clock")]
+            if core.hot.cycles >= core.count_fire_cycle {
                 break;
             }
 
             let t0 = Instant::now();
-            // Park exactly to the next deadline (capped), rather than a fixed
-            // slice; an interrupt still ends it at once via `wake`.
-            std::thread::park_timeout(Duration::from_nanos(park_timeout_nanos(core)));
+            // Still a bounded slice — `running` and the ci_clock threshold are
+            // only polled — but an interrupt now ends it at once.
+            std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
             let elapsed_ns = t0.elapsed().as_nanos() as u64;
-            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
+            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
         }
-        // Every exit, including the compare-deadline one, leaves the flag
-        // clear: a stale `true` would put `wake` on the mutex for a running
-        // CPU.
+        // If the wake was for a line the guest cannot take (masked), this
+        // was not an idle loop; back off so a device-poll or DELAY loop runs
+        // at full speed instead of one batch per slice.
+        let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+        let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
+        let im = core.cp0_status & STATUS_IM_MASK;
+        if ip != 0 && (ip & im) == 0 {
+            self.park_skip_until_cycle = core.hot.cycles.saturating_add(PARK_BACKOFF_CYCLES);
+        }
+        // Every exit, including the ci_clock one, leaves the flag clear: a
+        // stale `true` would put `wake` on the mutex for a running CPU.
+        PARKED.store(false, Ordering::SeqCst);
+    }
+
+    /// Pace a repeated state whose interrupts are masked.
+    ///
+    /// Unlike [`IdleParkState::park`], this never waits indefinitely: every
+    /// slice is bounded, so there is no deadlock risk when nothing can wake
+    /// the CPU. `hot.cycles` advances during the sleep at the host-pacing
+    /// rate (`STALL_NS_PER_CYCLE`), so cross-thread cycle readers keep seeing
+    /// progress and, under `ci_clock`, the Compare threshold still arrives.
+    /// The loop ends at once when `running` is cleared (monitor command /
+    /// soft reset), when an interrupt becomes deliverable, when the guest
+    /// re-enables interrupts (the normal park path takes over next), or —
+    /// under `ci_clock` — when the compare deadline is reached.
+    pub fn pace(&self, core: &mut MipsCore, running: &AtomicBool) {
+        *PARKER.lock() = Some(std::thread::current());
+        loop {
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+            // Announce the park before the last look at the pending word
+            // (Dekker): a writer sets its bit then reads `PARKED`, so either
+            // we see the bit here or the writer sees `PARKED` and unparks us
+            // via [`wake`].
+            PARKED.store(true, Ordering::SeqCst);
+            let ie = core.interrupts_enabled();
+            let pending = core.hot.interrupts.load(Ordering::SeqCst) as u32;
+            let ip = (core.cp0_cause | pending) & CAUSE_IP_MASK;
+            let im = core.cp0_status & STATUS_IM_MASK;
+            if (ip & im) != 0 {
+                break;
+            }
+            // The guest re-enabled interrupts: hand back to the run loop so
+            // the next `update` can park normally.
+            if ie && im != 0 {
+                break;
+            }
+            // ci_clock: stop once the compare deadline is reached, so the run
+            // loop can deliver IP7.
+            #[cfg(feature = "ci_clock")]
+            if core.hot.cycles >= core.count_fire_cycle {
+                break;
+            }
+            let t0 = Instant::now();
+            std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
+            let elapsed_ns = t0.elapsed().as_nanos() as u64;
+            core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
+        }
+        // Every exit leaves the flag clear: a stale `true` would put `wake`
+        // on the mutex for a running CPU.
         PARKED.store(false, Ordering::SeqCst);
     }
 }
@@ -280,10 +288,9 @@ impl IdleParkState {
 /// so there is no `cp0_compare`-armed guard and no `running` flag to poll: it
 /// stays parked until the architectural wake condition (or the soft-reset bit,
 /// which is set by `MipsCpu::signal` and also goes through [`wake`]). Only
-/// `hot.cycles` advances — at the 10 ns/guest-cycle host-pacing rate — so
-/// cross-thread cycle readers (Wd33c93a's deferred-interrupt spin) and the
-/// virtual CP0 Count keep seeing progress exactly as the old `spin_loop`
-/// stall did.
+/// `hot.cycles` advances — at the host-pacing rate — so cross-thread cycle
+/// readers (Wd33c93a's deferred-interrupt spin) and, under `ci_clock`, CP0
+/// Count keep seeing progress exactly as the old `spin_loop` stall did.
 pub fn park_wait(core: &mut MipsCore) {
     const SOFT_RESET_BIT: u64 = 1u64 << 63;
     *PARKER.lock() = Some(std::thread::current());
@@ -299,15 +306,16 @@ pub fn park_wait(core: &mut MipsCore) {
         if (ip & im) != 0 {
             break;
         }
-        // Stop once the soonest guest deadline is reached so the next step
-        // delivers it (same rule as `IdleParkState::park`).
-        if core.hot.cycles >= next_deadline_cycle(core) {
+        // ci_clock: stop once the compare deadline is reached so the next
+        // step delivers it (same rule as `IdleParkState::park`).
+        #[cfg(feature = "ci_clock")]
+        if core.hot.cycles >= core.count_fire_cycle {
             break;
         }
         let t0 = Instant::now();
-        std::thread::park_timeout(Duration::from_nanos(park_timeout_nanos(core)));
+        std::thread::park_timeout(Duration::from_nanos(SLICE_NS));
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / 10);
+        core.hot.cycles = core.hot.cycles.wrapping_add(elapsed_ns / STALL_NS_PER_CYCLE);
     }
     // Every exit leaves the flag clear: a stale `true` would put `wake` on the
     // mutex for a running CPU.
@@ -359,25 +367,12 @@ mod tests {
     }
 
     #[test]
-    fn update_paces_a_repeated_state_when_every_interrupt_is_masked() {
-        // IE set but IM zero: the guest would take an interrupt, but none can
-        // be delivered, so `park`'s wake condition can never be satisfied.
-        // The detector still recognises the repeated state and returns `Pace`
-        // instead (bounded slices, guest cycles keep advancing).
-        let (mut st, core) = repeated_idle_state(STATUS_IE);
-        assert!(
-            matches!(st.update(&core), IdleDecision::Pace),
-            "IM == 0 with a repeated state should pace, not park"
-        );
-    }
-
-    #[test]
     fn update_declines_to_park_while_a_masked_interrupt_is_pending() {
         // IRIX's splhi on IP22 leaves only IP6 (the bus error) unmasked, and
         // a loop that raises and drops the spl is sampled mostly in its
         // masked stretch. With the timer's IP4 already pending there, the
         // guest takes it a few instructions later at splx: nothing to wait
-        // for, so no park.
+        // for; pace rather than park.
         use crate::cpu::mips_core::CAUSE_IP4;
         let (mut st, core) = repeated_idle_state(STATUS_IE | (1 << (STATUS_IM_SHIFT + 6)));
         core.hot.interrupts.store(CAUSE_IP4 as u64, Ordering::SeqCst);
@@ -392,18 +387,31 @@ mod tests {
     }
 
     #[test]
-    fn update_paces_a_repeated_state_when_interrupts_are_disabled() {
-        // IE clear: no interrupt can be taken at all. A repeated state still
-        // paces (bounded slices) rather than parking.
+    fn update_declines_to_park_or_pace_when_every_interrupt_is_masked() {
+        // IE set but IM zero: the guest would take an interrupt, but none can
+        // be delivered, so the wait `park` performs can never end. This is
+        // also what a PROM device-poll or DELAY loop looks like; pacing it
+        // throttles boot to one batch per slice, so keep executing.
+        let (mut st, core) = repeated_idle_state(STATUS_IE);
+        assert!(
+            matches!(st.update(&core), IdleDecision::None),
+            "IM == 0 makes park's wake condition unsatisfiable and pacing unsafe"
+        );
+    }
+
+    #[test]
+    fn update_declines_to_pace_a_repeated_state_with_interrupts_disabled() {
+        // IE clear: no interrupt can be taken at all. A repeated IE=0 state
+        // is a busy wait, not an idle guest.
         let mut core = MipsCore::default();
-        core.cp0_status = 0; // IE clear, IM zero
+        core.cp0_status = 0;
         core.cp0_cause = 0;
         core.pc = 0x8000_0100;
         let mut st = IdleParkState::default();
-        st.update(&core); // first sighting fills the ring
+        st.update(&core);
         assert!(
-            matches!(st.update(&core), IdleDecision::Pace),
-            "IE == 0 with a repeated state should pace"
+            matches!(st.update(&core), IdleDecision::None),
+            "IE == 0 must not sleep"
         );
     }
 
@@ -419,143 +427,11 @@ mod tests {
         );
     }
 
-    /// With no armed guest deadline the park falls back to the short slice
-    /// (only an external interrupt can end it).
-    #[test]
-    fn park_timeout_is_a_slice_when_nothing_is_armed() {
-        let core = MipsCore::default();
-        assert_eq!(park_timeout_nanos(&core), SLICE_NS);
-    }
-
-    /// The park timeout is derived from the next guest-time deadline, not a
-    /// fixed slice: a timer 300 us of guest time away parks for 300 us.
-    #[test]
-    fn park_waits_to_the_next_guest_deadline() {
-        use crate::cpu::guest_timer::{GuestTimers, PIT_CH0};
-        use crate::cpu::mips_core::CyclesPtr;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
-        let mut core = MipsCore::default();
-        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park returns immediately while this is zero
-        // Wire the queue's clock at the core's own cycle counter, exactly as
-        // production does, so `park` advancing `hot.cycles` also advances it.
-        let timers = Arc::new(GuestTimers::new(CyclesPtr::new(
-            &core.hot.cycles as *const u64,
-        )));
-        // A PIT channel due in 30 000 guest cycles == 300 us at 10 ns/cycle.
-        timers.schedule(PIT_CH0, 30_000, 0, None);
-        core.guest_timers = Some(timers);
-        core.count_fire_cycle = 1_000_000; // Compare far in the future
-
-        assert_eq!(
-            park_timeout_nanos(&core),
-            300_000,
-            "park must target the 300 us queue deadline, not the fixed slice"
-        );
-
-        let running = AtomicBool::new(true);
-        let st = IdleParkState::default();
-        st.park(&mut core, &running);
-        assert!(
-            core.hot.cycles >= 30_000,
-            "park returned before the guest deadline: cycles={}",
-            core.hot.cycles
-        );
-    }
-
-    /// Park to a single guest-time deadline and return the host wall-clock
-    /// latency *after* that deadline at which `park` returned: the measured
-    /// sleep minus the sleep the deadline asked for.
-    ///
-    /// `park` cannot return before its deadline (it loops until `hot.cycles`
-    /// has advanced to it), and `park_timeout` only overshoots, so the
-    /// difference is the wake latency attributable to the park mechanism, in
-    /// host nanoseconds — the figure issue #68 asks for. A spurious `wake`
-    /// from another test only costs an extra loop iteration, not an early
-    /// return, because the exit test is the deadline, not the timer.
-    fn host_wake_latency_after_deadline(lead_cycles: u64) -> Duration {
-        use crate::cpu::guest_timer::{GuestTimers, PIT_CH0};
-        use crate::cpu::mips_core::CyclesPtr;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
-
-        let mut core = MipsCore::default();
-        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
-        core.cp0_compare = 1; // park returns immediately while this is zero
-        let timers = Arc::new(GuestTimers::new(CyclesPtr::new(
-            &core.hot.cycles as *const u64,
-        )));
-        // The queue deadline is the soonest armed timer; Compare is parked far
-        // out so it cannot mask the measurement.
-        timers.schedule(PIT_CH0, lead_cycles, 0, None);
-        core.guest_timers = Some(timers);
-        core.count_fire_cycle = u64::MAX;
-
-        let intended = Duration::from_nanos(park_timeout_nanos(&core));
-        let running = AtomicBool::new(true);
-        let st = IdleParkState::default();
-        let start = Instant::now();
-        st.park(&mut core, &running);
-        start.elapsed().saturating_sub(intended)
-    }
-
-    /// A bounded host wall-clock wake latency to the next guest deadline.
-    ///
-    /// The park targets the soonest queue deadline (a PIT channel); the test
-    /// asserts the CPU thread wakes within `LIMIT` of it. The deadline is
-    /// 300 us of guest time (30 000 cycles at `NS_PER_GUEST_CYCLE`), well
-    /// under the old fixed 1 ms slice, so a park that reverted to the slice
-    /// would overshoot it by ~700 us and fail. Measured intrinsic overshoot on
-    /// an idle dev host is ~60-75 us; the bound is the *best* of several
-    /// samples because a `park_timeout` is a futex wait and a loaded CI runner
-    /// can schedule the wake late for reasons the emulator does not control.
-    #[test]
-    fn host_wake_latency_after_the_guest_deadline_is_bounded() {
-        const LEAD_CYCLES: u64 = 30_000; // 300 us of guest time
-        const LIMIT: Duration = Duration::from_micros(500);
-
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            let latency = host_wake_latency_after_deadline(LEAD_CYCLES);
-            if latency < LIMIT {
-                return;
-            }
-            seen.push(latency);
-        }
-        panic!(
-            "host wake latency {seen:?} after a {LEAD_CYCLES}-cycle guest deadline, \
-             all at or above {LIMIT:?}"
-        );
-    }
-
-    /// Pacing a masked-interrupt spin advances guest cycles at the host-pacing
-    /// rate and stops at (not past) the next guest-time deadline.
-    #[test]
-    fn pace_advances_guest_cycles_to_a_guest_deadline() {
-        let mut core = MipsCore::default();
-        // Interrupts masked (IE=0, IM=0): this is exactly the `pace` path.
-        core.cp0_status = 0;
-        core.count_fire_cycle = 100_000; // 1 ms of guest time away
-        let running = AtomicBool::new(true);
-        let before = core.hot.cycles;
-        let st = IdleParkState::default();
-        st.pace(&mut core, &running);
-        assert!(core.hot.cycles > before, "pace must advance guest cycles");
-        assert!(
-            core.hot.cycles < before + 500_000,
-            "pace must not overshoot the deadline by too much: {}",
-            core.hot.cycles
-        );
-    }
-
     /// Pacing returns at once when `running` is cleared (monitor command /
     /// soft reset) — no sleep, no cycle advance.
     #[test]
     fn pace_returns_when_not_running() {
         let mut core = MipsCore::default();
-        core.count_fire_cycle = u64::MAX; // no deadline armed
         let running = AtomicBool::new(false);
         let before = core.hot.cycles;
         let st = IdleParkState::default();
@@ -577,6 +453,29 @@ mod tests {
             core.hot.cycles,
             before,
             "pace must not sleep while an interrupt is deliverable"
+        );
+    }
+
+    /// Pacing advances `hot.cycles` while it sleeps, so cross-thread cycle
+    /// readers keep seeing progress.
+    #[test]
+    fn pace_advances_guest_cycles_while_masked() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = 0; // interrupts masked: the pace path
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let before = core.hot.cycles;
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            stop.store(false, Ordering::SeqCst);
+            wake();
+        });
+        IdleParkState::default().pace(&mut core, &running);
+        stopper.join().unwrap();
+        assert!(
+            core.hot.cycles > before,
+            "pace must advance guest cycles while it sleeps"
         );
     }
 }
@@ -614,7 +513,7 @@ mod wake_tests {
             wake();
         });
 
-        let st = IdleParkState::default();
+        let mut st = IdleParkState::default();
         st.park(&mut core, &running);
         let returned = Instant::now();
         raiser.join().unwrap();
@@ -667,6 +566,99 @@ mod wake_tests {
         let _ = tx.send(());
         assert!(raiser.join().unwrap(),
             "park slept through a pending interrupt masked only by the spl");
+    }
+
+    /// A park that wakes on a masked line was a false positive: back off so
+    /// a device-poll or DELAY loop keeps running instead of sleeping a slice
+    /// per batch. A park woken by an unmasked line leaves parking enabled.
+    #[test]
+    fn a_park_woken_by_a_masked_line_backs_off() {
+        use crate::cpu::mips_core::CAUSE_IP4;
+        let _one = PARK_TEST_LOCK.lock();
+
+        // Masked: only IP6 unmasked, IP4 pending.
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 6));
+        core.cp0_compare = 1;
+        core.hot.interrupts.store(CAUSE_IP4 as u64, Ordering::SeqCst);
+        let running = AtomicBool::new(false); // return at the first check
+        let mut st = IdleParkState::default();
+        st.park(&mut core, &running);
+        assert!(
+            matches!(st.update(&core), IdleDecision::None),
+            "a masked wake must disable parking for the back-off window"
+        );
+
+        // Unmasked: IP7 unmasked and pending.
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.cp0_compare = 1;
+        core.hot.interrupts.store(CAUSE_IP7 as u64, Ordering::SeqCst);
+        let mut st = IdleParkState::default();
+        st.park(&mut core, &running);
+        assert!(
+            matches!(st.update(&core), IdleDecision::None),
+            "a deliverable pending interrupt means run, not park (ring cleared)"
+        );
+    }
+
+    /// The CP0 Compare deadline is an `hptimer` one-shot in a wall-clock
+    /// build. A parked CPU must wake when it fires, without any other thread
+    /// raising a line: the callback sets IP7 in `hot.interrupts`, and `park`
+    /// exits on any pending line. This is the link #43's queue used to
+    /// provide and #98 moved back to the host timer.
+    #[cfg(not(feature = "ci_clock"))]
+    #[test]
+    fn an_armed_compare_timer_ends_the_park() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.set_timer_manager(Arc::new(crate::hptimer::TimerManager::new()));
+        // Arm Compare a few Count ticks ahead: about 1 us at 33 MHz. park's
+        // own guard requires a non-zero Compare.
+        let now = core.count_now();
+        core.write_cp0(11, now.wrapping_add(33) as u64);
+        let running = AtomicBool::new(true);
+
+        let t0 = Instant::now();
+        IdleParkState::default().park(&mut core, &running);
+        let elapsed = t0.elapsed();
+        assert_ne!(
+            core.hot.interrupts.load(Ordering::SeqCst) as u32 & CAUSE_IP7,
+            0,
+            "the Compare one-shot must have raised IP7"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "park waited {elapsed:?} for the armed Compare timer"
+        );
+    }
+
+    /// Under `ci_clock` there is no host timer: the Compare deadline is a
+    /// `hot.cycles` threshold, and the park must stop once the advancing cycle
+    /// counter crosses it so the run loop can deliver IP7.
+    #[cfg(feature = "ci_clock")]
+    #[test]
+    fn the_cycle_compare_threshold_ends_the_park() {
+        let _one = PARK_TEST_LOCK.lock();
+        let mut core = MipsCore::default();
+        core.cp0_status = STATUS_IE | (1 << (STATUS_IM_SHIFT + 7));
+        core.cp0_compare = 1; // park's guard requires a non-zero Compare
+        core.count_fire_cycle = core.hot.cycles + 300_000; // 3 ms at 10 ns/cycle
+        let running = AtomicBool::new(true);
+
+        let t0 = Instant::now();
+        IdleParkState::default().park(&mut core, &running);
+        let elapsed = t0.elapsed();
+        assert!(
+            core.hot.cycles >= 300_000,
+            "park returned before the cycle threshold: cycles={}",
+            core.hot.cycles
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "park waited {elapsed:?} for the cycle threshold"
+        );
     }
 
     #[test]

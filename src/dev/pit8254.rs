@@ -1,73 +1,21 @@
-//! Intel 8254 programmable interval timer, as embedded in the SGI IOC.
-//!
-//! # Hardware wiring
-//!
-//! Counter 2 is clocked at 1 MHz from the IOC's divide-by-20 divider, and
-//! counter 2's OUT clocks counters 0 and 1. Counters 0 and 1 therefore do not
-//! count until the guest programs counter 2 as a rate generator (mode 2) or
-//! square-wave generator (mode 3); with counter 2 idle their count is frozen,
-//! exactly as on the chip. Terminal counts of counters 0 and 1 drive the IOC
-//! timer interrupt sources.
-//!
-//! # Time base
-//!
-//! Every channel's deadline is an absolute guest cycle (`hot.cycles`), and a
-//! read interpolates `deadline - now` in guest cycles at
-//! [`NS_PER_GUEST_CYCLE`] ns per cycle. Nothing here reads the host clock, so
-//! reads are deterministic and reproduce exactly with a snapshot.
-//!
-//! The consequence an OS timing probe must know: this is **not an independent
-//! reference**. CP0 Count is derived from the same `hot.cycles` clock (scaled
-//! by `count_hz`), so calibrating Count against the PIT measures the ratio the
-//! emulator was configured with, not the hardware. Against host wall time the
-//! rate is undefined while executing (one guest cycle is one retired
-//! instruction) and only tracks wall time while the CPU is parked or stalled
-//! in `WAIT`. The only host-referenced clock in the machine is the DS1386 RTC
-//! at 10 ms (hundredths of a second) resolution, so the guest has no
-//! microsecond wall-clock source.
-//!
-//! # Resolution and modelled behaviour
-//!
-//! - One count tick per input clock. At the 1 MHz input that is 1 µs, or 100
-//!   guest cycles per tick; a read truncates to whole ticks.
-//! - Modes 2 and 3 are modelled as rate generators; modes 0/1/4/5 are armed
-//!   and re-armed like mode 2 (documented approximation).
-//! - Counting is binary; BCD is recorded and reported in the status byte but
-//!   not applied.
-//! - A reload of 0 is treated as disarmed, not as 65536.
-//! - The counter latch command and the read-back command (count and status)
-//!   are implemented. GATE inputs and the OUT pin's electrical waveform are
-//!   not; the status OUT bit reports high while a mode 2/3 channel is armed.
-//!
-//! A frozen count is not stale data: when counter 2 supplies no clock the
-//! counter genuinely does not advance. Status bit D6 (null count) stays set
-//! until a count reaches the counting element, so a probe can distinguish
-//! "not clocked" from "counting" without relying on the value alone.
-
 use std::sync::Arc;
 use spin::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use crate::cpu::guest_timer::{GuestTimerCallback, GuestTimers, PIT_CH0, PIT_CH1, PIT_CH2, TimerKey};
-use crate::cpu::mips_core::NS_PER_GUEST_CYCLE;
+use std::time::{Duration, Instant};
 use crate::traits::{BusRead8, BusRead16, BusRead32, BusRead64, BUS_OK, BUS_ERR, Device, Resettable, Saveable};
 use crate::snapshot::{get_field, toml_u16, toml_u32, toml_u8, toml_bool, hex_u16, hex_u32, hex_u8};
+use crate::hptimer::{TimerManager, TimerId, TimerReturn};
 use std::io::Write;
 
 pub trait TimerCallback: Send + Sync {
     fn callback(&self);
 }
 
-/// Which queue key an 8254 channel registers its deadline under.
-const PIT_KEYS: [TimerKey; 3] = [PIT_CH0, PIT_CH1, PIT_CH2];
-
 struct Channel {
     // Registers
-    count: u16, // Last latched/loaded count (fallback when disarmed)
+    count: u16, // Current count value (simulated)
     reload: u16, // Reload value
     latched_count: Option<u16>,
-    /// Status byte captured by a read-back command, returned by the next read
-    /// of this channel before any count bytes.
     latched_status: Option<u8>,
 
     // Configuration
@@ -77,16 +25,13 @@ struct Channel {
 
     // Internal State
     rw_state: u8, // 0: First byte, 1: Second byte (for rw_mode 3)
-    /// 8254 status bit D6: the last count written has not reached the
-    /// counting element yet. Cleared when a channel with a clock is armed.
-    null_count: bool,
 
-    // Guest-time tracking: the absolute guest cycle the count next reaches
-    // zero, and the period in guest cycles. No host `Instant` — the count is
-    // `deadline - hot.cycles` converted to input-clock ticks.
-    deadline_cycle: Option<u64>,
-    period_cycles: Option<u64>,
+    // Timer tracking (for count interpolation between callbacks)
+    period_start: Option<Instant>,
+    period_duration: Option<Duration>,
     input_freq: u32,
+    // Active hptimer ID, if armed
+    timer_id: Option<TimerId>,
 }
 
 impl Channel {
@@ -100,40 +45,10 @@ impl Channel {
             rw_mode: 1, // Default LSB
             bcd: false,
             rw_state: 0,
-            null_count: true,
-            deadline_cycle: None,
-            period_cycles: None,
+            period_start: None,
+            period_duration: None,
             input_freq: 0,
-        }
-    }
-}
-
-/// Fires one 8254 channel's IOC callback at its guest-time deadline and
-/// advances the channel's mirrored deadline. The shared queue re-arms the
-/// entry itself (`deadline + period`), so this and the queue stay in step.
-struct PitChannelCallback {
-    chan: Arc<Mutex<Channel>>,
-    index: usize,
-    callback: Option<Arc<dyn TimerCallback>>,
-    debug: Arc<AtomicBool>,
-}
-
-impl GuestTimerCallback for PitChannelCallback {
-    fn fire(&self) {
-        {
-            let mut chan = self.chan.lock();
-            chan.count = 0;
-            if let (Some(d), Some(p)) = (chan.deadline_cycle, chan.period_cycles) {
-                chan.deadline_cycle = Some(d.wrapping_add(p));
-            }
-        }
-        if let Some(cb) = &self.callback {
-            if self.debug.load(Ordering::Relaxed) && self.index != 2 {
-                println!("PIT: Channel {} expired, triggering callback", self.index);
-            }
-            cb.callback();
-        } else if self.debug.load(Ordering::Relaxed) && self.index != 2 {
-            println!("PIT: Channel {} expired (no callback)", self.index);
+            timer_id: None,
         }
     }
 }
@@ -142,7 +57,7 @@ impl GuestTimerCallback for PitChannelCallback {
 pub struct Pit8254 {
     channels: [Arc<Mutex<Channel>>; 3],
     callbacks: [Option<Arc<dyn TimerCallback>>; 3],
-    guest_timers: Arc<OnceLock<Arc<GuestTimers>>>,
+    timer_manager: Arc<std::sync::OnceLock<Arc<TimerManager>>>,
     debug: Arc<AtomicBool>,
     base_frequency: u32,
 }
@@ -156,7 +71,7 @@ impl Pit8254 {
                 Arc::new(Mutex::new(Channel::new())),
             ],
             callbacks: [cb0, cb1, cb2],
-            guest_timers: Arc::new(OnceLock::new()),
+            timer_manager: Arc::new(std::sync::OnceLock::new()),
             debug: Arc::new(AtomicBool::new(false)),
             base_frequency,
         };
@@ -165,105 +80,128 @@ impl Pit8254 {
         pit
     }
 
-    /// Wire the shared guest-time timer queue, on which every channel's
-    /// deadline is registered as an absolute `hot.cycles` value.
-    pub fn set_guest_timers(&self, gt: Arc<GuestTimers>) {
-        let _ = self.guest_timers.set(gt);
-    }
-
-    fn guest_now(&self) -> u64 {
-        self.guest_timers.get().map(|t| t.now()).unwrap_or(0)
-    }
-
-    /// Remaining ticks of `chan` at guest time, or its latched `count` when it
-    /// is not armed.
-    fn remaining_ticks(&self, chan: &Channel) -> u16 {
-        if let Some(deadline) = chan.deadline_cycle {
-            if chan.input_freq > 0 {
-                let remaining = deadline.saturating_sub(self.guest_now());
-                let ns_per_tick = 1_000_000_000u64 / chan.input_freq as u64;
-                return (remaining.saturating_mul(NS_PER_GUEST_CYCLE) / ns_per_tick) as u16;
-            }
-        }
-        chan.count
+    pub fn set_timer_manager(&self, tm: Arc<TimerManager>) {
+        let _ = self.timer_manager.set(tm);
     }
 
     fn arm_channel(&self, idx: usize) {
-        let Some(tm) = self.guest_timers.get() else { return; };
+        let Some(tm) = self.timer_manager.get() else { return; };
 
         // Disarm any existing timer first
         self.disarm_channel(idx);
 
-        let (deadline, period_cycles);
+        let period;
         {
             let mut chan = self.channels[idx].lock();
             if chan.reload == 0 || chan.input_freq == 0 {
                 return;
             }
-            let ns_per_tick = 1_000_000_000u64 / chan.input_freq as u64;
-            let p = (chan.reload as u64 * ns_per_tick) / NS_PER_GUEST_CYCLE;
-            let now = tm.now();
-            deadline = now.saturating_add(p);
-            period_cycles = p;
-            chan.deadline_cycle = Some(deadline);
-            chan.period_cycles = Some(period_cycles);
-            // The count has now reached the counting element, so status bit
-            // D6 clears. A channel with no input clock (counter 2 not a rate
-            // generator) never gets here and keeps D6 set, which is what a
-            // real 8254 does: no clock edge, no load.
-            chan.null_count = false;
+            let ns = 1_000_000_000u64 / chan.input_freq as u64;
+            period = Duration::from_nanos(chan.reload as u64 * ns);
+            chan.period_start = Some(Instant::now());
+            chan.period_duration = Some(period);
         }
 
-        let cb: Arc<dyn GuestTimerCallback> = Arc::new(PitChannelCallback {
-            chan: self.channels[idx].clone(),
-            index: idx,
-            callback: self.callbacks[idx].clone(),
-            debug: self.debug.clone(),
+        let chan_arc = self.channels[idx].clone();
+        let callback = self.callbacks[idx].clone();
+        let debug = self.debug.clone();
+
+        let id = tm.add_recurring(Instant::now() + period, period, (), move |_| {
+            {
+                let mut chan = chan_arc.lock();
+                chan.count = 0;
+                chan.period_start = Some(Instant::now());
+            }
+            if let Some(cb) = &callback {
+                if debug.load(Ordering::Relaxed) && idx != 2 {
+                    println!("PIT: Channel {} expired, triggering callback", idx);
+                }
+                cb.callback();
+            } else if debug.load(Ordering::Relaxed) && idx != 2 {
+                println!("PIT: Channel {} expired (no callback)", idx);
+            }
+            TimerReturn::Continue
         });
-        tm.schedule(PIT_KEYS[idx], deadline, period_cycles, Some(cb));
+
+        self.channels[idx].lock().timer_id = Some(id);
     }
 
     fn disarm_channel(&self, idx: usize) {
-        if let Some(tm) = self.guest_timers.get() {
-            tm.cancel(PIT_KEYS[idx]);
+        let id = self.channels[idx].lock().timer_id.take();
+        if let Some(id) = id {
+            if let Some(tm) = self.timer_manager.get() {
+                tm.remove(id);
+            }
         }
         let mut chan = self.channels[idx].lock();
-        // Freeze the count where it stopped, so a read after the clock is
-        // removed reports the last running value rather than the reload.
-        if chan.deadline_cycle.is_some() {
-            chan.count = self.remaining_ticks(&chan);
+        chan.period_start = None;
+        chan.period_duration = None;
+    }
+
+    /// The counter's value right now: a pending latch wins, otherwise the
+    /// reload scaled by the time left in the current period.
+    fn current_count(chan: &Channel) -> u16 {
+        if let Some(latched) = chan.latched_count {
+            return latched;
         }
-        chan.deadline_cycle = None;
-        chan.period_cycles = None;
+        if let (Some(start), Some(duration)) = (chan.period_start, chan.period_duration) {
+            if chan.input_freq > 0 {
+                let elapsed = start.elapsed();
+                if elapsed < duration {
+                    let remaining = duration - elapsed;
+                    let ns_per_tick = 1_000_000_000 / chan.input_freq as u128;
+                    return (remaining.as_nanos() / ns_per_tick) as u16;
+                }
+                return 0;
+            }
+        }
+        chan.count
+    }
+
+    /// The 8254 status byte: OUT, null count, RW, mode, BCD.
+    ///
+    /// OUT is high while a channel is armed. Null count is not modelled: this
+    /// PIT always has a value to read, so that bit stays clear.
+    fn status_byte(chan: &Channel) -> u8 {
+        let out = if chan.timer_id.is_some() { 0x80 } else { 0 };
+        out | ((chan.rw_mode & 0x3) << 4) | ((chan.mode & 0x7) << 1) | chan.bcd as u8
+    }
+
+    /// Control word `11`: latch the selected counters' status and/or count.
+    /// D5/D4 are active low; a latch already pending is left alone until read.
+    fn readback_command(&self, val: u8) {
+        let latch_count = (val & 0x20) == 0;
+        let latch_status = (val & 0x10) == 0;
+        if !latch_count && !latch_status {
+            return;
+        }
+        for idx in 0..self.channels.len() {
+            if (val & (1 << (idx + 1))) == 0 {
+                continue;
+            }
+            let mut chan = self.channels[idx].lock();
+            if latch_count && chan.latched_count.is_none() {
+                chan.latched_count = Some(Self::current_count(&chan));
+            }
+            if latch_status && chan.latched_status.is_none() {
+                chan.latched_status = Some(Self::status_byte(&chan));
+            }
+        }
     }
 
     fn read_channel(&self, idx: usize) -> u8 {
         let mut chan = self.channels[idx].lock();
 
-        // A latched status byte is returned first, exactly once, then the
-        // latched (or live) count follows.
+        // A status latch is served before the count latch, as on the chip.
         if let Some(status) = chan.latched_status.take() {
             return status;
         }
 
-        // If latched, read from latched value
-        let val = if let Some(latched) = chan.latched_count {
-            latched
-        } else {
-            self.remaining_ticks(&chan)
-        };
+        let val = Self::current_count(&chan);
 
         match chan.rw_mode {
-            1 => { // LSB
-                let v = (val & 0xFF) as u8;
-                chan.latched_count = None; // a single-byte read releases the latch
-                v
-            }
-            2 => { // MSB
-                let v = (val >> 8) as u8;
-                chan.latched_count = None;
-                v
-            }
+            1 => { chan.latched_count = None; (val & 0xFF) as u8 }
+            2 => { chan.latched_count = None; (val >> 8) as u8 }
             3 => { // LSB then MSB
                 if chan.rw_state == 0 {
                     chan.rw_state = 1;
@@ -278,43 +216,6 @@ impl Pit8254 {
         }
     }
 
-    /// The 8254 status byte: OUT pin, null count, then the mode control word
-    /// exactly as programmed (RW, mode, BCD).
-    ///
-    /// OUT is modelled coarsely: high while a mode 2/3 channel is armed and
-    /// counting, low when it is stopped. The other modes are not modelled
-    /// (see the module docs), so their OUT pin is always reported low.
-    fn status_byte(&self, chan: &Channel) -> u8 {
-        let out = if chan.deadline_cycle.is_some() && matches!(chan.mode, 2 | 3) { 0x80 } else { 0 };
-        let null = if chan.null_count { 0x40 } else { 0 };
-        out | null | ((chan.rw_mode & 0x3) << 4) | ((chan.mode & 0x7) << 1) | chan.bcd as u8
-    }
-
-    /// The 8254 read-back command (control word `11`).
-    ///
-    /// D5=0 latches the selected counters' count, D4=0 latches their status,
-    /// D3/D2/D1 select counters 2/1/0. A latch already pending is left alone:
-    /// the first one wins until it has been read, as on the chip.
-    fn readback_command(&self, val: u8) {
-        let latch_count = (val & 0x20) == 0;
-        let latch_status = (val & 0x10) == 0;
-        for (idx, channel_arc) in self.channels.iter().enumerate() {
-            if (val & (1 << (idx + 1))) == 0 {
-                continue;
-            }
-            let mut chan = channel_arc.lock();
-            if latch_count && chan.latched_count.is_none() {
-                chan.latched_count = Some(self.remaining_ticks(&chan));
-            }
-            if latch_status && chan.latched_status.is_none() {
-                chan.latched_status = Some(self.status_byte(&chan));
-            }
-        }
-        if self.debug.load(Ordering::Relaxed) {
-            println!("PIT: read-back {:02x} (count={} status={})", val, latch_count, latch_status);
-        }
-    }
-
     fn write_channel(&self, idx: usize, val: u8) {
         let mut update_chain = false;
         let mut do_arm = false;
@@ -325,13 +226,11 @@ impl Pit8254 {
                 1 => { // LSB
                     chan.reload = (chan.reload & 0xFF00) | (val as u16);
                     chan.count = chan.reload;
-                    chan.null_count = true;
                     do_arm = true;
                 }
                 2 => { // MSB
                     chan.reload = (chan.reload & 0x00FF) | ((val as u16) << 8);
                     chan.count = chan.reload;
-                    chan.null_count = true;
                     do_arm = true;
                 }
                 3 => { // LSB then MSB
@@ -342,8 +241,6 @@ impl Pit8254 {
                         chan.reload = (chan.reload & 0x00FF) | ((val as u16) << 8);
                         chan.rw_state = 0;
                         chan.count = chan.reload;
-                        // Null count rises when the second byte is written.
-                        chan.null_count = true;
                         do_arm = true;
                     }
                 }
@@ -379,19 +276,18 @@ impl Pit8254 {
             let mut chan = self.channels[idx].lock();
 
             if rw == 0 {
-                // Counter Latch Command: capture the current guest-time count.
+                // Counter Latch Command
                 if chan.latched_count.is_none() {
-                    chan.latched_count = Some(self.remaining_ticks(&chan));
+                    chan.latched_count = Some(Self::current_count(&chan));
                 }
             } else {
-                // Mode/RW setup. Reprogramming releases a pending latch.
+                // Mode/RW setup
                 chan.rw_mode = rw;
                 chan.mode = m;
                 chan.bcd = bcd;
                 chan.rw_state = 0;
                 chan.latched_count = None;
                 chan.latched_status = None;
-                chan.null_count = true;
                 if idx == 2 {
                     update_chain = true;
                 }
@@ -422,47 +318,21 @@ impl Pit8254 {
 
         for i in 0..2 {
             let changed = {
-                let chan = self.channels[i].lock();
-                chan.input_freq != freq
-            };
-            if changed {
-                // Capture the count under the old clock first: changing
-                // `input_freq` makes `remaining_ticks` fall back to the stale
-                // register value.
-                self.disarm_channel(i);
-                {
-                    let mut chan = self.channels[i].lock();
+                let mut chan = self.channels[i].lock();
+                if chan.input_freq != freq {
                     if self.debug.load(Ordering::Relaxed) {
                         println!("PIT: Ch{} input freq updated to {} Hz (driven by Ch2)", i, freq);
                     }
                     chan.input_freq = freq;
+                    true
+                } else {
+                    false
                 }
+            };
+            if changed {
                 self.arm_channel(i);
             }
         }
-    }
-
-    /// Human-readable status for the `pit status` monitor command. Kept
-    /// separate from the command so a test can assert on the capability
-    /// lines without a writer.
-    fn status_lines(&self) -> Vec<String> {
-        let mut lines = vec![
-            "PIT status (Intel 8254, IOC PIO6; INT2 +0x30 on Indigo2):".to_string(),
-            "  reference: guest cycle clock, 10 ns per retired cycle".to_string(),
-            "  independent: no - derived from the same guest cycle clock as CP0 Count".to_string(),
-            "  host reference: no - guest cycles are retired instructions, not wall time".to_string(),
-            format!("  clock: counter 2 input {} Hz; counter 2 OUT clocks counters 0 and 1", self.base_frequency),
-            "  caps: counter latch=yes read-back=yes bcd=no modes=2,3".to_string(),
-        ];
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let chan = channel_arc.lock();
-            lines.push(format!(
-                "  channel {}: mode={} rw={} bcd={} reload={:04x} count={:04x} input={}Hz armed={} null={}",
-                i, chan.mode, chan.rw_mode, chan.bcd, chan.reload, self.remaining_ticks(&chan),
-                chan.input_freq, chan.deadline_cycle.is_some(), chan.null_count
-            ));
-        }
-        lines
     }
 
     pub fn read(&self, addr: u32) -> BusRead8 {
@@ -503,12 +373,13 @@ impl Device for Pit8254 {
     }
 
     fn start(&self) {
+
         for i in 0..3 {
             self.arm_channel(i);
         }
     }
 
-    fn is_running(&self) -> bool { self.guest_timers.get().is_some() }
+    fn is_running(&self) -> bool { self.timer_manager.get().is_some() }
     fn get_clock(&self) -> u64 { 0 }
 
     fn register_commands(&self) -> Vec<(String, String)> {
@@ -532,8 +403,11 @@ impl Device for Pit8254 {
                     Ok(())
                 }
                 "status" => {
-                    for line in self.status_lines() {
-                        writeln!(writer, "{}", line).unwrap();
+                    writeln!(writer, "PIT Status:").unwrap();
+                    for (i, channel_arc) in self.channels.iter().enumerate() {
+                        let chan = channel_arc.lock();
+                        writeln!(writer, "  Channel {}: Mode={} RW={} BCD={} Count={:04x} Reload={:04x} Freq={}Hz Running={}",
+                            i, chan.mode, chan.rw_mode, chan.bcd, chan.count, chan.reload, chan.input_freq, chan.period_start.is_some()).unwrap();
                     }
                     Ok(())
                 }
@@ -566,9 +440,9 @@ impl Resettable for Pit8254 {
             chan.rw_mode = 1; // default LSB
             chan.bcd = false;
             chan.rw_state = 0;
-            chan.null_count = true;
-            chan.deadline_cycle = None;
-            chan.period_cycles = None;
+            chan.period_start = None;
+            chan.period_duration = None;
+            chan.timer_id = None;
             // Channel 2 is driven by base frequency; channels 0,1 start with 0 until chaining fires.
             chan.input_freq = if i == 2 { self.base_frequency } else { 0 };
         }
@@ -593,23 +467,22 @@ fn chan_from_toml(v: &toml::Value, chan: &mut Channel) {
     if let Some(x) = get_field(v, "rw_mode")    { if let Some(n) = toml_u8(x)  { chan.rw_mode = n; } }
     if let Some(x) = get_field(v, "bcd")        { if let Some(b) = toml_bool(x) { chan.bcd = b; } }
     if let Some(x) = get_field(v, "input_freq") { if let Some(n) = toml_u32(x) { chan.input_freq = n; } }
-    // Transient guest-time deadlines are re-derived by `start()`/`arm_channel`
-    // from the restored register state; they are not restored from the
-    // snapshot (the guest cycle base is not snapshot state).
+    // Transient state cleared on load.
     chan.latched_count = None;
     chan.latched_status = None;
     chan.rw_state = 0;
-    chan.null_count = true;
-    chan.deadline_cycle = None;
-    chan.period_cycles = None;
+    chan.period_start = None;
+    chan.period_duration = None;
+    chan.timer_id = None;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::guest_timer::TestClock;
     use std::sync::atomic::{AtomicU32, Ordering as AOrdering};
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     // Serialise all timing-sensitive tests so they don't interfere with each other
     // when the test suite runs with multiple threads.
@@ -621,24 +494,15 @@ mod tests {
     }
 
     fn make_pit(freq: u32) -> Pit8254 {
-        let clock = TestClock::new();
-        let gt = Arc::new(GuestTimers::new(clock.ptr()));
         let pit = Pit8254::new(freq, None, None, None);
-        pit.set_guest_timers(gt);
-        // Keep the clock alive for the life of the test by leaking it: the
-        // pointer in `gt` must stay valid, and these tests are short-lived.
-        std::mem::forget(clock);
+        pit.set_timer_manager(Arc::new(TimerManager::new()));
         pit
     }
 
-    /// A PIT with a guest clock the test can advance manually. No host sleep,
-    /// no `Instant`: guest time is exactly what the test sets it to.
-    fn make_pit_clocked(freq: u32) -> (Pit8254, TestClock, Arc<GuestTimers>) {
-        let clock = TestClock::new();
-        let gt = Arc::new(GuestTimers::new(clock.ptr()));
-        let pit = Pit8254::new(freq, None, None, None);
-        pit.set_guest_timers(gt.clone());
-        (pit, clock, gt)
+    fn make_pit_cb(freq: u32, cb: Arc<dyn TimerCallback>) -> Pit8254 {
+        let pit = Pit8254::new(freq, None, None, Some(cb));
+        pit.set_timer_manager(Arc::new(TimerManager::new()));
+        pit
     }
 
     // Program channel `ch` as mode 2 (rate generator), LSB+MSB, with given reload.
@@ -655,346 +519,161 @@ mod tests {
         // Latch command: SC=ch, RW=0
         let ctrl = (ch << 6) | 0;
         pit.write(3, ctrl);
-        read_bytes16(pit, ch)
-    }
-
-    // Issue a read-back command for one channel, optionally latching its
-    // count and/or status (8254 control word D5/D4 = 0 selects each).
-    fn readback(pit: &Pit8254, ch: u8, latch_count: bool, latch_status: bool) {
-        let mut cmd = 0xC0 | (1 << (ch + 1));
-        if !latch_count {
-            cmd |= 0x20;
-        }
-        if !latch_status {
-            cmd |= 0x10;
-        }
-        pit.write(3, cmd);
-    }
-
-    fn read8(pit: &Pit8254, ch: u8) -> u8 {
-        let r = pit.read(ch as u32);
-        assert!(r.is_ok(), "PIT read of channel {} failed", ch);
-        r.data
-    }
-
-    fn read_bytes16(pit: &Pit8254, ch: u8) -> u16 {
-        let lo = read8(pit, ch);
-        let hi = read8(pit, ch);
+        let lo = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
+        let hi = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
         (hi as u16) << 8 | lo as u16
     }
 
-    /// Channel 2 at 1 MHz, reload=100: one period = 100 µs = 10 000 guest
-    /// cycles. Advance 105 000 cycles (10.5 periods) and the count must be
-    /// mid-period, i.e. < reload.
+    // Read channel without latching (LSB+MSB mode 3).
+    fn read16(pit: &Pit8254, ch: u8) -> u16 {
+        let lo = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
+        let hi = { let _r = pit.read(ch as u32); if _r.is_ok() { let v = _r.data; v } else { panic!("bad read") } };
+        (hi as u16) << 8 | lo as u16
+    }
+
+    // Start PIT, program channel 2, then wait briefly for the timer to be armed.
+    fn start_and_program(freq: u32, reload: u16) -> Pit8254 {
+        let pit = make_pit(freq);
+        pit.start();
+        program_mode2(&pit, 2, reload);
+        // Give the timer manager a moment to process the new timer.
+        thread::sleep(Duration::from_millis(2));
+        pit
+    }
+
+    fn start_and_program_cb(freq: u32, reload: u16, cb: Arc<dyn TimerCallback>) -> Pit8254 {
+        let pit = make_pit_cb(freq, cb);
+        pit.start();
+        program_mode2(&pit, 2, reload);
+        thread::sleep(Duration::from_millis(2));
+        pit
+    }
+
+    /// The read-back command (control word `11`) latches the selected counter's
+    /// status and/or count. When both are latched the status is returned first.
     #[test]
+    fn readback_latches_status_before_count() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB+MSB, mode 3, BCD off.
+        pit.write(3, (3 << 4) | (3 << 1));
+        pit.write(0, 0x34);
+        pit.write(0, 0x12);
+        // D5=0 (latch count), D4=0 (latch status), D1=1 (channel 0).
+        pit.write(3, 0xC0 | (1 << 1));
+        let status = pit.read(0).data;
+        let lo = pit.read(0).data;
+        let hi = pit.read(0).data;
+        assert_eq!(status, (3 << 4) | (3 << 1), "status carries RW, mode and BCD");
+        assert_eq!((hi as u16) << 8 | lo as u16, 0x1234, "the latched count follows the status");
+    }
+
+    /// A status-only read-back latches no count, so the next data read is the
+    /// counter, not another status byte.
+    #[test]
+    fn readback_status_only_then_count() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB only, mode 2.
+        pit.write(3, (1 << 4) | (2 << 1));
+        pit.write(0, 0x40);
+        // D5=1 (status only), D4=0, D1=1 (channel 0).
+        pit.write(3, 0xC0 | 0x20 | (1 << 1));
+        assert_eq!(pit.read(0).data, (1 << 4) | (2 << 1));
+        assert_eq!(pit.read(0).data, 0x40);
+    }
+
+    /// A single-byte latch is released by its one read; the next read sees the
+    /// live counter (here: the new reload written while it was latched).
+    #[test]
+    fn single_byte_latch_releases_after_one_read() {
+        let _lock = SERIAL.lock().unwrap();
+        let pit = make_pit(1_000_000);
+        // Channel 0: LSB only, mode 0.
+        pit.write(3, (1 << 4));
+        pit.write(0, 0x34);
+        // Counter latch command for channel 0.
+        pit.write(3, 0x00);
+        // Change the reload while the latch is pending (data write, RW stays LSB).
+        pit.write(0, 0x78);
+        assert_eq!(pit.read(0).data, 0x34, "the latched value");
+        assert_eq!(pit.read(0).data, 0x78, "the latch released; this is the live count");
+    }
+
+    /// Channel 2 at 1 MHz, reload=100: one period = 100 µs wall-clock.
+    /// After waiting well past one period the count must be < reload (timer running).
+    #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_100us_period() {
         let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 100);
-        clock.set(105_000);
-        gt.drain(clock.now());
+        let pit = start_and_program(1_000_000, 100);
+        // Sleep several extra periods so we're definitely mid-period.
+        thread::sleep(Duration::from_millis(1));
         let count = latch_read16(&pit, 2);
         pit.stop();
+        // In mode 2 the channel reloads; count is always in [0, reload).
         assert!(count < 100, "count={} should be < reload=100", count);
     }
 
-    /// Mid-period read: 7 ms into a 10 ms period, count is exactly 3000. Guest
-    /// time is set explicitly, so this is exact, not "≈".
+    /// Mid-period read: after ~5 ms into a 10 ms period count should be ~5000.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_midperiod_read() {
         let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 10_000); // 10 ms = 1 000 000 cycles
-        clock.set(700_000);
-        gt.drain(clock.now());
+        let pit = start_and_program(1_000_000, 10_000); // 10 ms period
+        thread::sleep(Duration::from_millis(5));
         let count = latch_read16(&pit, 2);
         pit.stop();
-        assert_eq!(count, 3000, "7 ms into a 10 ms period leaves 3000 ticks");
+        // startup sleep (~2ms) + 5ms measured = ~7ms elapsed, remaining ~3000. Allow ±1000.
+        let expected: i32 = 3000;
+        let delta = (count as i32 - expected).abs();
+        assert!(delta < 1000, "count={} expected ~{} (delta={})", count, expected, delta);
     }
 
-    /// Callback fires exactly 100 times when 100 periods (100 ms) of guest
-    /// time elapse — deterministic, no host jitter window.
+    /// Callback fires ~100 times per 100 ms when reload=1000 at 1 MHz (1 ms period).
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_callback_rate() {
         let _lock = SERIAL.lock().unwrap();
         let counter = Arc::new(AtomicU32::new(0));
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.stop();
-        // Rebuild with the counting callback on channel 2.
         let cb = Arc::new(CountCallback(counter.clone())) as Arc<dyn TimerCallback>;
-        let pit2 = Pit8254::new(1_000_000, None, None, Some(cb));
-        pit2.set_guest_timers(gt.clone());
-        pit2.start();
-        program_mode2(&pit2, 2, 1000); // 1 ms = 100 000 cycles
-        clock.set(10_000_000); // 100 periods
-        gt.drain(clock.now());
-        pit2.stop();
+        let pit = start_and_program_cb(1_000_000, 1000, cb);
+        thread::sleep(Duration::from_millis(100));
+        pit.stop();
         let fires = counter.load(AOrdering::SeqCst);
-        assert_eq!(fires, 100, "100 ms of guest time at a 1 ms period");
-        drop(pit);
+        // ~100 callbacks in 100 ms, allow ±25 for jitter.
+        assert!(fires >= 75 && fires <= 125,
+            "callback fired {} times in 100 ms, expected ~100", fires);
     }
 
     /// The count decrements monotonically within a period.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_count_decrements() {
         let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 0xFFFF); // ~65.5 ms = 6 553 500 cycles
+        let pit = start_and_program(1_000_000, 0xFFFF); // ~65 ms period
         let c0 = latch_read16(&pit, 2);
-        clock.set(500_000); // 5 ms
-        gt.drain(clock.now());
+        thread::sleep(Duration::from_millis(5));
         let c1 = latch_read16(&pit, 2);
         pit.stop();
-        assert_eq!(c0, 0xFFFF);
+        // c0 > c1 (count decrements toward 0)
         assert!(c0 > c1, "count should decrement: c0={} c1={}", c0, c1);
     }
 
-    /// Reload=0xFFFF at 1 MHz: period = 6 553 500 cycles. After 1 200 000
-    /// cycles (12 ms) the remaining count is exactly 53 535.
+    /// Reload=0xFFFF at 1 MHz: period = 65.535 ms. After 10 ms count ≈ 55535.
     #[test]
+    #[ignore = "timing-sensitive: requires a quiet system, run with -- --ignored"]
     fn test_ch2_large_reload() {
         let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 0xFFFF);
-        clock.set(1_200_000);
-        gt.drain(clock.now());
+        let pit = start_and_program(1_000_000, 0xFFFF);
+        thread::sleep(Duration::from_millis(10));
         let count = latch_read16(&pit, 2);
         pit.stop();
-        assert_eq!(count, 53_535);
-    }
-
-    // ------------------------------------------------------------------
-    // Channel 0 as a readable reference: the evidence for issue #106.
-    // ------------------------------------------------------------------
-
-    /// Counter 0 is readable and its count advances with guest time once
-    /// counter 2 clocks it. Half a 10 ms period is exactly 5000 ticks; a full
-    /// period reloads. No host time is involved anywhere.
-    #[test]
-    fn ch0_count_advances_with_guest_cycles() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1); // counter 2: 1 MHz output (divide by 1)
-        program_mode2(&pit, 0, 10_000); // counter 0: 100 Hz = 10 ms
-
-        clock.set(0);
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 10_000, "freshly loaded count");
-
-        clock.set(500_000); // 5 ms = 500 000 guest cycles
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 5_000, "5 ms of guest time is 5000 ticks");
-
-        clock.set(1_000_000); // exactly one period
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 10_000, "a full period reloads");
-        pit.stop();
-    }
-
-    /// Resolution against the guest cycle clock: one 1 MHz tick is exactly
-    /// 100 guest cycles (1 µs / 10 ns). A long run has no cumulative drift
-    /// because every deadline is `deadline + period`, never a re-read count.
-    #[test]
-    fn ch0_rate_is_exact_over_ten_seconds_of_guest_time() {
-        let _lock = SERIAL.lock().unwrap();
-        let counter = Arc::new(AtomicU32::new(0));
-        let cb = Arc::new(CountCallback(counter.clone())) as Arc<dyn TimerCallback>;
-        let (_idle, mut clock, gt) = make_pit_clocked(1_000_000);
-        let pit = Pit8254::new(1_000_000, Some(cb), None, None);
-        pit.set_guest_timers(gt.clone());
-        pit.start();
-        program_mode2(&pit, 2, 1000); // counter 2: 1 kHz
-        program_mode2(&pit, 0, 10); // counter 0: 100 Hz
-
-        clock.set(1_000_000_000); // 10 s at 10 ns per guest cycle
-        gt.drain(clock.now());
-        pit.stop();
-        assert_eq!(counter.load(AOrdering::SeqCst), 1_000, "100 Hz for 10 s of guest time");
-    }
-
-    /// A counter with no input clock is genuinely frozen: on its own, counter
-    /// 0 holds its loaded count and status bit D6 (null count) stays set.
-    /// Programming counter 2 as a rate generator starts it and clears D6.
-    ///
-    /// This is the hardware trap a timing probe must handle: reading counter
-    /// 0 without programming counter 2 first looks exactly like a dead PIT.
-    #[test]
-    fn ch0_is_frozen_until_counter_2_supplies_a_clock() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 0, 10_000);
-
-        clock.set(500_000);
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 10_000, "no clock, no count");
-
-        readback(&pit, 0, false, true);
-        assert_eq!(read8(&pit, 0) & 0x40, 0x40, "null count set while unclocked");
-
-        program_mode2(&pit, 2, 1); // counter 2: 1 MHz output
-        clock.set(1_000_000);
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 5_000, "counts once clocked");
-
-        readback(&pit, 0, false, true);
-        assert_eq!(read8(&pit, 0) & 0x40, 0, "null count clears once the count loads");
-        pit.stop();
-    }
-
-    /// The counter latch command captures the count at the instant it is
-    /// issued: guest time passing before the bytes are read does not change
-    /// what is returned.
-    #[test]
-    fn counter_latch_holds_its_value_across_guest_time() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1);
-        program_mode2(&pit, 0, 10_000);
-
-        clock.set(0);
-        gt.drain(clock.now());
-        pit.write(3, 0); // latch counter 0
-
-        clock.set(500_000);
-        gt.drain(clock.now());
-        assert_eq!(read_bytes16(&pit, 0), 10_000, "latched at t=0");
-        assert_eq!(latch_read16(&pit, 0), 5_000, "the live count has moved on");
-        pit.stop();
-    }
-
-    /// A single-byte (LSB-only) latch is released by its one read; the next
-    /// read returns the live count again.
-    #[test]
-    fn latch_single_byte_read_releases_the_latch() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1);
-        // Counter 0: mode 2, RW=1 (LSB only), reload 0x10 = 16 ticks.
-        pit.write(3, (1 << 4) | (2 << 1));
-        pit.write(0, 0x10);
-
-        clock.set(0);
-        gt.drain(clock.now());
-        pit.write(3, 0); // latch counter 0
-        assert_eq!(read8(&pit, 0), 0x10, "latched LSB");
-
-        clock.set(80_800); // 50.5 periods of 1600 cycles: 8 ticks left
-        gt.drain(clock.now());
-        assert_eq!(read8(&pit, 0), 0x08, "the first read released the latch");
-        pit.stop();
-    }
-
-    /// The read-back command latches count and status together. The status
-    /// byte is returned first, then the count as it was when latched, then
-    /// live counts again.
-    #[test]
-    fn readback_latches_count_and_status_status_first() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1);
-        program_mode2(&pit, 0, 10_000);
-
-        readback(&pit, 0, true, true); // latch both at t=0
-        clock.set(500_000);
-        gt.drain(clock.now());
-
-        // OUT=1, null=0, RW=3, mode=2, BCD=0.
-        assert_eq!(read8(&pit, 0), 0b1011_0100, "latched status byte");
-        assert_eq!(read_bytes16(&pit, 0), 10_000, "count as latched at t=0");
-        assert_eq!(latch_read16(&pit, 0), 5_000, "live count after the latch is drained");
-        pit.stop();
-    }
-
-    /// A second latch command before the first is read is ignored: the first
-    /// captured value wins, as on the 8254.
-    #[test]
-    fn readback_second_latch_is_ignored_until_read() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1);
-        program_mode2(&pit, 0, 10_000);
-
-        readback(&pit, 0, true, false); // count only, at t=0
-        clock.set(500_000);
-        gt.drain(clock.now());
-        readback(&pit, 0, true, false); // ignored: already latched
-
-        assert_eq!(read_bytes16(&pit, 0), 10_000, "first latch wins");
-        pit.stop();
-    }
-
-    /// When counter 2 stops being a rate generator, counters 0 and 1 lose
-    /// their clock and freeze at the count they had reached, not at their
-    /// reload value.
-    #[test]
-    fn stopping_the_clock_freezes_the_count_where_it_was() {
-        let _lock = SERIAL.lock().unwrap();
-        let (pit, mut clock, gt) = make_pit_clocked(1_000_000);
-        pit.start();
-        program_mode2(&pit, 2, 1);
-        program_mode2(&pit, 0, 10_000);
-
-        clock.set(500_000);
-        gt.drain(clock.now());
-
-        // Counter 2 to mode 0: its OUT no longer clocks counters 0 and 1.
-        pit.write(3, (2 << 6) | (3 << 4) | (0 << 1));
-        assert_eq!(latch_read16(&pit, 0), 5_000, "frozen at the last running count");
-
-        clock.set(1_000_000);
-        gt.drain(clock.now());
-        assert_eq!(latch_read16(&pit, 0), 5_000, "still frozen with no clock");
-        pit.stop();
-    }
-
-    /// `pit status` states the time base and the modelled capabilities, so a
-    /// host-side timing probe can see that the PIT is not an independent or
-    /// host-referenced clock before trying to calibrate against it.
-    #[test]
-    fn status_states_reference_and_capabilities() {
-        let _lock = SERIAL.lock().unwrap();
-        let pit = make_pit(1_000_000);
-        let text = pit.status_lines().join("\n");
-        assert!(text.contains("reference: guest cycle clock"), "{text}");
-        assert!(text.contains("independent: no"), "{text}");
-        assert!(text.contains("host reference: no"), "{text}");
-        assert!(text.contains("counter latch=yes"), "{text}");
-        assert!(text.contains("read-back=yes"), "{text}");
-        assert!(text.contains("bcd=no"), "{text}");
-    }
-
-    /// The monitor command renders the same lines (and none of the count
-    /// fields panic while a channel is being read from another thread).
-    #[test]
-    fn status_command_renders_capabilities() {
-        let _lock = SERIAL.lock().unwrap();
-        #[derive(Clone)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
-        }
-
-        let pit = make_pit(1_000_000);
-        let out = Buf(Arc::new(Mutex::new(Vec::new())));
-        pit.execute_command("pit", &["status"], Box::new(out.clone())).unwrap();
-        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("PIT status"), "{text}");
-        assert!(text.contains("independent: no"), "{text}");
-        assert!(text.contains("channel 0:"), "{text}");
+        // startup sleep (~2ms) + 10ms measured = ~12ms total elapsed, remaining ~53535
+        let expected: i32 = 0xFFFF - 12_000;
+        let delta = (count as i32 - expected).abs();
+        assert!(delta < 1000,
+            "count={} expected ~{} (delta={})", count, expected, delta);
     }
 
     /// Phase 1.7 round-trip: program a few channels with non-default values,
@@ -1018,29 +697,22 @@ mod tests {
 }
 
 impl Saveable for Pit8254 {
-    fn state_desc(&self) -> Option<crate::state_desc::StateDesc<'_>> {
-        use crate::state_desc::{FieldKind, StateDesc};
-        let mut d = StateDesc::new("pit", 1);
-        for (i, channel_arc) in self.channels.iter().enumerate() {
-            let save_arc = channel_arc.clone();
-            let load_arc = channel_arc.clone();
-            let name = format!("ch{}", i);
-            d = d.field(
-                name,
-                FieldKind::Table,
-                1,
-                move |t| { t.insert(format!("ch{}", i), chan_to_toml(&save_arc.lock())); },
-                move |v| { chan_from_toml(v, &mut load_arc.lock()); Ok(()) },
-            );
-        }
-        Some(d)
-    }
-
     fn save_state(&self) -> toml::Value {
-        self.state_desc().expect("pit has a state description").save()
+        let mut tbl = toml::map::Map::new();
+        for (i, channel_arc) in self.channels.iter().enumerate() {
+            let chan = channel_arc.lock();
+            tbl.insert(format!("ch{}", i), chan_to_toml(&chan));
+        }
+        toml::Value::Table(tbl)
     }
 
     fn load_state(&self, v: &toml::Value) -> Result<(), String> {
-        self.state_desc().expect("pit has a state description").load(v)
+        for (i, channel_arc) in self.channels.iter().enumerate() {
+            let mut chan = channel_arc.lock();
+            if let Some(ct) = get_field(v, &format!("ch{}", i)) {
+                chan_from_toml(ct, &mut chan);
+            }
+        }
+        Ok(())
     }
 }

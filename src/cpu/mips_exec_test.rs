@@ -1594,10 +1594,10 @@ mod tests {
 
     /// Issue #47, run-loop path: a longer run — a real countdown loop with a
     /// branch and delay slot, plus an external IP2 line partway through — must
-    /// record and replay identically when driven through the same dispatch and
-    /// guest-timer drain the CPU thread's batch loop uses (`step_run_loop` /
-    /// `drain_guest_timers`), not just a bare `step_int` trace. This is the
-    /// regression net for "the journal runs the real run loop".
+    /// record and replay identically when driven through the same dispatch the
+    /// CPU thread's batch loop uses (`step_run_loop`), not just a bare
+    /// `step_int` trace. This is the regression net for "the journal runs the
+    /// real run loop".
     #[test]
     fn journal_run_loop_replays_a_longer_run_with_a_loop_and_an_interrupt() {
         use crate::cpu::journal::{Journal, ReplayReport};
@@ -1692,9 +1692,11 @@ mod tests {
 
     /// Issue #47: version-1 CPU payloads predate the interrupt word; the
     /// registered migration must default it to "none pending" so pre-#47
-    /// snapshots keep loading rather than failing the field-set check.
+    /// snapshots keep loading rather than failing the field-set check. The
+    /// chain then reaches v3, which names the CP0 Count clock the payload
+    /// assumes (#98).
     #[test]
-    fn cpu_v1_state_migrates_to_v2_with_no_pending_interrupts() {
+    fn cpu_v1_state_migrates_to_v3_with_no_pending_interrupts() {
         use crate::cpu::mips_exec::MipsCpu;
         use crate::traits::Saveable;
 
@@ -1707,15 +1709,99 @@ mod tests {
             t.remove("interrupts");
         }
         let desc = cpu.state_desc().expect("cpu has a description");
-        assert_eq!(desc.version, 2, "adding the field bumped the CPU schema version");
+        assert_eq!(desc.version, 3, "the clock field bumped the CPU schema version");
         assert_eq!(desc.minimum_version, 1, "a v1 migration is registered");
 
-        let migrated = desc.migrate_value(1, &v1).expect("v1 migrates to v2");
-        desc.verify(&migrated).expect("migrated value matches the v2 field set");
+        let migrated = desc.migrate_value(1, &v1).expect("v1 migrates through v2 to v3");
+        desc.verify(&migrated).expect("migrated value matches the v3 field set");
         assert_eq!(
             migrated.get("interrupts").and_then(|v| v.as_integer()),
             Some(0),
             "migration defaults the interrupt word to none pending"
+        );
+        assert_eq!(
+            migrated.get("clock").and_then(|v| v.as_str()),
+            Some(if cfg!(feature = "ci_clock") { "cycles" } else { "wall" }),
+            "migration stamps the current CP0 Count clock"
+        );
+    }
+
+    /// #98: a version-2 CPU payload is the fork's cycle-clock snapshot. It
+    /// must load into the wall-clock model — the retired guest-timer queue is
+    /// dropped and the Compare deadline is re-armed from the restored
+    /// Count/Compare, not inherited from the old time base.
+    #[test]
+    fn cpu_v2_cycle_clock_payload_migrates_to_a_fresh_compare_deadline() {
+        use crate::cpu::mips_exec::MipsCpu;
+        use crate::traits::Saveable;
+
+        let (exec, _mem) = create_executor();
+        let cpu = MipsCpu::new(exec);
+        let mut v2 = cpu.save_state();
+        if let Some(t) = v2.as_table_mut() {
+            t.remove("clock");
+            // The v2 payload carried the guest-timer queue; it is dropped.
+            t.insert("timers".into(), toml::Value::Table(toml::map::Map::new()));
+        }
+        let desc = cpu.state_desc().expect("cpu has a description");
+        let migrated = desc.migrate_value(2, &v2).expect("v2 migrates to v3");
+        assert!(
+            !migrated.as_table().unwrap().contains_key("timers"),
+            "the cycle-clock queue is not part of the wall-clock payload"
+        );
+        assert_eq!(
+            migrated.get("clock").and_then(|v| v.as_str()),
+            Some(if cfg!(feature = "ci_clock") { "cycles" } else { "wall" }),
+            "a v2 payload adopts the current clock"
+        );
+
+        let (mut exec2, _mem2) = create_executor();
+        exec2
+            .core
+            .set_timer_manager(std::sync::Arc::new(crate::hptimer::TimerManager::new()));
+        exec2.core.cp0_compare = 0x1234;
+        let cpu2 = MipsCpu::new(exec2);
+        // Each CPU owns its own descriptor; load through *this* one so the
+        // restored fields land in `cpu2`.
+        cpu2.state_desc()
+            .expect("cpu has a description")
+            .load(&migrated)
+            .expect("v2 payload loads into this build");
+        let (armed, anchored) = cpu2
+            .with_core(|exec| (exec.core.timer_id.is_some(), exec.core.count_read_cycle == exec.core.hot.cycles))
+            .expect("executor");
+        assert!(
+            armed || cfg!(feature = "ci_clock"),
+            "restore must arm a fresh Compare deadline, not reuse the old one"
+        );
+        assert!(
+            anchored,
+            "the Count anchor must be reset at the restored cycle position"
+        );
+    }
+
+    /// #98: a version-3 payload names its CP0 Count clock. Loading it into a
+    /// build with the other clock must fail loudly rather than reinterpret
+    /// Count/Compare on the wrong time base.
+    #[test]
+    fn cpu_v3_payload_from_the_other_clock_is_refused() {
+        use crate::cpu::mips_exec::MipsCpu;
+        use crate::traits::Saveable;
+
+        let (exec, _mem) = create_executor();
+        let cpu = MipsCpu::new(exec);
+        let mut saved = cpu.save_state();
+        let other = if cfg!(feature = "ci_clock") { "wall" } else { "cycles" };
+        if let Some(t) = saved.as_table_mut() {
+            t.insert("clock".into(), toml::Value::String(other.into()));
+        }
+        let desc = cpu.state_desc().expect("cpu has a description");
+        let err = desc
+            .load(&saved)
+            .expect_err("a clock mismatch must refuse the restore");
+        assert!(
+            err.contains("clock"),
+            "the refusal must name the clock: {err}"
         );
     }
 
@@ -6411,9 +6497,16 @@ mod tests {
                     done_tx.send(Ok(parks)).unwrap();
                     return;
                 }
-                if idle.update(&exec.core) {
-                    parks += 1;
-                    idle.park(&mut exec.core, &run);
+                match idle.update(&exec.core) {
+                    crate::cpu::idle_park::IdleDecision::Park => {
+                        parks += 1;
+                        idle.park(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::Pace => {
+                        parks += 1;
+                        idle.pace(&mut exec.core, &run);
+                    }
+                    crate::cpu::idle_park::IdleDecision::None => {}
                 }
             }
             done_tx.send(Err(exec.core.pc)).unwrap();

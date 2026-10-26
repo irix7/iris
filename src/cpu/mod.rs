@@ -12,7 +12,6 @@ pub mod decode_cache;
 pub mod mips_exec;
 pub mod mips_exec_test;
 pub mod journal;
-pub mod guest_timer;
 pub mod mips_instr_stats;
 pub mod trace;
 #[cfg(feature = "idle-pause")]

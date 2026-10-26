@@ -62,12 +62,17 @@ pub fn validate_snapshot_determinism(
     // thread runs between load and digest. This is the key to surfacing
     // genuine load_state determinism issues vs. thread-scheduling jitter.
     machine.load_snapshot_paused(name)?;
-    let executed_a = machine.cpu_step_n_inline(n_instructions)?;
+    // Count must be live, not latched by `load_snapshot_paused`: the check is
+    // about whether two runs from this state produce the same state, and the
+    // CP0 Count clock is the input under test. With the default host clock,
+    // Count read during each pass differs by host elapsed time; with
+    // `ci_clock` it is a function of retired cycles.
+    let executed_a = machine.cpu_step_n_inline_with_live_count(n_instructions)?;
     let state_a = machine.cpu_state_digest()?;
 
     // Pass B: same starting snapshot, fresh load.
     machine.load_snapshot_paused(name)?;
-    let executed_b = machine.cpu_step_n_inline(n_instructions)?;
+    let executed_b = machine.cpu_step_n_inline_with_live_count(n_instructions)?;
     let state_b = machine.cpu_state_digest()?;
 
     if executed_a != executed_b {

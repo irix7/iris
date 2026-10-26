@@ -2574,12 +2574,12 @@ fn cvt_d_to_s_and_commit(core: &mut MipsCore, fs_reg: u32, fd_reg: u32, fr1: boo
 /// guarantees the compiler can't elide/hoist the write out of an unbounded
 /// loop, even though this isn't a synchronizing atomic RMW (readers only
 /// need eventual visibility of the count, not ordering against other
-/// memory). Also runs the Compare-fire check, immediately after, on the
-/// freshly-bumped value — "fire when hot.cycles >= count_fire_cycle" is a
-/// threshold test, not an edge trigger, so it stays correct (just
-/// coarser-grained, still deterministic) even when the caller only calls
-/// this once per N instructions instead of every single one — see
-/// `step_int_0cycles`'s doc comment.
+/// memory). Also runs `ci_clock`'s timer-fire check, immediately after, on
+/// the freshly-bumped value — `ci_clock`'s "fire when hot.cycles >=
+/// count_fire_cycle" is a threshold test, not an edge trigger, so it stays
+/// correct (just coarser-grained, still deterministic) even when the caller
+/// only calls this once per N instructions instead of every single one —
+/// see `step_int_0cycles`'s doc comment.
 macro_rules! step_cycles {
     ($self:ident) => {{
         unsafe {
@@ -2587,17 +2587,19 @@ macro_rules! step_cycles {
             std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
         }
 
-        // The compare "timer" is a deterministic hot.cycles threshold, not a
-        // host timer thread — check it here, before the pending load below,
-        // so the fire is delivered within this same step. Count is derived
-        // from the same cycles, so this is the guest-visible Compare match.
+        // ci_clock: the compare "timer" is a deterministic hot.cycles
+        // threshold instead of an hptimer thread — check it here, before the
+        // pending load below, so the fire is delivered within this same step.
+        #[cfg(feature = "ci_clock")]
         if $self.core.hot.cycles >= $self.core.count_fire_cycle {
             // Next architectural match is a full 32-bit Count wrap away;
-            // normally a Compare write re-arms much sooner. This also
-            // republishes the deadline on the shared guest-time queue so
-            // idle parking targets it.
-            $self.core.rearm_compare_after_fire();
+            // normally a Compare write re-arms much sooner.
+            let wrap_ns = ((1u128 << 32) * 1_000_000_000) / $self.core.count_hz as u128;
+            $self.core.count_fire_cycle = $self.core.hot.cycles
+                .saturating_add(wrap_ns as u64 / crate::cpu::mips_core::NS_PER_GUEST_CYCLE);
+            $self.core.hot.interrupts.fetch_or(crate::cpu::mips_core::CAUSE_IP7 as u64, Ordering::SeqCst);
             crate::pf_level!(crate::perfetto::events::IP7_LEVEL, crate::perfetto::events::IP7_COMPARE, true);
+            $self.core.fasttick_count.fetch_add(1, Ordering::Relaxed);
         }
     }};
 }
@@ -3058,21 +3060,6 @@ impl<T: Tlb, C: CpuModel> MipsExecutor<T, C> {
     /// process" contract as `interrupts_ptr` above.
     pub fn cycles_ptr(&self) -> crate::cpu::mips_core::CyclesPtr {
         crate::cpu::mips_core::CyclesPtr::new(&self.core.hot.cycles as *const u64)
-    }
-
-    /// Run every guest-time deadline that `hot.cycles` has reached, in queue
-    /// order. Called once per dispatch batch from the CPU run loop (and by the
-    /// 8254 PIT in its own tests), never per instruction: the batch is ~1000
-    /// instructions (~10 us of guest time), far finer than any guest timer.
-    ///
-    /// Runs while the executor lock is held, but the callbacks only touch
-    /// device state (the PIT's channels and the IOC's interrupt word) — the
-    /// same work the hptimer thread used to do — and never re-enter the
-    /// executor, so this cannot deadlock against the CPU thread.
-    pub fn drain_guest_timers(&self) {
-        if let Some(t) = &self.core.guest_timers {
-            t.drain(self.core.hot.cycles);
-        }
     }
 
     /// Install the CP0 Status change callback pointing at this executor.
@@ -4135,7 +4122,6 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
             acc += retired;
             done += step;
             self.journal_note_status(j, &mut acc, status);
-            self.drain_guest_timers();
         }
         j.delta(acc);
     }
@@ -4190,8 +4176,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                         acc += retired;
                         done += step;
                         self.journal_note_status(&mut out, &mut acc, status);
-                        self.drain_guest_timers();
-                    }
+                                }
                     // Close this delta at the same boundary the recorder did,
                     // so two consecutive deltas (a record run split into
                     // chunks) replay as two deltas rather than merging.
@@ -7946,7 +7931,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         // holding still here deadlocks it against a CPU waiting for the
         // very interrupt that spin is about to deliver.
         //
-        // Must be paced: it is also the *virtual time base*
+        // Must be paced: under `ci_clock` it is also the *virtual time base*
         // (`NS_PER_GUEST_CYCLE` = 10ns/cycle), and CP0 Count derives straight
         // from it (`count_now`). Bumping once per host iteration would run
         // guest time at hundreds of millions of cycles per real second inside
@@ -7954,8 +7939,7 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
         //
         // So: one guest cycle per 10ns of real time, which is exactly the
         // 1:1 rate `NS_PER_GUEST_CYCLE` defines, sampled off the host
-        // clock rather than off loop iterations. An idle guest's clock
-        // then tracks wall time the same way a running one does.
+        // clock rather than off loop iterations.
         #[cfg(not(feature = "idle-pause"))]
         {
             let stall_start = std::time::Instant::now();
@@ -7970,10 +7954,11 @@ va={:#018x} phys={:#010x} (code pfn {:#x}, page {:#010x}, word {}/{})",
                 if (ip & im) != 0 {
                     break;
                 }
-                // The compare deadline is a cycles threshold; break so the
-                // next step()'s preamble delivers IP7, exactly as idle parking
-                // does. Without this a WAIT whose only wake source is the
-                // compare timer would spin forever.
+                // ci_clock: the compare deadline is a cycles threshold;
+                // break so the next step()'s preamble delivers IP7, exactly
+                // as idle parking does. Without this a WAIT whose only wake
+                // source is the compare timer would spin forever.
+                #[cfg(feature = "ci_clock")]
                 if self.core.hot.cycles >= self.core.count_fire_cycle {
                     break;
                 }
@@ -11546,6 +11531,15 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
         self.executor.try_lock().ok_or_else(|| "CPU thread holds the executor lock; try 'cpu stop' first".to_string())
     }
 
+    /// Run `f` against the executor under its lock, for tests that need to
+    /// inspect restored clock state. `cpu stop` semantics: fails while the CPU
+    /// thread holds the lock.
+    #[cfg(test)]
+    pub(crate) fn with_core<R>(&self, f: impl FnOnce(&MipsExecutor<T, C>) -> R) -> Result<R, String> {
+        let guard = self.try_lock_executor()?;
+        Ok(f(&guard))
+    }
+
     /// Load a static ELF32 MSB image: copy each `PT_LOAD` to its `p_vaddr`,
     /// zero-fill to `p_memsz`, set PC to `e_entry`. Returns a segment summary.
     pub fn load_elf(&self, path: &str) -> Result<String, String> {
@@ -11648,6 +11642,21 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> MipsCpu<T, C> {
             // operation and a deterministic run should re-enter and continue.
         }
         Ok(executed)
+    }
+
+    /// `step_n_inline`, but with the CP0 Count clock live rather than latched
+    /// by the stopped-CPU state. The snapshot determinism validator uses this
+    /// so the two passes actually exercise the clock model: with the default
+    /// host wall clock, Count read during the pass depends on host elapsed
+    /// time; with `ci_clock` it is a function of retired cycles. The Compare
+    /// deadline is disarmed so no host timer can inject an interrupt between
+    /// the passes.
+    pub fn step_n_inline_with_live_count(&self, n: u64) -> Result<u64, String> {
+        {
+            let mut exec = self.try_lock_executor()?;
+            exec.core.resume_count_for_inline_pass();
+        }
+        self.step_n_inline(n)
     }
 
     /// Append a checkpoint fence to `j` at the current guest cycle. See
@@ -12189,9 +12198,6 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
                     hook(&mut guard);
                     guard.batch_hook = Some(hook);
                 }
-                // Fire any guest-time deadlines the batch crossed (8254 PIT
-                // channels and, harmlessly, the no-callback Compare entry).
-                guard.drain_guest_timers();
                 #[cfg(feature = "idle-pause")]
                 if crate::cpu::idle_park::idle_park_enabled() {
                     match idle_state.update(&guard.core) {
@@ -15372,6 +15378,9 @@ pub trait CpuDevice: Device + Resettable + Saveable + Send + Sync {
     fn load_elf(&self, path: &str) -> Result<String, String>;
     fn load_elf_bytes(&self, bytes: &[u8], name: &str) -> Result<String, String>;
     fn step_n_inline(&self, n: u64) -> Result<u64, String>;
+    /// `step_n_inline` with the Count clock live (snapshot determinism
+    /// validator; see `MipsCpu::step_n_inline_with_live_count`).
+    fn step_n_inline_with_live_count(&self, n: u64) -> Result<u64, String>;
     /// Guest-cycle record/replay journal (issue #47); see `cpu::journal`.
     fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) -> Result<(), String>;
     fn journal_record(&self, j: &mut crate::cpu::journal::Journal, n: u64, last_pending: &mut u32) -> Result<(), String>;
@@ -15424,6 +15433,9 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> CpuDevice for MipsCp
     fn load_elf(&self, p: &str) -> Result<String, String> { MipsCpu::load_elf(self, p) }
     fn load_elf_bytes(&self, b: &[u8], n: &str) -> Result<String, String> { MipsCpu::load_elf_bytes(self, b, n) }
     fn step_n_inline(&self, n: u64) -> Result<u64, String> { MipsCpu::step_n_inline(self, n) }
+    fn step_n_inline_with_live_count(&self, n: u64) -> Result<u64, String> {
+        MipsCpu::step_n_inline_with_live_count(self, n)
+    }
     fn journal_checkpoint(&self, j: &mut crate::cpu::journal::Journal, tag: &str) -> Result<(), String> {
         MipsCpu::journal_checkpoint(self, j, tag)
     }
@@ -15495,34 +15507,16 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
         // record/replay journal observes, so a replay restored from a snapshot
         // starts from the same pending-interrupt state the recording did.
         // Version 1 payloads migrate by defaulting it to "none pending".
-        let mut d = StateDesc::new("cpu", 2);
-
-        // Guest-time timer queue (#43): named deadlines only. Transient
-        // callbacks are never serialised (they are re-registered by their
-        // owners on load), so no anonymous timer can block or corrupt a
-        // savestate. Restored before the CP0 block below re-arms the Compare
-        // deadline, so the fresh deadline wins. Registered only when the
-        // machine has a queue, mirroring the legacy hand-written payload.
-        if self.executor.lock().core.guest_timers.is_some() {
-            d = d.field(
-                "timers",
-                FieldKind::Table,
-                1,
-                |t| {
-                    let exec = self.executor.lock();
-                    if let Some(q) = &exec.core.guest_timers {
-                        t.insert("timers".into(), q.save_state());
-                    }
-                },
-                |v| {
-                    let exec = self.executor.lock();
-                    if let Some(q) = &exec.core.guest_timers {
-                        q.load_state(v);
-                    }
-                    Ok(())
-                },
-            );
-        }
+        //
+        // Version 3 records which CP0 Count clock the payload assumes: the
+        // host wall clock (the default) or the retired-cycle clock
+        // (`ci_clock`). The two are not interchangeable — the saved Count and
+        // Compare are positions on different time bases — so a restore into
+        // the other build is refused with a clear message. Version 2 was the
+        // fork's cycle-only payload; it migrates to the *current* build's
+        // clock, and the CP0 load path re-anchors and re-arms, so it gets a
+        // fresh Compare deadline instead of inheriting a stale one.
+        let mut d = StateDesc::new("cpu", 3);
 
         d = d
             .field(
@@ -15688,6 +15682,34 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
             // state. The soft-reset bit (bit 63) is deliberately not persisted:
             // a snapshot is restored powered-on, not mid-reset.
             .field(
+                "clock",
+                FieldKind::Str,
+                3,
+                |t| {
+                    t.insert(
+                        "clock".into(),
+                        toml::Value::String(if cfg!(feature = "ci_clock") {
+                            "cycles".into()
+                        } else {
+                            "wall".into()
+                        }),
+                    );
+                },
+                |v| {
+                    let captured = v.as_str().unwrap_or_default();
+                    let current = if cfg!(feature = "ci_clock") { "cycles" } else { "wall" };
+                    if captured != current {
+                        return Err(format!(
+                            "snapshot was captured with the {captured} CP0 Count clock, \
+                             but this build uses the {current} clock; rebuild with \
+                             {} to load it",
+                            if captured == "cycles" { "--features ci_clock" } else { "the default feature set" }
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .field(
                 "interrupts",
                 FieldKind::U64,
                 2,
@@ -15736,6 +15758,23 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Saveable for MipsCpu
                 let mut t = v.as_table().cloned().unwrap_or_default();
                 t.entry("interrupts".to_string())
                     .or_insert(toml::Value::Integer(0));
+                Ok(toml::Value::Table(t))
+            })
+            // Version 2 is the fork's cycle-clock payload. Its Count/Compare
+            // are re-anchored by the CP0 load path, so it can adopt whichever
+            // clock this build uses; the retired guest-timer queue is dropped
+            // because the wall-clock model has none.
+            .migrate(2, |v| {
+                let mut t = v.as_table().cloned().unwrap_or_default();
+                t.insert(
+                    "clock".to_string(),
+                    toml::Value::String(if cfg!(feature = "ci_clock") {
+                        "cycles".into()
+                    } else {
+                        "wall".into()
+                    }),
+                );
+                t.remove("timers");
                 Ok(toml::Value::Table(t))
             });
 
