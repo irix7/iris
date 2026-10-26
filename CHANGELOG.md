@@ -18,6 +18,20 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork release 0.1.9
+
+- **The CPU clock is host wall time by default again.** Normal builds derive
+  CP0 Count from a host `Instant` and arm Compare on the `hptimer` thread, so
+  guest time tracks host time. Deterministic snapshots, replays and the
+  validator use `--features ci_clock`, which derives Count from retired
+  instructions and turns Compare into a cycle threshold. The 8254 PIT is
+  host-timed again (keeping upstream #323's read-back and latch release), and
+  idle-pace stays. Snapshots record their clock model and refuse a mismatched
+  restore; version-2 fork snapshots migrate with a fresh Compare deadline.
+- **CI:** the journal record/replay commands are restored (they were dropped in
+  the Workstation/O2 refactor), and the fleet and journal scripts now run on
+  macOS bash 3.2.
+
 ### Clock
 
 - **The default CPU clock is the host wall clock again; `ci_clock` is a real
