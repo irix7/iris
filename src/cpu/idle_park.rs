@@ -9,10 +9,14 @@ use std::time::{Duration, Instant};
 use crate::cpu::mips_core::{CAUSE_IP_MASK, STATUS_IM_MASK};
 use crate::cpu::mips_core::MipsCore;
 
-/// PCs kept for the idle-window test. The run loop samples one PC every
-/// [`SAMPLE_EVERY`] instructions, so this ring covers ~1000 instructions —
-/// several iterations of even a long idle loop.
+/// PCs kept for the idle-window test. The batch run loop calls [`sample`]
+/// after each ten-instruction group, so with [`SAMPLE_EVERY`] = 32 the ring
+/// spans about 10,000 guest instructions — several iterations of even a long
+/// idle loop. The single-step path spans 32.
 const PC_RING: usize = 32;
+/// Number of [`sample`] calls between recorded PCs. The batch loop calls it
+/// after every ten instructions (~320 guest instructions per record); the
+/// single-step path calls it after each instruction.
 const SAMPLE_EVERY: u32 = 32;
 /// A "cluster" is a run of sorted sample PCs no more than this far apart.
 /// IRIX's idle path is one hot loop plus a few helper functions (spl, the
@@ -104,7 +108,8 @@ pub fn wake() {
 /// iteration) and, worse, it *does* match short device-poll loops (e.g.
 /// `lbu/andi/bne -3` waiting on a SCSI bit), which must keep executing.
 ///
-/// This detector samples the PC every [`SAMPLE_EVERY`] instructions, groups
+/// This detector samples the PC every [`SAMPLE_EVERY`] calls (about 320
+/// instructions in the batch loop), groups
 /// the samples into PC-space clusters, and parks only when one long kernel
 /// cluster dominates the ring. User-mode samples are tolerated in a minority
 /// (a syscall wake runs a few user instructions between kernel stretches) but
@@ -189,9 +194,10 @@ impl IdleParkState {
         self.streak = 0;
     }
 
-    /// Sample the PC every [`SAMPLE_EVERY`] instructions. Called from the run
-    /// loop after each dispatched instruction; one predictable decrement and
-    /// a rarely-taken branch on the hot path.
+    /// Sample the PC every [`SAMPLE_EVERY`] calls. The batch run loop calls
+    /// this after each ten-instruction group, the single-step path after each
+    /// instruction; one predictable decrement and a rarely-taken branch on the
+    /// hot path.
     #[inline]
     pub fn sample(&mut self, core: &MipsCore) {
         self.sample_countdown -= 1;
@@ -264,7 +270,7 @@ impl IdleParkState {
     /// Update the PC window and decide what to do with the current state.
     ///
     /// Returns `None` unless the CPU has stayed inside one long, narrow
-    /// kernel code window for [`PC_RING`] batches with no interrupt ready to
+    /// kernel code window for [`PC_RING`] samples with no interrupt ready to
     /// deliver — that is a genuine idle loop. With interrupts enabled and a
     /// mask bit set the spin is safe to `park`; a pending-but-masked interrupt
     /// is paced instead (see [`IdleParkState::pace`]).

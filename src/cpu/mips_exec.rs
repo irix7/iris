@@ -12115,7 +12115,8 @@ impl<T: Tlb + Send + 'static, C: CpuModel + Send + 'static> Device for MipsCpu<T
             // --features idle-pause). When compiled in, set IRIS_NO_IDLE to keep
             // spinning the host CPU at runtime (for benchmarking/debug).
             //
-            // The detector samples the PC (one every 32 instructions) and parks
+            // The detector samples the PC once per 32 sample calls (about 320
+            // instructions in the batch loop) and parks
             // only when the execution stayed inside one long, narrow, kernel
             // code window with interrupts enabled and nothing pending. Short
             // poll/delay loops (2-3 instructions) are rejected by the window's
