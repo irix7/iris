@@ -6436,8 +6436,11 @@ mod tests {
         const T4: u32 = 12; // 1, for the handler to store
         const T5: u32 = 13; // the handler's Status: EXL | IE | IM6
         const STATUS: u32 = 12;
-        const NOPS: u32 = 194; // a pass is NOPS + 6 = 200 instructions:
-                               // 1000-step batches end at one place in it
+        // A pass is NOPS + 6 = 197 instructions. The PC-window detector
+        // samples once per 1000-instruction batch, so the loop length must
+        // not divide 1000 (a 200-instruction loop would alias to one PC and
+        // never look like a window); 197 is coprime with 1000.
+        const NOPS: u32 = 191;
         let mtc0 = |rt: u32, rd: u32| (OP_COP0 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11);
         let lw = |rt: u32, base: u32| (OP_LW << 26) | (base << 21) | (rt << 16);
         let sw = |rt: u32, base: u32| (OP_SW << 26) | (base << 21) | (rt << 16);
@@ -6487,11 +6490,12 @@ mod tests {
             exec.core.cp0_compare = 1; // (park only once a deadline is armed)
             ptr_tx.send(Ptr(&exec.core.hot.interrupts as *const AtomicU64)).unwrap();
 
-            let mut idle = IdleParkState::default();
+            let mut idle = IdleParkState::ready();
             let mut parks = 0u32;
             while run.load(Ordering::Relaxed) {
                 for _ in 0..1000 {
                     exec.step_int();
+                    idle.sample(&exec.core);
                 }
                 if exec.core.pc == kseg0(done_pa) || exec.core.pc == kseg0(done_pa + 4) {
                     done_tx.send(Ok(parks)).unwrap();
