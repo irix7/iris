@@ -1961,6 +1961,12 @@ impl Machine {
         self.restart_peripherals();
     }
 
+    /// Directory a snapshot named `name` lives in: `saves/<name>/` in a
+    /// neutral run, or the state directory's equivalent.
+    pub fn snapshot_dir(&self, name: &str) -> std::path::PathBuf {
+        self.snapshot_root.join(name)
+    }
+
     /// Save full machine snapshot to `saves/<name>/`.
     pub fn save_snapshot(&mut self, name: &str) -> Result<(), String> {
         self.stop();

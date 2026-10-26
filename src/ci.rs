@@ -471,6 +471,8 @@ fn dispatch(server: &CiServer, req: &Request) -> Response {
         "scratch-clear" => cmd_scratch_clear(server),
         "scratch-info"  => cmd_scratch_info(server),
         "validate"      => cmd_validate(server, &req.args),
+        "journal-record" => cmd_journal_record(server, &req.args),
+        "journal-replay" => cmd_journal_replay(server, &req.args),
         "gc"            => cmd_gc(),
         "diff"          => cmd_diff(&req.args),
         "tree"          => cmd_tree(),
@@ -1108,6 +1110,84 @@ fn cmd_validate(server: &CiServer, args: &Value) -> Response {
 // ----------------------------------------------------------------------------
 // Snapshot library: gc / diff / tree (Phase 3.2)
 // ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// Guest-cycle record/replay journal (issue #47)
+// ----------------------------------------------------------------------------
+
+/// Resolve the `path` arg for the journal commands, defaulting to the
+/// snapshot's own directory (which honours `--state-dir`) so a record/replay
+/// pair needs no extra bookkeeping.
+fn journal_path(
+    args: &Value,
+    default: std::path::PathBuf,
+    cmd: &str,
+) -> Result<std::path::PathBuf, String> {
+    match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => validate_host_path(p).map_err(|e| format!("{}: {}", cmd, e)),
+        None => Ok(default),
+    }
+}
+
+fn cmd_journal_record(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("journal-record: missing 'name' arg"),
+    };
+    let n = args.get("n_instructions").and_then(|v| v.as_u64()).unwrap_or(1_000_000);
+
+    let result = server.with_machine_result(|m| {
+        let m = m
+            .as_any_mut()
+            .downcast_mut::<crate::machine::Machine>()
+            .ok_or_else(|| "journal-record: only supported on the Indy/Indigo2 machine".to_string())?;
+        let path = journal_path(args, m.snapshot_dir(&name).join("journal.txt"), "journal-record")?;
+        let j = m.journal_record_snapshot(&name, n)?;
+        j.save(&path)
+            .map_err(|e| format!("journal-record: save {}: {}", path.display(), e))?;
+        Ok::<_, String>((j, path))
+    });
+    match result {
+        Ok((j, path)) => Response::data(serde_json::json!({
+            "entries": j.len(),
+            "interrupts": j.interrupts(),
+            "exceptions": j.exceptions(),
+            "end_cycle": j.end_cycle(),
+            "path": path.display().to_string(),
+            "summary": j.summary(),
+        })),
+        Err(e) => Response::err(format!("journal-record: {}", e)),
+    }
+}
+
+fn cmd_journal_replay(server: &CiServer, args: &Value) -> Response {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n.to_string(),
+        None => return Response::err("journal-replay: missing 'name' arg"),
+    };
+
+    let result = server.with_machine_result(|m| {
+        let m = m
+            .as_any_mut()
+            .downcast_mut::<crate::machine::Machine>()
+            .ok_or_else(|| "journal-replay: only supported on the Indy/Indigo2 machine".to_string())?;
+        let path = journal_path(args, m.snapshot_dir(&name).join("journal.txt"), "journal-replay")?;
+        let recording = crate::cpu::journal::Journal::load(&path)
+            .map_err(|e| format!("journal-replay: load {}: {}", path.display(), e))?;
+        m.journal_replay_snapshot(&name, &recording)
+    });
+    match result {
+        Ok(report) => Response::data(serde_json::json!({
+            "matches": report.matches,
+            "summary": report.summary(),
+            "recorded_end_cycle": report.recorded_end_cycle,
+            "replayed_end_cycle": report.replayed_end_cycle,
+            "recorded_entries": report.recorded_len,
+            "replayed_entries": report.observed.len(),
+        })),
+        Err(e) => Response::err(format!("journal-replay: {}", e)),
+    }
+}
 
 /// Walk every snapshot directory under `saves/`, parse each `chunks.bin`, and
 /// collect the set of referenced chunk hashes. Used by `gc` to figure out
