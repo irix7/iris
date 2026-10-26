@@ -18,6 +18,24 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Idle parking
+
+- **IRIX 6.5's idle loop is recognised and parked.** On a settled 6.5 IP22
+  getty the emulator process now uses ~2 % host CPU instead of ~200 %. The old
+  detector hashed PC and registers and required an exact repeat; 6.5's idle
+  path is a ~470-byte scheduler loop whose registers evolve every iteration,
+  so it never fired. The replacement samples the PC every 32 instructions and
+  parks when one long kernel cluster dominates the sample window, while
+  rejecting short countdown/device-poll loops and user-mode code.
+- **Boot is not slowed.** Parking waits 60 s after the CPU thread starts
+  (`IRIS_IDLE_WARMUP_SECS` overrides). A fresh 6.5 boot reaches a login prompt
+  in 42 s with idle-pause; `ci_clock,idle-pause` takes 46 s.
+- **New monitor commands.** `idle on|off|status` switches parking at runtime
+  and reports park/sleep/wake counters; `idleprof stats` prints the same park
+  counters.
+- **Not verified:** IRIX 5.3 (no image on the rig). Its 14-instruction idle
+  loop fits the new rules and the park/wake mechanics are unchanged.
+
 ### Fork release 0.1.9
 
 - **The CPU clock is host wall time by default again.** Normal builds derive

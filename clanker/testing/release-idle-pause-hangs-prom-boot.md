@@ -86,8 +86,28 @@ line the guest cannot take) fixed the `ci_clock` case. It does not fix the
 wall-clock case, where the wake line (`IP7`) *is* deliverable and the parked
 loop is a delay loop rather than an idle loop.
 
-At the IRIX 6.5 getty the detector does not engage at all: host CPU stayed at
+At the IRIX 6.5 getty the detector did not engage at all: host CPU stayed at
 ~194 % over three 10 s samples, while the same image with no `idle-pause` read
-~202 %. IRIX 5.3's idle loop (the one this detector was built against) does
-park. So the open item is now "detect IRIX 6.5's idle loop, and do not park
-wall-clock delay loops", not the original no-media PROM report.
+~202 %. IRIX 5.3's idle loop (the one this detector was built against) did
+park.
+
+## Resolved, 2026-10-27 (issue #65)
+
+The 6.5 detector was replaced with a PC-cluster sample (`src/cpu/idle_park.rs`;
+see `clanker/perf/idle-pause-work.md` for the capture and rules) plus a 60 s
+boot warm-up. Measured on `callisto`, IRIX 6.5 IP22, fresh disk:
+
+| state | host CPU / time |
+|---|---|
+| idle-pause cold boot to login | 42 s (three samples; was >400 s) |
+| `ci_clock,idle-pause` cold boot to login | 46 s |
+| settled getty, idle-pause | 2 %, 2 %, 2 % |
+| two parallel instances, each getty | 1-2 % each, both responsive |
+
+The remaining ~100 % of the old ~200 % was not parking at all: `seeq-enet`
+never cleared its `busy` flag on the idle fast path and spun forever. Fixed in
+`src/dev/seeq8003.rs`; see
+[seeq-enet-busy-pinned-by-idle-fast-path.md](../devices/seeq-enet-busy-pinned-by-idle-fast-path.md).
+
+Not verified: IRIX 5.3, because the rig has no 5.3 image. Its 14-instruction
+loop fits the new window rules and the park/wake mechanics are unchanged.

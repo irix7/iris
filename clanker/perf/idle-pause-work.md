@@ -10,6 +10,62 @@ Status as of 2026-05-29. Goal: **stop spinning the host CPU at 100% when IRIX is
 idle** by detecting the kernel idle loop and parking the emulator until the next
 interrupt. This doc records what's been built, what was learned, and what's left.
 
+---
+
+## Update 2026-10-27: IRIX 6.5 detector, measured
+
+The 5.3-era detector (architectural-state hash, exact repeat) never fired on
+IRIX 6.5. Captured with `idleprof` at a settled IP22 6.5 getty:
+
+- The idle path is not a tight branch: it is a ~470-byte **scheduler loop**
+  (0x880daedc..0x880db0b4, ~89 instructions) with calls to `spl`
+  (0x8801_03xx), the ll/sc lock (0x8801_ba90), and stores to kernel globals.
+  At idle it is ~98% of retired instructions, spread over the whole loop.
+- Its registers evolve every iteration (run-queue scan), so PC+GPRs never
+  repeats exactly — and the same hash *does* match short device-poll loops
+  (e.g. `lbu/andi/bne -3` on a SCSI bit), which must keep executing. The old
+  detector was wrong in both directions.
+
+Replace it with a **PC-cluster sample** detector (`src/cpu/idle_park.rs`):
+
+- The run loop samples the PC every 32 instructions into a ring of 32
+  (~1000 instructions, several idle-loop iterations).
+- Samples are sorted and grouped into clusters (consecutive PCs ≤256 bytes
+  apart). Park when one kernel cluster holds ≥12 of the 32 samples with ≥12
+  distinct PCs. This rejects the 2-instruction DELAY loop, 3-instruction
+  device polls, the 8-instruction ll/sc lock spin, and mixed work; it accepts
+  5.3's 14-instruction loop and 6.5's 89-instruction scheduler path.
+- User-mode samples are tolerated up to a quarter of the ring (a syscall wake
+  runs a few user instructions), but a user-dominated ring is never parked.
+- All previous safety rules stay: no parking with IE=0 or every mask clear,
+  wake on any pending line and on `running=false`, masked-wake back-off, and
+  no park before Compare is armed.
+- A **60 s warm-up** from process start (`IRIS_IDLE_WARMUP_SECS` overrides)
+  keeps boot at full speed; parking is a steady-state optimisation and IRIX
+  boot has long instruction-counted waits that must not be sliced.
+
+Runtime control and diagnostics: `idle on|off|status` and `idleprof stats`
+(`debug.md`). `idle status` prints park count, sleep time, wake reasons and
+the last window's largest cluster.
+
+Measured on `callisto` (x86_64, 16 cores), IRIX 6.5 IP22, R4400, fresh disk:
+
+| state | host CPU |
+|---|---|
+| no idle-pause (baseline) | 200-202% |
+| idle-pause, 6.5 getty | 2%, 2%, 2% |
+| two parallel instances, each getty | 1-2% each, both responsive |
+| idle-pause cold boot to login | 42 s (was >400 s) |
+| `ci_clock,idle-pause` cold boot to login | 46 s |
+
+The other half of the 200% was a separate bug: `seeq-enet` set `busy = true`
+after one frame and its idle fast-path `continue` never cleared it, so the
+thread spun forever. See
+[seeq-enet-busy-pinned-by-idle-fast-path.md](../devices/seeq-enet-busy-pinned-by-idle-fast-path.md).
+
+Not verified: IRIX 5.3 (no image on the rig). Its 14-instruction loop fits the
+window rules on paper, and the wake/park mechanics are unchanged.
+
 All changes so far are uncommitted on `main` (`git diff src/`). Nothing here is
 committed yet.
 
