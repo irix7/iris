@@ -61,3 +61,33 @@ hang is not deterministic; it may be load- or timing-dependent, or was an
 artifact of the busy host that first ran the smoke (fake apt, several downloads).
 Keep `IRIS_NO_IDLE=1` in the release self-test until someone reproduces it with
 the failing command and artifacts.
+
+## Update, 2026-10-26 (clock revert #98)
+
+The wall-clock revert changes what a parked CPU can rely on. `park` used to
+advance `hot.cycles`, and under the fork's cycle-derived clock that *was*
+guest time, so an instruction-counted delay loop inside a parked stretch could
+still "catch up" in Count. After #98 Count is host time; `hot.cycles` is a
+progress counter, so a delay loop that needs executed instructions is simply
+stalled.
+
+Measured on `callisto` with an IRIX 6.5 IP22 disk:
+
+| build | cold boot to login |
+|---|---|
+| default wall clock | 45 s (three runs) |
+| `ci_clock` | 45 s |
+| `ci_clock,idle-pause` before the back-off | 176 s |
+| `ci_clock,idle-pause` with the back-off | 45 s |
+| `idle-pause` (wall clock) | not reached in 400 s; serial console showed "The system is coming up" and the CPU was at 2 % |
+
+The back-off in `idle_park.rs` (do not re-park for ~20 ms after waking on a
+line the guest cannot take) fixed the `ci_clock` case. It does not fix the
+wall-clock case, where the wake line (`IP7`) *is* deliverable and the parked
+loop is a delay loop rather than an idle loop.
+
+At the IRIX 6.5 getty the detector does not engage at all: host CPU stayed at
+~194 % over three 10 s samples, while the same image with no `idle-pause` read
+~202 %. IRIX 5.3's idle loop (the one this detector was built against) does
+park. So the open item is now "detect IRIX 6.5's idle loop, and do not park
+wall-clock delay loops", not the original no-media PROM report.

@@ -25,7 +25,7 @@ Select with `cargo build --release --features <comma-separated-list>`; add
 | `perfetto` | Perfetto trace recording (`--perfetto FILE`, monitor `perfetto`); see [docs/perfetto.md](docs/perfetto.md). Lightning-compatible. | — |
 | `rexdiag` | REX3 per-GO activity and dispatch counters. Default on; removable in a core build. | — |
 | `fetchverify` | Compare executed instruction bytes with memory in interpreter/JIT; expensive stale-code detector. | — |
-| `ci_clock` | Retired no-op. The synthetic, cycle-derived Count clock it gated is now the default. | — |
+| `ci_clock` | Synthetic deterministic Count clock for CI/snapshot validation; replaces real-time Count timing. | — |
 | `opcodefusion` | Interpreter instruction fusion; breakpoints on a fused second instruction cannot fire. | — |
 | `lightning` | Strip breakpoints/traceback for speed; hides GUI Debug controls. | `opcodefusion` |
 | `tlbvmap` | Compatibility flag: vmap translation is unconditional. | — |
@@ -508,7 +508,7 @@ cargo run --release --features lightning             # disable emulator breakpoi
 cargo run --release --features gpujit                # enable the graphics JITs (rex-jit + gr4-jit + gr2-jit)
 cargo run --release --features jitv2,gpujit          # MIPS JIT v2 (experimental; see "JIT compilers")
 cargo run --release --features idle-pause            # park the CPU thread while the guest idles instead of spinning a host core
-cargo run --release --features ci_clock              # no-op: the cycle-derived CP0 Count clock is the default now
+cargo run --release --features ci_clock              # synthetic deterministic CP0 Count clock (CI/snapshot validator only; loses realtime desktop timing)
 cargo run --release --features pcap                  # bridge guest networking onto a real host interface via libpcap instead of the built-in NAT gateway. See [network] in iris.toml.
 cargo run -p iris-gui --release                      # the egui front-end, see iris-gui-README.md
 ```

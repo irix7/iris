@@ -1,13 +1,14 @@
 //! Record/replay journal keyed on guest cycles (issue #47).
 //!
-//! Guest time became reproducible when CP0 Count was made cycle-derived (#42)
-//! and the ordered guest-time timer queue landed (#43): an interrupt from the
-//! Compare deadline now fires at a deterministic `hot.cycles` value, and idle
-//! parking advances the same cycle counter. That makes a *journal* of the
-//! inputs a run consumed — how many cycles it retired, when an external
-//! interrupt line went pending, when it took an exception, and where its
-//! checkpoints were — enough to re-drive the same run and assert it byte-for-
-//! byte.
+//! A journal is enough to re-drive a run because the CPU's own time base is
+//! modelled explicitly: a journal of the inputs a run consumed — how many
+//! cycles it retired, when an external interrupt line went pending, when it
+//! took an exception, and where its checkpoints were — re-executes the same
+//! instruction sequence. Use `--features ci_clock` for a byte-for-byte
+//! comparison: in the default wall-clock build CP0 Count advances with host
+//! time, so a recording and its replay see different Count values (and
+//! possibly different Compare interrupts). The journal records `hot.cycles`,
+//! not Count, so the cycle stream itself matches in either build.
 //!
 //! The shape follows QEMU's `replay-internal.c` / `replay.c`
 //! (`docs/research/b06-timers-interrupts-determinism.md` §R4): a flat stream of
@@ -28,9 +29,9 @@
 //!
 //! The record/replay driver (`MipsExecutor::journal_record`/`journal_replay`)
 //! steps through the same dispatch the CPU thread's batch loop uses
-//! (`step_jit` when jitv2 dispatch is on, `step_int` otherwise) and drains the
-//! guest-time deadline queue, so a deadline or pending-line event that a real
-//! run produced replays at the same `hot.cycles` boundary. The CPU's snapshot
+//! (`step_jit` when jitv2 dispatch is on, `step_int` otherwise), so a
+//! pending-line event that a real run produced replays at the same
+//! `hot.cycles` boundary. The CPU's snapshot
 //! now carries the externally-raised interrupt word (`hot.interrupts`) the
 //! journal observes, so a replay restored from a snapshot starts from the same
 //! pending-line state the recording did.

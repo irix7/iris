@@ -631,14 +631,7 @@ impl Machine {
             None
         };
         let timer_manager = Arc::new(TimerManager::new());
-        // One ordered guest-time timer queue shared by the CPU (Compare
-        // deadline) and the 8254 PIT (#43). The live cycle pointer is wired in
-        // after the CPU exists (its `hot.cycles` address is only stable once
-        // the executor is inside `MipsCpu`), so it starts dangling.
-        let guest_timers = Arc::new(crate::cpu::guest_timer::GuestTimers::new(
-            crate::cpu::mips_core::CyclesPtr::dangling(),
-        ));
-        ioc.set_guest_timers(guest_timers.clone());
+        ioc.set_timer_manager(timer_manager.clone());
         ioc.set_heartbeat(heartbeat.clone());
         ioc.set_clock_ticks(fasttick_count.clone());
         let hpc3 = Hpc3::with_net(eeprom_hpc3.clone(), ioc.clone(), guinness, heartbeat.clone(), cfg.network(), cfg.no_audio, cfg.audio.clone(), cfg.nvram.clone(), cfg.rtc_offset, cfg.scsi_deferred_int);
@@ -1022,8 +1015,6 @@ impl Machine {
         // Compare write, by which time the core sits at its final address
         // inside the executor's Arc<Mutex<..>>.
         executor.core.set_timer_manager(timer_manager.clone());
-        // Register the CPU side of the shared guest-time queue before the move.
-        executor.core.guest_timers = Some(guest_timers.clone());
 
         Arc::new(MipsCpu::new(executor)) as Arc<dyn crate::cpu::mips_exec::CpuDevice>
         }}}
@@ -1039,9 +1030,6 @@ impl Machine {
             crate::config::CpuModel::R10000 => build_cpu!(R10000ShadowCache),
         };
 
-        // The executor now sits at its final address inside `MipsCpu`, so
-        // `hot.cycles` is stable: point the guest-time queue's clock at it.
-        guest_timers.set_clock(cpu.cycles_ptr());
         // Share count_hz_atomic from MipsCore with Rex3 so the refresh thread can display it.
         #[cfg(feature = "developer")]
         if let Some(rex3) = &phys.rex3 { rex3.set_count_hz_atomic(cpu.count_hz_atomic()); }
@@ -1572,6 +1560,12 @@ impl Machine {
     /// Caller must arrange `load_snapshot_paused` first.
     pub fn cpu_step_n_inline(&self, n: u64) -> Result<u64, String> {
         self.cpu.step_n_inline(n)
+    }
+
+    /// `cpu_step_n_inline` with the CP0 Count clock live; used by the
+    /// snapshot determinism validator so its passes exercise the clock model.
+    pub fn cpu_step_n_inline_with_live_count(&self, n: u64) -> Result<u64, String> {
+        self.cpu.step_n_inline_with_live_count(n)
     }
 
     /// Snapshot the deterministic-from-state CPU registers.

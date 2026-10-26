@@ -1,10 +1,10 @@
 # CP0 Count is wallclock-derived, so Count tests flake
 
-> **Superseded (issue #42).** Count is now derived from retired cycles, not a
-> host `Instant`, so the flakiness this note describes no longer occurs. The
-> retry in `cp0/count_writable` and its `diff-hw.py` exclusion are still
-> harmless; this note is kept for the history of the model. See
-> `HACKING.md` §4 and `src/cpu/mips_core.rs` (`NS_PER_GUEST_CYCLE`).
+> **Current again (2026-10-26, #98).** The fork reverted its cycle-derived
+> default and adopted upstream's model: Count is host-`Instant`-derived in
+> normal builds, and only `--features ci_clock` makes it a function of retired
+> cycles. The flakiness below applies to default builds; under `ci_clock` the
+> same test is deterministic. See `HACKING.md` §3 ("Time").
 
 IRIS derives CP0 Count from a host `Instant` anchor plus a fixed
 `count_hz` (33 MHz on IP22/IP24, 97.5 MHz on IP28), not from a guest instruction count — `src/cpu/mips_exec.rs:9686` calls
@@ -55,6 +55,8 @@ belongs in the same list.
 
 ## Related
 
+- The PIT is host-timed again for the same reason: see
+  [pit-is-not-an-independent-time-base.md](../devices/pit-is-not-an-independent-time-base.md).
 - [running-cpu-tests-on-real-hardware.md](../testing/running-cpu-tests-on-real-hardware.md)
 - The suite's own scorecard drifts for unrelated reasons too — see
   [cpu-tests-scorecard-drift.md](../testing/cpu-tests-scorecard-drift.md).
