@@ -10,6 +10,12 @@ instances under control**. The fork has just shipped the IRIX 6.5 idle
 detector, so the plan starts from that result rather than proposing another
 one.
 
+**Primary use case: headless software development.** The fleet is used for
+serial/telnet consoles, NFS or scratch sources, builds and tests, not desktop
+sessions. v1 therefore prioritises headless lifecycle, load telemetry, clean
+shutdown and a named headless profile that stops a desktop session if the
+image starts one. Desktop-instance management is out of scope.
+
 ---
 
 ## 0. Recommendation in one page
@@ -20,19 +26,22 @@ one.
 | Transport | SCC channel A (`/dev/ttyd2`), in-process `GuestLink` backend on the host |
 | Protocol | Newline-delimited JSON, a deliberately small QGA subset (not wire-compatible with QGA) |
 | Host surface | `[guest] enabled = true`; `iris-ci guest-*` over the existing CI socket; `guest ...` monitor commands |
-| Lifecycle policy | Observe `idle status` plus guest load; cleanly stop unused instances with `guest-shutdown powerdown` |
+| Lifecycle policy | Observe `idle status` plus guest load; apply the headless profile; cleanly stop unused instances with `guest-shutdown powerdown` |
 | Packaging | One IRIX `inst` product, `iris_guest`, one `sw` subsystem, `.tardist` built in the guest with MIPSpro + `gendist` |
 | New emulated hardware | None |
 | New host port/path | None (the CI socket and the existing state directory are the boundary) |
 | Pause/resume | **Out of scope**; the guest cannot pause the VM, and `machine-stop` is not a transparent pause |
 | Second idle detector | **Not proposed**; the host detector already does this |
-| Effort | ~12–15 engineer-days for one engineer, including rig time |
+| Headless profile | **v1**: stop `xdm`/`amstart` via a fixed allowlist if the image started them; report the result. No arbitrary command execution. |
+| Effort | ~13–16 engineer-days for one engineer, including rig time |
 
 The honest summary: **a guest agent will not lower the 2 % host CPU a settled
 6.5 getty already uses.** It earns its place by making it safe to *stop*
 instances that are running but unused, by replacing console scraping for
-lifecycle and telemetry, and by giving the fleet a reliable answer to "is this
-guest actually doing work?".
+lifecycle and telemetry, by giving the fleet a reliable answer to "is this
+guest actually doing work?", and by stopping a desktop session that a headless
+image did not need — the one case where the host detector cannot park because
+the CPU is busy in a userland spin.
 
 ---
 
@@ -103,13 +112,15 @@ Three separate questions hide in that one:
 | Load/telemetry | Parse `uptime`, `date`, `ps` from the console; each scrape costs guest CPU and bytes on the console | `guest-get-load`, `guest-get-time`, `guest-get-osinfo`, `iris-get-status`; one small request, no shell, no console echo | Request latency, bytes on the wire, guest CPU per scrape |
 | Fleet policy | The scheduler cannot tell "at getty" from "running a build" without scraping | Park counters (host) plus guest load (guest) plus job markers (launcher) | False stops in a fleet run |
 | Automation | `iris-ci run/put/get` drive `/bin/sh` and parse prompts; csh quirks, base64 over the console | v1 only telemetry/lifecycle; v2 `guest-exec`/`guest-file-*` gated | Console bytes per operation, failure rate |
-| Coverage the detector misses | A headless guest with `xdm` spinning on an absent framebuffer never parks (87,700 distinct PCs over 3 s in the 5.3 investigation) | The agent reports load and *can* apply a named headless profile (v1.1) to stop `xdm`; the idle detector then parks normally | Host CPU before/after the profile |
+| Coverage the detector misses | A headless guest with `xdm` spinning on an absent framebuffer never parks (87,700 distinct PCs over 3 s in the 5.3 investigation) | The agent applies the named headless profile in v1 (stop `xdm`/`amstart` through a fixed allowlist); the idle detector then parks normally | Host CPU before/after the profile; no userland process left spinning |
 | Quiesce before a snapshot | `sync` typed at the console | `iris-sync-fs`; future fsfreeze-like cooperation | Snapshot validator pass rate |
 
 The headless-`xdm` case is the one real "coverage" win, and it is **not** a
-detector: it is a guest configuration action (`/etc/init.d/xdm stop`) selected
-by a host profile. It belongs in v1.1, not the v1 core, because it needs a
-policy for desktop instances and a local action allowlist.
+detector: it is a guest configuration action (`/etc/init.d/xdm stop` or the
+equivalent script on the image) selected by the host profile. Because the fork
+is used for headless development, it belongs in **v1**, behind a fixed
+allowlist: the daemon may stop `xdm` and `amstart`, and nothing else. A desktop
+instance simply does not enable the profile.
 
 ### 1.4 What it is not
 
@@ -1099,13 +1110,13 @@ not widen it.
 |---|---|---|---|
 | M0 — Protocol + link, host-only | `src/guest.rs`, `src/guest_link.rs`, mock agent thread, unit tests | 2 | `cargo test guest_` covers ping/timeout/sync/reset/id mismatch |
 | M1 — Agent on ttyd2 | C daemon, termios, JSON subset, init script; manual run on 6.5 | 3 | `guest-ping`, `guest-info`, `guest-get-load`, `guest-get-time` from the monitor |
-| M2 — Lifecycle | `guest-shutdown` ack/act, CI `guest-*`, `idle-status`, policy script | 2 | Clean powerdown in ≤30 s p95; no fsck/XFS repair on next boot |
+| M2 — Lifecycle + headless profile | `guest-shutdown` ack/act, CI `guest-*`, `idle-status`, `iris-set-profile headless` (fixed `xdm`/`amstart` allowlist), policy script | 3 | Clean powerdown in ≤30 s p95; no fsck/XFS repair on next boot; profile idempotent and no userland spinner |
 | M3 — Packaging | idb/spec, gendist, tardist, install/upgrade/uninstall | 2 | `inst -a` ≤30 s; upgrade keeps config; uninstall leaves no process/links |
-| M4 — Fleet | `[guest]`, `--guest`, `--print-instance`, preflight skip, 8-instance run, docs | 3 | 8 instances: all ping; all stop; no cross-talk; idle CPU unchanged |
+| M4 — Fleet + headless | `[guest]`, `--guest`, `--print-instance`, preflight skip, 8 headless-instance run, profile + stop policy, docs | 3 | 8 instances: all ping; all apply headless; all stop; no cross-talk; idle CPU unchanged |
 | M5 — Rig hardening | 6.5.22/6.5.30, getty/respawn case, crash/recovery, measurements | 2–3 | Test matrix green; numbers recorded in `clanker/` |
-| v1.1 (optional) | TCP transport, headless profile, `guest-get-fsinfo`/network, supervisor | 3–5 | Separate plan |
+| v1.1 (optional) | TCP transport, `guest-get-fsinfo`/network, supervisor | 3–5 | Separate plan |
 
-Total v1: **12–15 engineer-days**, assuming access to a 6.5 guest and the
+Total v1: **13–16 engineer-days**, assuming access to a 6.5 guest and the
 packaging skill's workflow. The critical path is M1 (IRIX tty behaviour), not
 the host code.
 
@@ -1120,6 +1131,8 @@ the host code.
 | Upgrade | — | ≤30 s; config `.N`; version 101 | install 100 then 101 |
 | Uninstall | — | ≤10 s; no process, no links, `versions` empty | `inst -a -R` |
 | Parallel 8 instances | 8 × 1–2 % | all at getty; all ping ≤500 ms; all stop ≤60 s; no cross-talk | `scripts/fleet.sh -n 8` + policy |
+| Headless profile, image that starts xdm | 100 % CPU in the userland spin, never parks | profile stops `xdm`/`amstart`; settled CPU **1–5 %**; `idle status` parks | 3 runs, `pidstat`, `ps -l` shows no xdm/amstart |
+| Headless build cycle | — | no stop while a job marker/load is high; stop after the idle threshold; next boot clean | scripted build + 3 cycles |
 | Boot to login with agent | 42 s | ≤47 s | 3 runs |
 | Protocol reliability | — | 10,000 pings, 0 errors, p99 ≤50 ms in-process | `tests/guest_protocol.rs` stress |
 | Failure recovery | — | agent kill -> `guest-status` not responding ≤2 s; restart -> ping works | manual/rig |
@@ -1128,6 +1141,8 @@ the host code.
 
 - `guest-exec`, `guest-file-*`, `guest-fsfreeze-*`, `guest-ssh-*`,
   `guest-set-user-password`.
+- General desktop management beyond the fixed `xdm`/`amstart` stop; starting
+  or reconfiguring a desktop session is not a guest-service job.
 - Pause/resume and any second idle detector.
 - virtio/vsock/new emulated device; `hostcall` as the v1 transport.
 - O2/IP32 support; IRIX 5.3 guarantee (o32 builds, not tested).
@@ -1153,34 +1168,38 @@ the host code.
 
 ---
 
-## 8. Open questions for a human decision
+## 8. Decisions for headless development
 
-1. **Is `ttyd2` allowed to be owned exclusively by the service?** The default
-   is `off`, but some sites use it for a terminal or modem. If the answer is
-   "must share", the transport choice changes (TCP or a new device).
-2. **Is a root daemon acceptable in the guest image?** It needs root for
-   `/etc/shutdown` and the tty. A privilege-separated design (root helper for
-   shutdown, unprivileged reader) is possible but more code; is it required?
-3. **Should the package be installed in the fork's standard IRIX images, or
-   only in fleet images?** Default installation changes every guest; the plan
-   assumes opt-in.
-4. **Is `getloadavg(3)` available on the target 6.5?** If not, is
-   `sysmp(MP_SAGET, ...)` acceptable, or do we ship v1 without load?
-5. **Powerdown or snapshot+quit as the default idle action?** Powerdown is
-   simpler and flushes XFS; snapshot+quit is warmer but needs snapshot
-   validation. The plan defaults to powerdown.
-6. **Must fleet instances run `--ci`?** `iris-ci guest-*` only exists with the
-   CI socket. If a fleet runs without `--ci`, the only v1 control is the
-   monitor. Is that acceptable, or do we need a guest control socket outside
-   CI?
-7. **Do we need a per-instance guest log?** If yes, it becomes
-   `StatePaths::guest_log()` -> `<state_dir>/iris-guest.log` (the state root
-   already derives it); if no, `log::debug` is enough.
-8. **QGA compatibility:** do third-party tools need the exact QGA command
-   names/shapes, or is a QGA-inspired subset acceptable? The plan assumes the
-   latter and documents the deviations.
+The fork is primarily used for headless software development, so these are
+the v1 decisions. Revisit only if that use case changes.
 
----
+1. **`ttyd2` is owned exclusively by the service.** The package detects an
+   existing getty/respawn on channel A and stays stopped with a clear message;
+   sites that need a terminal on ttyd2 do not install the service.
+2. **A root daemon is acceptable for v1**, with a fixed command set, no
+   `guest-exec`/`guest-file-*`, and no network transport. Privilege
+   separation is a later hardening item, not a v1 requirement.
+3. **Install in headless/fleet images first**, opt-in through the package.
+   Standard desktop images are not changed by default.
+4. **Load API:** verify `getloadavg(3)` on the target 6.5; if absent, use
+   `sysmp(MP_SAGET, …)` only after checking the 6.5 header. If neither is
+   available, `guest-get-load` returns `Unsupported` and the policy relies on
+   host park counters plus job markers.
+5. **Default idle action is `guest-shutdown powerdown`.** Snapshot+quit is a
+   later warm-pool feature, not the v1 stop path.
+6. **`iris-ci guest-*` requires `--ci`.** Headless fleet runs already use it;
+   without `--ci`, the `guest ...` monitor commands remain available and the
+   agent is still reachable, but there is no CI-socket surface.
+7. **No per-instance guest log in v1.** Use the existing serial log and the
+   agent's guest-side log; if a host-side log is needed later, add
+   `StatePaths::guest_log()` through the seam rather than inventing a path.
+8. **No QGA wire compatibility.** The protocol is a documented QGA-inspired
+   subset; third-party QGA clients are not a goal.
+
+The only remaining human check is the IRIX fact list: `getloadavg`/`sysmp`,
+termios details, `/dev/ttyd2` permissions and the exact `xdm`/`amstart` init
+scripts on the target image. Those are verification tasks for M1/M2, not
+design decisions.
 
 ## 9. Sources
 
