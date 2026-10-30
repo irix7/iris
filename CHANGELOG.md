@@ -13,6 +13,15 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork release 0.1.12+irix7
+
+The first release from the rebooted tree with upstream `main` merged in full.
+On top of `0.1.11+irix7` this brings upstream's new work — the SCSI bus layer
+beneath every controller, the shared 16550 serial core (the O2's MACE and the
+Octane's IOC3), the O2/Octane networking and status-LED changes, the audio
+rate/format suite, and the GR2 FIN3 fix — with the fork's instance, CI and
+benchmark infrastructure carried on top.
+
 ### Fork release 0.1.11+irix7
 
 The fork is re-released from its fresh tree on upstream `main` (see the reboot
