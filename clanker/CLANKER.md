@@ -237,6 +237,42 @@ set `TMPDIR` off any full root filesystem.
   memory and out-of-bounds reads, and every one of those has already happened.
 - Both share `cpu-tests/harness` (toolchain probe, SCC console, startup and
   exception dispatch). Changing those files affects both suites.
+- `test/fleet/run.sh` — the parallel-agent end-to-end test: boots two isolated
+  instances (`--instance N`) and drives each over its own CI serial socket (the
+  Indy PROM command monitor), asserting disjoint derivation and concurrent
+  operation. No IRIX media needed; it runs in `.github/workflows/rust.yml`.
+  `$FLEET_N` sets the instance count and `$KEEP=1` keeps the temp dir.
+- **Benchmark history.** `tools/bench_history.py` records a run's measured cells
+  into `data/bench_history.json` and `tools/bench_graphs.py` renders the README
+  graphs; `tools/bench-backfill.sh` with `bench/backfill-commits.txt` drives a
+  sharded one-time backfill, and the `bench-*` workflows run it on CI.
+  `iris-bench --repeat N` pools repeated runs into one result. See
+  `BENCHMARKS.md`.
+
+## Parallel instances (fleet)
+
+An opt-in instance mode runs N machines side by side from one host; the model
+and the derivation table are in `docs/parallel-instances.md`. The rules that
+matter when editing:
+
+- **One `Machine` per process.** Never run two `Machine`s in one process — a
+  fleet is N processes, each `iris --instance N`. Idle parking, CPU affinity,
+  the dev log and the CI socket path are process-global, which is why.
+- **Two seams own isolation, and nothing else may invent paths or ports.**
+  `src/state.rs` (`StatePaths`) is the registry of persistent artefacts;
+  `config::derive_instance()` is the one pure step that turns a base config
+  plus `(id, state-dir, port-base)` into a derived one. A new persistent
+  artefact gets a `StatePaths` accessor; a new per-instance value is derived in
+  `derive_instance`.
+- **Opt-in and backwards compatible.** With no `--instance`/`--state-dir`/
+  `--port-base`, behaviour is unchanged. `--print-instance` prints the derived
+  endpoints as `key: value`.
+- **One owner per state directory.** `<state_dir>/iris.lock` takes an advisory
+  lock (not a PID file) for the process lifetime; `--replace` stops the
+  recorded owner, preferring a clean `quit` over its CI socket. Startup
+  preflights the listeners and probes a live Unix CI socket rather than
+  unlinking it. See `src/instance.rs` and
+  `clanker/testing/instance-lock-lifecycle.md`.
 
 ## Hard invariants (from HACKING.md)
 
