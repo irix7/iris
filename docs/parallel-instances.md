@@ -74,30 +74,38 @@ lines.
 
 ## Status
 
-Landed:
+Landed on this tree:
 
 - **#2** `StatePaths` seam (`src/state.rs`).
 - **#3** `InstanceIdentity` / `derive_instance` and the CLI flags
   (`src/config.rs`, `src/main.rs`).
+- **#4–#7** the derived state directory wired into `Machine`: NVRAM/EEPROM, the
+  serial log, the test dump, the jitv2 cache, the crash log, the snapshot and
+  chunk store, and the COW/CHD overlay and diff directories.
+- **#8–#9** per-instance ports from `--port-base`, a CI socket under the state
+  directory, a liveness probe that refuses a live socket, and a hard error on a
+  port/socket bind failure in instance mode.
+- **#11** snapshot commands scoped to the instance store
+  (`snapshot::store_root`).
+- **#13–#14** a fleet launcher and a derived per-VM telnet forward.
+- **#15–#21** the serial/CI session track: per-consumer read cursors,
+  reset-wakes-waiters, host-speed CI serial, a buffered `--serial-log`, TCP
+  `TCP_NODELAY` and second-client refusal, bounded CI connections, and macro
+  prompt-waits.
 - **#103** instance ownership: a locked `iris.lock` per state directory,
   liveness by lock rather than PID, `--replace`, listener preflight, and
   signal/exit cleanup (`src/instance.rs`, `tests/instance_lifecycle.rs`).
 
-Open, in dependency order (see the GitHub issues for acceptance criteria):
+Still open:
 
-- **#4–#7** wire the derived state dir into `Machine` — NVRAM/EEPROM/logs/test
-  dump, COW/CHD, snapshot/chunk store, jitv2 cache.
-- **#8–#9** per-instance ports and the CI socket, with a liveness probe so a
-  new instance never steals a live one's socket.
 - **#10** identity hardening: MAC/NAT subnet overrides, bridged NFS-host MAC.
-- **#11–#12** snapshot scoping + shared read-only base; disk advisory locking.
-- **#13–#14** fleet launcher; bridged networking and per-VM telnet.
-- **#15–#21** the serial/CI session track: per-connection read cursors,
-  reset-wakes-waiters, host-speed CI serial, buffered `--serial-log`, TCP
-  backend hardening, connection bounds, and macro prompt-waits. These are
-  independent of the instance track.
+- **#11** the opt-in shared, read-mostly snapshot base a fleet can fork from.
+- **#12** disk advisory locking (a read-write base image is not locked yet).
+- **GUI ownership.** `iris-gui` embeds `Machine` directly and does not take the
+  lock, so a GUI session and a CLI session on one state directory can still
+  collide; the GUI start preflight is the only guard there today.
 
-Known gaps while the work is in flight:
+Known gaps:
 
 - NAT subnets repeat past 255 (`N % 256`); full uniqueness is ticket #10.
 - The default subnet range can collide with a DaynaPort's default
@@ -105,10 +113,6 @@ Known gaps while the work is in flight:
   not silently.
 - `port_base` saturates at `u16::MAX`, so a very large fleet (id beyond ~5653)
   would share a block.
-- The ownership lock is taken by the `iris` CLI. `iris-gui` embeds `Machine`
-  directly and does not take it, so a GUI session and a CLI session using the
-  same state directory can still collide; the GUI start preflight is the only
-  guard there today.
 
 ## Ownership and cleanup
 
