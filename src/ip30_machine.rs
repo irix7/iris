@@ -86,7 +86,7 @@ pub struct OctaneMachine {
     monitor: Arc<crate::monitor::Monitor>,
     monitor_port: u16,
     /// The console UART's in-process host end in CI mode (`--ci`).
-    ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    ci_serial: Option<Arc<crate::dev::serial_host::CiSerialBackend>>,
     pub bridge: Arc<Bridge>,
     pub ioc3: Arc<Ioc3>,
     pub scsi: [Arc<Isp1040>; 2],
@@ -96,6 +96,8 @@ pub struct OctaneMachine {
     /// The IMPACT board, unless `[octane] graphics = "none"`.
     pub gfx: Option<Arc<ImpactXio>>,
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
+    /// Guest frames the network backend has processed.
+    frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     scratch_path: Option<std::path::PathBuf>,
     nvram_path: String,
     event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
@@ -162,7 +164,10 @@ impl OctaneMachine {
         // The status bar's activity bits, shared with the graphics board.
         let heartbeat = Arc::new(AtomicU64::new(0));
         let mac = cfg.network().mac;
-        let scsi = [Arc::new(Isp1040::new_at(0)), Arc::new(Isp1040::new_at(1))];
+        // The buses are filled from `[scsi.N]` before the controllers exist.
+        let [bus_a, bus_b] = [Isp1040::new_bus(), Isp1040::new_bus()];
+        let scratch_path = Self::attach_scsi(cfg, [&bus_a, &bus_b])?;
+        let scsi = [Arc::new(Isp1040::new_at(0, bus_a)), Arc::new(Isp1040::new_at(1, bus_b))];
         for s in &scsi {
             s.set_heartbeat(heartbeat.clone());
         }
@@ -240,7 +245,6 @@ impl OctaneMachine {
             }
         }));
 
-        let scratch_path = Self::attach_scsi(cfg, &scsi)?;
         eprintln!(
             "iris: Octane with {} MB ({}), {}",
             banks.iter().sum::<u64>() >> 20,
@@ -331,16 +335,17 @@ impl OctaneMachine {
             g.register_locks();
         }
         let monitor_port = cfg.monitor_port.unwrap_or(crate::monitor::DEFAULT_PORT);
-        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::z85c30::CiSerialBackend::new()));
+        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
         Self::connect_serial(cfg, &ioc3, ci_serial.as_ref());
 
         // The Ethernet on the NAT gateway `[network]` describes.
-        let mut nat = None;
-        if cfg.network.mode != crate::config::NetMode::Off {
-            let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        let (mut nat, mut frames) = (None, None);
+        let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
             eprintln!("iris: Octane Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
-            let addrs = (net.client_ip, net.gateway_ip, net.netmask);
-            nat = Some((eth.start_nat(net), addrs));
+            frames = Some(link.frames());
+            nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
+            eth.attach(link);
         }
         Ok(Self {
             phys,
@@ -361,6 +366,7 @@ impl OctaneMachine {
             flash,
             gfx,
             nat,
+            frames,
             scratch_path,
             nvram_path: cfg.nvram.clone(),
             event_rx: Some(event_rx),
@@ -379,82 +385,26 @@ impl OctaneMachine {
 
     /// The `[scsi.N]` devices: `controller` 0 is the internal bus, 1 the
     /// external one. Returns the `scratch = true` volume, if any.
-    fn attach_scsi(cfg: &MachineConfig, ctls: &[Arc<Isp1040>; 2]) -> Result<Option<std::path::PathBuf>, String> {
-        let mut scratch_path = None;
-        let mut ids: Vec<u8> = cfg.scsi.keys().copied().collect();
-        ids.sort();
-        for key in ids {
-            let dev = &cfg.scsi[&key];
-            let (controller, id) = dev.placement(key);
-            let at = crate::config::scsi_label(controller, id);
-            if dev.is_daynaport() {
-                return Err(format!("{at}: kind = \"daynaport\" is not available on the Octane"));
-            }
-            if let Some(path) = dev.prepare_scratch(key) {
-                scratch_path.get_or_insert(path);
-            }
-            let ctl = ctls
-                .get(controller as usize)
-                .ok_or_else(|| format!("{at}: controller {controller} (an Octane has controllers 0 and 1)"))?;
-            let (path, discs) = dev.media();
-            let cdrom = dev.is_cdrom();
-            let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| crate::config::ScsiDeviceConfig::ci_overlay_path(key));
-            match ctl.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref()) {
-                Ok(_) if path.is_empty() => eprintln!("ip30: {at}: CD-ROM, tray empty"),
-                Ok(blocks) => eprintln!("ip30: {at}: {path} ({blocks} blocks)"),
-                Err(e) => {
-                    let msg = format!("could not attach {path} to {at}: {e}");
-                    if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                        eprintln!("iris: warning: {msg}; continuing without {at}");
-                    } else {
-                        return Err(msg);
-                    }
-                }
-            }
+    fn attach_scsi(cfg: &MachineConfig, buses: [&crate::scsi::ScsiBus; 2]) -> Result<Option<std::path::PathBuf>, String> {
+        let attached = crate::scsi::attach_from_config(cfg, Some("ip30"), &|c| {
+            buses.get(c as usize)
+                .copied()
+                .ok_or_else(|| format!("controller {c} (an Octane has controllers 0 and 1)"))
+        })?;
+        if let Some(d) = attached.daynaports.first() {
+            return Err(format!("{}: kind = \"daynaport\" is not available on the Octane", crate::config::scsi_label(d.controller, d.id)));
         }
-        Ok(scratch_path)
+        Ok(attached.scratch)
     }
 
     /// IOC3's first port is the console: the CI socket's backend in CI
     /// mode, otherwise TCP on `serial_port_a`, either teed to `serial_log`.
     /// The second port serves TCP on `serial_port_b`.
-    fn connect_serial(cfg: &MachineConfig, ioc3: &Ioc3, ci: Option<&Arc<crate::dev::z85c30::CiSerialBackend>>) {
-        use crate::dev::z85c30::{null_serial_backend, tcp_serial_backend, TeeBackend};
-        let [port_a, port_b] = cfg.serial_ports();
-        let log = cfg.serial_log.as_deref().and_then(|path| {
-            match crate::dev::serial_log::SerialLog::create(std::path::Path::new(path), cfg.serial_log_timestamps) {
-                Ok(log) => Some(log),
-                Err(e) => {
-                    eprintln!("iris: Octane serial log {path}: {e}");
-                    None
-                }
-            }
-        });
-        if let Some(ci) = ci {
-            if let Some(log) = log {
-                ci.set_log(log);
-            }
-            ioc3.set_serial_backend(0, ci.clone());
-        } else {
-            let mut backend = null_serial_backend();
-            match tcp_serial_backend(port_a) {
-                Some((b, p)) => {
-                    eprintln!("iris: Octane serial port 1 on 127.0.0.1:{p}");
-                    backend = b;
-                }
-                None => eprintln!("iris: Octane serial port 1: port {port_a} unavailable (serial_port_a)"),
-            }
-            if let Some(log) = log {
-                backend = Arc::new(TeeBackend::new(backend, log));
-            }
-            ioc3.set_serial_backend(0, backend);
-        }
-        match tcp_serial_backend(port_b) {
-            Some((b, p)) => {
-                eprintln!("iris: Octane serial port 2 on 127.0.0.1:{p}");
-                ioc3.set_serial_backend(1, b);
-            }
-            None => eprintln!("iris: Octane serial port 2: port {port_b} unavailable (serial_port_b)"),
+    fn connect_serial(cfg: &MachineConfig, ioc3: &Ioc3, ci: Option<&Arc<crate::dev::serial_host::CiSerialBackend>>) {
+        let (console, second) = crate::dev::serial_host::console_backends(cfg, "Octane", ci);
+        ioc3.set_serial_backend(0, console);
+        if let Some(b) = second {
+            ioc3.set_serial_backend(1, b);
         }
     }
 
@@ -642,7 +592,7 @@ impl Workstation for OctaneMachine {
     fn fasttick_count(&self) -> Arc<AtomicU64> {
         self.cpu.fasttick_count()
     }
-    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> {
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> {
         self.ci_serial.clone()
     }
     fn inject_serial_console(&self, bytes: &[u8]) {
@@ -668,6 +618,21 @@ impl Workstation for OctaneMachine {
     /// Disc changes on the internal bus.
     fn disc_changer(&self) -> Option<Arc<dyn crate::workstation::DiscChanger>> {
         Some(self.scsi[0].clone() as Arc<dyn crate::workstation::DiscChanger>)
+    }
+    fn pending_chd_sync_count(&self) -> usize {
+        self.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+    }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        let buses: Vec<_> = self.scsi.iter().map(|c| c.bus()).collect();
+        crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
+    }
+    fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.frames.clone()
     }
     fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
         self.nat.as_ref().map(|(n, _)| n.clone())

@@ -88,6 +88,23 @@ conformance work) is not carried onto this tree.
   cursor position fields are 12-bit signed; they were read as unsigned, so a
   cursor partly off the edge was drawn 4000 pixels away. (`src/dev/o2gfx.rs`)
 
+### SCSI
+
+- Every SCSI controller attaches its targets through one shared bus, and
+  disks report one emulated identity on every machine. The O2 and Octane now
+  say `IRIS EMUL DISK` and `IRIS EMUL CDROM` in INQUIRY; the Indy and Indigo2
+  keep their Sony CD-ROM.
+- A disc change loads a CHD CD as well as an ISO, and the O2, the Octane and
+  the Indigo2's second controller fold pending CHD diffs on a clean exit as the
+  first controller always did.
+
+### Serial ports
+
+- The O2 and Octane serial ports share one 16550A core ported from QEMU. On the
+  O2 this adds the receive FIFO with trigger levels and the character timeout;
+  O2 snapshots from before are refused (snapshot schema 5).
+- Serial host backends moved out of the Z85C30 into `src/dev/serial_host.rs`.
+
 ### Host efficiency on small machines
 
 - **Threads that have nothing to do now sleep in milliseconds, not
@@ -187,6 +204,10 @@ conformance work) is not carried onto this tree.
   produced. (`src/ci.rs`, `src/gfx_display.rs`)
 ### SGI Octane (IP30)
 
+- **Octane audio plays at the rate the guest asks for.** RAD audio ran at
+  44.1 kHz whatever IRIX programmed, so games and other non-44.1 kHz sounds
+  played at the wrong speed. `test/audiotest` sweeps rates and formats.
+  ([#354](https://github.com/techomancer/iris/issues/354))
 - **IMPACT on the Octane passes the GL pixel and state suites.** On IRIX
   6.5.22 pixtest went from 52 to 366 passing cases (the two left fail on the
   Indigo2 too) and glstate from 393 to 394. The Octane's microcode keeps the
@@ -281,6 +302,14 @@ conformance work) is not carried onto this tree.
 
 ### SGI O2 (IP32)
 
+- **O2 audio at 8 and 11 kHz no longer plays sharp.** A read of MACE's
+  audio registers now brings the rings up to date, so IRIX, which keeps
+  only about 2 ms of sound queued, no longer lets them run dry between
+  service passes.
+- **The O2's Ethernet-address chip is on the shared 1-wire bus** (`dev::mace_id`,
+  ported from the QEMU model); the MAC reads correctly at any emulator speed.
+- The O2's front LEDs show in the status bar.
+- The O2's SCSI and Ethernet lights show in the status bar.
 - **The O2 is on `Physical`.** Its bus is the same decode table and memory
   window as the Indy's: CRIME's banks are RAM banks a bank-control write
   remaps, CRIME, GBE, VICE, MACE and the flash are table entries, and
@@ -606,6 +635,11 @@ conformance work) is not carried onto this tree.
   the root, as `tftpd -s` does, and serves netascii. `test/tftp/` has a
   portable client (`tftpget.c`) and a guest test script. The monitor's
   `ps2 esc` presses Esc, which stops the PROM's autoboot.
+- The SEEQ, DaynaPort, MEC and IOC3 now get their NAT or PCAP backend from one
+  shared link, so a new backend is one implementation. The backend threads are
+  named `seeq-net`, `daynaN-net`, `ip32-mec-net` and `ip30-eth-net`.
+- `mode = "pcap"` is allowed on the O2 and the Octane, untested on a real
+  interface.
 
 ### UI / input
 

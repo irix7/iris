@@ -70,16 +70,29 @@ reach the machine through one shared `MachineSlot` per machine, which the
 machine's `Drop` nulls, so a holder that outlives the machine (the monitor,
 after iris-gui's Stop) gets "machine is not running" instead of freed memory.
 
-SCSI storage follows the same pattern one level down. `src/scsi.rs` is the
-target (disk, CD-ROM, DaynaPort) any controller can hold, and
-`src/scsi_monitor.rs` implements the monitor's `scsi` and `cow` subcommands and
-the run-time disc changes once, over a controller's target table lent through
-its `ScsiTargets` trait. The WD33C93A (Indy, Indigo2) and the Adaptec 7880 (O2)
-lend theirs and keep only chip-specific subcommands (`regs`; the WD's `wdt`,
-`defer`, `debug`), and `DiscChanger` is implemented once for every
-`ScsiTargets`. Configuration is shared the same way: both machines attach
-their devices from the `[scsi.N]` tables, where the key is a slot
-(controller × 16 + id, see `config::scsi_slot`).
+SCSI storage follows the same pattern one level down. `ScsiTarget` is what
+varies on a bus (a `ScsiDevice` disk or CD-ROM, a `DaynaPort`): `request`,
+the lifecycle, and optional behaviour with do-nothing defaults (a
+copy-on-write layer, CHD sync, a disc changer), so callers ask for behaviour
+and never for a type. `ScsiBus` (`src/scsi/bus.rs`) is the mechanism: the
+id-to-target table with attach, request and overlay export and import, and
+the controller's INQUIRY identities. A disk or CD-ROM sits on a `BlockNode`
+(`src/block_node.rs`), built by `open_image` for everything that mounts an
+image. A CD-ROM's node is a `ChangerNode`: the queue of discs and the open
+active one, with the `Removable` trait (present, changed, eject, load)
+separate from `BlockNode` so that removable media which is not a block device,
+a tape, can use it too. The WD33C93A (Indy, Indigo2), the Adaptec
+7880 (O2) and the ISP1040 (Octane) each make an empty bus of their own kind
+(`new_bus`); the machine fills it from config and gives it to the controller's
+constructor, so a controller exists with its targets and keeps only its
+registers and DMA. `src/scsi_monitor.rs` implements the monitor's `scsi` and `cow`
+subcommands and the run-time disc changes once, over the bus a controller hands
+out through `ScsiTargets::scsi_bus`; chip-specific subcommands (`regs`; the
+WD's `wdt`, `defer`, `debug`) stay with the chip, and `DiscChanger` is
+implemented once for every `ScsiTargets`. Configuration is shared the same
+way: `scsi::attach_from_config` walks the `[scsi.N]` tables for every machine,
+where the key is a slot (controller × 16 + id, see `config::scsi_slot`), and
+the machine supplies only a route from controller number to bus.
 
 ## 2. Data path and endianness
 
@@ -144,6 +157,15 @@ interfaces exist for specific links: `DmaClient` (a peripheral on an HPC3 DMA
 channel), `FifoDevice` (serial byte streams), `InterruptController`/`IrqLine`
 (below), `GfxDisplay` (a graphics board's screen, for the window and
 screenshots), `CpuDevice` (what `Machine` holds for the CPU).
+
+Serial lines have two halves. A UART model owns the registers: the Indy's
+`Z85c30`, and `Ns16550` (`src/dev/ns16550.rs`), the 16550A core that the O2's
+`MaceUart` (lane decode, interrupt line, monitor) and the Octane's IOC3 wrap.
+The host end is a `SerialBackend` from `src/dev/serial_host.rs`, which the
+machine constructors pick with `console_backends`: the CI backend, a TCP
+console, or a log tee. A UART's transmit is instant and its receive side
+pulls from the backend with back-pressure (`pump`), so nothing in the model
+needs a thread of its own beyond the service loop's call.
 
 ### The physical address map
 
@@ -246,7 +268,7 @@ Every device that has real work to do runs on its own thread:
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
-| `seeq-enet`, `seeq-nat` | ethernet DMA pump; the NAT engine and its built-in services |
+| `seeq-enet`, `seeq-net` | ethernet DMA pump; the network backend (the NAT engine and its built-in services, or a PCAP bridge) |
 | `MC-DMA` | VDMA (graphics DMA) |
 | `SCC-TX/RX-*` | serial ports |
 | `VINO-DMA` | video capture (only with a video source) |
@@ -258,7 +280,7 @@ Every device that has real work to do runs on its own thread:
 | `machine-events` | power-off and reset requests from devices |
 | `ISP1040-0`, `ISP1040-1` | Octane SCSI request rings and disk transfers |
 | `IOC3-RX-A`, `IOC3-RX-B`, `IOC3-NVRAM` | Octane serial input per port; the DS1685 NVRAM file writer (IOC3's other deadlines are `hptimer` one-shots) |
-| `ip30-eth-rx`, `ip30-eth-nat` | Octane ethernet receive pump; the NAT engine |
+| `ip30-eth-rx`, `ip30-eth-net` | Octane ethernet receive pump; the network backend |
 
 Threads that have nothing to do park instead of spinning: the graphics
 consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds

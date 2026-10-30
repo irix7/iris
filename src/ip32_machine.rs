@@ -132,10 +132,12 @@ pub struct O2Machine {
     monitor_port: u16,
     /// The console UART's in-process host end in CI mode (`--ci`), which the
     /// CI socket types into and reads.
-    ci_serial: Option<Arc<crate::dev::z85c30::CiSerialBackend>>,
+    ci_serial: Option<Arc<crate::dev::serial_host::CiSerialBackend>>,
     /// The NAT's controls and the addresses it hands the guest (client,
     /// gateway, netmask), when the Ethernet is plugged in.
     nat: Option<(Arc<crate::net::NatControl>, (std::net::Ipv4Addr, std::net::Ipv4Addr, std::net::Ipv4Addr))>,
+    /// Guest frames the network backend has processed.
+    frames: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// The guest switching the machine off, for the machine-events thread.
     events: std::sync::mpsc::SyncSender<MachineEvent>,
     event_rx: Option<std::sync::mpsc::Receiver<MachineEvent>>,
@@ -193,8 +195,16 @@ impl O2Machine {
             Some(mac) => Some(crate::config::parse_mac(mac).map_err(|e| format!("network.mac: {e}"))?),
             None => None,
         };
+        // The SCSI devices, from the same `[scsi.N]` tables as the other
+        // machines; `controller` is the bus (0 internal, 1 external). The
+        // buses are filled before the controllers exist.
+        let scsi = [crate::dev::aic7880::Aic7880::new_bus(), crate::dev::aic7880::Aic7880::new_bus()];
+        let attached = crate::scsi::attach_from_config(cfg, Some("ip32"), &|c| {
+            scsi.get(c as usize)
+                .ok_or_else(|| format!("controller {c} (an O2 has controllers 0 and 1)"))
+        })?;
         let opts = Ip32Options {
-            scsi: true,
+            scsi: Some(scsi),
             flash_file: Some(cfg.nvram.clone().into()),
             keyboard: (!cfg.headless).then_some(o2.mouse),
             mac,
@@ -204,55 +214,10 @@ impl O2Machine {
         if !cfg.no_audio {
             bus.mace.audio.enable_output(cfg.audio.clone());
         }
-        // The SCSI devices, from the same `[scsi.N]` tables as the other
-        // machines; `controller` is the bus (0 internal, 1 external).
-        let mut scratch_path: Option<std::path::PathBuf> = None;
-        {
-            let ctls = bus.scsi.lock().unwrap();
-            let mut ids: Vec<u8> = cfg.scsi.keys().copied().collect();
-            ids.sort();
-            for key in ids {
-                let dev = &cfg.scsi[&key];
-                let (controller, id) = dev.placement(key);
-                let at = crate::config::scsi_label(controller, id);
-                if dev.is_daynaport() {
-                    return Err(format!("{at}: kind = \"daynaport\" is not available on the O2"));
-                }
-                if let Some(path) = dev.prepare_scratch(key) {
-                    if scratch_path.is_some() {
-                        println!("Note: multiple scratch SCSI devices configured; CI socket will use the lowest-id one");
-                    } else {
-                        scratch_path = Some(path);
-                    }
-                }
-                let ctl = ctls.get(controller as usize).ok_or_else(|| {
-                    format!("{at}: controller {controller} (an O2 has controllers 0 and 1)")
-                })?;
-                let (path, discs) = dev.media();
-                let cdrom = dev.is_cdrom();
-                // CI mode keeps each copy-on-write overlay under /tmp, as the
-                // Indy does, so an interactive iris holding PATH.overlay and
-                // any number of CI runs can share the image.
-                let ci_overlay = (cfg.ci && dev.overlay && !cdrom).then(|| crate::config::ScsiDeviceConfig::ci_overlay_path(key));
-                match ctl.attach_device(id, &path, cdrom, discs, dev.overlay, ci_overlay.as_deref()) {
-                    Ok(_) if path.is_empty() => eprintln!("ip32: {at}: CD-ROM, tray empty"),
-                    Ok(blocks) => eprintln!("ip32: {at}: {path} ({blocks} blocks)"),
-                    Err(e) => {
-                        // As on the Indy: a configured disk that will not attach
-                        // ends a command-line run, since booting on without it
-                        // only yields a confusing PROM "no such device" later;
-                        // an embedder (the GUI sets IRIS_NO_EXIT_ON_POWEROFF)
-                        // boots without the device instead.
-                        let msg = format!("could not attach {path} to {at}: {e}");
-                        if std::env::var_os("IRIS_NO_EXIT_ON_POWEROFF").is_some() {
-                            eprintln!("iris: warning: {msg}; continuing without {at}");
-                        } else {
-                            return Err(msg);
-                        }
-                    }
-                }
-            }
+        if let Some(d) = attached.daynaports.first() {
+            return Err(format!("{}: kind = \"daynaport\" is not available on the O2", crate::config::scsi_label(d.controller, d.id)));
         }
+        let scratch_path = attached.scratch;
         eprintln!(
             "iris: O2 with {} MB ({}), {}",
             kits.iter().sum::<u32>(),
@@ -263,61 +228,21 @@ impl O2Machine {
         // the CI socket types into, otherwise TCP on `serial_port_a` (as the
         // Indy's channel A), either teed to `serial_log` when one is set. The
         // second port serves TCP on `serial_port_b`.
-        let [port_a, port_b] = cfg.serial_ports();
-        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::z85c30::CiSerialBackend::new()));
-        if let Some(ci) = &ci_serial {
-            if let Some(path) = cfg.serial_log.as_deref() {
-                match crate::dev::serial_log::SerialLog::create(
-                    std::path::Path::new(path),
-                    cfg.serial_log_timestamps,
-                ) {
-                    Ok(log) => {
-                        ci.set_log(log);
-                        eprintln!("iris: O2 serial console mirroring to {path}");
-                    }
-                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
-                }
-            }
-            bus.mace.com0.set_backend(ci.clone());
-        } else {
-            let mut backend = crate::dev::z85c30::null_serial_backend();
-            match crate::dev::z85c30::tcp_serial_backend(port_a) {
-                Some((b, p)) => {
-                    eprintln!("iris: O2 serial port 1 on 127.0.0.1:{p}");
-                    backend = b;
-                }
-                None => eprintln!("iris: O2 serial port 1: port {port_a} unavailable; is another iris using it? (serial_port_a)"),
-            }
-            if let Some(path) = &cfg.serial_log {
-                // A fresh log each boot, as the O2 has always kept it: scripts
-                // look at its tail for this boot's prompts.
-                match crate::dev::serial_log::SerialLog::create(
-                    std::path::Path::new(path),
-                    cfg.serial_log_timestamps,
-                ) {
-                    Ok(log) => {
-                        backend = Arc::new(crate::dev::z85c30::TeeBackend::new(backend.clone(), log));
-                    }
-                    Err(e) => eprintln!("iris: O2 serial log {path}: {e}"),
-                }
-            }
-            bus.mace.com0.set_backend(backend);
-        }
-        match crate::dev::z85c30::tcp_serial_backend(port_b) {
-            Some((b, p)) => {
-                eprintln!("iris: O2 serial port 2 on 127.0.0.1:{p}");
-                bus.mace.com1.set_backend(b);
-            }
-            None => eprintln!("iris: O2 serial port 2: port {port_b} unavailable; is another iris using it? (serial_port_b)"),
+        let ci_serial = cfg.ci.then(|| Arc::new(crate::dev::serial_host::CiSerialBackend::new()));
+        let (console, second) = crate::dev::serial_host::console_backends(cfg, "O2", ci_serial.as_ref());
+        bus.mace.com0.set_backend(console);
+        if let Some(b) = second {
+            bus.mace.com1.set_backend(b);
         }
         // The Ethernet on the NAT gateway `[network]` describes (`mode =
         // "off"` leaves it unplugged; validate refuses pcap here for now).
-        let mut nat = None;
-        if cfg.network.mode != crate::config::NetMode::Off {
-            let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        let (mut nat, mut frames) = (None, None);
+        let net = crate::net::GatewayConfig::from_network(&cfg.network());
+        if let Some(link) = crate::net::Link::with_gateway(net.clone())? {
             eprintln!("iris: O2 Ethernet on NAT: gateway {}, guest {} (DHCP)", net.gateway_ip, net.client_ip);
-            let addrs = (net.client_ip, net.gateway_ip, net.netmask);
-            nat = Some((bus.mace.mec.start_nat(net), addrs));
+            frames = Some(link.frames());
+            nat = Some((link.nat(), (net.client_ip, net.gateway_ip, net.netmask)));
+            bus.mace.mec.attach(link);
         }
 
         let timer_manager = Arc::new(TimerManager::new());
@@ -423,17 +348,10 @@ impl O2Machine {
 
         let (events, event_rx) = std::sync::mpsc::sync_channel(4);
         // A snapshot's disks by slot (controller * 16 + id) and size.
-        let mut disks: Vec<crate::snapshot::DiskRef> = cfg
-            .scsi
-            .iter()
-            .filter(|(_, d)| !d.is_cdrom())
-            .map(|(&key, d)| crate::snapshot::DiskRef {
-                id: { let (c, id) = d.placement(key); crate::config::scsi_slot(c, id) },
-                path: d.path.clone(),
-                size_bytes: std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(0),
-            })
+        let disks: Vec<crate::snapshot::DiskRef> = attached.tables.iter()
+            .filter(|t| !t.is_cdrom)
+            .map(|t| crate::snapshot::DiskRef { id: t.slot, path: t.path.clone(), size_bytes: t.size_bytes })
             .collect();
-        disks.sort_by_key(|d| d.id);
         Ok(Self {
             bus,
             cpu,
@@ -445,6 +363,7 @@ impl O2Machine {
             monitor_port,
             ci_serial,
             nat,
+            frames,
             events,
             event_rx: Some(event_rx),
             controller_up: Arc::new(AtomicBool::new(false)),
@@ -768,6 +687,12 @@ impl O2Machine {
         if m.schema_version > SCHEMA_VERSION {
             return Err(format!("snapshot schema_version {} is newer than this iris build supports ({SCHEMA_VERSION})", m.schema_version));
         }
+        if m.schema_version < SCHEMA_VERSION {
+            return Err(format!(
+                "snapshot {name} is schema {}; the O2's UART state changed shape in schema 5, so it cannot be restored",
+                m.schema_version
+            ));
+        }
         // As the Indy: build, CPU and disks must match;
         // IRIS_SNAPSHOT_SKIP_CHECK=1 makes those warnings.
         let mut fatal = Vec::new();
@@ -924,7 +849,7 @@ impl Workstation for O2Machine {
     fn get_timer_manager(&self) -> Arc<TimerManager> { O2Machine::get_timer_manager(self) }
     fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> { self.cpu.clone().debug_adapter() }
     fn fasttick_count(&self) -> Arc<std::sync::atomic::AtomicU64> { self.cpu.fasttick_count() }
-    fn get_ci_serial(&self) -> Option<Arc<crate::dev::z85c30::CiSerialBackend>> { self.ci_serial.clone() }
+    fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> { self.ci_serial.clone() }
     /// Typed at serial port 1, the console with `graphics = false`.
     fn inject_serial_console(&self, bytes: &[u8]) {
         match &self.ci_serial {
@@ -944,6 +869,23 @@ impl Workstation for O2Machine {
         self.bus.scsi.lock().unwrap().first().map(|c| c.clone() as Arc<dyn crate::workstation::DiscChanger>)
     }
 
+    fn pending_chd_sync_count(&self) -> usize {
+        self.bus.scsi.lock().unwrap().iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+    }
+    fn sync_chd_disks(
+        &self,
+        only: Option<usize>,
+        progress: &mut dyn FnMut(usize, usize, f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        let controllers = self.bus.scsi.lock().unwrap().clone();
+        let buses: Vec<_> = controllers.iter().map(|c| c.bus()).collect();
+        crate::scsi::ScsiBus::sync_chd_disks(&buses, only, progress, cancel)
+    }
+
+    fn net_frames(&self) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        self.frames.clone()
+    }
     fn nat_control(&self) -> Option<Arc<crate::net::NatControl>> {
         self.nat.as_ref().map(|(n, _)| n.clone())
     }
@@ -1015,7 +957,7 @@ impl O2Display {
                 let take_shot = self.screenshot_pending.swap(false, Ordering::Relaxed);
                 let stats = crate::disp::BarStats {
                     now: start,
-                    hb: 0,
+                    hb: self.bus.mace.id.heartbeat.fetch_and(crate::dev::ng1::rex3::Rex3::HB_PERSISTENT, Ordering::Relaxed),
                     cycles: self.cycles.get(),
                     fasttick: self.ticks.load(Ordering::Relaxed),
                     decoded_delta: 0,
@@ -1118,7 +1060,7 @@ impl Device for O2Control {
     fn register_commands(&self) -> Vec<(String, String)> {
         vec![("o2".to_string(), "O2 control: o2 shot PATH | status | pixel X Y | type TEXT | key|keydown|keyup NAME | \
             mouse DX DY [BUTTONS] | click [BUTTON] | pc | regs | peek ADDR LEN PATH | \
-            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH | nictrace PATH".to_string())]
+            retrace PATH | scsi PATH | unmapped | ps2log PATH | crimelog PATH".to_string())]
     }
 
     fn execute_command(&self, cmd: &str, args: &[&str], mut w: Box<dyn std::io::Write + Send>) -> Result<(), String> {
@@ -1171,16 +1113,6 @@ fn control_command(bus: &Ip32Bus, cmd: &str, arg: &str, rgba: &mut [u8]) -> Stri
         ),
         // `crimelog PATH`: the guest's recent CRIME interrupt-register
         // accesses, oldest first.
-        "nictrace" => {
-            let mut t = bus.mace.nic_trace.text();
-            for l in bus.mace.onewire.protocol_log() {
-                t.push_str(&format!("# {l}\n"));
-            }
-            match std::fs::write(arg.trim(), t) {
-                Ok(()) => "ok".into(),
-                Err(e) => format!("err {e}"),
-            }
-        }
         "crimelog" => match std::fs::write(arg.trim(), bus.crime.regs.irqlog_text()) {
             Ok(()) => "ok".into(),
             Err(e) => format!("err {e}"),
