@@ -80,7 +80,8 @@ WORK=$(stage_dir)
 trap 'rm -rf "$WORK"' EXIT
 
 # ── GUI ──────────────────────────────────────────────────────────────────────
-BUNDLE_ARGS=(--features "$(with_bundled "$GUI_FEATURES")" --version "$VERSION" --out "$WORK" --sign "$IDENTITY")
+SHORT_VERSION="${VERSION%%+*}"
+BUNDLE_ARGS=(--features "$(with_bundled "$GUI_FEATURES")" --version "$VERSION" --short-version "$SHORT_VERSION" --build-version "$SHORT_VERSION" --out "$WORK" --sign "$IDENTITY")
 if [ "$SKIP_BUILD" = 1 ]; then
     lipo -create -output "$WORK/iris-gui" \
         "$(release_dir aarch64-apple-darwin)/iris-gui" "$(release_dir x86_64-apple-darwin)/iris-gui"

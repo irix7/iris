@@ -13,6 +13,17 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork release 0.1.11+irix7
+
+The fork is re-released from its fresh tree on upstream `main` (see the reboot
+note below). This build carries upstream's emulator plus the fork's development
+infrastructure: parallel `--instance` fleets with per-instance state, ports, CI
+sockets and ownership locking; the `iris-ci` automation surface (per-consumer
+serial cursors, host-speed console, live-socket refusal, batched `script`) and
+the `setup-iris` action; and the deep benchmark toolchain (`iris-bench
+--repeat`, per-commit speed history and README graphs). Release versioning
+keeps the `+irix7` build-metadata convention, so the tag is `v0.1.11+irix7`.
+
 ### Fork reboot on upstream main
 
 The `irix7/iris` fork was rebuilt as a fresh tree on upstream `main`, carrying
