@@ -13,6 +13,32 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## October 2026
 
+### Fork reboot on upstream main
+
+The `irix7/iris` fork was rebuilt as a fresh tree on upstream `main`, carrying
+only the development infrastructure rather than a long-diverged emulator
+branch. Ported from the previous fork tree:
+
+- **Parallel instances.** `--instance`, `--state-dir`, `--port-base` and
+  `--print-instance` derive a private state directory, monitor/serial/CI ports,
+  a CI socket, a stable per-instance MAC and a distinct NAT `/24`; a locked
+  `iris.lock` gives one owner per state directory, with `--replace` and
+  stale-socket cleanup. See `docs/parallel-instances.md` and the media-free
+  `test/fleet` end-to-end test.
+- **CI and serial automation.** The `iris-ci` control socket refuses a live
+  socket, per-consumer cursors isolate concurrent readers, the console runs at
+  host speed in `--ci`, and `script FILE` runs a whole scenario over one
+  connection. The `setup-iris` composite action installs `iris` and `iris-ci`
+  from a release or a checkout.
+- **Deep benchmarks.** `iris-bench` pools repeated runs (`--repeat`) and
+  reports host-normalised efficiency; `tools/bench_history.py` and
+  `tools/bench_graphs.py` build a per-commit speed history with a sharded
+  one-time backfill, graphed in the README. See `BENCHMARKS.md`.
+
+The fork's earlier emulator work (the vino descriptor rewrite, the registered
+state-description/snapshot codec, the MIPS JIT experiments and the graphics
+conformance work) is not carried onto this tree.
+
 ### VNC, and screen and pointer commands
 
 - **Built-in VNC server.** `--vnc [ADDR]` or `[vnc] listen` serves the

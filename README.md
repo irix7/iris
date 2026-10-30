@@ -23,6 +23,30 @@ Boots IRIX 6.5 and 5.3. Has networking. Has a framebuffer.
 
 Prebuilt releases are available in [GitHub Releases](https://github.com/techomancer/iris/releases).
 
+## About this fork
+
+This repository (`irix7/iris`) is a fork of
+[`techomancer/iris`](https://github.com/techomancer/iris), the canonical SGI
+Indy / Indigo2 emulator. This checkout is a **fresh tree built on upstream
+`main`**, carrying only the fork's development infrastructure:
+
+- **Parallel instances** (`--instance N`, `--state-dir`, `--port-base`): one
+  opt-in flag derives a private state directory, ports, CI socket, guest MAC and
+  NAT subnet, with an ownership lock and stale-socket cleanup so a fleet runs
+  side by side. See [docs/parallel-instances.md](docs/parallel-instances.md).
+- **CI and automation**: the `iris-ci` control socket (per-consumer serial
+  cursors, host-speed console, live-socket refusal, batched `script`), the
+  `setup-iris` composite action, the Nix dev shell and its launcher, and the
+  media-free `test/fleet` end-to-end test.
+- **Serial session isolation** for concurrent agents driving one machine.
+- **The deep benchmark toolchain**: `iris-bench` with pooled `--repeat`, the
+  per-commit speed history built by `tools/bench_history.py` and
+  `tools/bench_graphs.py`, the sharded backfill, and the graphs below.
+
+Upstream remains canonical. The fork's earlier emulator work (graphics, the
+snapshot codec, the MIPS JIT) is deliberately not carried here — much of it has
+already landed upstream, and the rest is out of scope for this tree.
+
 ## Q&A
 
 **Q: What is it?**
