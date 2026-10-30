@@ -43,3 +43,6 @@ flake.lock
 # Agent/parallel-build artifacts (cargo target dirs and test temp).
 .tmp/
 target-fleet/
+
+# Runtime instance ownership lock (see docs/parallel-instances.md).
+/iris.lock
