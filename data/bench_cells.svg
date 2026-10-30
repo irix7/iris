@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="480" viewBox="0 0 920 480" font-family="system-ui,sans-serif">
+<text x="80" y="32" font-size="18" font-weight="600" fill="#222">Latest Benchmark — irix7/iris c2526639 (2026-10-21)</text>
+<text x="80" y="50" font-size="12" fill="#666">host: AMD EPYC 9V45 96-Core Processor · 4 cores</text>
+<line x1="80" y1="420.0" x2="890" y2="420.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="424.0" font-size="10" fill="#888" text-anchor="end">0</text>
+<line x1="80" y1="348.0" x2="890" y2="348.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="352.0" font-size="10" fill="#888" text-anchor="end">2138</text>
+<line x1="80" y1="276.0" x2="890" y2="276.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="280.0" font-size="10" fill="#888" text-anchor="end">4276</text>
+<line x1="80" y1="204.0" x2="890" y2="204.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="208.0" font-size="10" fill="#888" text-anchor="end">6414</text>
+<line x1="80" y1="132.0" x2="890" y2="132.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="136.0" font-size="10" fill="#888" text-anchor="end">8551</text>
+<line x1="80" y1="60.0" x2="890" y2="60.0" stroke="#e5e5e5" stroke-width="1"/>
+<text x="72" y="64.0" font-size="10" fill="#888" text-anchor="end">10689</text>
+<rect x="119.0" y="358.6" width="40.5" height="61.4" fill="#5b8db8"/>
+<rect x="160.5" y="360.0" width="40.5" height="60.0" fill="#4a7ab8"/>
+<rect x="202.0" y="308.3" width="40.5" height="111.7" fill="#3a6ab8"/>
+<rect x="243.5" y="217.9" width="40.5" height="202.1" fill="#2a5ab8"/>
+<text x="263.8" y="213.9" font-size="9" fill="#333" text-anchor="middle">6001</text>
+<text x="181.2" y="438.0" font-size="12" fill="#333" text-anchor="middle">R4400 INTERP</text>
+<rect x="321.5" y="107.0" width="40.5" height="313.0" fill="#c9763f"/>
+<text x="341.8" y="103.0" font-size="9" fill="#333" text-anchor="middle">644</text>
+<rect x="363.0" y="231.3" width="40.5" height="188.7" fill="#b86632"/>
+<text x="383.2" y="227.3" font-size="9" fill="#333" text-anchor="middle">531</text>
+<rect x="404.5" y="220.3" width="40.5" height="199.7" fill="#a85628"/>
+<rect x="446.0" y="375.9" width="40.5" height="44.1" fill="#98461e"/>
+<text x="466.2" y="371.9" font-size="9" fill="#333" text-anchor="middle">1308</text>
+<text x="383.8" y="438.0" font-size="12" fill="#333" text-anchor="middle">R4400 JITV2</text>
+<rect x="524.0" y="390.0" width="40.5" height="30.0" fill="#5b8db8"/>
+<rect x="565.5" y="387.2" width="40.5" height="32.8" fill="#4a7ab8"/>
+<rect x="607.0" y="361.0" width="40.5" height="59.0" fill="#3a6ab8"/>
+<rect x="648.5" y="321.7" width="40.5" height="98.3" fill="#2a5ab8"/>
+<text x="668.8" y="317.7" font-size="9" fill="#333" text-anchor="middle">2919</text>
+<text x="586.2" y="438.0" font-size="12" fill="#333" text-anchor="middle">R5000 INTERP</text>
+<rect x="726.5" y="223.1" width="40.5" height="196.9" fill="#c9763f"/>
+<text x="746.8" y="219.1" font-size="9" fill="#333" text-anchor="middle">405</text>
+<rect x="768.0" y="107.0" width="40.5" height="313.0" fill="#b86632"/>
+<text x="788.2" y="103.0" font-size="9" fill="#333" text-anchor="middle">881</text>
+<rect x="809.5" y="107.0" width="40.5" height="313.0" fill="#a85628"/>
+<rect x="851.0" y="107.0" width="40.5" height="313.0" fill="#98461e"/>
+<text x="871.2" y="103.0" font-size="9" fill="#333" text-anchor="middle">9295</text>
+<text x="788.8" y="438.0" font-size="12" fill="#333" text-anchor="middle">R5000 JITV2</text>
+<rect x="80" y="452" width="12" height="12" fill="#5b8db8" opacity="0.9"/>
+<text x="96" y="461" font-size="11" fill="#444">MIPS</text>
+<rect x="142" y="452" width="12" height="12" fill="#4a7ab8" opacity="0.9"/>
+<text x="158" y="461" font-size="11" fill="#444">DMIPS</text>
+<rect x="211" y="452" width="12" height="12" fill="#3a6ab8" opacity="0.9"/>
+<text x="227" y="461" font-size="11" fill="#444">LINPACK MFLOPS</text>
+<rect x="343" y="452" width="12" height="12" fill="#2a5ab8" opacity="0.9"/>
+<text x="359" y="461" font-size="11" fill="#444">Whetstone k/s</text>
+</svg>

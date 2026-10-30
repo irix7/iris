@@ -1,0 +1,130 @@
+# One-time benchmark backfill.
+#
+# Benchmarks historical EMULATOR builds with the CURRENT harness to build a
+# speed history of the code. Commits come from a hardcoded list
+# (bench/backfill-commits.txt by default), oldest first; only the emulator
+# varies, the apparatus (checked-in suite + iris-bench + one host baseline per
+# runner) is fixed at the checked-out commit. See tools/bench-backfill.sh.
+#
+# The list is split into 8 shards, each running as its own job on its own
+# runner so the whole backfill finishes inside the job timeout. Each shard
+# records the host baseline for its own machine, so the host-normalised
+# efficiency stitches the shards into one comparable history; the merge job then
+# folds the shard fragments into data/bench_history.json and regenerates the
+# graphs.
+name: Benchmark backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: "A file of commit hashes (one per line), or a git rev-list spec"
+        required: true
+        default: "bench/backfill-commits.txt"
+      step:
+        description: "Take every Nth commit (rev-list specs only)"
+        required: true
+        default: "1"
+      cpu:
+        description: "Emulated CPU (r4400 or r5000)"
+        required: true
+        default: "r4400"
+      engine:
+        description: "interp or jitv2 (jitv2 only where the commit supports it)"
+        required: true
+        default: "interp"
+      repeat:
+        description: "Samples per commit"
+        required: true
+        default: "3"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # GitHub now allows 10 concurrent jobs per account here; 10 shards all start
+  # at once. Keep this in step with the matrix below.
+  SHARDS: "10"
+
+jobs:
+  backfill:
+    name: shard ${{ matrix.shard }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Backfill shard
+        env:
+          BACKFILL_SHARD: ${{ matrix.shard }}
+          BACKFILL_SHARDS: ${{ env.SHARDS }}
+          BACKFILL_REPEAT: ${{ inputs.repeat }}
+        run: |
+          set -o pipefail
+          tools/bench-backfill.sh \
+            "${{ inputs.spec }}" "${{ inputs.step }}" \
+            "${{ inputs.cpu }}" "${{ inputs.engine }}" \
+            2>&1 | tee "bench-backfill-${{ matrix.shard }}.log"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: backfill-frag-${{ matrix.shard }}
+          path: bench/build/backfill-history.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: backfill-log-${{ matrix.shard }}
+          path: bench-backfill-${{ matrix.shard }}.log
+          if-no-files-found: ignore
+
+  merge:
+    name: Merge history
+    needs: backfill
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: backfill-frag-*
+          path: fragments
+
+      - name: Fold the shard fragments into the history
+        run: |
+          # Always merge onto the latest history, so the interpreter and jitv2
+          # backfills (separate runs) don't overwrite each other's entries.
+          git fetch origin main
+          git checkout origin/main -- data/bench_history.json || true
+          mapfile -t FRAGS < <(find fragments -name history.json | sort)
+          if [ "${#FRAGS[@]}" -eq 0 ]; then echo "no fragments to merge"; exit 0; fi
+          printf 'merging %d fragments\n' "${#FRAGS[@]}"
+          python3 tools/bench_history.py merge --from "${FRAGS[@]}"
+          python3 tools/bench_graphs.py
+
+      - name: Record history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ README.md
+          if git diff --cached --quiet; then echo "no history to record"; exit 0; fi
+          git commit -m "bench: backfill benchmark history [skip ci]"
+          git push || { git pull --rebase origin main && git push; }
