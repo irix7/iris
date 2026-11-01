@@ -134,6 +134,17 @@ pub const NO_ECC_BASE: u64 = 0x8000_0000;
 /// How much of memory also answers from address 0: the first 256 MB.
 pub const LOW_ALIAS_SIZE: u32 = 0x1000_0000;
 
+/// Where an O2 can answer with memory. The no-ECC alias is left out: the CPU
+/// folds it onto [`RAM_BASE`], so no other code sees an address in it.
+pub fn memory_map() -> crate::memory_map::MemoryMap {
+    use crate::memory_map::{MemKind, MemRange, MemoryMap};
+    MemoryMap::new(vec![
+        MemRange::new("low alias", MemKind::Alias, 0, LOW_ALIAS_SIZE as u64),
+        MemRange::new("prom", MemKind::Rom, PROM_BASE as u64, (PROM_BASE + PROM_SIZE) as u64),
+        MemRange::new("ram", MemKind::Ram, RAM_BASE as u64, RAM_BASE as u64 + RAM_WINDOW_SIZE as u64),
+    ])
+}
+
 /// Boot PROM. Same address as the Indy's, which is the one thing that carries
 /// over: the MIPS reset vector is 0xbfc00000 on both.
 pub const PROM_BASE: u32 = 0x1fc0_0000;
@@ -422,6 +433,12 @@ pub struct Ip32Bus {
 }
 
 impl Ip32Bus {
+    /// Flush the disks on every SCSI controller.
+    pub fn flush_disks(&self) -> std::io::Result<()> {
+        let controllers = self.scsi.lock().unwrap().clone();
+        controllers.iter().try_for_each(|c| c.bus().flush())
+    }
+
     /// `ram_bytes` of memory in the usual fitting for that size, or, for a
     /// size no O2 can have, one bank of it (power-of-two sizes only). `prom`
     /// must be the raw 512 KiB IP32 PROM image.
@@ -647,6 +664,9 @@ impl crate::traits::Saveable for Ip32Bus {
         t.insert("mace".into(), self.mace.save_state());
         let scsi = self.scsi.lock().unwrap().iter().map(|c| c.save_state()).collect();
         t.insert("scsi".into(), toml::Value::Array(scsi));
+        if let Some(words) = self.ram.stack_page_words() {
+            t.insert("stack_page".into(), toml::Value::Array(words.into_iter().map(crate::snapshot::hex_u64).collect()));
+        }
         toml::Value::Table(t)
     }
 
@@ -673,6 +693,10 @@ impl crate::traits::Saveable for Ip32Bus {
                 c.load_state(s)?;
             }
         }
+        if let Some(toml::Value::Array(a)) = get_field(v, "stack_page") {
+            let words: Option<Vec<u64>> = a.iter().map(crate::snapshot::toml_u64).collect();
+            self.ram.restore_stack_page(&words.ok_or("stack_page: not a list of dwords")?)?;
+        }
         Ok(())
     }
 }
@@ -683,6 +707,7 @@ impl Ip32Bus {
     /// on the hardware. The PROM sets up the rest again as it starts.
     pub fn power_on(&self) {
         use crate::traits::Resettable;
+        self.ram.set_stack_page(false);
         self.crime.regs.power_on();
         let m = &self.mace;
         let devices: [&dyn Resettable; 8] =
@@ -745,6 +770,7 @@ impl BusDevice for Ip32Bus {
     fn write16(&self, addr: u64, val: u16) -> u32 { self.phys.write16(addr, val) }
     fn write32(&self, addr: u64, val: u32) -> u32 { self.phys.write32(addr, val) }
     fn write64(&self, addr: u64, val: u64) -> u32 { self.phys.write64(addr, val) }
+    fn describe_fault(&self, addr: u64, size: usize) -> Option<String> { self.phys.describe_fault(addr, size) }
     fn mem_ptr(&self, addr: u64) -> Option<*const u64> { self.phys.mem_ptr(addr) }
     fn read_block(&self, addr: u64, buf: &mut [u64]) -> u32 { self.phys.read_block(addr, buf) }
     fn write_block(&self, addr: u64, buf: &[u64]) -> u32 { self.phys.write_block(addr, buf) }

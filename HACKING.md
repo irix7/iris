@@ -120,6 +120,7 @@ pub trait BusDevice: Send + Sync {
     // read16/write16, read32/write32, read64/write64 ...
     fn dma_read64 / dma_write64 (+ _bulk)              // accesses initiated by a DMA engine
     fn read_block / write_block / write64_masked       // bulk and byte-enable fast paths
+    fn cas32 / cas64                                   // SC on memory the ppmem window does not reach
     fn mem_ptr(&self, addr: u64) -> Option<*const u64>; // direct backing store, for RAM
     fn gen_ptr(&self, addr: u64) -> *const AtomicU64;  // jitv2 page generation counter
 }
@@ -227,6 +228,23 @@ aligned 32- and 64-bit host accesses are atomic (though unordered), and the
 hardware synchronisation points (descriptor ownership bits, interrupts) are
 kept where the real hardware has them.
 
+### The memory map
+
+The decode table says what answers at an address, but not whether that is
+memory. Each machine therefore also builds a `MemoryMap` (`src/memory_map.rs`)
+when it is constructed: a list of named ranges, each one RAM, an alias of RAM,
+or ROM. The Indy and Indigo2 take theirs from `ip22_bus::memory_map`, the O2
+from `ip32::memory_map`, and the Octane from `ip30::memory_map`, which sizes RAM
+from `banks`. The machine keeps it and passes it to the CPU in `MipsCpuConfig`.
+
+Code that needs to tell memory from everything else asks the map, not a
+machine's constants: the undo buffer records stores to RAM, the JIT sizes its
+page table to the map's end, and the `j2` monitor commands check addresses and
+lay out their report by range. A range says where the memory controller can
+answer, so an address in one may have nothing behind it until the firmware has
+programmed the controller. `lomem` and `himem` belong to the Indy and Indigo2
+devices and should not appear outside them.
+
 ### Interrupts
 
 A device holds an `IrqLine` (`src/irq.rs`): a reference to the controller it
@@ -264,7 +282,7 @@ Every device that has real work to do runs on its own thread:
 
 | Thread(s) | Work |
 |---|---|
-| `MIPS-CPU` | the interpreter or jitv2 dispatch loop |
+| `MIPS-CPU`, `MIPS-CPU1` | the interpreter or jitv2 dispatch loop, one thread per processor |
 | jitv2 compile pool | Cranelift compiles of requested pages (`[jitv2] threads`) |
 | `WD33C93A` | SCSI command execution and DMA |
 | `AIC-7880-0`, `AIC-7880-1` | O2 SCSI: command execution, host-memory DMA and disk I/O; the CPU's register writes only queue and kick |
@@ -287,6 +305,9 @@ consumers when their FIFO is empty, and the CPU thread in `idle-pause` builds
 when the guest is in its idle loop. A producer that adds work, or a device
 that raises an interrupt, unparks the thread it is waiting on. See
 `clanker/perf/` for what went wrong each time a parking rule was missed.
+
+`hptimer` sleeps to 50 µs short of its next deadline and spins only the rest,
+so a 1 kHz tick costs a few percent of a core, not all of it.
 
 The idle detector samples the guest PC every 32 sample calls (about 320
 instructions in the batch loop) and parks only when one long kernel cluster of
@@ -352,6 +373,28 @@ consumer thread never takes `rec`.
 - With `opcodefusion` (implied by `lightning`), the interpreter executes
   common pairs (branch + NOP, LUI + ORI/ADDIU, address + load/store) as one
   dispatch.
+
+### Several CPUs
+
+An Octane can have two ([docs/Octane/multiprocessor.md](docs/Octane/multiprocessor.md)).
+Each is its own `MipsCpu` with its own core, TLB, cache model and thread, over
+one `Physical`. `src/cpu/smp.rs` holds what they share:
+
+- **Which CPU this is.** `set_current_cpu` marks a CPU thread and `current_cpu()`
+  reads it. `BusDevice` carries no initiator; only HEART asks, for `PRID` and
+  `IMSR`. Any other thread reads as CPU 0.
+- **Holding a CPU still.** `ParkSlot::hold` sets `HOST_PARK_BIT` in the CPU's
+  interrupt word. Every preamble bails on any set bit, so the CPU leaves compiled
+  code at once and parks at its next batch boundary, with its executor unlocked
+  and its jitv2 page pointer cleared. HEART's disable bits use this.
+- **Getting the machine to yourself.** `World::stop_others` parks every other
+  CPU and runs a closure. Call it holding no lock another CPU could be waiting
+  on. Two callers take turns, and the one waiting counts as parked. Remapping
+  memory and flushing jitv2 go through it.
+
+The monitor reaches CPUs through `CpuMonitor` (`src/cpu/cpu_monitor.rs`), on
+every machine: it routes each command and the commands themselves live in
+`src/cpu/mips_exec/monitor.rs`.
 
 ### ExecStatus
 
@@ -441,6 +484,19 @@ without locks and composes it through the board's colour maps and DAC.
 Everything that touches the host GL context (including teardown) runs on the
 thread that owns it.
 
+The status bar under the frame is fed by `StatusSource` (`src/disp.rs`),
+which the machine builds once and hands to every graphics board: the
+heartbeat word (front-panel LEDs and SCSI/network activity bits), the CPU
+cycle counter, the Compare-match count and, in developer builds, the fetch
+counters. A display thread calls `status.snapshot(now, gfifo_pending)` once
+per presented frame and passes the result to `Renderer::present`; the call
+clears the activity bits and keeps the LEDs. Only the board's own queue depth
+is supplied by the board. A new board takes the `Arc<StatusSource>` in its
+constructor, answers `GfxDisplay::cycles` from it, and does not build a
+`BarStats` itself. The machine wires the cycle counter in with one
+`set_cpu_cycles` once the CPU exists, and each further CPU with
+`add_cpu_stats`.
+
 ### The composed frame and the hardware cursor
 
 `GfxDisplay` (`src/gfx_display.rs`) is what the window, the CI socket, the
@@ -493,6 +549,11 @@ code into host code with Cranelift. The concepts:
   an emitter end the compiled region or call the interpreter's handler. The
   equivalence tests, the cpu-tests matrix, `jitcheck` and the
   `jitv2_lockstep` feature compare the JIT against the interpreter.
+- **Several CPUs share one pool.** Compiled code reaches CPU state only through
+  its core pointer, so it runs on either CPU. Dispatch reads pages lock-free, the
+  pfn map publishes a slot after its claim, and inline stores bump generations
+  atomically. Compiled code is freed only by a full flush, and every flush parks
+  all CPUs first (`jitv2_flush_from_here`, `run_leader_flush`).
 - Compiled pages can optionally be cached on disk across runs
   (`[jitv2] cache`, [docs/jitv2-persistent-cache.md](docs/jitv2-persistent-cache.md)).
 

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::config::{CpuModel, MachineConfig};
 use crate::cpu::mips_cache_shadow::R10000ShadowCache;
+use crate::cpu::smp::World;
 use crate::cpu::mips_exec::{CpuDevice, MipsCpu, MipsCpuConfig, MipsExecutor};
 use crate::cpu::mips_tlb::MipsTlb;
 use crate::dev::bridge::{Bridge, RawFlash};
@@ -76,12 +77,16 @@ fn record_bus(barcode: &str, part: &str, revision: &str, name: &str, serial: u64
 }
 
 pub struct OctaneMachine {
+    /// Where this machine has memory.
+    pub memory: Arc<crate::memory_map::MemoryMap>,
     pub phys: Arc<Ip30Bus>,
     pub heart: Arc<Heart>,
     pub ram: Arc<HeartRam>,
     pub xbow: Arc<Xbow>,
-    cpu: Arc<dyn CpuDevice>,
-    flash_lines: Arc<CachedFlashLines>,
+    /// CPU 0 first. Whatever means "the CPU" to a front end is CPU 0.
+    cpus: Vec<Arc<dyn CpuDevice>>,
+    /// One per CPU: each caches the PROM's data privately.
+    flash_lines: Vec<Arc<CachedFlashLines>>,
     timer_manager: Arc<TimerManager>,
     monitor: Arc<crate::monitor::Monitor>,
     monitor_port: u16,
@@ -122,6 +127,10 @@ impl OctaneMachine {
         if prom.len() > FLASH_SIZE {
             return Err(format!("Octane PROM {prom_path} is {} bytes; the flash holds {FLASH_SIZE}", prom.len()));
         }
+        let cpu_count = cfg.machine.cpus;
+        if !(1..=2).contains(&cpu_count) {
+            return Err(format!("[machine] cpus = {cpu_count}: IRIX runs an Octane with 1 or 2"));
+        }
         let banks = heart_banks(cfg);
         let board = match cfg.graphics_board() {
             crate::config::GraphicsBoard::None => None,
@@ -134,9 +143,12 @@ impl OctaneMachine {
         // Memory, and HEART, whose descriptors place it.
         let ram = Arc::new(HeartRam::try_new(std::array::from_fn(|i| cfg.banks[i]))?);
         let mem = ram.dma_view();
-        let heart = Arc::new(Heart::new(HeartConfig::octane(banks), host_clock()));
+        let heart = Arc::new(Heart::new(HeartConfig { cpus: cpu_count, ..HeartConfig::octane(banks) }, host_clock()));
         // HEART's MicroLAN holds the processor module's record.
-        heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", "PM10", 0x5145_4d55_5500));
+        // The PROM's diagnostics hold it to the processors HEART reports: a
+        // PM10 has one and a PM20 two.
+        let module = if cpu_count > 1 { "PM20" } else { "PM10" };
+        heart.set_microlan(record_bus("EMUU00", "030-0888-004", "B", module, 0x5145_4d55_5500));
 
         let gfx_link = if board.is_some() { 1 << WIDGET_GFX } else { 0 };
         let xbow = Arc::new(Xbow::new(XBOW_REVISION, (1 << WIDGET_HEART) | (1 << WIDGET_BRIDGE) | gfx_link));
@@ -182,7 +194,11 @@ impl OctaneMachine {
         ioc3.connect_superio_interrupt(bridge.pin_line(SUPERIO_PIN));
         ioc3.set_timer_manager(timer_manager.clone());
         // The guest switching the machine off through the clock.
-        ioc3.set_event_sender(event_tx);
+        ioc3.set_event_sender(event_tx.clone());
+        // ... and resetting itself through HEART.
+        heart.on_soft_reset(Box::new(move || {
+            let _ = event_tx.try_send(MachineEvent::HardReset);
+        }));
         if let Err(e) = ioc3.set_nvram_file(&cfg.nvram) {
             eprintln!("iris: Octane NVRAM {}: {e}", cfg.nvram);
         }
@@ -196,7 +212,8 @@ impl OctaneMachine {
         // The status bar's activity bits and the CPU's Compare matches,
         // shared with the graphics board before the CPU exists.
         let fasttick = Arc::new(AtomicU64::new(0));
-        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), heartbeat, fasttick.clone()));
+        let status = crate::disp::StatusSource::new(heartbeat.clone(), fasttick.clone());
+        let gfx = board.map(|b| ImpactXio::with_board(WIDGET_GFX, b, heart.clone(), mem.clone(), status.clone()));
 
         // The bus over them, then the table.
         let phys = Ip30Bus::new(ram.clone());
@@ -216,10 +233,13 @@ impl OctaneMachine {
         // Descriptor writes place memory; Crossbow link changes switch the
         // widgets' windows; a link reset of widget 15 resets the Bridge at
         // its far end. Weak, so none of these keeps the bus or the Bridge.
+        // The window moves under no running CPU but the one that wrote.
+        let world = Arc::new(World::new());
         let weak = Arc::downgrade(&phys);
+        let remap_world = world.clone();
         heart.on_memcfg(Box::new(move |m| {
             if let Some(p) = weak.upgrade() {
-                p.remap_banks(m);
+                remap_world.stop_others(|| p.remap_banks(m));
             }
         }));
         let weak = Arc::downgrade(&phys);
@@ -253,29 +273,41 @@ impl OctaneMachine {
         );
 
         let count_hz = cfg.clock.fixed_mhz.map_or(OCTANE_COUNT_HZ, |mhz| (mhz * 1_000_000.0) as u64);
-        let flash_lines = Arc::new(CachedFlashLines::new(phys.phys.clone()));
-        let cpu = Self::build_cpu(phys.phys.clone(), flash_lines.clone(), &timer_manager, count_hz.max(1), fasttick);
+        let flash_lines: Vec<_> = (0..cpu_count)
+            .map(|_| {
+                let bus: Arc<dyn BusDevice> = phys.phys.clone();
+                Arc::new(if cpu_count > 1 { CachedFlashLines::for_one_of_several_cpus(bus) } else { CachedFlashLines::new(bus) })
+            })
+            .collect();
+        // CPU 0 keeps the counter the graphics board already reads.
+        let mut ticks = vec![fasttick];
+        ticks.extend((1..cpu_count).map(|_| Arc::new(AtomicU64::new(0))));
+        let memory = Arc::new(crate::ip30::memory_map(&cfg.banks[..4]));
+        let cpus: Vec<Arc<dyn CpuDevice>> = (0..cpu_count)
+            .map(|id| Self::build_cpu(id, cpu_count, memory.clone(), phys.phys.clone(), flash_lines[id as usize].clone(), &timer_manager, count_hz.max(1), ticks[id as usize].clone()))
+            .collect();
+        let cpu = cpus[0].clone();
+        world.set_slots(cpus.iter().map(|c| c.park_slot()).collect());
+        // One page pool and one body of compiled code: it reaches each CPU's
+        // state through the core pointer it is called with.
+        #[cfg(feature = "jitv2")]
+        if cpu_count > 1 {
+            #[cfg(feature = "jitv2_lockstep")]
+            return Err("[machine] cpus = 2 cannot run with jitv2_lockstep".into());
+            let jit = cpu.jitv2();
+            for c in &cpus {
+                c.share_jitv2(jit.clone(), world.clone());
+            }
+        }
+        status.set_cpu_cycles(cpu.cycles_ptr());
+        status.set_count_hz(cpu.count_hz_atomic());
+        for (c, tick) in cpus.iter().zip(&ticks).skip(1) {
+            status.add_cpu_stats(c.cycles_ptr(), tick.clone());
+        }
         if let Some(g) = &gfx {
-            g.mgras().set_cpu_cycles(cpu.cycles_ptr());
             // Host GL frames composite straight into the IMPACT framebuffer.
             #[cfg(feature = "hostgl")]
             iris_hostcall::set_display(Arc::new(crate::dev::mgras::ImpactScreen(g.mgras().clone())));
-        }
-
-        #[cfg(feature = "jitv2")]
-        {
-            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
-            let jit = cpu.jitv2();
-            let mut g = jit.lock();
-            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
-            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
-            g.compile_queue.set_owner(Arc::downgrade(&jit));
-            #[cfg(not(feature = "jitv2_lockstep"))]
-            {
-                let stats = g.stats.clone();
-                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
-            }
-            std::mem::forget(cpu_device);
         }
 
         // The shadow cache and the JIT read RAM straight from the ppmem
@@ -285,24 +317,61 @@ impl OctaneMachine {
             unsafe {
                 sp.set_bitmap_sink(cpu.ppmem_bitmap_ptr());
                 cpu.set_tcache_window(sp.window_base());
+                cpu.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
                 let bitmap = cpu.tcache_bitmap_ptr();
                 if !bitmap.is_null() {
                     sp.set_bitmap_sink2(bitmap);
                 }
                 #[cfg(feature = "jitv2")]
                 cpu.set_tcache_gen_window(sp.gen_window_base());
+                for c in cpus.iter().skip(1) {
+                    sp.add_bitmap_sink(c.ppmem_bitmap_ptr());
+                    c.set_tcache_window(sp.window_base());
+                    c.set_tcache_shift(crate::ppmem::window_shift(sp.window_size()));
+                    let bitmap = c.tcache_bitmap_ptr();
+                    if !bitmap.is_null() {
+                        sp.add_bitmap_sink(bitmap);
+                    }
+                    #[cfg(feature = "jitv2")]
+                    c.set_tcache_gen_window(sp.gen_window_base());
+                }
             }
             phys.phys.resync_ppmem_bitmap();
         }
         // Publish the descriptors as they stand into the sinks just set.
         ram.set_memcfg(heart.memcfg());
 
-        // HEART's levels 0 to 4 are the CPU's IP2 to IP6.
-        heart.set_interrupts(cpu.interrupts_ptr());
+        // After the windows above: each compile worker takes the cache's
+        // geometry once, as it starts, and without the windows that geometry
+        // has no inline load or store path.
+        #[cfg(feature = "jitv2")]
+        {
+            let cpu_device: Arc<dyn Device> = cpu.clone().as_device();
+            let jit = cpu.jitv2();
+            let mut g = jit.lock();
+            g.compile_queue.set_thread_count(cfg.jitv2.threads.max(1));
+            g.compile_queue.set_cpu(Arc::downgrade(&cpu_device));
+            g.compile_queue.set_owner(Arc::downgrade(&jit));
+            if cpu_count > 1 {
+                g.compile_queue.set_world(world.clone());
+            }
+            #[cfg(not(feature = "jitv2_lockstep"))]
+            {
+                let stats = g.stats.clone();
+                g.compile_queue.start(phys.phys.clone() as Arc<dyn BusDevice>, stats);
+            }
+            std::mem::forget(cpu_device);
+        }
+
+        // HEART's levels 0 to 4 are each CPU's IP2 to IP6.
+        for (id, c) in cpus.iter().enumerate() {
+            heart.set_cpu_interrupts(id, c.interrupts_ptr());
+            heart.set_cpu_park(id, c.park_slot());
+        }
 
         let monitor = crate::monitor::Monitor::new();
         monitor.register_device(crate::devlog::init_devlog());
-        monitor.register_device(cpu.clone().as_device());
+        monitor.register_device(Arc::new(crate::cpu::cpu_monitor::CpuMonitor::new(cpus.clone())));
         monitor.register_device(heart.clone());
         monitor.register_device(phys.phys.clone());
         monitor.register_device(Arc::new(Ip30Monitor {
@@ -348,11 +417,12 @@ impl OctaneMachine {
             eth.attach(link);
         }
         Ok(Self {
+            memory,
             phys,
             heart,
             ram,
             xbow,
-            cpu,
+            cpus,
             flash_lines,
             timer_manager,
             monitor: Arc::new(monitor),
@@ -408,14 +478,18 @@ impl OctaneMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_cpu(
+        id: u8,
+        cpu_count: u8,
+        memory: Arc<crate::memory_map::MemoryMap>,
         sysad: Arc<dyn BusDevice>,
         cached: Arc<CachedFlashLines>,
         tm: &Arc<TimerManager>,
         count_hz: u64,
         fasttick: Arc<AtomicU64>,
     ) -> Arc<dyn CpuDevice> {
-        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>();
+        let cfg = MipsCpuConfig::for_model::<R10000ShadowCache>(memory);
         let tlb = MipsTlb::new(cfg.tlb_entries);
         let mut exec: MipsExecutor<MipsTlb, R10000ShadowCache> = MipsExecutor::new(sysad, tlb, &cfg);
         // Cached accesses see the PROM's dirty flash lines; see `CachedFlashLines`.
@@ -431,8 +505,10 @@ impl OctaneMachine {
         // The R10000 drives 40 physical address bits; HEART decodes them
         // all, and the attribute bits above fold away.
         exec.phys_mask = (1 << 40) - 1;
-        exec.batch_hook = Some(Box::new(|exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
-            LAST_PC.store(exec.core.pc, Ordering::Relaxed);
+        exec.core.cpu_id = id;
+        exec.core.smp = cpu_count > 1;
+        exec.batch_hook = Some(Box::new(move |exec: &mut MipsExecutor<MipsTlb, R10000ShadowCache>| {
+            LAST_PC[id as usize].store(exec.core.pc, Ordering::Relaxed);
         }));
         Arc::new(MipsCpu::new(exec))
     }
@@ -454,6 +530,18 @@ impl OctaneMachine {
         d
     }
 
+    /// Reverse of start order, but graphics last: its stop joins a display
+    /// thread, which can fail to end, and the disks must be stopped by then.
+    fn stop_devices(&self) {
+        // `devices` ends with the graphics board, if there is one.
+        for d in self.devices().iter().rev().skip(self.gfx.iter().count()) {
+            d.stop();
+        }
+        if let Some(g) = &self.gfx {
+            g.stop();
+        }
+    }
+
     pub fn start(&mut self) {
         if let Ok(starting) = self.lifecycle.transition(crate::machine_state::GuestState::Starting) {
             self.lifecycle = starting;
@@ -462,7 +550,7 @@ impl OctaneMachine {
         self.restart_peripherals();
         // CI mode: the harness starts the CPU (`iris-ci start`).
         if self.ci_serial.is_none() {
-            self.cpu.clone().as_device().start();
+            self.start_cpus();
         }
     }
 
@@ -471,10 +559,8 @@ impl OctaneMachine {
     /// [`Self::restart_peripherals`]. HEART's counter holds still meanwhile
     /// and IOC3 writes its NVRAM out.
     pub fn stop(&mut self) {
-        self.cpu.clone().as_device().stop();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_cpus();
+        self.stop_devices();
         // The guest clock points into this machine's CPU core.
         #[cfg(feature = "perfetto")]
         crate::perfetto::set_guest_cycles(None);
@@ -488,10 +574,14 @@ impl OctaneMachine {
     /// PCI function's header returns to power-up (RST#).
     pub fn reset(&mut self) {
         self.stop();
-        Resettable::power_on(&*self.cpu);
+        for c in &self.cpus {
+            Resettable::power_on(&**c);
+        }
         self.xbow.power_on();
         self.heart.power_on();
-        self.flash_lines.clear();
+        for f in &self.flash_lines {
+            f.clear();
+        }
         self.bridge.reset();
         self.bridge.reset_pci();
         self.ioc3.power_on();
@@ -518,6 +608,18 @@ impl OctaneMachine {
         }
     }
 
+    fn start_cpus(&self) {
+        for c in &self.cpus {
+            c.clone().as_device().start();
+        }
+    }
+
+    fn stop_cpus(&self) {
+        for c in &self.cpus {
+            c.clone().as_device().stop();
+        }
+    }
+
     pub fn machine_slot(&mut self) -> MachineSlot {
         let ptr = self as *mut OctaneMachine as *mut dyn Workstation;
         let slot = self.controller_slot.get_or_insert_with(|| Arc::new(parking_lot::Mutex::new(MachineRef(ptr))));
@@ -531,10 +633,9 @@ impl Drop for OctaneMachine {
         if let Some(slot) = self.controller_slot.take() {
             slot.lock().0 = MachineRef::null();
         }
-        self.cpu.clone().as_device().stop();
-        for d in self.devices().iter().rev() {
-            d.stop();
-        }
+        self.stop_cpus();
+        self.stop_devices();
+        crate::workstation::flush_on_drop(self);
         self.monitor.shutdown();
     }
 }
@@ -553,10 +654,10 @@ impl Workstation for OctaneMachine {
         OctaneMachine::restart_peripherals(self)
     }
     fn cpu_start(&self) {
-        self.cpu.clone().as_device().start()
+        self.start_cpus()
     }
     fn cpu_is_running(&self) -> bool {
-        self.cpu.clone().as_device().is_running()
+        self.cpus.iter().any(|c| c.clone().as_device().is_running())
     }
     fn machine_slot(&mut self) -> MachineSlot {
         OctaneMachine::machine_slot(self)
@@ -587,10 +688,13 @@ impl Workstation for OctaneMachine {
         self.timer_manager.clone()
     }
     fn get_cpu_debug(&self) -> Arc<dyn crate::gdb_stub::CpuDebug> {
-        self.cpu.clone().debug_adapter()
+        self.cpus[0].clone().debug_adapter()
     }
     fn fasttick_count(&self) -> Arc<AtomicU64> {
-        self.cpu.fasttick_count()
+        self.cpus[0].fasttick_count()
+    }
+    fn cpu_counters(&self) -> Vec<(crate::cpu::mips_core::CyclesPtr, Arc<AtomicU64>)> {
+        self.cpus.iter().map(|c| (c.cycles_ptr(), c.fasttick_count())).collect()
     }
     fn get_ci_serial(&self) -> Option<Arc<crate::dev::serial_host::CiSerialBackend>> {
         self.ci_serial.clone()
@@ -621,6 +725,9 @@ impl Workstation for OctaneMachine {
     }
     fn pending_chd_sync_count(&self) -> usize {
         self.scsi.iter().map(|c| c.bus().pending_chd_sync_count()).sum()
+    }
+    fn flush_disks(&self) -> std::io::Result<()> {
+        self.scsi.iter().try_for_each(|c| c.bus().flush())
     }
     fn sync_chd_disks(
         &self,
