@@ -13,6 +13,27 @@ hashes are given where a change is easiest to understand by reading the commit.
 
 ## November 2026
 
+### Fork release 0.1.13+irix7
+
+Fixes on top of `0.1.12+irix7`, with upstream `main` merged to `4ad1b1d`.
+The release keeps the same feature set: `lightning`, `jitv2`, `gpujit`,
+`idle-pause` and `hostgl`.
+
+- **Disk writes after a cache flush reach the device.** An L1 writeback
+  stopped in the secondary cache, so the descriptor and bounce buffer the
+  guest had just cleaned were stale when the SCSI DMA fetched them. A
+  `WRITE(6)` could report success while writing the MC's bus-error fill.
+- **A console burst longer than the SCC's four-byte FIFO is no longer
+  truncated.** Bytes queue in order; the FIFO depth remains the status model.
+- **A no-media PROM boot reaches the System Maintenance Menu again.** The
+  idle-park path no longer sleeps on a masked line while the guest polls with
+  interrupts off, which had parked the release build's PROM console.
+- **The jitv2 compile pool starts `min(host CPUs, 4)` workers.** One worker
+  could leave a short kernel's cold page uncompiled for the whole run.
+- **The REX3 full-screen auxiliary-plane clear is pinned by a conformance
+  test**, matching the JIT against the interpreter for the OLAY, PUP and CID
+  fills IRIX 7 performs at `gfx::init`.
+
 ### A disk write after a cache flush reaches the device
 
 - **A CACHE `Hit_Writeback_Invalidate` now pushes its line through the
