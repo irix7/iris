@@ -3143,16 +3143,23 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
     /// A D-cache write-back done by a CACHE op. With CE set, the ECC register
     /// is XOR'd into the check bits of the doubleword the op addresses as the
     /// line is written to L2 (R4000 UM A-45).
-    fn l1d_writeback_op(&self, eidx: usize, virt_addr: u64, cascade: bool) {
+    ///
+    /// The write leaves the L2 line clean, so it reaches memory: a device's
+    /// DMA reads memory, and the kernel's `cache 0x15`
+    /// (Hit_Writeback_Invalidate) flushes only the primary. The secondary on
+    /// these machines is write-through, so a writeback that stopped in L2
+    /// would leave the descriptor or buffer a device reads stale — a SCSI
+    /// WRITE(6) that "succeeds" with whatever the buffer held before.
+    fn l1d_writeback_op(&self, eidx: usize, virt_addr: u64, _cascade: bool) {
         if !ECC {
-            self.writeback_l1d_line(eidx, cascade);
+            self.writeback_l1d_line(eidx, true);
             return;
         }
         let tag: L1DTag = self.dc.get_tag(eidx);
         let phys = l1d_tag_to_phys(tag, ((eidx & Self::DC_NUM_LINES_MASK) << Self::DC_LINE_SHIFT) as u64)
             | (virt_addr & Self::DC_LINE_MASK as u64 & !7);
         let written = tag.is_valid() && tag.dirty;
-        self.writeback_l1d_line(eidx, cascade);
+        self.writeback_l1d_line(eidx, true);
         let e = self.perr();
         if written && e.ce && HAS_L2 && self.hit_l2(phys).is_some() {
             let ecc = e.ecc;
@@ -4177,9 +4184,10 @@ impl<const IC_SIZE: usize, const IC_LINE: usize, const IC_WAYS: usize, const IC_
             }
         }
 
-        // cascade: on R5K, L1 cache ops must propagate to L2 (and L2 to memory) because
-        // the PROM only flushes L1 when SC=1, relying on hardware to keep L2 coherent.
-        //let cascade = !is_l2;
+        // cascade: only a writeback cascades. An invalidate must not drop an
+        // L2 line that another L1 sub-line has left dirty, so the invalidation
+        // paths below keep this false. `l1d_writeback_op` pushes its line
+        // through to memory on its own for DMA coherency.
         let cascade = false;
 
         if ECC && operation == C_ILT {
@@ -5571,11 +5579,13 @@ mod tests {
         let virt = kseg0(phys);
         let _ = cache.write::<4>(virt, phys as u64, 0xCAFE_0001u64);
 
-        // Hit_WBInvalidate flushes L1D dirty data to L2 and invalidates the tag.
+        // Hit_WBInvalidate flushes L1D dirty data through L2 to memory. A
+        // device DMA reads memory, so the op must leave it there itself; the
+        // kernel flushes only the primary before handing a buffer to a device.
         cache.cache_op(C_HWBINV | CACH_PD, virt, phys as u64);
-        // Flush L2 → memory to verify data made it out of L1D.
         flush_l2_to_mem(&cache, phys);
-        assert_eq!(mem_read(&mem, phys), 0xCAFE_0001, "Hit_WBInv(PD) did not flush dirty data to L2");
+        assert_eq!(mem_read(&mem, phys), 0xCAFE_0001,
+            "Hit_WBInv(PD) did not reach memory (a DMA read would see stale data)");
 
         // L1D tag was invalidated — overwrite memory and a subsequent read refills.
         mem_write(&mem, phys, 0xFACE_0002);
@@ -6409,29 +6419,24 @@ mod tests {
             "phys-only writeback did not reach memory");
     }
 
-    /// `writeback` must also flush a dirty L2 line that has no matching L1D
-    /// line anymore (L1D already wrote through to L2 and was invalidated).
+    /// An index writeback reaches memory directly: the secondary is
+    /// write-through, so there is no dirty L2 line left to flush afterwards.
     #[test]
-    // tcache writes through to RAM, so "memory is still stale until an explicit
-    // writeback" — the property this test asserts — is false by construction.
-    // The test still describes the real cache correctly; it simply does not
-    // apply when the cache holds no data.
-    #[cfg_attr(feature = "tcache", ignore = "write-through: memory is never stale under tcache")]
-    fn writeback_flushes_dirty_l2_line() {
+    fn index_writeback_invalidate_pushes_through_to_memory() {
         let mem = Arc::new(Memory::new(MEM_MB));
         let cache = make_cache(mem.clone());
 
         let phys: u32 = 0x3000;
         let virt = kseg0(phys);
         let _ = cache.write::<4>(virt, phys as u64, 0x5555_aaaa);
-        // Push L1D's dirty line into L2 and drop it from L1D, leaving only L2 dirty.
+        // Push L1D's dirty line through L2 to memory, then drop it from L1D.
         cache.cache_op(C_IWBINV | CACH_PD, virt, phys as u64 & 0x1FFF_FFFF);
-        assert_eq!(mem_read(&mem, phys), 0, "L2 writeback should not have happened yet");
-
-        let n = cache.writeback(Some(virt), phys as u64, R4400Cache::L2_LINE as u64);
-        assert!(n >= 1, "expected at least the L2 line to be written back");
         assert_eq!(mem_read(&mem, phys), 0x5555_aaaa,
-            "writeback did not flush the dirty L2 line to memory");
+            "Index_WBInv(PD) stopped in L2; a DMA read would see stale data");
+
+        // The line is clean now, so an explicit L2 writeback has nothing to do.
+        let n = cache.writeback(Some(virt), phys as u64, R4400Cache::L2_LINE as u64);
+        assert_eq!(n, 0, "the write-through left a dirty L2 line behind");
     }
 
 }
