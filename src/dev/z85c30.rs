@@ -320,9 +320,26 @@ impl Channel {
 
     pub fn write_data(&mut self, val: u8) {
         crate::dlog_dev!(LogModule::Scc, "SCC({}): Write Data {:02x} (Queue len {})", self.name, val, self.tx_queue.len());
-        // Push to TX queue (capacity 4)
-        if self.tx_queue.len() >= 4 {
-            self.tx_queue.pop_front();
+        // The four-byte depth is the FIFO's status model, not a licence to
+        // discard bytes.  Dropping the oldest byte here silently corrupted the
+        // guest's console output when a burst outran the transmitter: a
+        // NodeId lost its leading `0` in the M2 evidence.  Keep the backlog
+        // in order; the TX thread drains it at the character rate and
+        // TX_BUFFER_EMPTY stays clear while it is deep, so a guest that polls
+        // is backpressured rather than corrupted.
+        const TX_BACKLOG_LIMIT: usize = 64 * 1024;
+        if self.tx_queue.len() >= TX_BACKLOG_LIMIT {
+            // Only a guest that ignores TX_BUFFER_EMPTY for minutes reaches
+            // this.  Drop the newest byte so the failure is visible as a gap,
+            // not as a rewritten prefix.
+            crate::dlog_dev!(
+                LogModule::Scc,
+                "SCC({}): TX backlog {} exceeded; dropping byte {:02x}",
+                self.name,
+                self.tx_queue.len(),
+                val
+            );
+            return;
         }
         self.tx_queue.push_back(val);
 
@@ -1014,6 +1031,28 @@ mod tests {
         assert_eq!(received.len(), line.len(),
             "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
         assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
+    }
+
+    #[test]
+    fn tx_burst_preserves_every_byte_in_order() {
+        let scc = Z85c30::new(None);
+        let mut ch = scc.channel_a.0.lock();
+        let burst = b"08006969B60100000000000000000000";
+        for byte in burst {
+            ch.write_data(*byte);
+        }
+        assert_eq!(
+            ch.tx_queue.len(),
+            burst.len(),
+            "a burst longer than the four-byte FIFO depth must discard nothing"
+        );
+        assert_eq!(
+            ch.status & rr0::TX_BUFFER_EMPTY,
+            0,
+            "a deep TX queue must report the transmitter busy"
+        );
+        let drained: Vec<u8> = ch.tx_queue.drain(..).collect();
+        assert_eq!(&drained, burst, "byte order changed across the backlog");
     }
 
     #[test]
