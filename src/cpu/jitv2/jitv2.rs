@@ -2875,7 +2875,8 @@ impl CompileQueue {
     /// queue is ever `start()`-ed (later calls are a no-op, guarded by
     /// `debug_assert!`, since the whole point is "fixed at startup, no
     /// runtime mutation"). `Machine::new` is the only real caller today
-    /// (reading `[jitv2].threads`/`--jitv2-threads` from config, default 1).
+    /// (reading `[jitv2].threads`/`--jitv2-threads` from config; the
+    /// default is the host's parallelism capped at four).
     /// `n.max(1)`: a misconfigured 0 would
     /// otherwise silently degrade to "no compile threads at all."
     pub fn set_thread_count(&mut self, n: usize) {

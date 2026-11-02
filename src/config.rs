@@ -1334,7 +1334,17 @@ pub struct Jitv2Config {
     pub cache_dir: String,
 }
 
-fn default_jitv2_threads() -> usize { 1 }
+/// Compile-pool size when `[jitv2] threads` is unset.
+///
+/// A cold page's first publish is queued behind the pages ahead of it. One
+/// worker leaves a short kernel (a conversion benchmark runs for ~130 ms)
+/// interpreted for its whole life when a dozen pages are queued; four keep
+/// the queue short enough for the compile to land (issue #112). The cost is
+/// one to three seconds on a 38-second bench suite and one occasionally
+/// slower cell, so cap it at four rather than take every core.
+fn default_jitv2_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+}
 
 impl Default for Jitv2Config {
     fn default() -> Self {

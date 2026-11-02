@@ -11,6 +11,34 @@ history; author dates can differ after rebases or cherry-picks. Historical
 feature names describe the build at the time, not flags to use today. Commit
 hashes are given where a change is easiest to understand by reading the commit.
 
+## November 2026
+
+### A disk write after a cache flush reaches the device
+
+- **A CACHE `Hit_Writeback_Invalidate` now pushes its line through the
+  secondary cache to memory.** It used to stop in L2. A device DMA reads
+  memory, so a descriptor or bounce buffer the guest had just cleaned was
+  stale when the SCSI controller fetched it: `WRITE(6)` wrote the MC's bus-error
+  fill (`0xFF`) while the guest saw success. The IRIX 7 epoch store on a
+  scratch volume is the case that surfaced it; a restarted node now restores
+  its confirmed epoch instead of falling back to the seed.
+
+### The SCC keeps a console burst whole
+
+- **The transmitter no longer discards the oldest queued byte when its
+  four-byte FIFO is full.** The four-byte depth remains the status model, so a
+  polling guest is still backpressured; bytes are queued in order and drained
+  at the character rate. A 32-byte NodeId written in one burst no longer loses
+  its leading character.
+
+### The compile pool starts four workers on a capable host
+
+- **`jitv2.threads` unset now means `min(host parallelism, 4)`, not 1.** A
+  cold page's first publish queues behind the pages ahead of it; with one
+  worker a short kernel could run interpreted for its whole life. The default
+  is capped at four because more workers lengthen the bench suite. Set
+  `[jitv2] threads = 1` to keep the old behaviour.
+
 ## October 2026
 
 ### Fork release 0.1.12+irix7
