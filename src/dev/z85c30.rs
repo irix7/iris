@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn tx_burst_preserves_every_byte_in_order() {
-        let scc = Z85c30::new_null(None);
+        let scc = Z85c30::new(None);
         let mut ch = scc.channel_a.0.lock();
         let burst = b"08006969B60100000000000000000000";
         for byte in burst {
