@@ -26,6 +26,7 @@ CPU architecture: CP0, TLB and its fast paths, caches, FPU, LL/SC, CPU models. B
 | [cached-flash-is-a-cache-with-two-cpus.md](cpu/cached-flash-is-a-cache-with-two-cpus.md) | rule | With two CPUs, cached flash reads must hold their lines: a fetch through to a chip in status mode executes `0x80808080` |
 | [cache-attributes-and-fetch-alignment.md](cpu/cache-attributes-and-fetch-alignment.md) | rule | Cache attributes and fetch alignment: three hardcodings, all wrong |
 | [cache-tag-index-and-check-bits.md](cpu/cache-tag-index-and-check-bits.md) | rule | Cache tags: index ops index by address; check bits are generated, not stored |
+| [cache-writeback-must-reach-memory.md](cpu/cache-writeback-must-reach-memory.md) | rule | A CACHE writeback must reach memory, not stop in L2: SCSI DMA reads memory and wrote stale/`0xFF` data |
 | [cop0-requires-kernel-or-cu0.md](cpu/cop0-requires-kernel-or-cu0.md) | rule | CP0 instructions must be gated on Kernel-or-CU0 |
 | [cp0-index-masks-never-wraps.md](cpu/cp0-index-masks-never-wraps.md) | rule | CP0 `Index` selects a TLB slot by masking, never modulo |
 | [cp0-status-writes-must-resync-privilege-state.md](cpu/cp0-status-writes-must-resync-privilege-state.md) | rule | Every `cp0_status` write must call `resync_privilege_state()` |
